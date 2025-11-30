@@ -316,6 +316,65 @@ class HttpClient:
         raise RuntimeError(f"Network failure after retries for {url}")
 
 
+# ------------- Google Scholar Client (optional) -------------
+class ScholarlyClient:
+    """Google Scholar client via scholarly package (opt-in, reliability-focused)."""
+
+    def __init__(self, proxy: str = "none", delay: float = 5.0, logger: Optional[logging.Logger] = None):
+        self.delay = delay
+        self.logger = logger or logging.getLogger(__name__)
+        self._last_request = 0.0
+        self._scholarly = None
+        self._setup(proxy)
+
+    def _setup(self, proxy: str) -> None:
+        try:
+            from scholarly import ProxyGenerator, scholarly
+
+            self._scholarly = scholarly
+            if proxy == "tor":
+                pg = ProxyGenerator()
+                pg.Tor_Internal()
+                scholarly.use_proxy(pg)
+                self.logger.debug("Scholarly: using Tor proxy")
+            elif proxy == "free":
+                pg = ProxyGenerator()
+                pg.FreeProxies()
+                scholarly.use_proxy(pg)
+                self.logger.debug("Scholarly: using free proxies")
+            else:
+                self.logger.debug("Scholarly: no proxy configured")
+        except ImportError:
+            self.logger.warning("scholarly package not installed; Google Scholar fallback disabled")
+            self._scholarly = None
+
+    def _rate_limit(self) -> None:
+        elapsed = time.time() - self._last_request
+        if elapsed < self.delay:
+            time.sleep(self.delay - elapsed)
+        self._last_request = time.time()
+
+    def search(self, title: str, first_author: str) -> Optional[Dict[str, Any]]:
+        """Search Google Scholar and return filled publication or None."""
+        if not self._scholarly:
+            return None
+        try:
+            self._rate_limit()
+            query = f"{title} {first_author}"
+            self.logger.debug("Scholarly search: %s", query[:80])
+            search_results = self._scholarly.search_pubs(query)
+            pub = next(search_results, None)
+            if pub:
+                self._rate_limit()
+                filled = self._scholarly.fill(pub)
+                return filled
+        except StopIteration:
+            self.logger.debug("Scholarly: no results found")
+        except Exception as e:
+            self.logger.warning("Scholarly search failed: %s", e)
+        return None
+
+
 # ------------- Detection -------------
 @dataclass
 class PreprintDetection:
@@ -414,9 +473,12 @@ class PublishedRecord:
 
 
 class Resolver:
-    def __init__(self, http: HttpClient, logger: logging.Logger) -> None:
+    def __init__(
+        self, http: HttpClient, logger: logging.Logger, scholarly_client: Optional[ScholarlyClient] = None
+    ) -> None:
         self.http = http
         self.logger = logger
+        self.scholarly_client = scholarly_client
 
     # --- arXiv ---
     def arxiv_candidate_doi(self, arxiv_id: str) -> Optional[str]:
@@ -670,6 +732,59 @@ class Resolver:
                 parts.append(given)
         return " and ".join(parts)
 
+    def _scholarly_to_record(self, pub: Dict[str, Any]) -> Optional[PublishedRecord]:
+        """Convert scholarly publication dict to PublishedRecord."""
+        if not pub:
+            return None
+        bib = pub.get("bib", {})
+        if not bib:
+            return None
+
+        # Extract DOI from pub_url or eprint_url if possible
+        doi = None
+        for url_field in ["pub_url", "eprint_url"]:
+            url = pub.get(url_field, "") or ""
+            if "doi.org/" in url:
+                doi = doi_normalize(url.split("doi.org/")[-1])
+                break
+
+        # Parse authors from "Author One and Author Two" format
+        authors = []
+        author_str = bib.get("author", "")
+        if author_str:
+            for name in author_str.split(" and "):
+                name = name.strip()
+                if not name:
+                    continue
+                parts = name.split()
+                if len(parts) >= 2:
+                    authors.append({"given": " ".join(parts[:-1]), "family": parts[-1]})
+                elif parts:
+                    authors.append({"given": "", "family": parts[0]})
+
+        venue = bib.get("venue") or bib.get("journal") or bib.get("booktitle")
+        year = None
+        if bib.get("pub_year"):
+            try:
+                year = int(bib["pub_year"])
+            except (ValueError, TypeError):
+                pass
+
+        return PublishedRecord(
+            doi=doi,
+            url=pub.get("pub_url"),
+            title=bib.get("title"),
+            authors=authors,
+            journal=venue,
+            year=year,
+            volume=bib.get("volume"),
+            number=bib.get("number"),
+            pages=bib.get("pages"),
+            type="journal-article" if venue else "unknown",
+            method="GoogleScholar(search)",
+            confidence=0.0,
+        )
+
     def resolve(self, entry: Dict[str, Any], detection: PreprintDetection) -> Optional[PublishedRecord]:
         # 1) arXiv -> DOI -> Crossref
         candidate_doi: Optional[str] = None
@@ -845,6 +960,27 @@ class Resolver:
                 best.method = "Crossref(search)"
                 best.confidence = score
                 return best
+
+        # 6) Google Scholar fallback (opt-in only)
+        if self.scholarly_client and title_norm:
+            first_author = first_author_surname(entry)
+            pub = self.scholarly_client.search(title_norm, first_author)
+            if pub:
+                rec = self._scholarly_to_record(pub)
+                if rec and rec.title:
+                    tb = normalize_title_for_match(rec.title)
+                    title_score = token_sort_ratio(title_norm, tb)
+                    authors_ref = authors_last_names(entry.get("author", ""))
+                    blns = [strip_diacritics(a.get("family") or "").lower() for a in rec.authors][:3]
+                    auth_score = jaccard_similarity(authors_ref[:3], blns)
+                    combined = 0.7 * (title_score / 100.0) + 0.3 * auth_score
+                    if combined >= 0.9:
+                        rec.method = "GoogleScholar(search)"
+                        rec.confidence = combined
+                        self.logger.debug(
+                            "Google Scholar match: %.2f (title=%.0f, auth=%.2f)", combined, title_score, auth_score
+                        )
+                        return rec
 
         return None
 
@@ -1078,6 +1214,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-workers", type=int, default=4, help="Max concurrent workers")
     p.add_argument("--timeout", type=float, default=20.0, help="HTTP timeout seconds")
     p.add_argument("--verbose", action="store_true", help="Verbose logging")
+    # Google Scholar options (opt-in)
+    p.add_argument(
+        "--use-scholarly", action="store_true", help="Enable Google Scholar fallback (requires scholarly package)"
+    )
+    p.add_argument(
+        "--scholarly-proxy",
+        choices=["tor", "free", "none"],
+        default="none",
+        help="Proxy for Google Scholar requests (default: none)",
+    )
+    p.add_argument(
+        "--scholarly-delay",
+        type=float,
+        default=5.0,
+        help="Delay between Google Scholar requests in seconds (default: 5.0)",
+    )
     return p
 
 
@@ -1139,7 +1291,24 @@ def main(argv: Optional[List[str]] = None) -> int:
     http = HttpClient(
         timeout=args.timeout, user_agent=user_agent, rate_limiter=rate_limiter, cache=cache, verbose=args.verbose
     )
-    resolver = Resolver(http=http, logger=logger)
+
+    # Google Scholar client (opt-in)
+    scholarly_client = None
+    if args.use_scholarly:
+        scholarly_client = ScholarlyClient(
+            proxy=args.scholarly_proxy,
+            delay=args.scholarly_delay,
+            logger=logger,
+        )
+        if scholarly_client._scholarly:
+            logger.info(
+                "Google Scholar fallback enabled (delay=%.1fs, proxy=%s)", args.scholarly_delay, args.scholarly_proxy
+            )
+        else:
+            logger.warning("Google Scholar fallback requested but scholarly package not available")
+            scholarly_client = None
+
+    resolver = Resolver(http=http, logger=logger, scholarly_client=scholarly_client)
     detector = Detector()
     updater = Updater(keep_preprint_note=args.keep_preprint_note, rekey=args.rekey)
 
@@ -1343,6 +1512,8 @@ def test_pipeline_with_dblp_fallback():
                 authors=[{"given": "Jane", "family": "Doe"}, {"given": "John", "family": "Smith"}],
                 journal="International Journal of Widgetry",
                 year=2023,
+                volume="10",
+                pages="1-15",
                 type="journal-article",
                 method="DBLP(search)",
                 confidence=0.95,
