@@ -20,6 +20,9 @@ dev = [
     "mypy>=1.13.0",
     "types-requests>=2.31.0",
 ]
+scholarly = [
+    "scholarly>=1.7.0",
+]
 
 [tool.black]
 line-length = 120
