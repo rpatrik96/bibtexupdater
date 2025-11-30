@@ -1,0 +1,28 @@
+\documentclass{article}
+\usepackage{natbib}
+
+\begin{document}
+
+\section{Introduction}
+% Test standard \cite command
+This paper discusses examples \cite{smith2020}.
+
+% Test \citep (parenthetical citation)
+Several works explore this topic \citep{jones2021}.
+
+% Test \citet (textual citation)
+\citet{brown2019} introduced the concept.
+
+% Test multiple citations in one command
+See also \cite{smith2020, preprint2022}.
+
+% This is a comment - citations here should be IGNORED: \cite{should_be_ignored}
+% \citep{also_ignored}
+
+% Test citation with optional argument
+According to \cite[Chapter 3]{textbook2018}, this is important.
+
+% Test citation with pre and post notes
+As noted by \citep[see][p.~42]{smith2020}, examples are useful.
+
+\end{document}

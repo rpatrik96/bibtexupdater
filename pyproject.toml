@@ -1,0 +1,60 @@
+[project]
+name = "bibtexupdater"
+version = "0.1.0"
+description = "Replace preprint BibTeX entries with published versions"
+requires-python = ">=3.9"
+dependencies = [
+    "bibtexparser",
+    "requests",
+    "crossref-commons",
+    "httpx",
+    "rapidfuzz",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pre-commit>=3.6.0",
+    "black>=24.0.0",
+    "ruff>=0.7.0",
+    "mypy>=1.13.0",
+    "types-requests>=2.31.0",
+]
+
+[tool.black]
+line-length = 120
+target-version = ["py39", "py310", "py311", "py312"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py39"
+
+[tool.ruff.lint]
+select = [
+    "E",      # pycodestyle errors
+    "W",      # pycodestyle warnings
+    "F",      # Pyflakes
+    "I",      # isort
+    "B",      # flake8-bugbear
+    "C4",     # flake8-comprehensions
+]
+ignore = [
+    "E501",   # line too long (handled by black)
+    "B008",   # do not perform function calls in argument defaults
+    "B905",   # zip without explicit strict parameter
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["bibtex_updater"]
+
+[tool.mypy]
+python_version = "3.9"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = [".", "tests"]
+python_files = ["bibtex_updater.py", "test_*.py"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short"
