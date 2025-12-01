@@ -36,17 +36,14 @@ jobs:
         run: |
           pip install bibtexparser requests crossref-commons httpx rapidfuzz
 
-      - name: Copy bibtexupdater script
+      - name: Verify bibtexupdater script exists
         run: |
-          # Download with error checking to prevent committing 404 pages
-          curl -fsSL https://raw.githubusercontent.com/rpatrik96/bibtexupdater/main/bibtex_updater.py -o bibtex_updater.py
-
-          # Verify download is a valid Python file
-          if ! head -1 bibtex_updater.py | grep -q "^#!.*python"; then
-            echo "ERROR: bibtex_updater.py download failed or is invalid"
+          # Script is part of this repo - no need to download
+          if [ ! -f bibtex_updater.py ]; then
+            echo "ERROR: bibtex_updater.py not found in repository"
             exit 1
           fi
-          echo "Script downloaded successfully"
+          echo "Script found in repository"
 
       - name: Find .bib files to process
         id: find-bib
