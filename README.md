@@ -308,6 +308,16 @@ You can also manually trigger the workflow from the GitHub Actions tab:
 3. Click "Run workflow"
 4. Optionally specify a specific .bib file
 
+## Bibliography Filtering
+
+Filter your bibliography to include only cited references:
+
+```bash
+python filter_bibliography.py paper.tex references.bib -o filtered.bib
+```
+
+For detailed documentation including Overleaf integration and local latexmkrc setup, see [docs/FILTER_BIBLIOGRAPHY.md](docs/FILTER_BIBLIOGRAPHY.md).
+
 ## License
 
 MIT License - see [LICENSE](LICENSE) for details.
