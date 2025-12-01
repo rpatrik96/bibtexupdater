@@ -1,43 +1,141 @@
-@article{smith2020,
-  title = {A Sample Article},
-  author = {Smith, John and Doe, Jane},
-  journal = {Journal of Examples},
+% Real-world machine learning papers for testing
+% Includes different entry types: @article, @inproceedings, @misc (arXiv), @book
+
+% === Optimization ===
+@inproceedings{kingma2015adam,
+  title = {Adam: A Method for Stochastic Optimization},
+  author = {Kingma, Diederik P. and Ba, Jimmy},
+  booktitle = {International Conference on Learning Representations (ICLR)},
+  year = {2015},
+  url = {https://arxiv.org/abs/1412.6980}
+}
+
+% === Transformers / Attention ===
+@inproceedings{vaswani2017attention,
+  title = {Attention is All You Need},
+  author = {Vaswani, Ashish and Shazeer, Noam and Parmar, Niki and Uszkoreit, Jakob and Jones, Llion and Gomez, Aidan N. and Kaiser, Lukasz and Polosukhin, Illia},
+  booktitle = {Advances in Neural Information Processing Systems (NeurIPS)},
+  volume = {30},
+  year = {2017},
+  pages = {5998--6008}
+}
+
+@article{devlin2019bert,
+  title = {{BERT}: Pre-training of Deep Bidirectional Transformers for Language Understanding},
+  author = {Devlin, Jacob and Chang, Ming-Wei and Lee, Kenton and Toutanova, Kristina},
+  journal = {Proceedings of NAACL-HLT},
+  pages = {4171--4186},
+  year = {2019}
+}
+
+% === Computer Vision ===
+@inproceedings{he2016resnet,
+  title = {Deep Residual Learning for Image Recognition},
+  author = {He, Kaiming and Zhang, Xiangyu and Ren, Shaoqing and Sun, Jian},
+  booktitle = {IEEE Conference on Computer Vision and Pattern Recognition (CVPR)},
+  pages = {770--778},
+  year = {2016},
+  doi = {10.1109/CVPR.2016.90}
+}
+
+@inproceedings{dosovitskiy2021vit,
+  title = {An Image is Worth 16x16 Words: Transformers for Image Recognition at Scale},
+  author = {Dosovitskiy, Alexey and Beyer, Lucas and Kolesnikov, Alexander and Weissenborn, Dirk and Zhai, Xiaohua and Unterthiner, Thomas and Dehghani, Mostafa and Minderer, Matthias and Heigold, Georg and Gelly, Sylvain and Uszkoreit, Jakob and Houlsby, Neil},
+  booktitle = {International Conference on Learning Representations (ICLR)},
+  year = {2021}
+}
+
+% === Generative Models ===
+@inproceedings{goodfellow2014gan,
+  title = {Generative Adversarial Nets},
+  author = {Goodfellow, Ian and Pouget-Abadie, Jean and Mirza, Mehdi and Xu, Bing and Warde-Farley, David and Ozair, Sherjil and Courville, Aaron and Bengio, Yoshua},
+  booktitle = {Advances in Neural Information Processing Systems (NeurIPS)},
+  volume = {27},
+  year = {2014},
+  pages = {2672--2680}
+}
+
+@inproceedings{ho2020ddpm,
+  title = {Denoising Diffusion Probabilistic Models},
+  author = {Ho, Jonathan and Jain, Ajay and Abbeel, Pieter},
+  booktitle = {Advances in Neural Information Processing Systems (NeurIPS)},
+  volume = {33},
+  pages = {6840--6851},
+  year = {2020}
+}
+
+% === Representation Learning ===
+@misc{chen2020simclr,
+  title = {A Simple Framework for Contrastive Learning of Visual Representations},
+  author = {Chen, Ting and Kornblith, Simon and Norouzi, Mohammad and Hinton, Geoffrey},
   year = {2020},
-  volume = {1},
-  pages = {1-10},
-  doi = {10.1234/example.2020}
-}
-
-@inproceedings{jones2021,
-  title = {Conference Paper Example},
-  author = {Jones, Alice},
-  booktitle = {Proceedings of Example Conference},
-  year = {2021},
-  pages = {100-110}
-}
-
-@article{brown2019,
-  title = {Another Research Paper},
-  author = {Brown, Bob and White, Carol},
-  journal = {Research Quarterly},
-  year = {2019},
-  volume = {5},
-  number = {2},
-  pages = {50-75}
-}
-
-@misc{preprint2022,
-  title = {A Preprint Paper},
-  author = {Green, David},
-  year = {2022},
-  eprint = {2201.12345},
+  eprint = {2002.05709},
   archiveprefix = {arXiv},
   primaryclass = {cs.LG}
 }
 
-@book{textbook2018,
-  title = {Introduction to Examples},
-  author = {Miller, Eve},
-  publisher = {Academic Press},
-  year = {2018}
+@inproceedings{radford2021clip,
+  title = {Learning Transferable Visual Models From Natural Language Supervision},
+  author = {Radford, Alec and Kim, Jong Wook and Hallacy, Chris and Ramesh, Aditya and Goh, Gabriel and Agarwal, Sandhini and Sastry, Girish and Askell, Amanda and Mishkin, Pamela and Clark, Jack and Krueger, Gretchen and Sutskever, Ilya},
+  booktitle = {International Conference on Machine Learning (ICML)},
+  pages = {8748--8763},
+  year = {2021}
+}
+
+% === Normalization / Regularization ===
+@inproceedings{ioffe2015batchnorm,
+  title = {Batch Normalization: Accelerating Deep Network Training by Reducing Internal Covariate Shift},
+  author = {Ioffe, Sergey and Szegedy, Christian},
+  booktitle = {International Conference on Machine Learning (ICML)},
+  pages = {448--456},
+  year = {2015}
+}
+
+@article{srivastava2014dropout,
+  title = {Dropout: A Simple Way to Prevent Neural Networks from Overfitting},
+  author = {Srivastava, Nitish and Hinton, Geoffrey and Krizhevsky, Alex and Sutskever, Ilya and Salakhutdinov, Ruslan},
+  journal = {Journal of Machine Learning Research},
+  volume = {15},
+  number = {56},
+  pages = {1929--1958},
+  year = {2014}
+}
+
+% === Foundational / Classic ===
+@article{lecun1998cnn,
+  title = {Gradient-based Learning Applied to Document Recognition},
+  author = {LeCun, Yann and Bottou, L{\'e}on and Bengio, Yoshua and Haffner, Patrick},
+  journal = {Proceedings of the IEEE},
+  volume = {86},
+  number = {11},
+  pages = {2278--2324},
+  year = {1998},
+  doi = {10.1109/5.726791}
+}
+
+@book{goodfellow2016deeplearning,
+  title = {Deep Learning},
+  author = {Goodfellow, Ian and Bengio, Yoshua and Courville, Aaron},
+  publisher = {MIT Press},
+  year = {2016},
+  url = {http://www.deeplearningbook.org}
+}
+
+% === Large Language Models ===
+@misc{brown2020gpt3,
+  title = {Language Models are Few-Shot Learners},
+  author = {Brown, Tom and Mann, Benjamin and Ryder, Nick and Subbiah, Melanie and Kaplan, Jared and Dhariwal, Prafulla and Neelakantan, Arvind and Shyam, Pranav and Sastry, Girish and Askell, Amanda and others},
+  year = {2020},
+  eprint = {2005.14165},
+  archiveprefix = {arXiv},
+  primaryclass = {cs.CL}
+}
+
+@misc{touvron2023llama,
+  title = {{LLaMA}: Open and Efficient Foundation Language Models},
+  author = {Touvron, Hugo and Lavril, Thibaut and Izacard, Gautier and Martinet, Xavier and Lachaux, Marie-Anne and Lacroix, Timoth{\'e}e and Rozi{\`e}re, Baptiste and Goyal, Naman and Hambro, Eric and Azhar, Faisal and others},
+  year = {2023},
+  eprint = {2302.13971},
+  archiveprefix = {arXiv},
+  primaryclass = {cs.CL}
 }

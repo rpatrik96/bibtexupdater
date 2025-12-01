@@ -40,7 +40,15 @@ jobs:
 
       - name: Download bibtexupdater
         run: |
-          curl -sL https://raw.githubusercontent.com/rpatrik96/bibtexupdater/main/bibtex_updater.py -o bibtex_updater.py
+          # Download with error checking to prevent committing 404 pages
+          curl -fsSL https://raw.githubusercontent.com/rpatrik96/bibtexupdater/main/bibtex_updater.py -o bibtex_updater.py
+
+          # Verify download is a valid Python file
+          if ! head -1 bibtex_updater.py | grep -q "^#!.*python"; then
+            echo "ERROR: bibtex_updater.py download failed or is invalid"
+            exit 1
+          fi
+          echo "Script downloaded successfully"
 
       - name: Process bibliography files
         run: |
