@@ -279,14 +279,6 @@ Edit .bib in Overleaf → Sync to GitHub → Action runs → Updated .bib commit
 
 3. **Done!** Any .bib changes synced from Overleaf will automatically trigger updates.
 
-### Available Workflows
-
-| Workflow | Description |
-|----------|-------------|
-| `update-bibliography.yml` | Update preprints only |
-| `update-and-filter-bibliography.yml` | Update preprints AND filter to cited entries |
-| `reusable-bib-update.yml` | Reusable workflow for other repos |
-
 ### Reusable Workflow Options
 
 ```yaml
@@ -310,10 +302,10 @@ You can also manually trigger the workflow from the GitHub Actions tab:
 
 ## Bibliography Filtering
 
-Filter your bibliography to include only cited references:
+Filter your bibliography to include only cited references. Uses only Python standard library (no pip dependencies), making it ideal for Overleaf and restricted environments.
 
 ```bash
-python filter_bibliography.py paper.tex references.bib -o filtered.bib
+python filter_bibliography.py paper.tex -b references.bib -o filtered.bib
 ```
 
 For detailed documentation including Overleaf integration and local latexmkrc setup, see [docs/FILTER_BIBLIOGRAPHY.md](docs/FILTER_BIBLIOGRAPHY.md).
