@@ -1,0 +1,28 @@
+# Example GitHub Actions workflow: Update preprint references
+#
+# Copy this file to your repository's .github/workflows/ directory
+# to automatically update preprint BibTeX entries when .bib files change.
+#
+# This workflow uses the reusable workflow from bibtexupdater.
+
+name: Update Bibliography
+
+on:
+  push:
+    paths:
+      - '**.bib'
+  workflow_dispatch:
+    inputs:
+      bib_file:
+        description: 'Specific .bib file to process (leave empty for all)'
+        required: false
+        default: ''
+
+jobs:
+  update:
+    uses: rpatrik96/bibtexupdater/.github/workflows/reusable-bib-update.yml@main
+    with:
+      bib_files: 'references.bib'  # Adjust to your .bib file name
+      dedupe: true
+      keep_preprint_note: false
+      verbose: false

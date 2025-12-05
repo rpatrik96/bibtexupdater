@@ -1,29 +1,28 @@
 # .latexmkrc.example - Bibliography filtering integration for latexmk
 #
-# This configuration runs filter_bibliography_minimal.py to include only
+# This configuration runs filter_bibliography.py to include only
 # cited references in your bibliography.
 #
-# Two filter script versions are available:
-#   - filter_bibliography.py: Full version (requires bibtexparser)
-#   - filter_bibliography_minimal.py: Standalone version (works on Overleaf!)
+# filter_bibliography.py uses only Python standard library (no pip dependencies),
+# making it ideal for Overleaf and restricted environments.
 #
 # RECOMMENDED: Use the END block approach for Overleaf (works with pdfLaTeX compiler).
 #
 # Usage:
 #   1. Copy this file to your project as '.latexmkrc'
-#   2. Copy filter_bibliography_minimal.py to your project
+#   2. Copy filter_bibliography.py to your project
 #   3. Adjust BIB_FILE name(s) below
 #   4. Recompile - refs_filtered.bib appears in your file list!
 #
 # Requirements:
-#   - filter_bibliography_minimal.py: Python 3 only (no dependencies - works on Overleaf!)
+#   - filter_bibliography.py: Python 3 only (no dependencies - works on Overleaf!)
 
 # ==============================================================================
 # Configuration - Adjust these for your project
 # ==============================================================================
 
 # Path to filter script
-$FILTER_SCRIPT = 'filter_bibliography_minimal.py';
+$FILTER_SCRIPT = 'filter_bibliography.py';
 
 # Your bibliography file(s) - space-separated for multiple files
 # Multiple files are merged; duplicates cause an error.
@@ -72,18 +71,18 @@ END {
 # Overleaf Quick Setup (pdfLaTeX compiler)
 # ==============================================================================
 #
-# 1. Upload filter_bibliography_minimal.py to your Overleaf project
+# 1. Upload filter_bibliography.py to your Overleaf project
 #
 # 2. Create '.latexmkrc' with:
 #
 #    # Single bib file:
 #    END {
-#      system("python3 filter_bibliography_minimal.py . -b references.bib -o refs_filtered.bib -r --no-warn-missing");
+#      system("python3 filter_bibliography.py . -b references.bib -o refs_filtered.bib -r --no-warn-missing");
 #    }
 #
 #    # Multiple bib files:
 #    END {
-#      system("python3 filter_bibliography_minimal.py . -b refs1.bib refs2.bib -o refs_filtered.bib -r --no-warn-missing");
+#      system("python3 filter_bibliography.py . -b refs1.bib refs2.bib -o refs_filtered.bib -r --no-warn-missing");
 #    }
 #
 # 3. Recompile - refs_filtered.bib appears in your file list!
