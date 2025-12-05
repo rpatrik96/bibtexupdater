@@ -4,7 +4,14 @@ Filter your bibliography to include only cited references from your LaTeX docume
 
 ## Overview
 
-`filter_bibliography.py` scans LaTeX source files for citation commands and creates a filtered bibliography file containing only the entries that are actually cited in your document. This helps:
+Two versions are available:
+
+| Script | Dependencies | Use Case |
+|--------|--------------|----------|
+| `filter_bibliography.py` | `bibtexparser` | Local development |
+| `filter_bibliography_minimal.py` | **None** (stdlib only) | **Overleaf**, CI/CD, restricted environments |
+
+Both scripts scan LaTeX source files for citation commands and create a filtered bibliography file containing only the entries that are actually cited in your document. This helps:
 
 - Reduce .bib file size for submissions
 - Keep bibliographies clean and focused
@@ -12,16 +19,18 @@ Filter your bibliography to include only cited references from your LaTeX docume
 
 ## Installation
 
-The script requires only `bibtexparser`:
+### Full Version (filter_bibliography.py)
 
 ```bash
 pip install bibtexparser
 ```
 
-Or install all project dependencies:
+### Minimal Version (filter_bibliography_minimal.py)
+
+No installation needed! Uses only Python standard library. Just download the script:
 
 ```bash
-pip install -r requirements.txt
+curl -O https://raw.githubusercontent.com/rpatrik96/bibtexupdater/main/filter_bibliography_minimal.py
 ```
 
 ## CLI Usage
@@ -30,29 +39,32 @@ pip install -r requirements.txt
 
 ```bash
 # Filter to only cited entries
-python filter_bibliography.py paper.tex references.bib -o filtered.bib
+python filter_bibliography.py paper.tex -b references.bib -o filtered.bib
 
 # Process multiple .tex files
-python filter_bibliography.py *.tex references.bib -o filtered.bib
+python filter_bibliography.py *.tex -b references.bib -o filtered.bib
 
 # Recursively scan a directory
-python filter_bibliography.py ./chapters/ references.bib -o filtered.bib --recursive
+python filter_bibliography.py ./chapters/ -b references.bib -o filtered.bib --recursive
+
+# Multiple bib files (merged; errors on duplicates)
+python filter_bibliography.py paper.tex -b refs1.bib refs2.bib -o filtered.bib
 ```
 
 ### Command Reference
 
 ```
-usage: filter_bibliography.py [-h] [-o OUTPUT] [-r] [--case-sensitive]
-                              [-n] [-v] [--list-citations]
+usage: filter_bibliography.py [-h] -b BIB [BIB ...] [-o OUTPUT] [-r]
+                              [--case-sensitive] [-n] [-v] [--list-citations]
                               [--warn-missing | --no-warn-missing]
-                              tex_sources [tex_sources ...] bib_file
+                              tex_sources [tex_sources ...]
 ```
 
 | Option | Description |
 |--------|-------------|
 | `tex_sources` | One or more .tex files or directories to scan |
-| `bib_file` | Input bibliography file |
-| `-o, --output` | Output file (default: `<input>_filtered.bib`) |
+| `-b, --bib` | Input bibliography file(s). Multiple files are merged; duplicates cause an error. |
+| `-o, --output` | Output file (default: `<first_input>_filtered.bib`) |
 | `-r, --recursive` | Recursively search directories for .tex files |
 | `--case-sensitive` | Use case-sensitive key matching (default: case-insensitive) |
 | `-n, --dry-run` | Preview changes without writing |
@@ -65,56 +77,94 @@ usage: filter_bibliography.py [-h] [-o OUTPUT] [-r] [--case-sensitive]
 
 ```bash
 # Preview what would be filtered (dry run)
-python filter_bibliography.py paper.tex refs.bib --dry-run
+python filter_bibliography.py paper.tex -b refs.bib --dry-run
 
 # List all citations found in a document
-python filter_bibliography.py paper.tex refs.bib --list-citations
+python filter_bibliography.py paper.tex -b refs.bib --list-citations
 
 # Process entire project with subdirectories
-python filter_bibliography.py . references.bib -o filtered.bib -r
+python filter_bibliography.py . -b references.bib -o filtered.bib -r
 
 # Suppress warnings about citations not in .bib
-python filter_bibliography.py paper.tex refs.bib -o out.bib --no-warn-missing
+python filter_bibliography.py paper.tex -b refs.bib -o out.bib --no-warn-missing
+
+# Merge multiple bib files
+python filter_bibliography.py paper.tex -b main.bib extra.bib -o filtered.bib
 ```
 
 ## Supported Citation Commands
 
-The script detects citations from all major LaTeX bibliography packages:
+Both versions detect citations from major LaTeX bibliography packages:
 
-### Standard LaTeX / natbib
-- `\cite`, `\cite*`
-- `\citep`, `\citep*`, `\citet`, `\citet*`
-- `\citealt`, `\citealp`
-- `\citeauthor`, `\citeyear`, `\citeyearpar`
+### Common Commands (both versions)
+- `\cite`, `\cite*`, `\citep`, `\citep*`, `\citet`, `\citet*`
 - `\nocite`
-
-### BibLaTeX
 - `\parencite`, `\Parencite`
 - `\textcite`, `\Textcite`
 - `\autocite`, `\Autocite`
-- `\smartcite`, `\Smartcite`
-- `\supercite`
-- `\fullcite`
-- `\footcite`, `\footcitetext`
+
+### Additional Commands (full version only)
+- `\citealt`, `\citealp`
+- `\citeauthor`, `\citeyear`, `\citeyearpar`
+- `\smartcite`, `\Smartcite`, `\supercite`
+- `\fullcite`, `\footcite`, `\footcitetext`
 
 ### Optional Arguments
-The script correctly handles optional arguments:
+Both versions correctly handle optional arguments:
 - `\cite[p. 5]{key}`
 - `\citep[see][p. 10]{key1,key2}`
 
 ## Overleaf Integration
 
-### Why latexmkrc Doesn't Work on Overleaf
+### Option 1: END Block (Recommended for pdfLaTeX)
 
-You **cannot** run `filter_bibliography.py` directly on Overleaf via latexmkrc because:
+The minimal version `filter_bibliography_minimal.py` works directly on Overleaf with no dependencies!
 
-1. **Missing dependencies**: Overleaf doesn't have `bibtexparser` installed
-2. **No pip access**: You cannot install Python packages on Overleaf
-3. **Limited shell access**: While Overleaf has shell-escape enabled, it only works for pre-installed tools
+This approach runs the filter **after** compilation completes. The filtered `.bib` file appears in your Overleaf file list for download. Keep your original `\bibliography{references}` unchanged.
 
-### Recommended: GitHub Actions Workflow
+**Setup:**
 
-The best way to use bibliography filtering with Overleaf is through the GitHub Actions workflow, which runs in GitHub's environment with full Python support.
+1. Download `filter_bibliography_minimal.py` from the repository
+2. Upload it to your Overleaf project root
+3. Create a file named `.latexmkrc` in your project root with:
+
+**Single bib file:**
+```perl
+END {
+  system("python3 filter_bibliography_minimal.py . -b references.bib -o refs_filtered.bib -r --no-warn-missing");
+}
+```
+
+**Multiple bib files:**
+```perl
+END {
+  system("python3 filter_bibliography_minimal.py . -b refs1.bib refs2.bib -o refs_filtered.bib -r --no-warn-missing");
+}
+```
+
+4. Recompile - you'll see `refs_filtered.bib` appear in your Overleaf file list!
+
+### Option 2: Pre-bibtex Hook (Alternative)
+
+If you want to **use** the filtered bibliography during compilation (instead of just generating it as an artifact), use the bibtex/biber hook approach:
+
+**For natbib** (`\usepackage{natbib}`):
+```perl
+$bibtex = "python3 filter_bibliography_minimal.py %R.tex -b references.bib -o refs_filtered.bib --no-warn-missing && bibtex %O %B";
+```
+
+**For biblatex** (`\usepackage{biblatex}`):
+```perl
+$biber = "python3 filter_bibliography_minimal.py %R.tex -b references.bib -o refs_filtered.bib --no-warn-missing && biber %O %S";
+```
+
+**Important:** Update your .tex file to use the filtered bibliography:
+- natbib: `\bibliography{refs_filtered}` (without .bib extension)
+- biblatex: `\addbibresource{refs_filtered.bib}`
+
+### Option 3: GitHub Actions Workflow
+
+Alternatively, use GitHub Actions for both preprint updates AND filtering. This is useful if you also want to auto-update preprints to published versions.
 
 #### Setup
 
@@ -157,7 +207,7 @@ The best way to use bibliography filtering with Overleaf is through the GitHub A
 
          - name: Filter bibliography
            run: |
-             python filter_bibliography.py . references.bib -o references.bib -r --no-warn-missing
+             python filter_bibliography.py . -b references.bib -o references.bib -r --no-warn-missing
 
          - name: Commit changes
            run: |
@@ -192,27 +242,50 @@ jobs:
       dedupe: true
 ```
 
-## Local latexmkrc Integration
+## Local .latexmkrc Integration
 
 For local compilation (not Overleaf), you can integrate `filter_bibliography.py` with latexmk.
 
 ### Basic Setup
 
-1. Copy `latexmkrc.example` to your project as `latexmkrc` (or `.latexmkrc`)
+1. Copy `.latexmkrc.example` to your project as `.latexmkrc`
 2. Adjust paths to match your project
 3. Run `latexmk -pdf main.tex`
 
-### Example latexmkrc
+### Example .latexmkrc
 
+**Recommended: END block** (generates filtered file as artifact):
 ```perl
-# Filter bibliography before bibtex runs
-$bibtex = 'python /path/to/filter_bibliography.py %R.tex references.bib -o references.bib --no-warn-missing && bibtex %O %B';
+END {
+  system('python3 /path/to/filter_bibliography.py . -b references.bib -o refs_filtered.bib -r --no-warn-missing');
+}
 ```
 
-See `latexmkrc.example` in the repository for a complete example with comments.
+**Alternative: bibtex/biber hook** (uses filtered file during compilation):
+
+For natbib:
+```perl
+$bibtex = 'python3 /path/to/filter_bibliography.py %R.tex -b references.bib -o refs_filtered.bib --no-warn-missing && bibtex %O %B';
+```
+
+For biblatex:
+```perl
+$biber = 'python3 /path/to/filter_bibliography.py %R.tex -b references.bib -o refs_filtered.bib --no-warn-missing && biber %O %S';
+```
+
+**Multiple bib files:**
+```perl
+END {
+  system('python3 /path/to/filter_bibliography.py . -b refs1.bib refs2.bib -o refs_filtered.bib -r --no-warn-missing');
+}
+```
+
+**Note**: When using the bibtex/biber hook, update your .tex file to use `refs_filtered` instead of `references`.
+
+See `.latexmkrc.example` in the repository for a complete example with comments.
 
 ### Notes
 
-- The filter runs every time bibtex is invoked
+- The END block runs after compilation; the hook runs before bibtex/biber
 - Use `--no-warn-missing` to avoid noise during compilation
-- Works with both bibtex and biber backends
+- Multiple bib files are merged; duplicate keys cause an error

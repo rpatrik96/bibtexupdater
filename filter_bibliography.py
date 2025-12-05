@@ -4,6 +4,14 @@ Filter Bibliography: Extract cited references from .tex files and create a filte
 
 This script scans LaTeX files for citation commands and creates a new bibliography file
 containing only the entries that are actually cited in the document.
+
+Usage:
+    python filter_bibliography.py paper.tex -b references.bib -o filtered.bib
+    python filter_bibliography.py *.tex -b references.bib -o filtered.bib
+    python filter_bibliography.py ./chapters/ -b references.bib -o filtered.bib -r
+
+    # Multiple bib files (merged, errors on duplicates):
+    python filter_bibliography.py paper.tex -b refs1.bib refs2.bib -o filtered.bib
 """
 
 import argparse
@@ -13,7 +21,7 @@ import re
 import sys
 import tempfile
 from pathlib import Path
-from typing import List, Set, Tuple
+from typing import Dict, List, Set, Tuple
 
 import bibtexparser
 from bibtexparser.bparser import BibTexParser
@@ -214,6 +222,42 @@ class BibWriter:
         os.replace(tmp.name, path)
 
 
+def load_bib_files(
+    loader: BibLoader, filepaths: List[str]
+) -> Tuple[bibtexparser.bibdatabase.BibDatabase, Dict[str, List[str]]]:
+    """
+    Load multiple .bib files and merge into single database.
+
+    Args:
+        loader: BibLoader instance
+        filepaths: List of paths to .bib files
+
+    Returns:
+        Tuple of (merged BibDatabase, dict of duplicate keys to their files)
+    """
+    merged_db = bibtexparser.bibdatabase.BibDatabase()
+    key_to_file: Dict[str, str] = {}
+    duplicates: Dict[str, List[str]] = {}
+
+    for filepath in filepaths:
+        db = loader.load_file(filepath)
+        for entry in db.entries:
+            key_lower = entry["ID"].lower()
+            if key_lower in key_to_file:
+                # Track duplicate but don't error yet
+                if key_lower not in duplicates:
+                    duplicates[key_lower] = [key_to_file[key_lower]]
+                duplicates[key_lower].append(filepath)
+                LOG.debug(
+                    f"Duplicate key '{entry['ID']}' found in '{filepath}' (first seen in '{key_to_file[key_lower]}')"
+                )
+            else:
+                key_to_file[key_lower] = filepath
+            merged_db.entries.append(entry)
+
+    return merged_db, duplicates
+
+
 # ------------- Bibliography Filtering -------------
 
 
@@ -264,16 +308,31 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s paper.tex references.bib -o filtered.bib
-  %(prog)s *.tex references.bib -o filtered.bib
-  %(prog)s ./chapters/ references.bib -o filtered.bib --recursive
-  %(prog)s paper.tex refs.bib --dry-run
+  %(prog)s paper.tex -b references.bib -o filtered.bib
+  %(prog)s *.tex -b references.bib -o filtered.bib
+  %(prog)s ./chapters/ -b references.bib -o filtered.bib --recursive
+  %(prog)s paper.tex -b refs.bib --dry-run
+
+  # Multiple bib files:
+  %(prog)s paper.tex -b refs1.bib refs2.bib refs3.bib -o filtered.bib
         """,
     )
 
     parser.add_argument("tex_sources", nargs="+", help="LaTeX file(s) or directory(ies) to scan for citations")
 
-    parser.add_argument("bib_file", help="Input bibliography file (.bib)")
+    parser.add_argument(
+        "bib_file",
+        nargs="?",
+        help="Input bibliography file (.bib) - for backward compatibility",
+    )
+    parser.add_argument(
+        "-b",
+        "--bib",
+        dest="bib_files",
+        nargs="+",
+        metavar="BIB",
+        help="Input bibliography file(s) (.bib). Multiple files are merged; duplicates cause an error.",
+    )
 
     parser.add_argument("-o", "--output", help="Output bibliography file (default: <input>_filtered.bib)")
 
@@ -327,19 +386,64 @@ def main() -> int:
         LOG.warning("No citations found in the input files")
         return 0
 
-    # Load bibliography
-    LOG.info(f"Loading bibliography from {args.bib_file}...")
+    # Determine bib files to use (support both old positional and new -b flag syntax)
+    # For backward compatibility: if no -b flag, check if any tex_source is actually a .bib file
+    if args.bib_files:
+        bib_files = args.bib_files
+    elif args.bib_file:
+        bib_files = [args.bib_file]
+    else:
+        # Check if any "tex_sources" are actually .bib files (backward compatibility)
+        bib_in_sources = [s for s in args.tex_sources if s.endswith(".bib")]
+        if bib_in_sources:
+            bib_files = bib_in_sources
+            # Remove .bib files from tex_sources
+            args.tex_sources = [s for s in args.tex_sources if not s.endswith(".bib")]
+            if not args.tex_sources:
+                LOG.error("No LaTeX sources specified (only .bib files found)")
+                return 1
+            # Re-extract citations with corrected tex_sources
+            LOG.info(f"Scanning {len(args.tex_sources)} source(s) for citations...")
+            citations, processed_files = extract_citations_from_project(args.tex_sources, recursive=args.recursive)
+            LOG.info(f"Processed {len(processed_files)} .tex file(s)")
+            LOG.info(f"Found {len(citations)} unique citation(s)")
+            if not citations:
+                LOG.warning("No citations found in the input files")
+                return 0
+        else:
+            LOG.error("No bibliography file specified. Use -b flag or provide as positional argument.")
+            return 1
+
+    # Load bibliography file(s)
+    LOG.info(f"Loading bibliography from {len(bib_files)} file(s)...")
     loader = BibLoader()
     try:
-        bib_db = loader.load_file(args.bib_file)
+        bib_db, duplicates = load_bib_files(loader, bib_files)
     except Exception as e:
         LOG.error(f"Failed to load bibliography: {e}")
         return 1
 
-    LOG.info(f"Loaded {len(bib_db.entries)} entries from bibliography")
+    LOG.info(f"Loaded {len(bib_db.entries)} entries from {len(bib_files)} bibliography file(s)")
+
+    if duplicates:
+        LOG.debug(f"Found {len(duplicates)} duplicate key(s) in bibliography (will error only if cited)")
 
     # Filter bibliography
     filtered_db, found_keys, missing_keys = filter_bibliography(bib_db, citations, case_sensitive=args.case_sensitive)
+
+    # Check if any cited keys have duplicates
+    cited_duplicates = []
+    for key in found_keys:
+        key_lower = key.lower() if not args.case_sensitive else key
+        if key_lower in duplicates:
+            cited_duplicates.append((key, duplicates[key_lower]))
+
+    if cited_duplicates:
+        LOG.error("The following cited keys have duplicates in the bibliography:")
+        for key, files in cited_duplicates:
+            LOG.error(f"  - '{key}' appears in: {', '.join(files)}")
+        LOG.error("Please remove duplicate entries to avoid ambiguity.")
+        return 1
 
     LOG.info(f"Matched {len(found_keys)} citation(s) to bibliography entries")
 
@@ -353,7 +457,7 @@ def main() -> int:
     if args.output:
         output_path = args.output
     else:
-        base = os.path.splitext(args.bib_file)[0]
+        base = os.path.splitext(bib_files[0])[0]
         output_path = f"{base}_filtered.bib"
 
     # Write output
