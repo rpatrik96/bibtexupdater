@@ -714,6 +714,10 @@ class Resolver:
             return False
         if not rec.journal:
             return False
+        # Reject if journal looks like a preprint venue (ensures idempotency)
+        j_lower = rec.journal.lower()
+        if any(host in j_lower for host in PREPRINT_HOSTS):
+            return False
         if not rec.year:
             return False
         return bool(rec.volume or rec.number or rec.pages or rec.url)
@@ -974,7 +978,7 @@ class Resolver:
                     blns = [strip_diacritics(a.get("family") or "").lower() for a in rec.authors][:3]
                     auth_score = jaccard_similarity(authors_ref[:3], blns)
                     combined = 0.7 * (title_score / 100.0) + 0.3 * auth_score
-                    if combined >= 0.9:
+                    if combined >= 0.9 and self._credible_journal_article(rec):
                         rec.method = "GoogleScholar(search)"
                         rec.confidence = combined
                         self.logger.debug(
@@ -1497,6 +1501,30 @@ def test_updater_idempotent():
     d = Detector()
     det2 = d.detect(updated)
     assert not det2.is_preprint
+
+
+def test_credible_journal_rejects_preprint_venues():
+    """Ensure _credible_journal_article rejects records with preprint venue names."""
+    # Records with preprint hosts in journal name should be rejected
+    for preprint_journal in ["arXiv", "arxiv.org", "bioRxiv", "medRxiv", "ArXiv preprint"]:
+        rec = PublishedRecord(
+            doi="10.1000/valid",
+            journal=preprint_journal,
+            year=2023,
+            volume="1",
+            type="journal-article",
+        )
+        assert not Resolver._credible_journal_article(rec), f"Should reject journal='{preprint_journal}'"
+
+    # Records with legitimate journal names should be accepted
+    rec_ok = PublishedRecord(
+        doi="10.1000/valid",
+        journal="Nature",
+        year=2023,
+        volume="1",
+        type="journal-article",
+    )
+    assert Resolver._credible_journal_article(rec_ok)
 
 
 def test_pipeline_with_dblp_fallback():
