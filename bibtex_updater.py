@@ -1261,6 +1261,20 @@ def summarize(results: List[ProcessResult], logger: logging.Logger) -> Dict[str,
     }
 
 
+def print_failures(results: List[ProcessResult], logger: logging.Logger) -> None:
+    """Print details of preprints that could not be upgraded."""
+    failures = [r for r in results if r.action == "failed"]
+    if not failures:
+        return
+
+    logger.info("Failed to find published versions for %d preprint(s):", len(failures))
+    for r in failures:
+        key = r.original.get("ID", "unknown")
+        title = latex_to_plain(r.original.get("title", ""))[:80]
+        reason = r.message or "unknown reason"
+        logger.info("  - [%s] %s (%s)", key, title, reason)
+
+
 def write_report_line(fh, res: ProcessResult, src_file: Optional[str] = None) -> None:
     line = {
         "file": src_file,
@@ -1361,6 +1375,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                         write_report_line(fh, res, src_file=path)
 
             summary = summarize(results, logger)
+            print_failures(results, logger)
             if summary["failures"] > 0 and overall_exit == 0:
                 overall_exit = 2
         return overall_exit
@@ -1413,6 +1428,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                     write_report_line(fh, res, src_file=src_for_entry[idx] if idx < len(src_for_entry) else None)
 
         summary = summarize(ordered_results, logger)
+        print_failures(ordered_results, logger)
         if summary["failures"] > 0:
             return 2
         return 0
