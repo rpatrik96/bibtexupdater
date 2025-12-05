@@ -1,0 +1,75 @@
+# Example GitHub Actions workflow: Update AND filter bibliography
+#
+# Copy this file to your repository's .github/workflows/ directory
+# to automatically update preprints AND filter to cited entries.
+#
+# This combines both bibtex_updater.py (requires pip) and
+# filter_bibliography.py (stdlib only) in one workflow.
+
+name: Update and Filter Bibliography
+
+on:
+  push:
+    paths:
+      - '**.bib'
+      - '**.tex'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update-and-filter:
+    runs-on: ubuntu-latest
+    if: github.actor != 'github-actions[bot]'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies for updater
+        run: |
+          pip install bibtexparser requests crossref-commons httpx rapidfuzz
+
+      - name: Download scripts
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/rpatrik96/bibtexupdater/main/bibtex_updater.py -o bibtex_updater.py
+          curl -fsSL https://raw.githubusercontent.com/rpatrik96/bibtexupdater/main/filter_bibliography.py -o filter_bibliography.py
+
+      - name: Update preprint references
+        run: |
+          # Adjust path to your .bib file
+          python bibtex_updater.py references.bib --in-place --dedupe --verbose || echo "Warning: Some entries may have failed"
+
+      - name: Filter to cited entries
+        run: |
+          # Adjust paths to match your project
+          python filter_bibliography.py . -b references.bib -o references.bib -r --no-warn-missing
+
+      - name: Check for changes
+        id: check-changes
+        run: |
+          if git diff --quiet; then
+            echo "changed=false" >> $GITHUB_OUTPUT
+          else
+            git diff --stat
+            echo "changed=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Commit changes
+        if: steps.check-changes.outputs.changed == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "chore: update and filter bibliography
+
+          - Preprint entries upgraded to published versions
+          - Filtered to only cited entries"
+          git push

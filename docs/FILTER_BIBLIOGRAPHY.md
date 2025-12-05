@@ -139,18 +139,11 @@ $biber = "python3 filter_bibliography.py %R.tex -b references.bib -o refs_filter
 
 For local compilation, integrate with latexmk:
 
-1. Copy `.latexmkrc.example` to your project as `.latexmkrc`
+1. Copy [examples/latexmkrc](../examples/latexmkrc) to your project as `.latexmkrc`
 2. Adjust paths to match your project
 3. Run `latexmk -pdf main.tex`
 
-### Example .latexmkrc
-
-**END block** (generates filtered file as artifact):
-```perl
-END {
-  system('python3 /path/to/filter_bibliography.py . -b references.bib -o refs_filtered.bib -r --no-warn-missing');
-}
-```
+See [examples/](../examples/) for complete configuration examples.
 
 **Notes:**
 - The END block runs after compilation; the hook runs before bibtex/biber
