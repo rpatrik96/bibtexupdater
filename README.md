@@ -7,6 +7,7 @@ Tools for managing BibTeX bibliographies: automatically update preprints to publ
 | Tool | Description | Dependencies |
 |------|-------------|--------------|
 | `bibtex_updater.py` | Replace preprints with published versions | pip install required |
+| `zotero_updater.py` | Update preprints in Zotero library | pip install required |
 | `filter_bibliography.py` | Filter to only cited entries | **None** (stdlib only) |
 
 ## Quick Start
@@ -21,6 +22,23 @@ pip install bibtexparser requests crossref-commons httpx rapidfuzz
 python bibtex_updater.py references.bib -o updated.bib
 ```
 
+### Update Zotero Library
+
+```bash
+# Install dependencies
+pip install pyzotero
+
+# Set credentials (get from zotero.org/settings/keys)
+export ZOTERO_LIBRARY_ID="your_user_id"
+export ZOTERO_API_KEY="your_api_key"
+
+# Preview changes
+python zotero_updater.py --dry-run
+
+# Apply updates
+python zotero_updater.py
+```
+
 ### Filter Bibliography
 
 ```bash
@@ -32,7 +50,8 @@ python filter_bibliography.py paper.tex -b references.bib -o filtered.bib
 
 | Document | Description |
 |----------|-------------|
-| [docs/BIBTEX_UPDATER.md](docs/BIBTEX_UPDATER.md) | Full updater documentation |
+| [docs/BIBTEX_UPDATER.md](docs/BIBTEX_UPDATER.md) | Full BibTeX updater documentation |
+| [docs/ZOTERO_UPDATER.md](docs/ZOTERO_UPDATER.md) | Full Zotero updater documentation |
 | [docs/FILTER_BIBLIOGRAPHY.md](docs/FILTER_BIBLIOGRAPHY.md) | Full filter documentation |
 | [examples/](examples/) | Example workflows and configuration files |
 
@@ -63,6 +82,14 @@ For `filter_bibliography.py` only (no dependencies required):
 - **Batch processing**: Multiple files with concurrent workers
 - **Deduplication**: Merge duplicates by DOI or normalized title+authors
 - **Caching**: On-disk cache to avoid repeated API calls
+
+### Zotero Updater
+
+- **Direct Zotero integration**: Fetches and updates items via Zotero API
+- **Same resolution pipeline**: Uses bibtex_updater's multi-source resolution
+- **Preserves metadata**: Keeps notes, tags, and attachments intact
+- **Idempotent**: Already-published papers are automatically skipped
+- **Dry-run mode**: Preview changes before applying
 
 ### Filter Bibliography
 
