@@ -473,6 +473,19 @@ class PublishedRecord:
 
 
 class Resolver:
+    # Accepted publication types for upgrades (includes ML conference papers)
+    ACCEPTED_TYPES = {
+        "journal-article",
+        "proceedings-article",  # Conference papers (NeurIPS, ICML, AISTATS, etc.)
+        "book-chapter",
+    }
+
+    # Semantic Scholar publication type mappings
+    ACCEPTED_S2_TYPES = {
+        "journalarticle",
+        "conference",
+    }
+
     def __init__(
         self, http: HttpClient, logger: logging.Logger, scholarly_client: Optional[ScholarlyClient] = None
     ) -> None:
