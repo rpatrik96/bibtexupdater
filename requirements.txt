@@ -4,3 +4,4 @@ crossref-commons
 httpx
 rapidfuzz
 scholarly>=1.7.0
+pyzotero
