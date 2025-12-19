@@ -9,7 +9,9 @@ import pytest
 
 from bibtex_updater import (
     Detector,
+    FieldChecker,
     HttpClient,
+    MissingFieldProcessor,
     PreprintDetection,
     PublishedRecord,
     Resolver,
@@ -194,3 +196,66 @@ def fake_resolver():
         return FakeResolver(result)
 
     return _create
+
+
+# ------------- Field Checking Fixtures -------------
+
+
+@pytest.fixture
+def field_checker():
+    """Create a FieldChecker instance."""
+    return FieldChecker()
+
+
+@pytest.fixture
+def make_incomplete_entry(make_entry):
+    """Factory fixture for creating incomplete BibTeX entries."""
+
+    def _make_incomplete(**kwargs) -> Dict[str, Any]:
+        # Start with minimal entry, then apply overrides
+        entry = {
+            "ENTRYTYPE": kwargs.pop("ENTRYTYPE", "article"),
+            "ID": kwargs.pop("ID", "incomplete"),
+        }
+        entry.update(kwargs)
+        return entry
+
+    return _make_incomplete
+
+
+@pytest.fixture
+def complete_article_entry(make_entry):
+    """A complete article entry with all required and recommended fields."""
+    return make_entry(
+        ID="complete2020",
+        title="Complete Article Title",
+        author="Smith, John and Doe, Jane",
+        journal="Journal of Complete Testing",
+        year="2020",
+        volume="42",
+        number="1",
+        pages="1-20",
+        doi="10.1000/jct.2020.001",
+        url="https://doi.org/10.1000/jct.2020.001",
+    )
+
+
+@pytest.fixture
+def incomplete_article_entry(make_incomplete_entry):
+    """An article entry missing required and recommended fields."""
+    return make_incomplete_entry(
+        ID="incomplete2020",
+        title="Incomplete Article",
+        # Missing: author, journal, year, volume, pages, doi, url
+    )
+
+
+@pytest.fixture
+def field_processor_check_only(field_checker):
+    """Create a MissingFieldProcessor in check-only mode."""
+    return MissingFieldProcessor(
+        checker=field_checker,
+        filler=None,
+        fill_mode="recommended",
+        fill_enabled=False,
+    )

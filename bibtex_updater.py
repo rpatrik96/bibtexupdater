@@ -384,6 +384,520 @@ class PreprintDetection:
     doi: Optional[str] = None
 
 
+# ------------- Field Checking -------------
+@dataclass
+class FieldRequirement:
+    """Defines required/recommended/optional fields for a BibTeX entry type."""
+
+    required: frozenset
+    recommended: frozenset
+    optional: frozenset = field(default_factory=frozenset)
+
+
+@dataclass
+class MissingFieldReport:
+    """Report of missing fields for a single entry."""
+
+    entry_key: str
+    entry_type: str
+    missing_required: List[str]
+    missing_recommended: List[str]
+    filled_fields: Dict[str, Tuple[str, str]] = field(default_factory=dict)  # field -> (value, source)
+    errors: List[str] = field(default_factory=list)
+
+
+@dataclass
+class FieldCheckResult:
+    """Result of field checking/filling for a single entry."""
+
+    original: Dict[str, Any]
+    updated: Dict[str, Any]
+    report: MissingFieldReport
+    changed: bool
+    action: str  # "complete", "filled", "partial", "unfillable"
+
+
+class FieldRequirementRegistry:
+    """Registry of required/recommended fields per BibTeX entry type."""
+
+    ENTRY_REQUIREMENTS: Dict[str, FieldRequirement] = {
+        "article": FieldRequirement(
+            required=frozenset({"author", "title", "journal", "year"}),
+            recommended=frozenset({"volume", "number", "pages", "doi", "url"}),
+            optional=frozenset({"month", "note", "abstract", "keywords", "publisher"}),
+        ),
+        "inproceedings": FieldRequirement(
+            required=frozenset({"author", "title", "booktitle", "year"}),
+            recommended=frozenset({"pages", "doi", "url", "publisher", "address"}),
+            optional=frozenset({"editor", "volume", "number", "series", "organization", "month"}),
+        ),
+        "incollection": FieldRequirement(
+            required=frozenset({"author", "title", "booktitle", "publisher", "year"}),
+            recommended=frozenset({"editor", "pages", "doi", "url", "address"}),
+            optional=frozenset({"volume", "number", "series", "chapter", "edition", "month"}),
+        ),
+        "book": FieldRequirement(
+            required=frozenset({"title", "publisher", "year"}),  # author or editor required
+            recommended=frozenset({"author", "editor", "volume", "number", "series", "address", "edition", "isbn"}),
+            optional=frozenset({"month", "note", "doi", "url"}),
+        ),
+        "phdthesis": FieldRequirement(
+            required=frozenset({"author", "title", "school", "year"}),
+            recommended=frozenset({"address", "month", "url", "doi"}),
+            optional=frozenset({"note", "type"}),
+        ),
+        "mastersthesis": FieldRequirement(
+            required=frozenset({"author", "title", "school", "year"}),
+            recommended=frozenset({"address", "month", "url"}),
+            optional=frozenset({"note", "type"}),
+        ),
+        "techreport": FieldRequirement(
+            required=frozenset({"author", "title", "institution", "year"}),
+            recommended=frozenset({"number", "address", "month", "url"}),
+            optional=frozenset({"note", "type"}),
+        ),
+        "unpublished": FieldRequirement(
+            required=frozenset({"author", "title", "note"}),
+            recommended=frozenset({"year", "month", "url"}),
+            optional=frozenset(),
+        ),
+        "misc": FieldRequirement(
+            required=frozenset({"title"}),
+            recommended=frozenset({"author", "year", "url", "howpublished"}),
+            optional=frozenset({"note", "month"}),
+        ),
+    }
+
+    # Default for unknown entry types
+    _DEFAULT_REQUIREMENT = FieldRequirement(
+        required=frozenset({"title"}),
+        recommended=frozenset({"author", "year"}),
+        optional=frozenset(),
+    )
+
+    @classmethod
+    def get_requirements(cls, entry_type: str) -> FieldRequirement:
+        """Get field requirements for an entry type."""
+        return cls.ENTRY_REQUIREMENTS.get(entry_type.lower(), cls._DEFAULT_REQUIREMENT)
+
+    @classmethod
+    def get_all_entry_types(cls) -> List[str]:
+        """Get all registered entry types."""
+        return list(cls.ENTRY_REQUIREMENTS.keys())
+
+
+class FieldChecker:
+    """Checks BibTeX entries for missing required/recommended fields."""
+
+    def __init__(self, registry: Optional[FieldRequirementRegistry] = None):
+        self.registry = registry or FieldRequirementRegistry()
+
+    def _field_present(self, entry: Dict[str, Any], field_name: str) -> bool:
+        """Check if a field is present and non-empty."""
+        value = entry.get(field_name, "")
+        if isinstance(value, str):
+            return bool(value.strip())
+        return bool(value)
+
+    def _check_venue(self, entry: Dict[str, Any], entry_type: str) -> bool:
+        """Check if venue field is present based on entry type."""
+        etype = entry_type.lower()
+        if etype == "article":
+            return self._field_present(entry, "journal")
+        elif etype in ("inproceedings", "incollection"):
+            return self._field_present(entry, "booktitle")
+        return True  # Other types don't require venue
+
+    def check_entry(self, entry: Dict[str, Any]) -> MissingFieldReport:
+        """Check an entry for missing fields."""
+        entry_key = entry.get("ID", "unknown")
+        entry_type = entry.get("ENTRYTYPE", "misc").lower()
+        requirements = self.registry.get_requirements(entry_type)
+
+        missing_required = []
+        missing_recommended = []
+
+        # Check required fields
+        for field_name in requirements.required:
+            if not self._field_present(entry, field_name):
+                # Special case: book can have author OR editor
+                if entry_type == "book" and field_name in ("author", "editor"):
+                    if not (self._field_present(entry, "author") or self._field_present(entry, "editor")):
+                        if "author" not in missing_required:
+                            missing_required.append("author")
+                else:
+                    missing_required.append(field_name)
+
+        # Check recommended fields
+        for field_name in requirements.recommended:
+            if not self._field_present(entry, field_name):
+                # Skip author/editor for book if one is already present
+                if entry_type == "book" and field_name in ("author", "editor"):
+                    if self._field_present(entry, "author") or self._field_present(entry, "editor"):
+                        continue
+                missing_recommended.append(field_name)
+
+        return MissingFieldReport(
+            entry_key=entry_key,
+            entry_type=entry_type,
+            missing_required=sorted(missing_required),
+            missing_recommended=sorted(missing_recommended),
+            filled_fields={},
+            errors=[],
+        )
+
+    def has_missing_fields(self, report: MissingFieldReport) -> bool:
+        """Check if any fields are missing."""
+        return bool(report.missing_required or report.missing_recommended)
+
+    def has_missing_required(self, report: MissingFieldReport) -> bool:
+        """Check if any required fields are missing."""
+        return bool(report.missing_required)
+
+
+class FieldFiller:
+    """Attempts to fill missing fields using external APIs (Crossref, DBLP)."""
+
+    # Minimum match score for accepting a search result
+    MATCH_THRESHOLD = 0.85
+
+    def __init__(self, resolver: "Resolver", logger: logging.Logger):
+        self.resolver = resolver
+        self.logger = logger
+
+    def fill_entry(
+        self, entry: Dict[str, Any], report: MissingFieldReport, fill_mode: str = "recommended"
+    ) -> Tuple[Dict[str, Any], MissingFieldReport]:
+        """
+        Attempt to fill missing fields in an entry.
+
+        Args:
+            entry: The BibTeX entry dict
+            report: MissingFieldReport from FieldChecker
+            fill_mode: "required" | "recommended" | "all"
+
+        Returns:
+            Tuple of (updated_entry, updated_report)
+        """
+        fields_to_fill = self._get_fields_to_fill(report, fill_mode)
+
+        if not fields_to_fill:
+            return entry, report
+
+        updated = dict(entry)
+        filled_fields: Dict[str, Tuple[str, str]] = {}
+        errors: List[str] = []
+
+        # Strategy 1: If DOI present, use Crossref for authoritative data
+        doi = doi_normalize(entry.get("doi"))
+        if doi:
+            filled, remaining = self._fill_from_doi(doi, fields_to_fill)
+            for field_name, (value, source) in filled.items():
+                updated[field_name] = value
+                filled_fields[field_name] = (value, source)
+            fields_to_fill = remaining
+
+        # Strategy 2: Search by title + author (fuzzy matching)
+        if fields_to_fill and (entry.get("title") or entry.get("author")):
+            filled, remaining, search_errors = self._fill_from_search(entry, fields_to_fill)
+            for field_name, (value, source) in filled.items():
+                updated[field_name] = value
+                filled_fields[field_name] = (value, source)
+            fields_to_fill = remaining
+            errors.extend(search_errors)
+
+        # Update report with filled fields
+        updated_report = MissingFieldReport(
+            entry_key=report.entry_key,
+            entry_type=report.entry_type,
+            missing_required=[f for f in report.missing_required if f not in filled_fields],
+            missing_recommended=[f for f in report.missing_recommended if f not in filled_fields],
+            filled_fields=filled_fields,
+            errors=report.errors + errors,
+        )
+
+        return updated, updated_report
+
+    def _get_fields_to_fill(self, report: MissingFieldReport, fill_mode: str) -> List[str]:
+        """Determine which fields to attempt filling based on mode."""
+        if fill_mode == "required":
+            return list(report.missing_required)
+        elif fill_mode == "recommended":
+            return list(report.missing_required) + list(report.missing_recommended)
+        else:  # "all"
+            return list(report.missing_required) + list(report.missing_recommended)
+
+    def _fill_from_doi(self, doi: str, fields_to_fill: List[str]) -> Tuple[Dict[str, Tuple[str, str]], List[str]]:
+        """Fill fields using DOI lookup via Crossref."""
+        filled: Dict[str, Tuple[str, str]] = {}
+
+        msg = self.resolver.crossref_get(doi)
+        if not msg:
+            return filled, fields_to_fill
+
+        rec = self.resolver._message_to_record(msg)
+        if not rec:
+            return filled, fields_to_fill
+
+        source = "Crossref(DOI)"
+        filled = self._extract_fields_from_record(rec, fields_to_fill, source)
+        remaining = [f for f in fields_to_fill if f not in filled]
+
+        return filled, remaining
+
+    def _fill_from_search(
+        self, entry: Dict[str, Any], fields_to_fill: List[str]
+    ) -> Tuple[Dict[str, Tuple[str, str]], List[str], List[str]]:
+        """Fill fields using search APIs."""
+        filled: Dict[str, Tuple[str, str]] = {}
+        errors: List[str] = []
+
+        title = normalize_title_for_match(entry.get("title", ""))
+        first_author = first_author_surname(entry)
+
+        if not title:
+            return filled, fields_to_fill, ["No title for search"]
+
+        query = f"{title} {first_author}".strip()
+
+        # Try Crossref search first (no filter_type to get all results)
+        items = self.resolver.crossref_search(query, rows=5, filter_type=None)
+        if items:
+            best_match = self._find_best_crossref_match(entry, items)
+            if best_match:
+                rec = self.resolver._message_to_record(best_match)
+                if rec:
+                    filled = self._extract_fields_from_record(rec, fields_to_fill, "Crossref(search)")
+                    remaining = [f for f in fields_to_fill if f not in filled]
+                    return filled, remaining, errors
+
+        # Try DBLP as fallback
+        hits = self.resolver.dblp_search(query, h=5)
+        if hits:
+            best_hit = self._find_best_dblp_match(entry, hits)
+            if best_hit:
+                rec = self.resolver._dblp_hit_to_record(best_hit)
+                if rec:
+                    filled = self._extract_fields_from_record(rec, fields_to_fill, "DBLP(search)")
+                    remaining = [f for f in fields_to_fill if f not in filled]
+                    return filled, remaining, errors
+
+        if not filled:
+            errors.append("No matching record found in APIs")
+
+        return filled, fields_to_fill, errors
+
+    def _find_best_crossref_match(self, entry: Dict[str, Any], items: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """Find best matching Crossref item using title/author similarity."""
+        title_a = normalize_title_for_match(entry.get("title", ""))
+        authors_a = authors_last_names(entry.get("author", ""), limit=3)
+
+        best_score = 0.0
+        best_item = None
+
+        for item in items:
+            rec = self.resolver._message_to_record(item)
+            if not rec:
+                continue
+
+            title_b = normalize_title_for_match(rec.title or "")
+            title_score = token_sort_ratio(title_a, title_b)
+
+            authors_b = [a.get("family", "").lower() for a in rec.authors[:3]]
+            auth_score = jaccard_similarity(authors_a, authors_b)
+
+            combined = 0.7 * (title_score / 100.0) + 0.3 * auth_score
+
+            if combined > best_score and combined >= self.MATCH_THRESHOLD:
+                best_score = combined
+                best_item = item
+
+        return best_item
+
+    def _find_best_dblp_match(self, entry: Dict[str, Any], hits: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """Find best matching DBLP hit using title/author similarity."""
+        title_a = normalize_title_for_match(entry.get("title", ""))
+        authors_a = authors_last_names(entry.get("author", ""), limit=3)
+
+        best_score = 0.0
+        best_hit = None
+
+        for hit in hits:
+            info = hit.get("info", {})
+            title_raw = info.get("title", "")
+            title_b = normalize_title_for_match(re.sub(r"<[^>]*>", "", title_raw))
+            title_score = token_sort_ratio(title_a, title_b)
+
+            # Extract author names from DBLP format
+            authors_field = info.get("authors", {}).get("author", [])
+            if isinstance(authors_field, dict):
+                authors_field = [authors_field]
+            authors_b = []
+            for a in authors_field[:3]:
+                if isinstance(a, dict):
+                    name = a.get("text") or a.get("name") or ""
+                else:
+                    name = str(a)
+                if name:
+                    parts = name.split()
+                    if parts:
+                        authors_b.append(parts[-1].lower())
+
+            auth_score = jaccard_similarity(authors_a, authors_b)
+            combined = 0.7 * (title_score / 100.0) + 0.3 * auth_score
+
+            if combined > best_score and combined >= self.MATCH_THRESHOLD:
+                best_score = combined
+                best_hit = hit
+
+        return best_hit
+
+    def _extract_fields_from_record(
+        self, rec: "PublishedRecord", fields: List[str], source: str
+    ) -> Dict[str, Tuple[str, str]]:
+        """Extract requested fields from PublishedRecord."""
+        filled: Dict[str, Tuple[str, str]] = {}
+
+        field_mapping: Dict[str, Optional[str]] = {
+            "year": str(rec.year) if rec.year else None,
+            "journal": rec.journal,
+            "booktitle": rec.journal,  # Use journal for booktitle if available
+            "volume": rec.volume,
+            "number": rec.number,
+            "pages": rec.pages,
+            "doi": rec.doi,
+            "url": rec.url or (doi_url(rec.doi) if rec.doi else None),
+            "publisher": rec.publisher,
+            "title": rec.title,
+            "author": self.resolver._authors_to_bibtex_string(rec) if rec.authors else None,
+        }
+
+        for field_name in fields:
+            value = field_mapping.get(field_name)
+            if value and value.strip():
+                filled[field_name] = (value.strip(), source)
+
+        return filled
+
+
+class MissingFieldProcessor:
+    """Orchestrates field checking and filling with reporting."""
+
+    def __init__(
+        self,
+        checker: FieldChecker,
+        filler: Optional[FieldFiller] = None,
+        fill_mode: str = "recommended",
+        fill_enabled: bool = True,
+    ):
+        self.checker = checker
+        self.filler = filler
+        self.fill_mode = fill_mode
+        self.fill_enabled = fill_enabled and filler is not None
+
+    def process_entry(self, entry: Dict[str, Any]) -> FieldCheckResult:
+        """Process a single entry: check and optionally fill missing fields."""
+        report = self.checker.check_entry(entry)
+
+        has_missing = self.checker.has_missing_fields(report)
+
+        if not has_missing:
+            return FieldCheckResult(
+                original=entry,
+                updated=entry,
+                report=report,
+                changed=False,
+                action="complete",
+            )
+
+        # Attempt to fill if enabled and filler is available
+        if self.fill_enabled and self.filler:
+            updated_entry, updated_report = self.filler.fill_entry(entry, report, self.fill_mode)
+            changed = entry != updated_entry
+
+            # Determine action based on results
+            if updated_report.missing_required:
+                action = "partial" if updated_report.filled_fields else "unfillable"
+            elif updated_report.filled_fields:
+                action = "filled"
+            else:
+                action = "complete" if not updated_report.missing_recommended else "partial"
+
+            return FieldCheckResult(
+                original=entry,
+                updated=updated_entry,
+                report=updated_report,
+                changed=changed,
+                action=action,
+            )
+        else:
+            # Check only mode - no filling
+            action = "unfillable" if report.missing_required else "partial"
+            return FieldCheckResult(
+                original=entry,
+                updated=entry,
+                report=report,
+                changed=False,
+                action=action,
+            )
+
+    def generate_summary(self, results: List[FieldCheckResult]) -> Dict[str, Any]:
+        """Generate a summary of field check results."""
+        complete = sum(1 for r in results if r.action == "complete")
+        filled = sum(1 for r in results if r.action == "filled")
+        partial = sum(1 for r in results if r.action == "partial")
+        unfillable = sum(1 for r in results if r.action == "unfillable")
+
+        # Field statistics
+        field_stats: Dict[str, Dict[str, int]] = {}
+        for result in results:
+            for field_name in result.report.missing_required + result.report.missing_recommended:
+                if field_name not in field_stats:
+                    field_stats[field_name] = {"total_missing": 0, "filled": 0, "still_missing": 0}
+                field_stats[field_name]["total_missing"] += 1
+                if field_name in result.report.filled_fields:
+                    field_stats[field_name]["filled"] += 1
+                else:
+                    field_stats[field_name]["still_missing"] += 1
+
+        return {
+            "total": len(results),
+            "complete": complete,
+            "filled": filled,
+            "partial": partial,
+            "unfillable": unfillable,
+            "field_statistics": field_stats,
+        }
+
+    def generate_json_report(self, results: List[FieldCheckResult]) -> Dict[str, Any]:
+        """Generate a detailed JSON report."""
+        import datetime
+
+        entries = []
+        for result in results:
+            entry_data = {
+                "key": result.report.entry_key,
+                "type": result.report.entry_type,
+                "action": result.action,
+                "missing_required": result.report.missing_required,
+                "missing_recommended": result.report.missing_recommended,
+                "filled_fields": {
+                    field: {"value": value, "source": source}
+                    for field, (value, source) in result.report.filled_fields.items()
+                },
+                "errors": result.report.errors,
+            }
+            entries.append(entry_data)
+
+        summary = self.generate_summary(results)
+        summary["timestamp"] = datetime.datetime.now().isoformat()
+
+        return {
+            "summary": summary,
+            "entries": entries,
+        }
+
+
 class Detector:
     def __init__(self) -> None:
         pass
@@ -1231,6 +1745,41 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-workers", type=int, default=4, help="Max concurrent workers")
     p.add_argument("--timeout", type=float, default=20.0, help="HTTP timeout seconds")
     p.add_argument("--verbose", action="store_true", help="Verbose logging")
+
+    # Field checking options
+    field_group = p.add_argument_group("field checking", "Options for missing field detection and filling")
+    field_group.add_argument(
+        "--check-fields",
+        action="store_true",
+        help="Check entries for missing required/recommended fields (report only)",
+    )
+    field_group.add_argument(
+        "--fill-fields",
+        action="store_true",
+        help="Fill missing fields from external APIs (implies --check-fields)",
+    )
+    field_group.add_argument(
+        "--field-fill-mode",
+        choices=["required", "recommended", "all"],
+        default="recommended",
+        help="Which missing fields to fill: 'required' only, 'recommended' (default), or 'all'",
+    )
+    field_group.add_argument(
+        "--field-report",
+        metavar="FILE",
+        help="Write field check report to FILE (JSON format)",
+    )
+    field_group.add_argument(
+        "--skip-preprint-upgrade",
+        action="store_true",
+        help="Only check/fill fields, skip preprint-to-published resolution",
+    )
+    field_group.add_argument(
+        "--strict-fields",
+        action="store_true",
+        help="Exit with error code 3 if required fields remain missing after filling",
+    )
+
     # Google Scholar options (opt-in)
     p.add_argument(
         "--use-scholarly", action="store_true", help="Enable Google Scholar fallback (requires scholarly package)"
@@ -1292,6 +1841,85 @@ def print_failures(results: List[ProcessResult], logger: logging.Logger) -> None
         logger.info("  - [%s] %s (%s)", key, title, reason)
 
 
+def summarize_field_check(field_results: List[FieldCheckResult], logger: logging.Logger) -> Dict[str, Any]:
+    """Summarize field check results and print to console."""
+    processor = MissingFieldProcessor(FieldChecker())  # Just for summary generation
+    summary = processor.generate_summary(field_results)
+
+    logger.info(
+        "Field Check Summary: total=%d, complete=%d, filled=%d, partial=%d, unfillable=%d",
+        summary["total"],
+        summary["complete"],
+        summary["filled"],
+        summary["partial"],
+        summary["unfillable"],
+    )
+
+    # Print field statistics if there are any
+    if summary["field_statistics"]:
+        logger.info("Missing Field Statistics:")
+        for field_name, stats in sorted(summary["field_statistics"].items()):
+            logger.info(
+                "  %s: %d entries (%d filled, %d still missing)",
+                field_name,
+                stats["total_missing"],
+                stats["filled"],
+                stats["still_missing"],
+            )
+
+    return summary
+
+
+def print_field_check_details(
+    field_results: List[FieldCheckResult], logger: logging.Logger, verbose: bool = False
+) -> None:
+    """Print detailed field check results."""
+    for i, result in enumerate(field_results, 1):
+        key = result.report.entry_key
+        action = result.action.upper()
+
+        if action == "COMPLETE":
+            if verbose:
+                logger.info("[%d/%d] %s: COMPLETE", i, len(field_results), key)
+        elif action == "FILLED":
+            filled_list = ", ".join(result.report.filled_fields.keys())
+            sources = {src for _, src in result.report.filled_fields.values()}
+            source_str = ", ".join(sources)
+            logger.info(
+                "[%d/%d] %s: FILLED %d fields (%s) via %s",
+                i,
+                len(field_results),
+                key,
+                len(result.report.filled_fields),
+                filled_list,
+                source_str,
+            )
+        elif action == "PARTIAL":
+            filled_list = ", ".join(result.report.filled_fields.keys()) if result.report.filled_fields else "none"
+            missing = result.report.missing_required + result.report.missing_recommended
+            missing_str = ", ".join(missing[:5])
+            if len(missing) > 5:
+                missing_str += f", ... ({len(missing) - 5} more)"
+            logger.info(
+                "[%d/%d] %s: PARTIAL - filled: %s, missing: %s",
+                i,
+                len(field_results),
+                key,
+                filled_list,
+                missing_str,
+            )
+        elif action == "UNFILLABLE":
+            missing = result.report.missing_required
+            missing_str = ", ".join(missing[:5])
+            logger.info(
+                "[%d/%d] %s: UNFILLABLE - missing required: %s",
+                i,
+                len(field_results),
+                key,
+                missing_str,
+            )
+
+
 def write_report_line(fh, res: ProcessResult, src_file: Optional[str] = None) -> None:
     line = {
         "file": src_file,
@@ -1343,6 +1971,22 @@ def main(argv: Optional[List[str]] = None) -> int:
     detector = Detector()
     updater = Updater(keep_preprint_note=args.keep_preprint_note, rekey=args.rekey)
 
+    # Field checking setup
+    field_check_enabled = args.check_fields or args.fill_fields
+    field_fill_enabled = args.fill_fields
+    field_processor = None
+    if field_check_enabled:
+        field_checker = FieldChecker()
+        field_filler = FieldFiller(resolver=resolver, logger=logger) if field_fill_enabled else None
+        field_processor = MissingFieldProcessor(
+            checker=field_checker,
+            filler=field_filler,
+            fill_mode=args.field_fill_mode,
+            fill_enabled=field_fill_enabled,
+        )
+        mode_str = "fill" if field_fill_enabled else "check-only"
+        logger.info("Field checking enabled (mode: %s, fill_mode: %s)", mode_str, args.field_fill_mode)
+
     loader = BibLoader()
     writer = BibWriter()
 
@@ -1358,14 +2002,46 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if args.in_place:
         overall_exit = 0
+        all_field_results: List[FieldCheckResult] = []
+
         for path, db in databases:
             results: List[ProcessResult] = []
-            with concurrent.futures.ThreadPoolExecutor(max_workers=args.max_workers) as ex:
-                futures = [ex.submit(process_entry, entry, detector, resolver, updater, logger) for entry in db.entries]
-                for fut in concurrent.futures.as_completed(futures):
-                    results.append(fut.result())
+            field_results: List[FieldCheckResult] = []
 
-            new_entries: List[Dict[str, Any]] = [r.updated for r in results]
+            # Step 1: Preprint upgrade (unless skipped)
+            if not args.skip_preprint_upgrade:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=args.max_workers) as ex:
+                    futures = [
+                        ex.submit(process_entry, entry, detector, resolver, updater, logger) for entry in db.entries
+                    ]
+                    for fut in concurrent.futures.as_completed(futures):
+                        results.append(fut.result())
+                new_entries = [r.updated for r in results]
+            else:
+                # Skip preprint upgrade, use entries as-is
+                new_entries = list(db.entries)
+                results = [ProcessResult(original=e, updated=e, changed=False, action="skipped") for e in db.entries]
+
+            # Step 2: Field checking (if enabled)
+            if field_check_enabled and field_processor:
+                for i, entry in enumerate(new_entries):
+                    field_result = field_processor.process_entry(entry)
+                    field_results.append(field_result)
+                    if field_result.changed:
+                        new_entries[i] = field_result.updated
+                        # Update the ProcessResult to reflect field changes
+                        if results[i].action != "upgraded":
+                            results[i] = ProcessResult(
+                                original=results[i].original,
+                                updated=field_result.updated,
+                                changed=True,
+                                action="field_filled",
+                                method=None,
+                                confidence=0.0,
+                                message=None,
+                            )
+                all_field_results.extend(field_results)
+
             new_db = bibtexparser.bibdatabase.BibDatabase()
             new_db.entries = new_entries
 
@@ -1391,10 +2067,31 @@ def main(argv: Optional[List[str]] = None) -> int:
                     for res in results:
                         write_report_line(fh, res, src_file=path)
 
-            summary = summarize(results, logger)
-            print_failures(results, logger)
-            if summary["failures"] > 0 and overall_exit == 0:
-                overall_exit = 2
+            if not args.skip_preprint_upgrade:
+                summary = summarize(results, logger)
+                print_failures(results, logger)
+                if summary["failures"] > 0 and overall_exit == 0:
+                    overall_exit = 2
+
+        # Field check summary and reporting
+        if field_check_enabled and all_field_results:
+            print_field_check_details(all_field_results, logger, verbose=args.verbose)
+            field_summary = summarize_field_check(all_field_results, logger)
+
+            if args.field_report:
+                report_data = field_processor.generate_json_report(all_field_results)
+                with open(args.field_report, "w", encoding="utf-8") as fh:
+                    json.dump(report_data, fh, indent=2, ensure_ascii=False)
+                logger.info("Field check report written to %s", args.field_report)
+
+            # Strict mode: exit with error if required fields missing
+            if args.strict_fields and field_summary["unfillable"] > 0:
+                logger.error(
+                    "Strict mode: %d entries have required fields that could not be filled",
+                    field_summary["unfillable"],
+                )
+                return 3
+
         return overall_exit
 
     else:
@@ -1406,21 +2103,53 @@ def main(argv: Optional[List[str]] = None) -> int:
             src_for_entry.extend([path] * len(db.entries))
 
         results: List[ProcessResult] = []
-        with concurrent.futures.ThreadPoolExecutor(max_workers=args.max_workers) as ex:
-            futures = [
-                ex.submit(process_entry, entry, detector, resolver, updater, logger) for entry in merged_db.entries
-            ]
-            for fut in concurrent.futures.as_completed(futures):
-                results.append(fut.result())
+        field_results: List[FieldCheckResult] = []
 
-        obj_map = {id(r.original): r for r in results}
-        ordered_results: List[ProcessResult] = []
-        for e in merged_db.entries:
-            r = obj_map.get(id(e))
-            ordered_results.append(r if r else ProcessResult(original=e, updated=e, changed=False, action="unchanged"))
+        # Step 1: Preprint upgrade (unless skipped)
+        if not args.skip_preprint_upgrade:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=args.max_workers) as ex:
+                futures = [
+                    ex.submit(process_entry, entry, detector, resolver, updater, logger) for entry in merged_db.entries
+                ]
+                for fut in concurrent.futures.as_completed(futures):
+                    results.append(fut.result())
+
+            obj_map = {id(r.original): r for r in results}
+            ordered_results: List[ProcessResult] = []
+            for e in merged_db.entries:
+                r = obj_map.get(id(e))
+                ordered_results.append(
+                    r if r else ProcessResult(original=e, updated=e, changed=False, action="unchanged")
+                )
+            new_entries = [r.updated for r in ordered_results]
+        else:
+            # Skip preprint upgrade, use entries as-is
+            new_entries = list(merged_db.entries)
+            ordered_results = [
+                ProcessResult(original=e, updated=e, changed=False, action="skipped") for e in merged_db.entries
+            ]
+
+        # Step 2: Field checking (if enabled)
+        if field_check_enabled and field_processor:
+            for i, entry in enumerate(new_entries):
+                field_result = field_processor.process_entry(entry)
+                field_results.append(field_result)
+                if field_result.changed:
+                    new_entries[i] = field_result.updated
+                    # Update the ProcessResult to reflect field changes
+                    if ordered_results[i].action != "upgraded":
+                        ordered_results[i] = ProcessResult(
+                            original=ordered_results[i].original,
+                            updated=field_result.updated,
+                            changed=True,
+                            action="field_filled",
+                            method=None,
+                            confidence=0.0,
+                            message=None,
+                        )
 
         new_db = bibtexparser.bibdatabase.BibDatabase()
-        new_db.entries = [r.updated for r in ordered_results]
+        new_db.entries = new_entries
 
         merged_info: List[Tuple[str, List[str]]] = []
         if args.dedupe:
@@ -1444,10 +2173,32 @@ def main(argv: Optional[List[str]] = None) -> int:
                 for idx, res in enumerate(ordered_results):
                     write_report_line(fh, res, src_file=src_for_entry[idx] if idx < len(src_for_entry) else None)
 
-        summary = summarize(ordered_results, logger)
-        print_failures(ordered_results, logger)
-        if summary["failures"] > 0:
-            return 2
+        if not args.skip_preprint_upgrade:
+            summary = summarize(ordered_results, logger)
+            print_failures(ordered_results, logger)
+
+        # Field check summary and reporting
+        if field_check_enabled and field_results:
+            print_field_check_details(field_results, logger, verbose=args.verbose)
+            field_summary = summarize_field_check(field_results, logger)
+
+            if args.field_report:
+                report_data = field_processor.generate_json_report(field_results)
+                with open(args.field_report, "w", encoding="utf-8") as fh:
+                    json.dump(report_data, fh, indent=2, ensure_ascii=False)
+                logger.info("Field check report written to %s", args.field_report)
+
+            # Strict mode: exit with error if required fields missing
+            if args.strict_fields and field_summary["unfillable"] > 0:
+                logger.error(
+                    "Strict mode: %d entries have required fields that could not be filled",
+                    field_summary["unfillable"],
+                )
+                return 3
+
+        if not args.skip_preprint_upgrade:
+            if summary["failures"] > 0:
+                return 2
         return 0
 
 
