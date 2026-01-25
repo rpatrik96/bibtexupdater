@@ -30,7 +30,6 @@ import re
 import sys
 import tempfile
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 LOG = logging.getLogger(__name__)
@@ -83,9 +82,9 @@ def strip_comments(text: str) -> str:
     return "\n".join(lines)
 
 
-def extract_citations_from_text(text: str) -> Set[str]:
+def extract_citations_from_text(text: str) -> set[str]:
     """Extract citation keys from LaTeX text."""
-    citations: Set[str] = set()
+    citations: set[str] = set()
     for match in CITE_KEYS_PATTERN.finditer(text):
         keys_str = match.group(2)
         for key in keys_str.split(","):
@@ -95,12 +94,12 @@ def extract_citations_from_text(text: str) -> Set[str]:
     return citations
 
 
-def extract_citations_from_file(filepath: str) -> Set[str]:
+def extract_citations_from_file(filepath: str) -> set[str]:
     """Extract citations from a .tex file, ignoring comments."""
     try:
-        with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+        with open(filepath, encoding="utf-8", errors="replace") as f:
             text = f.read()
-    except IOError as e:
+    except OSError as e:
         LOG.error(f"Could not read file {filepath}: {e}")
         return set()
 
@@ -172,7 +171,7 @@ def find_matching_brace(text: str, start_pos: int) -> int:
     return -1  # Unmatched brace
 
 
-def extract_entry_key(entry_body: str) -> Optional[str]:
+def extract_entry_key(entry_body: str) -> str | None:
     """
     Extract the citation key from an entry body.
 
@@ -191,7 +190,7 @@ def extract_entry_key(entry_body: str) -> Optional[str]:
     return key if key else None
 
 
-def parse_bib_file(filepath: str) -> List[BibEntry]:
+def parse_bib_file(filepath: str) -> list[BibEntry]:
     """
     Parse a .bib file and return list of BibEntry objects.
 
@@ -199,18 +198,18 @@ def parse_bib_file(filepath: str) -> List[BibEntry]:
     Skips @string, @preamble, and @comment entries.
     """
     try:
-        with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+        with open(filepath, encoding="utf-8", errors="replace") as f:
             content = f.read()
-    except IOError as e:
+    except OSError as e:
         LOG.error(f"Could not read bib file {filepath}: {e}")
         return []
 
     return parse_bib_string(content)
 
 
-def parse_bib_string(content: str) -> List[BibEntry]:
+def parse_bib_string(content: str) -> list[BibEntry]:
     """Parse BibTeX content from a string."""
-    entries: List[BibEntry] = []
+    entries: list[BibEntry] = []
 
     for match in ENTRY_START_PATTERN.finditer(content):
         entry_type = match.group(1).lower()
@@ -243,7 +242,7 @@ def parse_bib_string(content: str) -> List[BibEntry]:
     return entries
 
 
-def parse_bib_files(filepaths: List[str]) -> Tuple[List[BibEntry], Dict[str, List[str]]]:
+def parse_bib_files(filepaths: list[str]) -> tuple[list[BibEntry], dict[str, list[str]]]:
     """
     Parse multiple .bib files and merge entries.
 
@@ -253,9 +252,9 @@ def parse_bib_files(filepaths: List[str]) -> Tuple[List[BibEntry], Dict[str, Lis
     Returns:
         Tuple of (list of all BibEntry objects, dict of duplicate keys to their files)
     """
-    all_entries: List[BibEntry] = []
-    key_to_file: Dict[str, str] = {}  # key (lowercase) -> first file it appeared in
-    duplicates: Dict[str, List[str]] = {}  # key (lowercase) -> list of files with this key
+    all_entries: list[BibEntry] = []
+    key_to_file: dict[str, str] = {}  # key (lowercase) -> first file it appeared in
+    duplicates: dict[str, list[str]] = {}  # key (lowercase) -> list of files with this key
 
     for filepath in filepaths:
         entries = parse_bib_file(filepath)
@@ -282,10 +281,10 @@ def parse_bib_files(filepaths: List[str]) -> Tuple[List[BibEntry], Dict[str, Lis
 
 
 def filter_entries(
-    entries: List[BibEntry],
-    cited_keys: Set[str],
+    entries: list[BibEntry],
+    cited_keys: set[str],
     case_sensitive: bool = False,
-) -> Tuple[List[BibEntry], Set[str], Set[str]]:
+) -> tuple[list[BibEntry], set[str], set[str]]:
     """
     Filter entries to only include those that are cited.
 
@@ -305,8 +304,8 @@ def filter_entries(
         key_map = {entry.key.lower(): entry for entry in entries}
         lookup_keys = {k.lower() for k in cited_keys}
 
-    filtered: List[BibEntry] = []
-    found_keys: Set[str] = set()
+    filtered: list[BibEntry] = []
+    found_keys: set[str] = set()
 
     for key in lookup_keys:
         if key in key_map:
@@ -318,7 +317,7 @@ def filter_entries(
     return filtered, found_keys, missing_keys
 
 
-def write_bib_file(entries: List[BibEntry], filepath: str) -> None:
+def write_bib_file(entries: list[BibEntry], filepath: str) -> None:
     """
     Write filtered entries to a .bib file atomically.
 
@@ -356,7 +355,7 @@ def write_bib_file(entries: List[BibEntry], filepath: str) -> None:
 # =============================================================================
 
 
-def find_tex_files(path: str, recursive: bool = True) -> List[str]:
+def find_tex_files(path: str, recursive: bool = True) -> list[str]:
     """Find all .tex files in a path."""
     p = Path(path)
 
@@ -368,12 +367,12 @@ def find_tex_files(path: str, recursive: bool = True) -> List[str]:
 
 
 def extract_citations_from_project(
-    paths: List[str],
+    paths: list[str],
     recursive: bool = True,
-) -> Tuple[Set[str], List[str]]:
+) -> tuple[set[str], list[str]]:
     """Extract all citations from multiple .tex files or directories."""
-    all_citations: Set[str] = set()
-    all_files: List[str] = []
+    all_citations: set[str] = set()
+    all_files: list[str] = []
 
     for path in paths:
         if os.path.isfile(path):
