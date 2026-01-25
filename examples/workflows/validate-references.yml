@@ -1,0 +1,100 @@
+# Example GitHub Actions workflow: Validate bibliography references
+#
+# Copy this file to your repository's .github/workflows/ directory
+# to automatically validate that all references in your bibliography
+# exist and have correct metadata.
+#
+# Use --strict to fail the workflow if hallucinated or missing references
+# are detected.
+
+name: Validate References
+
+on:
+  push:
+    paths:
+      - '**.bib'
+  pull_request:
+    paths:
+      - '**.bib'
+  workflow_dispatch:
+
+jobs:
+  validate-references:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install bibtexparser httpx rapidfuzz
+
+      - name: Download fact-checker
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/rpatrik96/bibtexupdater/main/reference_fact_checker.py -o reference_fact_checker.py
+          curl -fsSL https://raw.githubusercontent.com/rpatrik96/bibtexupdater/main/bib_utils.py -o bib_utils.py
+
+      - name: Validate references
+        id: validate
+        run: |
+          # Adjust path to your .bib file
+          # Use --strict to fail on NOT_FOUND or HALLUCINATED entries
+          python reference_fact_checker.py references.bib \
+            --report fact-check-report.json \
+            --jsonl fact-check-failures.jsonl \
+            --verbose
+        continue-on-error: true
+
+      - name: Upload validation report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fact-check-report
+          path: |
+            fact-check-report.json
+            fact-check-failures.jsonl
+
+      - name: Comment on PR with summary
+        if: github.event_name == 'pull_request' && always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let report;
+            try {
+              report = JSON.parse(fs.readFileSync('fact-check-report.json', 'utf8'));
+            } catch (e) {
+              console.log('No report found');
+              return;
+            }
+
+            const summary = report.summary;
+            const problems = summary.status_counts.not_found + summary.status_counts.hallucinated;
+
+            let body = `## Reference Validation Report\n\n`;
+            body += `| Metric | Value |\n|--------|-------|\n`;
+            body += `| Total entries | ${summary.total} |\n`;
+            body += `| Verified | ${summary.status_counts.verified} |\n`;
+            body += `| Not found | ${summary.status_counts.not_found} |\n`;
+            body += `| Hallucinated | ${summary.status_counts.hallucinated} |\n`;
+            body += `| Verified rate | ${(summary.verified_rate * 100).toFixed(1)}% |\n\n`;
+
+            if (problems > 0) {
+              body += `⚠️ **${problems} problematic reference(s) detected.** Check the report artifact for details.\n`;
+            } else {
+              body += `✅ All references validated successfully.\n`;
+            }
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
