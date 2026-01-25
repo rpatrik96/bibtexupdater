@@ -27,10 +27,13 @@ import argparse
 import datetime
 import json
 import logging
+import re
 import sys
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
+from urllib.parse import urlparse
 
 import bibtexparser
 from rapidfuzz.fuzz import token_sort_ratio
@@ -66,6 +69,7 @@ from bib_utils import (
 class FactCheckStatus(Enum):
     """Status codes for fact check results."""
 
+    # Academic verification statuses
     VERIFIED = "verified"
     NOT_FOUND = "not_found"
     TITLE_MISMATCH = "title_mismatch"
@@ -75,6 +79,23 @@ class FactCheckStatus(Enum):
     PARTIAL_MATCH = "partial_match"
     HALLUCINATED = "hallucinated"
     API_ERROR = "api_error"
+
+    # Web reference statuses
+    URL_VERIFIED = "url_verified"  # URL accessible and content matches
+    URL_ACCESSIBLE = "url_accessible"  # URL returns 200, no content check
+    URL_NOT_FOUND = "url_not_found"  # 404 or domain unreachable
+    URL_CONTENT_MISMATCH = "url_content_mismatch"  # Page content differs from entry
+
+    # Book statuses
+    BOOK_VERIFIED = "book_verified"  # Found in book API with matching metadata
+    BOOK_NOT_FOUND = "book_not_found"  # Not in any book database
+
+    # Working paper statuses
+    WORKING_PAPER_VERIFIED = "working_paper_verified"
+    WORKING_PAPER_NOT_FOUND = "working_paper_not_found"
+
+    # General
+    SKIPPED = "skipped"  # Entry type not verifiable
 
 
 @dataclass
@@ -102,6 +123,10 @@ class FactCheckResult:
     api_sources_queried: List[str]
     api_sources_with_hits: List[str]
     errors: List[str]
+    # New fields for extended verification
+    category: Optional[EntryCategory] = None
+    url_check: Optional[URLCheckResult] = None
+    book_match: Optional[BookRecord] = None
 
 
 @dataclass
@@ -114,6 +139,750 @@ class FactCheckerConfig:
     venue_threshold: float = 0.70
     hallucination_max_score: float = 0.50
     max_candidates_per_source: int = 10
+
+
+# ------------- Entry Classification -------------
+
+
+class EntryCategory(Enum):
+    """Categories for BibTeX entry types."""
+
+    ACADEMIC = "academic"  # journal articles, conference papers, preprints
+    WEB_REFERENCE = "web_reference"  # blogs, podcasts, websites with URL
+    BOOK = "book"  # @book entries
+    WORKING_PAPER = "working_paper"  # NBER, HBS, non-peer-reviewed academic
+    UNKNOWN = "unknown"  # fallback
+
+
+@dataclass
+class ClassificationResult:
+    """Result of classifying a BibTeX entry."""
+
+    category: EntryCategory
+    reason: str
+    extracted_url: Optional[str] = None
+    extracted_isbn: Optional[str] = None
+
+
+@dataclass
+class URLCheckResult:
+    """Result of checking URL accessibility."""
+
+    url: str
+    accessible: bool
+    status_code: Optional[int] = None
+    is_redirect: bool = False
+    final_url: Optional[str] = None
+    error: Optional[str] = None
+
+
+@dataclass
+class BookRecord:
+    """A book record from a book API."""
+
+    title: str
+    authors: List[str]
+    publisher: Optional[str] = None
+    year: Optional[int] = None
+    isbn: Optional[str] = None
+    isbn_13: Optional[str] = None
+    source: str = ""  # "openlibrary" | "google_books"
+    url: Optional[str] = None
+
+
+@dataclass
+class WebVerifierConfig:
+    """Configuration for web reference verification."""
+
+    verify_content: bool = False
+    content_threshold: float = 0.60
+    timeout: float = 10.0
+    follow_redirects: bool = True
+    max_redirects: int = 5
+
+
+@dataclass
+class BookVerifierConfig:
+    """Configuration for book verification."""
+
+    use_google_books: bool = True
+    google_books_api_key: Optional[str] = None
+    match_threshold: float = 0.80
+    title_threshold: float = 0.85
+    author_threshold: float = 0.70
+
+
+@dataclass
+class WorkingPaperConfig:
+    """Configuration for working paper verification."""
+
+    search_crossref: bool = True
+    relaxed_thresholds: bool = True
+
+
+class EntryClassifier:
+    """Classifies BibTeX entries by type for appropriate verification."""
+
+    # Domains that indicate academic content (should use academic verification)
+    ACADEMIC_DOMAINS = {
+        "arxiv.org",
+        "doi.org",
+        "dblp.org",
+        "semanticscholar.org",
+        "acm.org",
+        "ieee.org",
+        "springer.com",
+        "nature.com",
+        "sciencedirect.com",
+        "wiley.com",
+        "aps.org",
+        "iopscience.iop.org",
+    }
+
+    # Indicators that an entry is a working paper
+    WORKING_PAPER_INDICATORS = [
+        "working paper",
+        "discussion paper",
+        "nber",
+        "hbs working",
+        "technical report",
+        "ssrn",
+    ]
+
+    def classify(self, entry: Dict[str, Any]) -> ClassificationResult:
+        """Classify an entry into a category for verification."""
+        entry_type = entry.get("ENTRYTYPE", "").lower()
+
+        # Check for book first
+        if entry_type in ("book", "inbook"):
+            isbn = self._extract_isbn(entry)
+            return ClassificationResult(
+                category=EntryCategory.BOOK,
+                reason=f"Entry type is {entry_type}",
+                extracted_isbn=isbn,
+            )
+
+        # Check for working paper
+        if self._is_working_paper(entry, entry_type):
+            return ClassificationResult(
+                category=EntryCategory.WORKING_PAPER,
+                reason="Contains working paper indicators",
+            )
+
+        # Check for web reference (misc with URL in non-academic domain)
+        url = self._extract_url(entry)
+        if url and entry_type == "misc":
+            if not self._is_academic_url(url):
+                # Check if it looks like a preprint (has eprint/archiveprefix)
+                if not entry.get("eprint") and not entry.get("archiveprefix"):
+                    return ClassificationResult(
+                        category=EntryCategory.WEB_REFERENCE,
+                        reason="misc entry with non-academic URL",
+                        extracted_url=url,
+                    )
+
+        # Check for academic indicators
+        if self._is_academic(entry, entry_type):
+            return ClassificationResult(
+                category=EntryCategory.ACADEMIC,
+                reason="Has academic indicators (DOI, known entry type, or academic URL)",
+            )
+
+        # Default: if has a title, try academic verification
+        if entry.get("title"):
+            return ClassificationResult(
+                category=EntryCategory.ACADEMIC,
+                reason="Default classification for entries with title",
+            )
+
+        return ClassificationResult(
+            category=EntryCategory.UNKNOWN,
+            reason="Could not classify entry",
+        )
+
+    def _extract_url(self, entry: Dict[str, Any]) -> Optional[str]:
+        """Extract URL from entry fields."""
+        # Direct url field
+        if entry.get("url"):
+            return entry["url"]
+
+        # howpublished with \url{...}
+        howpub = entry.get("howpublished", "")
+        match = re.search(r"\\url\{([^}]+)\}", howpub)
+        if match:
+            return match.group(1)
+
+        # note field sometimes contains URLs
+        note = entry.get("note", "")
+        match = re.search(r"\\url\{([^}]+)\}", note)
+        if match:
+            return match.group(1)
+
+        # Plain URL in howpublished
+        match = re.search(r"https?://[^\s}]+", howpub)
+        if match:
+            return match.group(0)
+
+        return None
+
+    def _extract_isbn(self, entry: Dict[str, Any]) -> Optional[str]:
+        """Extract ISBN from entry fields."""
+        # Direct isbn field
+        isbn = entry.get("isbn", "")
+        if isbn:
+            # Clean up ISBN (remove dashes, spaces)
+            return re.sub(r"[-\s]", "", isbn)
+
+        # Check note field
+        note = entry.get("note", "")
+        match = re.search(r"ISBN[:\s]*([\d\-X]+)", note, re.IGNORECASE)
+        if match:
+            return re.sub(r"[-\s]", "", match.group(1))
+
+        return None
+
+    def _is_academic_url(self, url: str) -> bool:
+        """Check if URL is from an academic domain."""
+        try:
+            domain = urlparse(url).netloc.lower()
+            return any(academic in domain for academic in self.ACADEMIC_DOMAINS)
+        except Exception:
+            return False
+
+    def _is_working_paper(self, entry: Dict[str, Any], entry_type: str) -> bool:
+        """Check if entry is a working paper."""
+        if entry_type in ("techreport", "unpublished"):
+            return True
+
+        # Check for institution + number (typical working paper pattern)
+        if entry.get("institution") and entry.get("number"):
+            return True
+
+        # Check text fields for working paper indicators
+        text_to_check = " ".join(
+            [
+                entry.get("note", ""),
+                entry.get("journal", ""),
+                entry.get("series", ""),
+                entry.get("type", ""),
+            ]
+        ).lower()
+
+        return any(indicator in text_to_check for indicator in self.WORKING_PAPER_INDICATORS)
+
+    def _is_academic(self, entry: Dict[str, Any], entry_type: str) -> bool:
+        """Check if entry has academic indicators."""
+        # Has DOI
+        if entry.get("doi"):
+            return True
+
+        # Has eprint/archiveprefix (arXiv)
+        if entry.get("eprint") or entry.get("archiveprefix"):
+            return True
+
+        # Known academic entry types
+        if entry_type in ("article", "inproceedings", "incollection", "phdthesis", "mastersthesis", "proceedings"):
+            return True
+
+        # Check if URL is academic
+        url = self._extract_url(entry)
+        if url and self._is_academic_url(url):
+            return True
+
+        return False
+
+
+# ------------- Verifiers -------------
+
+
+class BaseVerifier(ABC):
+    """Abstract base class for entry verifiers."""
+
+    @abstractmethod
+    def verify(self, entry: Dict[str, Any], classification: ClassificationResult) -> FactCheckResult:
+        """Verify an entry and return a FactCheckResult."""
+        pass
+
+    @abstractmethod
+    def supports(self, category: EntryCategory) -> bool:
+        """Return True if this verifier handles the given category."""
+        pass
+
+    def _make_result(
+        self,
+        entry: Dict[str, Any],
+        status: FactCheckStatus,
+        category: EntryCategory,
+        confidence: float = 0.0,
+        field_comparisons: Optional[Dict[str, FieldComparison]] = None,
+        best_match: Optional[PublishedRecord] = None,
+        api_sources_queried: Optional[List[str]] = None,
+        api_sources_with_hits: Optional[List[str]] = None,
+        errors: Optional[List[str]] = None,
+        url_check: Optional[URLCheckResult] = None,
+        book_match: Optional[BookRecord] = None,
+    ) -> FactCheckResult:
+        """Create a FactCheckResult with common fields."""
+        return FactCheckResult(
+            entry_key=entry.get("ID", "unknown"),
+            entry_type=entry.get("ENTRYTYPE", "misc").lower(),
+            status=status,
+            overall_confidence=confidence,
+            field_comparisons=field_comparisons or {},
+            best_match=best_match,
+            api_sources_queried=api_sources_queried or [],
+            api_sources_with_hits=api_sources_with_hits or [],
+            errors=errors or [],
+            category=category,
+            url_check=url_check,
+            book_match=book_match,
+        )
+
+
+class WebVerifier(BaseVerifier):
+    """Verifies web references (blogs, podcasts, websites)."""
+
+    def __init__(self, http: HttpClient, config: WebVerifierConfig, logger: logging.Logger):
+        self.http = http
+        self.config = config
+        self.logger = logger
+        self.classifier = EntryClassifier()
+
+    def supports(self, category: EntryCategory) -> bool:
+        return category == EntryCategory.WEB_REFERENCE
+
+    def verify(self, entry: Dict[str, Any], classification: ClassificationResult) -> FactCheckResult:
+        """Verify a web reference by checking URL accessibility."""
+        url = classification.extracted_url or self.classifier._extract_url(entry)
+
+        if not url:
+            return self._make_result(
+                entry,
+                FactCheckStatus.API_ERROR,
+                EntryCategory.WEB_REFERENCE,
+                errors=["No URL found in entry"],
+            )
+
+        # Check URL accessibility
+        url_result = self._check_url(url)
+
+        if not url_result.accessible:
+            return self._make_result(
+                entry,
+                FactCheckStatus.URL_NOT_FOUND,
+                EntryCategory.WEB_REFERENCE,
+                url_check=url_result,
+                api_sources_queried=["url_check"],
+                errors=[url_result.error] if url_result.error else [],
+            )
+
+        # Optionally verify content matches entry metadata
+        if self.config.verify_content:
+            content_result = self._verify_content(url, entry)
+            if content_result:
+                return self._make_result(
+                    entry,
+                    FactCheckStatus.URL_VERIFIED,
+                    EntryCategory.WEB_REFERENCE,
+                    confidence=content_result,
+                    url_check=url_result,
+                    api_sources_queried=["url_check", "content_verify"],
+                    api_sources_with_hits=["url_check", "content_verify"],
+                )
+
+        # URL accessible but no content verification
+        return self._make_result(
+            entry,
+            FactCheckStatus.URL_ACCESSIBLE,
+            EntryCategory.WEB_REFERENCE,
+            confidence=1.0,
+            url_check=url_result,
+            api_sources_queried=["url_check"],
+            api_sources_with_hits=["url_check"],
+        )
+
+    def _check_url(self, url: str) -> URLCheckResult:
+        """Check if URL is accessible via HEAD request."""
+        import requests
+
+        try:
+            # Use HEAD request to minimize data transfer
+            resp = requests.head(
+                url,
+                timeout=self.config.timeout,
+                allow_redirects=self.config.follow_redirects,
+                headers={"User-Agent": "BibtexFactChecker/1.0"},
+            )
+
+            is_redirect = len(resp.history) > 0
+            final_url = resp.url if is_redirect else None
+
+            return URLCheckResult(
+                url=url,
+                accessible=resp.status_code < 400,
+                status_code=resp.status_code,
+                is_redirect=is_redirect,
+                final_url=final_url,
+            )
+        except requests.exceptions.SSLError as e:
+            return URLCheckResult(url=url, accessible=False, error=f"SSL error: {e}")
+        except requests.exceptions.ConnectionError as e:
+            return URLCheckResult(url=url, accessible=False, error=f"Connection error: {e}")
+        except requests.exceptions.Timeout:
+            return URLCheckResult(url=url, accessible=False, error="Request timed out")
+        except Exception as e:
+            return URLCheckResult(url=url, accessible=False, error=str(e))
+
+    def _verify_content(self, url: str, entry: Dict[str, Any]) -> Optional[float]:
+        """Verify that page content matches entry metadata."""
+        import requests
+
+        try:
+            resp = requests.get(
+                url,
+                timeout=self.config.timeout,
+                headers={"User-Agent": "BibtexFactChecker/1.0"},
+            )
+            if resp.status_code != 200:
+                return None
+
+            content = resp.text.lower()
+            title = entry.get("title", "").lower()
+
+            # Simple check: does the title appear in the page?
+            if title and title in content:
+                return 1.0
+
+            # Fuzzy match on title
+            title_norm = normalize_title_for_match(entry.get("title", ""))
+            if title_norm and title_norm in content:
+                return 0.8
+
+            return 0.5  # URL accessible but title not found
+
+        except Exception:
+            return None
+
+
+class BookVerifier(BaseVerifier):
+    """Verifies books using Open Library and Google Books APIs."""
+
+    OPEN_LIBRARY_API = "https://openlibrary.org/search.json"
+    GOOGLE_BOOKS_API = "https://www.googleapis.com/books/v1/volumes"
+
+    def __init__(self, http: HttpClient, config: BookVerifierConfig, logger: logging.Logger):
+        self.http = http
+        self.config = config
+        self.logger = logger
+        self.classifier = EntryClassifier()
+
+    def supports(self, category: EntryCategory) -> bool:
+        return category == EntryCategory.BOOK
+
+    def verify(self, entry: Dict[str, Any], classification: ClassificationResult) -> FactCheckResult:
+        """Verify a book entry using book APIs."""
+        title = entry.get("title", "")
+        author = entry.get("author", "")
+        isbn = classification.extracted_isbn or self.classifier._extract_isbn(entry)
+
+        if not title:
+            return self._make_result(
+                entry,
+                FactCheckStatus.API_ERROR,
+                EntryCategory.BOOK,
+                errors=["No title found for book search"],
+            )
+
+        candidates: List[Tuple[float, BookRecord, str]] = []
+        sources_queried: List[str] = []
+        sources_with_hits: List[str] = []
+        errors: List[str] = []
+
+        # Try Open Library
+        sources_queried.append("openlibrary")
+        try:
+            ol_results = self._search_open_library(title, author, isbn)
+            if ol_results:
+                sources_with_hits.append("openlibrary")
+                for book in ol_results:
+                    score = self._score_book_match(entry, book)
+                    candidates.append((score, book, "openlibrary"))
+        except Exception as e:
+            errors.append(f"Open Library: {e}")
+
+        # Try Google Books if enabled
+        if self.config.use_google_books:
+            sources_queried.append("google_books")
+            try:
+                gb_results = self._search_google_books(title, author, isbn)
+                if gb_results:
+                    sources_with_hits.append("google_books")
+                    for book in gb_results:
+                        score = self._score_book_match(entry, book)
+                        candidates.append((score, book, "google_books"))
+            except Exception as e:
+                errors.append(f"Google Books: {e}")
+
+        if not candidates:
+            status = FactCheckStatus.API_ERROR if errors and not sources_with_hits else FactCheckStatus.BOOK_NOT_FOUND
+            return self._make_result(
+                entry,
+                status,
+                EntryCategory.BOOK,
+                api_sources_queried=sources_queried,
+                api_sources_with_hits=sources_with_hits,
+                errors=errors,
+            )
+
+        # Find best match
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        best_score, best_match, source = candidates[0]
+
+        if best_score >= self.config.match_threshold:
+            return self._make_result(
+                entry,
+                FactCheckStatus.BOOK_VERIFIED,
+                EntryCategory.BOOK,
+                confidence=best_score,
+                book_match=best_match,
+                api_sources_queried=sources_queried,
+                api_sources_with_hits=sources_with_hits,
+            )
+
+        return self._make_result(
+            entry,
+            FactCheckStatus.BOOK_NOT_FOUND,
+            EntryCategory.BOOK,
+            confidence=best_score,
+            book_match=best_match,
+            api_sources_queried=sources_queried,
+            api_sources_with_hits=sources_with_hits,
+        )
+
+    def _search_open_library(self, title: str, author: str, isbn: Optional[str]) -> List[BookRecord]:
+        """Search Open Library for books."""
+        results = []
+
+        # Build query
+        query_parts = []
+        if title:
+            query_parts.append(f"title:{title}")
+        if author:
+            # Extract first author's last name
+            first_author = first_author_surname({"author": author})
+            if first_author:
+                query_parts.append(f"author:{first_author}")
+
+        if not query_parts:
+            return []
+
+        query = " ".join(query_parts)
+        params = {"q": query, "limit": 5}
+
+        try:
+            resp = self.http._request("GET", self.OPEN_LIBRARY_API, params=params, accept="application/json")
+            if resp.status_code != 200:
+                return []
+
+            data = resp.json()
+            for doc in data.get("docs", [])[:5]:
+                book = BookRecord(
+                    title=doc.get("title", ""),
+                    authors=doc.get("author_name", []),
+                    publisher=doc.get("publisher", [""])[0] if doc.get("publisher") else None,
+                    year=doc.get("first_publish_year"),
+                    isbn=doc.get("isbn", [""])[0] if doc.get("isbn") else None,
+                    source="openlibrary",
+                    url=f"https://openlibrary.org{doc.get('key', '')}" if doc.get("key") else None,
+                )
+                results.append(book)
+
+        except Exception as e:
+            self.logger.debug("Open Library search failed: %s", e)
+
+        return results
+
+    def _search_google_books(self, title: str, author: str, isbn: Optional[str]) -> List[BookRecord]:
+        """Search Google Books for books."""
+        results = []
+
+        # Build query
+        query_parts = []
+        if isbn:
+            query_parts.append(f"isbn:{isbn}")
+        else:
+            if title:
+                query_parts.append(f"intitle:{title}")
+            if author:
+                first_author = first_author_surname({"author": author})
+                if first_author:
+                    query_parts.append(f"inauthor:{first_author}")
+
+        if not query_parts:
+            return []
+
+        query = "+".join(query_parts)
+        params = {"q": query, "maxResults": 5}
+
+        if self.config.google_books_api_key:
+            params["key"] = self.config.google_books_api_key
+
+        try:
+            resp = self.http._request("GET", self.GOOGLE_BOOKS_API, params=params, accept="application/json")
+            if resp.status_code != 200:
+                return []
+
+            data = resp.json()
+            for item in data.get("items", [])[:5]:
+                vol = item.get("volumeInfo", {})
+                identifiers = {i.get("type"): i.get("identifier") for i in vol.get("industryIdentifiers", [])}
+
+                book = BookRecord(
+                    title=vol.get("title", ""),
+                    authors=vol.get("authors", []),
+                    publisher=vol.get("publisher"),
+                    year=(
+                        int(vol.get("publishedDate", "")[:4])
+                        if vol.get("publishedDate", "").isdigit()
+                        or (len(vol.get("publishedDate", "")) >= 4 and vol.get("publishedDate", "")[:4].isdigit())
+                        else None
+                    ),
+                    isbn=identifiers.get("ISBN_10"),
+                    isbn_13=identifiers.get("ISBN_13"),
+                    source="google_books",
+                    url=vol.get("infoLink"),
+                )
+                results.append(book)
+
+        except Exception as e:
+            self.logger.debug("Google Books search failed: %s", e)
+
+        return results
+
+    def _score_book_match(self, entry: Dict[str, Any], book: BookRecord) -> float:
+        """Score how well a book matches the entry."""
+        title_entry = normalize_title_for_match(entry.get("title", ""))
+        title_book = normalize_title_for_match(book.title)
+        title_score = token_sort_ratio(title_entry, title_book) / 100.0
+
+        # Author matching
+        entry_authors = authors_last_names(entry.get("author", ""), limit=3)
+        book_authors = [strip_diacritics(a.split()[-1]).lower() for a in book.authors[:3] if a]
+        author_score = jaccard_similarity(entry_authors, book_authors)
+
+        # Year matching (bonus if matches)
+        year_bonus = 0.0
+        try:
+            entry_year = int(entry.get("year", 0))
+            if book.year and abs(entry_year - book.year) <= 1:
+                year_bonus = 0.1
+        except (ValueError, TypeError):
+            pass
+
+        return 0.6 * title_score + 0.3 * author_score + year_bonus
+
+
+class WorkingPaperVerifier(BaseVerifier):
+    """Verifies working papers using academic APIs with relaxed thresholds."""
+
+    def __init__(
+        self,
+        crossref: "CrossrefClient",
+        config: WorkingPaperConfig,
+        academic_config: FactCheckerConfig,
+        logger: logging.Logger,
+    ):
+        self.crossref = crossref
+        self.config = config
+        self.academic_config = academic_config
+        self.logger = logger
+
+    def supports(self, category: EntryCategory) -> bool:
+        return category == EntryCategory.WORKING_PAPER
+
+    def verify(self, entry: Dict[str, Any], classification: ClassificationResult) -> FactCheckResult:
+        """Verify a working paper entry."""
+        title = entry.get("title", "")
+        if not title:
+            return self._make_result(
+                entry,
+                FactCheckStatus.API_ERROR,
+                EntryCategory.WORKING_PAPER,
+                errors=["No title found for working paper search"],
+            )
+
+        sources_queried: List[str] = []
+        sources_with_hits: List[str] = []
+        errors: List[str] = []
+        candidates: List[Tuple[float, PublishedRecord]] = []
+
+        # Search Crossref (often indexes working papers)
+        if self.config.search_crossref:
+            sources_queried.append("crossref")
+            try:
+                first_author = first_author_surname(entry)
+                query = f"{normalize_title_for_match(title)} {first_author}".strip()
+                items = self.crossref.search(query, rows=10)
+                if items:
+                    sources_with_hits.append("crossref")
+                    for item in items:
+                        rec = crossref_message_to_record(item)
+                        if rec:
+                            score = self._score_candidate(entry, rec)
+                            candidates.append((score, rec))
+            except Exception as e:
+                errors.append(f"Crossref: {e}")
+
+        if not candidates:
+            status = FactCheckStatus.API_ERROR if errors else FactCheckStatus.WORKING_PAPER_NOT_FOUND
+            return self._make_result(
+                entry,
+                status,
+                EntryCategory.WORKING_PAPER,
+                api_sources_queried=sources_queried,
+                api_sources_with_hits=sources_with_hits,
+                errors=errors,
+            )
+
+        # Find best match with relaxed thresholds
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        best_score, best_match = candidates[0]
+
+        # Use relaxed threshold for working papers (0.7 instead of 0.9)
+        threshold = 0.70 if self.config.relaxed_thresholds else 0.90
+
+        if best_score >= threshold:
+            return self._make_result(
+                entry,
+                FactCheckStatus.WORKING_PAPER_VERIFIED,
+                EntryCategory.WORKING_PAPER,
+                confidence=best_score,
+                best_match=best_match,
+                api_sources_queried=sources_queried,
+                api_sources_with_hits=sources_with_hits,
+            )
+
+        return self._make_result(
+            entry,
+            FactCheckStatus.WORKING_PAPER_NOT_FOUND,
+            EntryCategory.WORKING_PAPER,
+            confidence=best_score,
+            best_match=best_match,
+            api_sources_queried=sources_queried,
+            api_sources_with_hits=sources_with_hits,
+        )
+
+    def _score_candidate(self, entry: Dict[str, Any], rec: PublishedRecord) -> float:
+        """Score a candidate record against the entry."""
+        title_entry = normalize_title_for_match(entry.get("title", ""))
+        title_rec = normalize_title_for_match(rec.title or "")
+        title_score = token_sort_ratio(title_entry, title_rec) / 100.0
+
+        authors_entry = authors_last_names(entry.get("author", ""), limit=3)
+        authors_rec = [strip_diacritics(a.get("family", "")).lower() for a in rec.authors[:3]]
+        author_score = jaccard_similarity(authors_entry, authors_rec)
+
+        return 0.7 * title_score + 0.3 * author_score
 
 
 # ------------- API Clients -------------
@@ -430,13 +1199,122 @@ class FactChecker:
         return FactCheckStatus.PARTIAL_MATCH
 
 
+class AcademicVerifier(BaseVerifier):
+    """Verifies academic publications (journals, conferences, preprints).
+
+    This wraps the existing FactChecker logic to implement the BaseVerifier interface.
+    """
+
+    def __init__(self, fact_checker: FactChecker):
+        self.fact_checker = fact_checker
+
+    def supports(self, category: EntryCategory) -> bool:
+        return category == EntryCategory.ACADEMIC
+
+    def verify(self, entry: Dict[str, Any], classification: ClassificationResult) -> FactCheckResult:
+        """Verify an academic entry using the existing FactChecker logic."""
+        result = self.fact_checker.check_entry(entry)
+        # Add category to result
+        return FactCheckResult(
+            entry_key=result.entry_key,
+            entry_type=result.entry_type,
+            status=result.status,
+            overall_confidence=result.overall_confidence,
+            field_comparisons=result.field_comparisons,
+            best_match=result.best_match,
+            api_sources_queried=result.api_sources_queried,
+            api_sources_with_hits=result.api_sources_with_hits,
+            errors=result.errors,
+            category=EntryCategory.ACADEMIC,
+            url_check=None,
+            book_match=None,
+        )
+
+
+class UnifiedFactChecker:
+    """Unified fact-checker that delegates to specialized verifiers based on entry category."""
+
+    def __init__(
+        self,
+        http: HttpClient,
+        crossref: CrossrefClient,
+        dblp: DBLPClient,
+        s2: SemanticScholarClient,
+        config: FactCheckerConfig,
+        web_config: Optional[WebVerifierConfig] = None,
+        book_config: Optional[BookVerifierConfig] = None,
+        working_paper_config: Optional[WorkingPaperConfig] = None,
+        logger: Optional[logging.Logger] = None,
+        skip_categories: Optional[List[EntryCategory]] = None,
+    ):
+        self.logger = logger or logging.getLogger("unified_fact_checker")
+        self.classifier = EntryClassifier()
+        self.skip_categories = set(skip_categories or [])
+
+        # Initialize verifiers
+        academic_checker = FactChecker(crossref, dblp, s2, config, self.logger)
+        self.verifiers: Dict[EntryCategory, BaseVerifier] = {
+            EntryCategory.ACADEMIC: AcademicVerifier(academic_checker),
+            EntryCategory.WEB_REFERENCE: WebVerifier(http, web_config or WebVerifierConfig(), self.logger),
+            EntryCategory.BOOK: BookVerifier(http, book_config or BookVerifierConfig(), self.logger),
+            EntryCategory.WORKING_PAPER: WorkingPaperVerifier(
+                crossref, working_paper_config or WorkingPaperConfig(), config, self.logger
+            ),
+        }
+
+    def check_entry(self, entry: Dict[str, Any]) -> FactCheckResult:
+        """Fact-check a single entry using the appropriate verifier."""
+        # Classify entry
+        classification = self.classifier.classify(entry)
+        self.logger.debug(
+            "Entry %s classified as %s: %s",
+            entry.get("ID"),
+            classification.category.value,
+            classification.reason,
+        )
+
+        # Check if category should be skipped
+        if classification.category in self.skip_categories:
+            return FactCheckResult(
+                entry_key=entry.get("ID", "unknown"),
+                entry_type=entry.get("ENTRYTYPE", "misc").lower(),
+                status=FactCheckStatus.SKIPPED,
+                overall_confidence=0.0,
+                field_comparisons={},
+                best_match=None,
+                api_sources_queried=[],
+                api_sources_with_hits=[],
+                errors=[f"Category {classification.category.value} is skipped"],
+                category=classification.category,
+            )
+
+        # Get appropriate verifier
+        verifier = self.verifiers.get(classification.category)
+        if not verifier:
+            return FactCheckResult(
+                entry_key=entry.get("ID", "unknown"),
+                entry_type=entry.get("ENTRYTYPE", "misc").lower(),
+                status=FactCheckStatus.SKIPPED,
+                overall_confidence=0.0,
+                field_comparisons={},
+                best_match=None,
+                api_sources_queried=[],
+                api_sources_with_hits=[],
+                errors=[f"No verifier for category: {classification.category.value}"],
+                category=classification.category,
+            )
+
+        # Delegate to verifier
+        return verifier.verify(entry, classification)
+
+
 # ------------- Processor & Reporting -------------
 
 
 class FactCheckProcessor:
     """Batch processing and reporting for fact-checking."""
 
-    def __init__(self, checker: FactChecker, logger: logging.Logger):
+    def __init__(self, checker: Union[FactChecker, UnifiedFactChecker], logger: logging.Logger):
         self.checker = checker
         self.logger = logger
 
@@ -454,12 +1332,20 @@ class FactCheckProcessor:
         for r in results:
             counts[r.status.value] += 1
 
+        # Count by category
+        category_counts: Dict[str, int] = {}
+        for r in results:
+            if r.category:
+                cat_name = r.category.value
+                category_counts[cat_name] = category_counts.get(cat_name, 0) + 1
+
         field_mismatches: Dict[str, int] = {}
         for r in results:
             for name, c in r.field_comparisons.items():
                 if not c.matches:
                     field_mismatches[name] = field_mismatches.get(name, 0) + 1
 
+        # Include new problematic statuses
         problematic_statuses = [
             "not_found",
             "hallucinated",
@@ -467,13 +1353,22 @@ class FactCheckProcessor:
             "author_mismatch",
             "year_mismatch",
             "venue_mismatch",
+            "url_not_found",
+            "url_content_mismatch",
+            "book_not_found",
+            "working_paper_not_found",
         ]
+
+        # Calculate verified rate including new verified statuses
+        verified_statuses = ["verified", "url_verified", "url_accessible", "book_verified", "working_paper_verified"]
+        verified_count = sum(counts.get(s, 0) for s in verified_statuses)
 
         return {
             "total": len(results),
             "status_counts": counts,
+            "by_category": category_counts,
             "field_mismatch_counts": field_mismatches,
-            "verified_rate": counts["verified"] / len(results) if results else 0,
+            "verified_rate": verified_count / len(results) if results else 0,
             "problematic_count": sum(counts.get(s, 0) for s in problematic_statuses),
         }
 
@@ -484,6 +1379,7 @@ class FactCheckProcessor:
             entry_data = {
                 "key": r.entry_key,
                 "type": r.entry_type,
+                "category": r.category.value if r.category else None,
                 "status": r.status.value,
                 "confidence": r.overall_confidence,
                 "field_comparisons": {
@@ -508,6 +1404,27 @@ class FactCheckProcessor:
                     "journal": r.best_match.journal,
                     "year": r.best_match.year,
                 }
+            # Add URL check details for web references
+            if r.url_check:
+                entry_data["url_check"] = {
+                    "url": r.url_check.url,
+                    "accessible": r.url_check.accessible,
+                    "status_code": r.url_check.status_code,
+                    "is_redirect": r.url_check.is_redirect,
+                    "final_url": r.url_check.final_url,
+                    "error": r.url_check.error,
+                }
+            # Add book match details
+            if r.book_match:
+                entry_data["book_match"] = {
+                    "title": r.book_match.title,
+                    "authors": r.book_match.authors,
+                    "publisher": r.book_match.publisher,
+                    "year": r.book_match.year,
+                    "isbn": r.book_match.isbn,
+                    "source": r.book_match.source,
+                    "url": r.book_match.url,
+                }
             entries.append(entry_data)
 
         summary = self.generate_summary(results)
@@ -523,6 +1440,7 @@ class FactCheckProcessor:
                 json.dumps(
                     {
                         "key": r.entry_key,
+                        "category": r.category.value if r.category else None,
                         "status": r.status.value,
                         "confidence": r.overall_confidence,
                         "mismatched_fields": [n for n, c in r.field_comparisons.items() if not c.matches],
@@ -600,6 +1518,56 @@ Examples:
         help="Requests per minute limit (default: 45)",
     )
 
+    # Entry type filtering
+    entry_types = p.add_argument_group("entry type filtering")
+    entry_types.add_argument(
+        "--skip-web",
+        action="store_true",
+        help="Skip web reference verification (blogs, websites)",
+    )
+    entry_types.add_argument(
+        "--skip-books",
+        action="store_true",
+        help="Skip book verification",
+    )
+    entry_types.add_argument(
+        "--skip-working-papers",
+        action="store_true",
+        help="Skip working paper verification",
+    )
+    entry_types.add_argument(
+        "--academic-only",
+        action="store_true",
+        help="Only verify academic entries (skip web, books, working papers)",
+    )
+
+    # Web verification options
+    web_opts = p.add_argument_group("web verification options")
+    web_opts.add_argument(
+        "--verify-url-content",
+        action="store_true",
+        help="Fetch web pages and verify content matches metadata",
+    )
+    web_opts.add_argument(
+        "--url-timeout",
+        type=float,
+        default=10.0,
+        help="Timeout for URL requests in seconds (default: 10)",
+    )
+
+    # Book verification options
+    book_opts = p.add_argument_group("book verification options")
+    book_opts.add_argument(
+        "--google-books-api-key",
+        metavar="KEY",
+        help="Google Books API key for higher rate limits",
+    )
+    book_opts.add_argument(
+        "--no-google-books",
+        action="store_true",
+        help="Disable Google Books API (use Open Library only)",
+    )
+
     return p
 
 
@@ -651,12 +1619,51 @@ def main() -> int:
         venue_threshold=args.venue_threshold,
     )
 
-    checker = FactChecker(
-        crossref=CrossrefClient(http),
-        dblp=DBLPClient(http),
-        s2=SemanticScholarClient(http),
+    # Setup API clients
+    crossref = CrossrefClient(http)
+    dblp = DBLPClient(http)
+    s2 = SemanticScholarClient(http)
+
+    # Determine categories to skip
+    skip_categories: List[EntryCategory] = []
+    if args.academic_only:
+        skip_categories = [EntryCategory.WEB_REFERENCE, EntryCategory.BOOK, EntryCategory.WORKING_PAPER]
+    else:
+        if args.skip_web:
+            skip_categories.append(EntryCategory.WEB_REFERENCE)
+        if args.skip_books:
+            skip_categories.append(EntryCategory.BOOK)
+        if args.skip_working_papers:
+            skip_categories.append(EntryCategory.WORKING_PAPER)
+
+    # Setup verifier configs
+    web_config = WebVerifierConfig(
+        verify_content=args.verify_url_content,
+        timeout=args.url_timeout,
+    )
+
+    book_config = BookVerifierConfig(
+        use_google_books=not args.no_google_books,
+        google_books_api_key=args.google_books_api_key,
+    )
+
+    working_paper_config = WorkingPaperConfig(
+        search_crossref=True,
+        relaxed_thresholds=True,
+    )
+
+    # Create unified fact checker
+    checker = UnifiedFactChecker(
+        http=http,
+        crossref=crossref,
+        dblp=dblp,
+        s2=s2,
         config=config,
+        web_config=web_config,
+        book_config=book_config,
+        working_paper_config=working_paper_config,
         logger=logger,
+        skip_categories=skip_categories,
     )
 
     processor = FactCheckProcessor(checker, logger)
@@ -668,9 +1675,19 @@ def main() -> int:
     # Print summary
     logger.info("=" * 60)
     logger.info("SUMMARY: %d entries checked", summary["total"])
+
+    # Print category breakdown
+    if summary.get("by_category"):
+        logger.info("By category:")
+        for cat, count in summary["by_category"].items():
+            logger.info("  %s: %d", cat, count)
+
+    # Print status counts
+    logger.info("By status:")
     for status, count in summary["status_counts"].items():
         if count > 0:
             logger.info("  %s: %d", status.upper(), count)
+
     logger.info("Verified rate: %.1f%%", summary["verified_rate"] * 100)
     if summary["problematic_count"] > 0:
         logger.warning("Problematic entries: %d", summary["problematic_count"])
