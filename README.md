@@ -1,12 +1,13 @@
 # BibTeX Updater
 
-Tools for managing BibTeX bibliographies: automatically update preprints to published versions and filter to only cited references.
+Tools for managing BibTeX bibliographies: automatically update preprints to published versions, validate references against external databases, and filter to only cited references.
 
 ## Tools
 
 | Tool | Description | Dependencies |
 |------|-------------|--------------|
 | `bibtex_updater.py` | Replace preprints with published versions | pip install required |
+| `reference_fact_checker.py` | Validate references exist with correct metadata | pip install required |
 | `zotero_updater.py` | Update preprints in Zotero library | pip install required |
 | `filter_bibliography.py` | Filter to only cited entries | **None** (stdlib only) |
 
@@ -39,6 +40,16 @@ python zotero_updater.py --dry-run
 python zotero_updater.py
 ```
 
+### Validate References (Fact-Check)
+
+```bash
+# Check if references exist and have correct metadata
+python reference_fact_checker.py references.bib --report report.json
+
+# Strict mode: exit with error if hallucinated/not-found entries
+python reference_fact_checker.py references.bib --strict
+```
+
 ### Filter Bibliography
 
 ```bash
@@ -51,6 +62,7 @@ python filter_bibliography.py paper.tex -b references.bib -o filtered.bib
 | Document | Description |
 |----------|-------------|
 | [docs/BIBTEX_UPDATER.md](docs/BIBTEX_UPDATER.md) | Full BibTeX updater documentation |
+| [docs/REFERENCE_FACT_CHECKER.md](docs/REFERENCE_FACT_CHECKER.md) | Full reference fact-checker documentation |
 | [docs/ZOTERO_UPDATER.md](docs/ZOTERO_UPDATER.md) | Full Zotero updater documentation |
 | [docs/FILTER_BIBLIOGRAPHY.md](docs/FILTER_BIBLIOGRAPHY.md) | Full filter documentation |
 | [examples/](examples/) | Example workflows and configuration files |
@@ -90,6 +102,14 @@ For `filter_bibliography.py` only (no dependencies required):
 - **Preserves metadata**: Keeps notes, tags, and attachments intact
 - **Idempotent**: Already-published papers are automatically skipped
 - **Dry-run mode**: Preview changes before applying
+
+### Reference Fact-Checker
+
+- **Multi-source validation**: Crossref, DBLP, Semantic Scholar
+- **Detailed mismatch detection**: Title, author, year, venue comparisons
+- **Hallucination detection**: Identifies likely fabricated references
+- **Structured reports**: JSON and JSONL output formats
+- **CI/CD integration**: Strict mode with exit codes for automation
 
 ### Filter Bibliography
 

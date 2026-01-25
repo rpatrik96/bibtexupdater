@@ -259,3 +259,77 @@ def field_processor_check_only(field_checker):
         fill_mode="recommended",
         fill_enabled=False,
     )
+
+
+# ------------- Fact Checker Fixtures -------------
+
+
+@pytest.fixture
+def make_verified_entry(make_entry):
+    """Factory for creating entries that should verify successfully.
+
+    These entries have real paper metadata that exists in external databases.
+    """
+
+    def _make(**kwargs):
+        return make_entry(
+            ID="vaswani2017attention",
+            title="Attention Is All You Need",
+            author="Vaswani, Ashish and Shazeer, Noam",
+            journal="NeurIPS",
+            year="2017",
+            **kwargs,
+        )
+
+    return _make
+
+
+@pytest.fixture
+def make_hallucinated_entry(make_entry):
+    """Factory for creating entries that appear to be fabricated.
+
+    These entries have fake metadata that won't match any real papers.
+    """
+
+    def _make(**kwargs):
+        return make_entry(
+            ID="fakename2099",
+            title="Quantum Widgets for AI: A Novel Approach",
+            author="Fakename, Xavier and Imaginary, Yolanda",
+            journal="Imaginary Journal of Nonexistent Science",
+            year="2099",
+            **kwargs,
+        )
+
+    return _make
+
+
+@pytest.fixture
+def make_mismatched_entry(make_entry):
+    """Factory for creating entries with mismatched metadata.
+
+    These entries have real paper metadata but with intentional mismatches.
+    """
+
+    def _make(mismatch_type="title", **kwargs):
+        base = {
+            "ID": "mismatched2020",
+            "title": "Attention Is All You Need",
+            "author": "Vaswani, Ashish",
+            "journal": "NeurIPS",
+            "year": "2017",
+        }
+
+        if mismatch_type == "title":
+            base["title"] = "This Title Is Completely Wrong"
+        elif mismatch_type == "author":
+            base["author"] = "Wrong, Author and Different, Person"
+        elif mismatch_type == "year":
+            base["year"] = "2010"
+        elif mismatch_type == "venue":
+            base["journal"] = "Wrong Conference"
+
+        base.update(kwargs)
+        return make_entry(**base)
+
+    return _make
