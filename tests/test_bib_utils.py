@@ -6,7 +6,7 @@ Core utility functions are tested in test_utils.py.
 
 from __future__ import annotations
 
-from bib_utils import (
+from bibtex_updater.utils import (
     DiskCache,
     RateLimiter,
     crossref_message_to_record,

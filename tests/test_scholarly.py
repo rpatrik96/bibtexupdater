@@ -38,7 +38,7 @@ class TestScholarlyClient:
         result = client.search("Test Title", "Smith")
         assert result is None
 
-    @patch("bibtex_updater.time.sleep")
+    @patch("bibtex_updater.updater.time.sleep")
     def test_rate_limit_waits_when_needed(self, mock_sleep):
         """Rate limiter should sleep when requests are too fast."""
         client = ScholarlyClient.__new__(ScholarlyClient)
@@ -62,7 +62,7 @@ class TestScholarlyClient:
         client.logger = logging.getLogger(__name__)
         client._scholarly = None
 
-        with patch("bibtex_updater.time.sleep") as mock_sleep:
+        with patch("bibtex_updater.updater.time.sleep") as mock_sleep:
             client._rate_limit()
             mock_sleep.assert_not_called()
 
@@ -505,7 +505,7 @@ class TestScholarlyProxyConfiguration:
             ScholarlyClient(proxy="none", delay=1.0)
             mock_setup.assert_called_once_with("none")
 
-    @patch("bibtex_updater.time.sleep")
+    @patch("bibtex_updater.updater.time.sleep")
     def test_default_delay_is_5_seconds(self, mock_sleep):
         """Default delay should be 5 seconds."""
         client = ScholarlyClient.__new__(ScholarlyClient)

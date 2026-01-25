@@ -29,16 +29,15 @@ import os
 import re
 import sys
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
-# Import from bibtex_updater (same directory)
-from bibtex_updater import (
-    Detector,
+# Import from bibtex_updater package
+from bibtex_updater.updater import Detector, Resolver
+from bibtex_updater.utils import (
     DiskCache,
     HttpClient,
     PublishedRecord,
     RateLimiter,
-    Resolver,
     doi_normalize,
     doi_url,
     extract_arxiv_id_from_text,
@@ -55,7 +54,7 @@ except ImportError:
 # ------------- Zotero <-> BibTeX Bridge -------------
 
 
-def zotero_to_bibtex_entry(item: Dict[str, Any]) -> Dict[str, Any]:
+def zotero_to_bibtex_entry(item: dict[str, Any]) -> dict[str, Any]:
     """Convert Zotero item to bibtex-like dict for the Detector/Resolver."""
     data = item.get("data", item)
 
@@ -98,7 +97,7 @@ def zotero_to_bibtex_entry(item: Dict[str, Any]) -> Dict[str, Any]:
     return entry
 
 
-def is_zotero_preprint(item: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
+def is_zotero_preprint(item: dict[str, Any]) -> tuple[bool, str | None]:
     """
     Check if a Zotero item is a preprint.
     Returns (is_preprint, arxiv_id).
@@ -139,7 +138,7 @@ def is_zotero_preprint(item: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
     return bool(arxiv_id), arxiv_id
 
 
-def published_record_to_zotero_update(rec: PublishedRecord, original_item: Dict[str, Any]) -> Dict[str, Any]:
+def published_record_to_zotero_update(rec: PublishedRecord, original_item: dict[str, Any]) -> dict[str, Any]:
     """
     Convert PublishedRecord to Zotero update payload.
     Preserves: tags, collections, notes, attachments (not touched here).
@@ -216,11 +215,11 @@ class UpdateResult:
     title: str
     action: str  # "updated", "not_found", "skipped", "error"
     message: str
-    old_journal: Optional[str] = None
-    new_journal: Optional[str] = None
-    doi: Optional[str] = None
-    method: Optional[str] = None
-    confidence: Optional[float] = None
+    old_journal: str | None = None
+    new_journal: str | None = None
+    doi: str | None = None
+    method: str | None = None
+    confidence: float | None = None
 
 
 class ZoteroPrePrintUpdater:
@@ -257,10 +256,10 @@ class ZoteroPrePrintUpdater:
 
     def fetch_preprints(
         self,
-        collection_key: Optional[str] = None,
-        tag: Optional[str] = None,
+        collection_key: str | None = None,
+        tag: str | None = None,
         limit: int = 100,
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         """Fetch items that look like preprints from Zotero."""
         params = {"limit": limit, "itemType": "journalArticle || preprint"}
 
@@ -281,7 +280,7 @@ class ZoteroPrePrintUpdater:
         self.logger.info(f"Found {len(preprints)} preprint(s) out of {len(items)} items")
         return preprints
 
-    def process_item(self, item: Dict[str, Any]) -> UpdateResult:
+    def process_item(self, item: dict[str, Any]) -> UpdateResult:
         """Process a single Zotero item."""
         data = item.get("data", item)
         key = data.get("key", "")
@@ -379,10 +378,10 @@ class ZoteroPrePrintUpdater:
 
     def run(
         self,
-        collection_key: Optional[str] = None,
-        tag: Optional[str] = None,
+        collection_key: str | None = None,
+        tag: str | None = None,
         limit: int = 100,
-    ) -> List[UpdateResult]:
+    ) -> list[UpdateResult]:
         """Run the update process."""
         preprints = self.fetch_preprints(collection_key=collection_key, tag=tag, limit=limit)
 
@@ -404,7 +403,7 @@ class ZoteroPrePrintUpdater:
         return results
 
 
-def print_summary(results: List[UpdateResult]) -> None:
+def print_summary(results: list[UpdateResult]) -> None:
     """Print summary of results."""
     updated = [r for r in results if r.action in ("updated", "would_update")]
     not_found = [r for r in results if r.action == "not_found"]
@@ -431,7 +430,7 @@ def print_summary(results: List[UpdateResult]) -> None:
             print(f"  [{r.item_key}] {r.title}")
 
 
-def main(argv: Optional[List[str]] = None) -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Update Zotero preprints to published versions",
         formatter_class=argparse.RawDescriptionHelpFormatter,

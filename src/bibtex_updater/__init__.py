@@ -1,0 +1,123 @@
+"""BibTeX Updater - Tools for managing academic BibTeX bibliographies.
+
+This package provides tools for:
+- Upgrading preprint references to their published versions
+- Validating bibliography references against authoritative sources
+- Filtering bibliographies to only cited entries
+- Updating Zotero libraries with published versions
+
+Example usage:
+    from bibtex_updater import Detector, Resolver, Updater
+
+    # Check if an entry is a preprint
+    detector = Detector()
+    detection = detector.detect(entry)
+
+    # Resolve a preprint to its published version
+    resolver = Resolver(http_client)
+    candidate = resolver.resolve(detection)
+
+    # Update a bibliography file
+    updater = Updater(detector, resolver)
+    results = updater.process(entries)
+"""
+
+from bibtex_updater._version import __version__
+
+# Core updater classes and functions
+from bibtex_updater.updater import (
+    BibLoader,
+    BibWriter,
+    Dedupe,
+    Detector,
+    FieldChecker,
+    FieldCheckResult,
+    FieldFiller,
+    FieldRequirement,
+    FieldRequirementRegistry,
+    MissingFieldProcessor,
+    MissingFieldReport,
+    PreprintDetection,
+    ProcessResult,
+    Resolver,
+    ScholarlyClient,
+    Updater,
+    process_entry,
+)
+
+# Shared utilities
+from bibtex_updater.utils import (
+    # Classes
+    DiskCache,
+    HttpClient,
+    PublishedRecord,
+    RateLimiter,
+    # Author handling
+    authors_last_names,
+    # API converters
+    crossref_message_to_record,
+    dblp_hit_to_record,
+    # DOI/arXiv utilities
+    doi_normalize,
+    doi_url,
+    extract_arxiv_id_from_text,
+    first_author_surname,
+    # Matching utilities
+    jaccard_similarity,
+    last_name_from_person,
+    # Text normalization
+    latex_to_plain,
+    normalize_title_for_match,
+    s2_data_to_record,
+    safe_lower,
+    split_authors_bibtex,
+    strip_diacritics,
+)
+
+__all__ = [
+    # Version
+    "__version__",
+    # Core classes
+    "BibLoader",
+    "BibWriter",
+    "Dedupe",
+    "Detector",
+    "FieldChecker",
+    "FieldCheckResult",
+    "FieldFiller",
+    "FieldRequirement",
+    "FieldRequirementRegistry",
+    "MissingFieldProcessor",
+    "MissingFieldReport",
+    "PreprintDetection",
+    "ProcessResult",
+    "Resolver",
+    "ScholarlyClient",
+    "Updater",
+    "process_entry",
+    # Utility classes
+    "DiskCache",
+    "HttpClient",
+    "PublishedRecord",
+    "RateLimiter",
+    # Text normalization
+    "latex_to_plain",
+    "normalize_title_for_match",
+    "safe_lower",
+    "strip_diacritics",
+    # Author handling
+    "authors_last_names",
+    "first_author_surname",
+    "last_name_from_person",
+    "split_authors_bibtex",
+    # Matching utilities
+    "jaccard_similarity",
+    # DOI/arXiv utilities
+    "doi_normalize",
+    "doi_url",
+    "extract_arxiv_id_from_text",
+    # API converters
+    "crossref_message_to_record",
+    "dblp_hit_to_record",
+    "s2_data_to_record",
+]

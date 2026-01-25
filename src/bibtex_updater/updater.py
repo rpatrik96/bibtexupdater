@@ -45,12 +45,12 @@ import sys
 import tempfile
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 from rapidfuzz.fuzz import token_sort_ratio
 
-# Shared utilities from bib_utils
-from bib_utils import (
+# Shared utilities
+from bibtex_updater.utils import (
     # Constants
     ARXIV_API,
     CROSSREF_API,
@@ -134,7 +134,7 @@ class BibWriter:
 class ScholarlyClient:
     """Google Scholar client via scholarly package (opt-in, reliability-focused)."""
 
-    def __init__(self, proxy: str = "none", delay: float = 5.0, logger: Optional[logging.Logger] = None):
+    def __init__(self, proxy: str = "none", delay: float = 5.0, logger: logging.Logger | None = None):
         self.delay = delay
         self.logger = logger or logging.getLogger(__name__)
         self._last_request = 0.0
@@ -168,7 +168,7 @@ class ScholarlyClient:
             time.sleep(self.delay - elapsed)
         self._last_request = time.time()
 
-    def search(self, title: str, first_author: str) -> Optional[Dict[str, Any]]:
+    def search(self, title: str, first_author: str) -> dict[str, Any] | None:
         """Search Google Scholar and return filled publication or None."""
         if not self._scholarly:
             return None
@@ -194,8 +194,8 @@ class ScholarlyClient:
 class PreprintDetection:
     is_preprint: bool
     reason: str = ""
-    arxiv_id: Optional[str] = None
-    doi: Optional[str] = None
+    arxiv_id: str | None = None
+    doi: str | None = None
 
 
 # ------------- Field Checking -------------
@@ -214,18 +214,18 @@ class MissingFieldReport:
 
     entry_key: str
     entry_type: str
-    missing_required: List[str]
-    missing_recommended: List[str]
-    filled_fields: Dict[str, Tuple[str, str]] = field(default_factory=dict)  # field -> (value, source)
-    errors: List[str] = field(default_factory=list)
+    missing_required: list[str]
+    missing_recommended: list[str]
+    filled_fields: dict[str, tuple[str, str]] = field(default_factory=dict)  # field -> (value, source)
+    errors: list[str] = field(default_factory=list)
 
 
 @dataclass
 class FieldCheckResult:
     """Result of field checking/filling for a single entry."""
 
-    original: Dict[str, Any]
-    updated: Dict[str, Any]
+    original: dict[str, Any]
+    updated: dict[str, Any]
     report: MissingFieldReport
     changed: bool
     action: str  # "complete", "filled", "partial", "unfillable"
@@ -234,7 +234,7 @@ class FieldCheckResult:
 class FieldRequirementRegistry:
     """Registry of required/recommended fields per BibTeX entry type."""
 
-    ENTRY_REQUIREMENTS: Dict[str, FieldRequirement] = {
+    ENTRY_REQUIREMENTS: dict[str, FieldRequirement] = {
         "article": FieldRequirement(
             required=frozenset({"author", "title", "journal", "year"}),
             recommended=frozenset({"volume", "number", "pages", "doi", "url"}),
@@ -295,7 +295,7 @@ class FieldRequirementRegistry:
         return cls.ENTRY_REQUIREMENTS.get(entry_type.lower(), cls._DEFAULT_REQUIREMENT)
 
     @classmethod
-    def get_all_entry_types(cls) -> List[str]:
+    def get_all_entry_types(cls) -> list[str]:
         """Get all registered entry types."""
         return list(cls.ENTRY_REQUIREMENTS.keys())
 
@@ -303,17 +303,17 @@ class FieldRequirementRegistry:
 class FieldChecker:
     """Checks BibTeX entries for missing required/recommended fields."""
 
-    def __init__(self, registry: Optional[FieldRequirementRegistry] = None):
+    def __init__(self, registry: FieldRequirementRegistry | None = None):
         self.registry = registry or FieldRequirementRegistry()
 
-    def _field_present(self, entry: Dict[str, Any], field_name: str) -> bool:
+    def _field_present(self, entry: dict[str, Any], field_name: str) -> bool:
         """Check if a field is present and non-empty."""
         value = entry.get(field_name, "")
         if isinstance(value, str):
             return bool(value.strip())
         return bool(value)
 
-    def _check_venue(self, entry: Dict[str, Any], entry_type: str) -> bool:
+    def _check_venue(self, entry: dict[str, Any], entry_type: str) -> bool:
         """Check if venue field is present based on entry type."""
         etype = entry_type.lower()
         if etype == "article":
@@ -322,7 +322,7 @@ class FieldChecker:
             return self._field_present(entry, "booktitle")
         return True  # Other types don't require venue
 
-    def check_entry(self, entry: Dict[str, Any]) -> MissingFieldReport:
+    def check_entry(self, entry: dict[str, Any]) -> MissingFieldReport:
         """Check an entry for missing fields."""
         entry_key = entry.get("ID", "unknown")
         entry_type = entry.get("ENTRYTYPE", "misc").lower()
@@ -375,13 +375,13 @@ class FieldFiller:
     # Minimum match score for accepting a search result
     MATCH_THRESHOLD = 0.85
 
-    def __init__(self, resolver: "Resolver", logger: logging.Logger):
+    def __init__(self, resolver: Resolver, logger: logging.Logger):
         self.resolver = resolver
         self.logger = logger
 
     def fill_entry(
-        self, entry: Dict[str, Any], report: MissingFieldReport, fill_mode: str = "recommended"
-    ) -> Tuple[Dict[str, Any], MissingFieldReport]:
+        self, entry: dict[str, Any], report: MissingFieldReport, fill_mode: str = "recommended"
+    ) -> tuple[dict[str, Any], MissingFieldReport]:
         """
         Attempt to fill missing fields in an entry.
 
@@ -399,8 +399,8 @@ class FieldFiller:
             return entry, report
 
         updated = dict(entry)
-        filled_fields: Dict[str, Tuple[str, str]] = {}
-        errors: List[str] = []
+        filled_fields: dict[str, tuple[str, str]] = {}
+        errors: list[str] = []
 
         # Strategy 1: If DOI present, use Crossref for authoritative data
         doi = doi_normalize(entry.get("doi"))
@@ -432,7 +432,7 @@ class FieldFiller:
 
         return updated, updated_report
 
-    def _get_fields_to_fill(self, report: MissingFieldReport, fill_mode: str) -> List[str]:
+    def _get_fields_to_fill(self, report: MissingFieldReport, fill_mode: str) -> list[str]:
         """Determine which fields to attempt filling based on mode."""
         if fill_mode == "required":
             return list(report.missing_required)
@@ -441,9 +441,9 @@ class FieldFiller:
         else:  # "all"
             return list(report.missing_required) + list(report.missing_recommended)
 
-    def _fill_from_doi(self, doi: str, fields_to_fill: List[str]) -> Tuple[Dict[str, Tuple[str, str]], List[str]]:
+    def _fill_from_doi(self, doi: str, fields_to_fill: list[str]) -> tuple[dict[str, tuple[str, str]], list[str]]:
         """Fill fields using DOI lookup via Crossref."""
-        filled: Dict[str, Tuple[str, str]] = {}
+        filled: dict[str, tuple[str, str]] = {}
 
         msg = self.resolver.crossref_get(doi)
         if not msg:
@@ -460,11 +460,11 @@ class FieldFiller:
         return filled, remaining
 
     def _fill_from_search(
-        self, entry: Dict[str, Any], fields_to_fill: List[str]
-    ) -> Tuple[Dict[str, Tuple[str, str]], List[str], List[str]]:
+        self, entry: dict[str, Any], fields_to_fill: list[str]
+    ) -> tuple[dict[str, tuple[str, str]], list[str], list[str]]:
         """Fill fields using search APIs."""
-        filled: Dict[str, Tuple[str, str]] = {}
-        errors: List[str] = []
+        filled: dict[str, tuple[str, str]] = {}
+        errors: list[str] = []
 
         title = normalize_title_for_match(entry.get("title", ""))
         first_author = first_author_surname(entry)
@@ -501,7 +501,7 @@ class FieldFiller:
 
         return filled, fields_to_fill, errors
 
-    def _find_best_crossref_match(self, entry: Dict[str, Any], items: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    def _find_best_crossref_match(self, entry: dict[str, Any], items: list[dict[str, Any]]) -> dict[str, Any] | None:
         """Find best matching Crossref item using title/author similarity."""
         title_a = normalize_title_for_match(entry.get("title", ""))
         authors_a = authors_last_names(entry.get("author", ""), limit=3)
@@ -528,7 +528,7 @@ class FieldFiller:
 
         return best_item
 
-    def _find_best_dblp_match(self, entry: Dict[str, Any], hits: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    def _find_best_dblp_match(self, entry: dict[str, Any], hits: list[dict[str, Any]]) -> dict[str, Any] | None:
         """Find best matching DBLP hit using title/author similarity."""
         title_a = normalize_title_for_match(entry.get("title", ""))
         authors_a = authors_last_names(entry.get("author", ""), limit=3)
@@ -567,12 +567,12 @@ class FieldFiller:
         return best_hit
 
     def _extract_fields_from_record(
-        self, rec: "PublishedRecord", fields: List[str], source: str
-    ) -> Dict[str, Tuple[str, str]]:
+        self, rec: PublishedRecord, fields: list[str], source: str
+    ) -> dict[str, tuple[str, str]]:
         """Extract requested fields from PublishedRecord."""
-        filled: Dict[str, Tuple[str, str]] = {}
+        filled: dict[str, tuple[str, str]] = {}
 
-        field_mapping: Dict[str, Optional[str]] = {
+        field_mapping: dict[str, str | None] = {
             "year": str(rec.year) if rec.year else None,
             "journal": rec.journal,
             "booktitle": rec.journal,  # Use journal for booktitle if available
@@ -600,7 +600,7 @@ class MissingFieldProcessor:
     def __init__(
         self,
         checker: FieldChecker,
-        filler: Optional[FieldFiller] = None,
+        filler: FieldFiller | None = None,
         fill_mode: str = "recommended",
         fill_enabled: bool = True,
     ):
@@ -609,7 +609,7 @@ class MissingFieldProcessor:
         self.fill_mode = fill_mode
         self.fill_enabled = fill_enabled and filler is not None
 
-    def process_entry(self, entry: Dict[str, Any]) -> FieldCheckResult:
+    def process_entry(self, entry: dict[str, Any]) -> FieldCheckResult:
         """Process a single entry: check and optionally fill missing fields."""
         report = self.checker.check_entry(entry)
 
@@ -655,7 +655,7 @@ class MissingFieldProcessor:
                 action=action,
             )
 
-    def generate_summary(self, results: List[FieldCheckResult]) -> Dict[str, Any]:
+    def generate_summary(self, results: list[FieldCheckResult]) -> dict[str, Any]:
         """Generate a summary of field check results."""
         complete = sum(1 for r in results if r.action == "complete")
         filled = sum(1 for r in results if r.action == "filled")
@@ -663,7 +663,7 @@ class MissingFieldProcessor:
         unfillable = sum(1 for r in results if r.action == "unfillable")
 
         # Field statistics
-        field_stats: Dict[str, Dict[str, int]] = {}
+        field_stats: dict[str, dict[str, int]] = {}
         for result in results:
             for field_name in result.report.missing_required + result.report.missing_recommended:
                 if field_name not in field_stats:
@@ -683,7 +683,7 @@ class MissingFieldProcessor:
             "field_statistics": field_stats,
         }
 
-    def generate_json_report(self, results: List[FieldCheckResult]) -> Dict[str, Any]:
+    def generate_json_report(self, results: list[FieldCheckResult]) -> dict[str, Any]:
         """Generate a detailed JSON report."""
         import datetime
 
@@ -721,7 +721,7 @@ class Detector:
         v = safe_lower(value)
         return any(host in v for host in PREPRINT_HOSTS)
 
-    def detect(self, entry: Dict[str, Any]) -> PreprintDetection:
+    def detect(self, entry: dict[str, Any]) -> PreprintDetection:
         etype = safe_lower(entry.get("ENTRYTYPE"))
         journal = safe_lower(entry.get("journal"))
         howpub = safe_lower(entry.get("howpublished"))
@@ -798,14 +798,14 @@ class Resolver:
     }
 
     def __init__(
-        self, http: HttpClient, logger: logging.Logger, scholarly_client: Optional[ScholarlyClient] = None
+        self, http: HttpClient, logger: logging.Logger, scholarly_client: ScholarlyClient | None = None
     ) -> None:
         self.http = http
         self.logger = logger
         self.scholarly_client = scholarly_client
 
     # --- arXiv ---
-    def arxiv_candidate_doi(self, arxiv_id: str) -> Optional[str]:
+    def arxiv_candidate_doi(self, arxiv_id: str) -> str | None:
         params = {"id_list": arxiv_id}
         try:
             resp = self.http._request("GET", ARXIV_API, params=params, accept="application/atom+xml")
@@ -822,7 +822,7 @@ class Resolver:
         return None
 
     # --- Crossref Works ---
-    def crossref_get(self, doi: str) -> Optional[Dict[str, Any]]:
+    def crossref_get(self, doi: str) -> dict[str, Any] | None:
         doi = doi_normalize(doi) or ""
         from urllib.parse import quote
 
@@ -839,8 +839,8 @@ class Resolver:
             return None
 
     def crossref_search(
-        self, query: str, rows: int = 25, filter_type: Optional[str] = "journal-article"
-    ) -> List[Dict[str, Any]]:
+        self, query: str, rows: int = 25, filter_type: str | None = "journal-article"
+    ) -> list[dict[str, Any]]:
         params = {"query.bibliographic": query, "rows": rows}
         if filter_type:
             params["filter"] = f"type:{filter_type}"
@@ -855,7 +855,7 @@ class Resolver:
             return []
 
     # --- DBLP ---
-    def dblp_search(self, query: str, h: int = 25) -> List[Dict[str, Any]]:
+    def dblp_search(self, query: str, h: int = 25) -> list[dict[str, Any]]:
         params = {"q": query, "h": h, "format": "json"}
         try:
             resp = self.http._request("GET", DBLP_API_SEARCH, params=params, accept="application/json")
@@ -871,12 +871,12 @@ class Resolver:
             return []
 
     @staticmethod
-    def _dblp_hit_to_record(hit: Dict[str, Any]) -> Optional[PublishedRecord]:
+    def _dblp_hit_to_record(hit: dict[str, Any]) -> PublishedRecord | None:
         """Convert DBLP hit to PublishedRecord. Delegates to bib_utils."""
         return dblp_hit_to_record(hit)
 
     # --- Semantic Scholar (safe alternative to Google Scholar scraping) ---
-    def s2_from_arxiv(self, arxiv_id: str) -> Optional[PublishedRecord]:
+    def s2_from_arxiv(self, arxiv_id: str) -> PublishedRecord | None:
         fields = "externalIds,doi,title,year,authors,venue,publicationTypes,publicationVenue,url"
         url = f"{S2_API}/paper/arXiv:{arxiv_id}"
         try:
@@ -914,7 +914,7 @@ class Resolver:
             confidence=0.95,
         )
 
-    def s2_search(self, query: str, limit: int = 20) -> List[Dict[str, Any]]:
+    def s2_search(self, query: str, limit: int = 20) -> list[dict[str, Any]]:
         params = {"query": query, "limit": limit, "fields": "title,authors,year,venue,publicationTypes,doi,url"}
         url = f"{S2_API}/paper/search"
         try:
@@ -928,7 +928,7 @@ class Resolver:
 
     # --- Shared helpers ---
     @staticmethod
-    def _message_to_record(msg: Dict[str, Any]) -> Optional[PublishedRecord]:
+    def _message_to_record(msg: dict[str, Any]) -> PublishedRecord | None:
         """Convert Crossref message to PublishedRecord. Delegates to bib_utils."""
         return crossref_message_to_record(msg)
 
@@ -960,7 +960,7 @@ class Resolver:
                 parts.append(given)
         return " and ".join(parts)
 
-    def _scholarly_to_record(self, pub: Dict[str, Any]) -> Optional[PublishedRecord]:
+    def _scholarly_to_record(self, pub: dict[str, Any]) -> PublishedRecord | None:
         """Convert scholarly publication dict to PublishedRecord."""
         if not pub:
             return None
@@ -1013,9 +1013,9 @@ class Resolver:
             confidence=0.0,
         )
 
-    def resolve(self, entry: Dict[str, Any], detection: PreprintDetection) -> Optional[PublishedRecord]:
+    def resolve(self, entry: dict[str, Any], detection: PreprintDetection) -> PublishedRecord | None:
         # 1) arXiv -> DOI -> Crossref
-        candidate_doi: Optional[str] = None
+        candidate_doi: str | None = None
         if detection.arxiv_id:
             # Semantic Scholar first (direct arXiv mapping is strong)
             s2 = self.s2_from_arxiv(detection.arxiv_id)
@@ -1073,7 +1073,7 @@ class Resolver:
             if hits:
                 authors_ref = authors_last_names(entry.get("author", ""))
                 ta = title_norm
-                best: Optional[Tuple[float, PublishedRecord]] = None
+                best: tuple[float, PublishedRecord] | None = None
                 for h in hits:
                     rec = self._dblp_hit_to_record(h)
                     if not rec:
@@ -1111,7 +1111,7 @@ class Resolver:
             if data:
                 authors_ref = authors_last_names(entry.get("author", ""))
                 ta = title_norm
-                candidates: List[Tuple[float, PublishedRecord]] = []
+                candidates: list[tuple[float, PublishedRecord]] = []
                 for item in data:
                     doi = doi_normalize(item.get("doi"))
                     pub_types = item.get("publicationTypes") or []
@@ -1158,7 +1158,7 @@ class Resolver:
                 title_a = title_norm
                 authors_a = authors_last_names(entry.get("author", ""))
 
-                def score_item(msg: Dict[str, Any]) -> Tuple[float, PublishedRecord]:
+                def score_item(msg: dict[str, Any]) -> tuple[float, PublishedRecord]:
                     rec = self._message_to_record(msg)
                     if not rec or rec.type != "journal-article":
                         return (0.0, PublishedRecord(doi=""))
@@ -1169,7 +1169,7 @@ class Resolver:
                     combined = 0.7 * (title_score / 100.0) + 0.3 * auth_score
                     return (combined, rec)
 
-                candidates: List[Tuple[float, PublishedRecord]] = [score_item(it) for it in items]
+                candidates: list[tuple[float, PublishedRecord]] = [score_item(it) for it in items]
                 passing = [(s, r) for (s, r) in candidates if (s >= 0.9 and self._credible_journal_article(r))]
                 if not passing:
                     candidates.sort(key=lambda x: x[0], reverse=True)
@@ -1234,11 +1234,11 @@ class Updater:
         return Resolver._authors_to_bibtex_string(rec)
 
     @staticmethod
-    def _year_from_record(rec: PublishedRecord) -> Optional[str]:
+    def _year_from_record(rec: PublishedRecord) -> str | None:
         return str(rec.year) if rec.year else None
 
     @staticmethod
-    def _generate_key(entry: Dict[str, Any], rec: PublishedRecord) -> str:
+    def _generate_key(entry: dict[str, Any], rec: PublishedRecord) -> str:
         first_author = ""
         if rec.authors:
             fa = rec.authors[0]
@@ -1252,7 +1252,7 @@ class Updater:
         key = re.sub(r"[^A-Za-z0-9]+", "", key)
         return key or (entry.get("ID") or "key")
 
-    def update_entry(self, entry: Dict[str, Any], rec: PublishedRecord, detection: PreprintDetection) -> Dict[str, Any]:
+    def update_entry(self, entry: dict[str, Any], rec: PublishedRecord, detection: PreprintDetection) -> dict[str, Any]:
         new_entry = dict(entry)
         new_entry["ENTRYTYPE"] = "article"
         if rec.title:
@@ -1300,7 +1300,7 @@ class Updater:
 # ------------- Dedupe -------------
 class Dedupe:
     @staticmethod
-    def _key(entry: Dict[str, Any]) -> Tuple[str, str]:
+    def _key(entry: dict[str, Any]) -> tuple[str, str]:
         doi = doi_normalize(entry.get("doi") or "")
         if doi:
             return ("doi", doi)
@@ -1310,7 +1310,7 @@ class Dedupe:
         return ("fuzzy", key)
 
     @staticmethod
-    def _score(entry: Dict[str, Any]) -> int:
+    def _score(entry: dict[str, Any]) -> int:
         score = 0
         if safe_lower(entry.get("ENTRYTYPE")) == "article":
             score += 5
@@ -1320,7 +1320,7 @@ class Dedupe:
         return score
 
     @staticmethod
-    def merge_entries(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
+    def merge_entries(a: dict[str, Any], b: dict[str, Any]) -> dict[str, Any]:
         best = a if Dedupe._score(a) >= Dedupe._score(b) else b
         other = b if best is a else a
         merged = dict(best)
@@ -1335,13 +1335,13 @@ class Dedupe:
 
     def dedupe_db(
         self, db: bibtexparser.bibdatabase.BibDatabase, logger: logging.Logger
-    ) -> Tuple[bibtexparser.bibdatabase.BibDatabase, List[Tuple[str, List[str]]]]:
-        groups: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+    ) -> tuple[bibtexparser.bibdatabase.BibDatabase, list[tuple[str, list[str]]]]:
+        groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
         for e in db.entries:
             groups.setdefault(self._key(e), []).append(e)
 
-        new_entries: List[Dict[str, Any]] = []
-        merged_info: List[Tuple[str, List[str]]] = []
+        new_entries: list[dict[str, Any]] = []
+        merged_info: list[tuple[str, list[str]]] = []
 
         for (_k, _), entries in groups.items():
             if len(entries) == 1:
@@ -1362,14 +1362,14 @@ class Dedupe:
 
 
 # ------------- Diff Preview -------------
-def entry_to_bib(entry: Dict[str, Any]) -> str:
+def entry_to_bib(entry: dict[str, Any]) -> str:
     db = bibtexparser.bibdatabase.BibDatabase()
     db.entries = [entry]
     writer = BibWriter()
     return writer.dumps(db).strip()
 
 
-def diff_entries(old: Dict[str, Any], new: Dict[str, Any], key: str) -> str:
+def diff_entries(old: dict[str, Any], new: dict[str, Any], key: str) -> str:
     a = entry_to_bib(old).splitlines(keepends=True)
     b = entry_to_bib(new).splitlines(keepends=True)
     return "".join(difflib.unified_diff(a, b, fromfile=f"{key} (old)", tofile=f"{key} (new)", lineterm=""))
@@ -1378,17 +1378,17 @@ def diff_entries(old: Dict[str, Any], new: Dict[str, Any], key: str) -> str:
 # ------------- Processing Pipeline -------------
 @dataclass
 class ProcessResult:
-    original: Dict[str, Any]
-    updated: Dict[str, Any]
+    original: dict[str, Any]
+    updated: dict[str, Any]
     changed: bool
     action: str
-    method: Optional[str] = None
-    confidence: Optional[float] = None
-    message: Optional[str] = None
+    method: str | None = None
+    confidence: float | None = None
+    message: str | None = None
 
 
 def process_entry(
-    entry: Dict[str, Any], detector: Detector, resolver: Resolver, updater: Updater, logger: logging.Logger
+    entry: dict[str, Any], detector: Detector, resolver: Resolver, updater: Updater, logger: logging.Logger
 ) -> ProcessResult:
     det = detector.detect(entry)
     if not det.is_preprint:
@@ -1502,7 +1502,7 @@ def init_logging(verbose: bool) -> logging.Logger:
     return logging.getLogger("replace_preprints")
 
 
-def summarize(results: List[ProcessResult], logger: logging.Logger) -> Dict[str, int]:
+def summarize(results: list[ProcessResult], logger: logging.Logger) -> dict[str, int]:
     total = len(results)
     upgraded = sum(1 for r in results if r.action == "upgraded")
     failed = sum(1 for r in results if r.action == "failed")
@@ -1524,7 +1524,7 @@ def summarize(results: List[ProcessResult], logger: logging.Logger) -> Dict[str,
     }
 
 
-def print_failures(results: List[ProcessResult], logger: logging.Logger) -> None:
+def print_failures(results: list[ProcessResult], logger: logging.Logger) -> None:
     """Print details of preprints that could not be upgraded."""
     failures = [r for r in results if r.action == "failed"]
     if not failures:
@@ -1538,7 +1538,7 @@ def print_failures(results: List[ProcessResult], logger: logging.Logger) -> None
         logger.info("  - [%s] %s (%s)", key, title, reason)
 
 
-def summarize_field_check(field_results: List[FieldCheckResult], logger: logging.Logger) -> Dict[str, Any]:
+def summarize_field_check(field_results: list[FieldCheckResult], logger: logging.Logger) -> dict[str, Any]:
     """Summarize field check results and print to console."""
     processor = MissingFieldProcessor(FieldChecker())  # Just for summary generation
     summary = processor.generate_summary(field_results)
@@ -1568,7 +1568,7 @@ def summarize_field_check(field_results: List[FieldCheckResult], logger: logging
 
 
 def print_field_check_details(
-    field_results: List[FieldCheckResult], logger: logging.Logger, verbose: bool = False
+    field_results: list[FieldCheckResult], logger: logging.Logger, verbose: bool = False
 ) -> None:
     """Print detailed field check results."""
     for i, result in enumerate(field_results, 1):
@@ -1617,7 +1617,7 @@ def print_field_check_details(
             )
 
 
-def write_report_line(fh, res: ProcessResult, src_file: Optional[str] = None) -> None:
+def write_report_line(fh, res: ProcessResult, src_file: str | None = None) -> None:
     line = {
         "file": src_file,
         "key_old": res.original.get("ID"),
@@ -1633,7 +1633,7 @@ def write_report_line(fh, res: ProcessResult, src_file: Optional[str] = None) ->
     fh.write(json.dumps(line, ensure_ascii=False) + "\n")
 
 
-def main(argv: Optional[List[str]] = None) -> int:
+def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
     logger = init_logging(args.verbose)
 
@@ -1688,7 +1688,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     writer = BibWriter()
 
     # Read inputs
-    databases: List[Tuple[str, bibtexparser.bibdatabase.BibDatabase]] = []
+    databases: list[tuple[str, bibtexparser.bibdatabase.BibDatabase]] = []
     try:
         for path in args.inputs:
             db = loader.load_file(path)
@@ -1699,11 +1699,11 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if args.in_place:
         overall_exit = 0
-        all_field_results: List[FieldCheckResult] = []
+        all_field_results: list[FieldCheckResult] = []
 
         for path, db in databases:
-            results: List[ProcessResult] = []
-            field_results: List[FieldCheckResult] = []
+            results: list[ProcessResult] = []
+            field_results: list[FieldCheckResult] = []
 
             # Step 1: Preprint upgrade (unless skipped)
             if not args.skip_preprint_upgrade:
@@ -1742,7 +1742,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             new_db = bibtexparser.bibdatabase.BibDatabase()
             new_db.entries = new_entries
 
-            merged_info: List[Tuple[str, List[str]]] = []
+            merged_info: list[tuple[str, list[str]]] = []
             if args.dedupe:
                 new_db, merged_info = Dedupe().dedupe_db(new_db, logger)
 
@@ -1794,13 +1794,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     else:
         merged_db = bibtexparser.bibdatabase.BibDatabase()
         merged_db.entries = []
-        src_for_entry: List[str] = []
+        src_for_entry: list[str] = []
         for path, db in databases:
             merged_db.entries.extend(db.entries)
             src_for_entry.extend([path] * len(db.entries))
 
-        results: List[ProcessResult] = []
-        field_results: List[FieldCheckResult] = []
+        results: list[ProcessResult] = []
+        field_results: list[FieldCheckResult] = []
 
         # Step 1: Preprint upgrade (unless skipped)
         if not args.skip_preprint_upgrade:
@@ -1812,7 +1812,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                     results.append(fut.result())
 
             obj_map = {id(r.original): r for r in results}
-            ordered_results: List[ProcessResult] = []
+            ordered_results: list[ProcessResult] = []
             for e in merged_db.entries:
                 r = obj_map.get(id(e))
                 ordered_results.append(
@@ -1848,7 +1848,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         new_db = bibtexparser.bibdatabase.BibDatabase()
         new_db.entries = new_entries
 
-        merged_info: List[Tuple[str, List[str]]] = []
+        merged_info: list[tuple[str, list[str]]] = []
         if args.dedupe:
             new_db, merged_info = Dedupe().dedupe_db(new_db, logger)
 
@@ -1900,7 +1900,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
 
 # ------------- Tests (pytest style) -------------
-def _make_entry(**kwargs) -> Dict[str, Any]:
+def _make_entry(**kwargs) -> dict[str, Any]:
     e = {
         "ENTRYTYPE": "article",
         "ID": kwargs.pop("ID", "key"),

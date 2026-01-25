@@ -32,13 +32,13 @@ import sys
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any
 from urllib.parse import urlparse
 
 import bibtexparser
 from rapidfuzz.fuzz import token_sort_ratio
 
-from bib_utils import (
+from bibtex_updater.utils import (
     # API endpoints
     CROSSREF_API,
     DBLP_API_SEARCH,
@@ -103,11 +103,11 @@ class FieldComparison:
     """Result of comparing a single field between entry and API record."""
 
     field_name: str
-    entry_value: Optional[str]
-    api_value: Optional[str]
+    entry_value: str | None
+    api_value: str | None
     similarity_score: float
     matches: bool
-    note: Optional[str] = None
+    note: str | None = None
 
 
 @dataclass
@@ -118,15 +118,15 @@ class FactCheckResult:
     entry_type: str
     status: FactCheckStatus
     overall_confidence: float
-    field_comparisons: Dict[str, FieldComparison]
-    best_match: Optional[PublishedRecord]
-    api_sources_queried: List[str]
-    api_sources_with_hits: List[str]
-    errors: List[str]
+    field_comparisons: dict[str, FieldComparison]
+    best_match: PublishedRecord | None
+    api_sources_queried: list[str]
+    api_sources_with_hits: list[str]
+    errors: list[str]
     # New fields for extended verification
-    category: Optional[EntryCategory] = None
-    url_check: Optional[URLCheckResult] = None
-    book_match: Optional[BookRecord] = None
+    category: EntryCategory | None = None
+    url_check: URLCheckResult | None = None
+    book_match: BookRecord | None = None
 
 
 @dataclass
@@ -160,8 +160,8 @@ class ClassificationResult:
 
     category: EntryCategory
     reason: str
-    extracted_url: Optional[str] = None
-    extracted_isbn: Optional[str] = None
+    extracted_url: str | None = None
+    extracted_isbn: str | None = None
 
 
 @dataclass
@@ -170,10 +170,10 @@ class URLCheckResult:
 
     url: str
     accessible: bool
-    status_code: Optional[int] = None
+    status_code: int | None = None
     is_redirect: bool = False
-    final_url: Optional[str] = None
-    error: Optional[str] = None
+    final_url: str | None = None
+    error: str | None = None
 
 
 @dataclass
@@ -181,13 +181,13 @@ class BookRecord:
     """A book record from a book API."""
 
     title: str
-    authors: List[str]
-    publisher: Optional[str] = None
-    year: Optional[int] = None
-    isbn: Optional[str] = None
-    isbn_13: Optional[str] = None
+    authors: list[str]
+    publisher: str | None = None
+    year: int | None = None
+    isbn: str | None = None
+    isbn_13: str | None = None
     source: str = ""  # "openlibrary" | "google_books"
-    url: Optional[str] = None
+    url: str | None = None
 
 
 @dataclass
@@ -206,7 +206,7 @@ class BookVerifierConfig:
     """Configuration for book verification."""
 
     use_google_books: bool = True
-    google_books_api_key: Optional[str] = None
+    google_books_api_key: str | None = None
     match_threshold: float = 0.80
     title_threshold: float = 0.85
     author_threshold: float = 0.70
@@ -249,7 +249,7 @@ class EntryClassifier:
         "ssrn",
     ]
 
-    def classify(self, entry: Dict[str, Any]) -> ClassificationResult:
+    def classify(self, entry: dict[str, Any]) -> ClassificationResult:
         """Classify an entry into a category for verification."""
         entry_type = entry.get("ENTRYTYPE", "").lower()
 
@@ -300,7 +300,7 @@ class EntryClassifier:
             reason="Could not classify entry",
         )
 
-    def _extract_url(self, entry: Dict[str, Any]) -> Optional[str]:
+    def _extract_url(self, entry: dict[str, Any]) -> str | None:
         """Extract URL from entry fields."""
         # Direct url field
         if entry.get("url"):
@@ -325,7 +325,7 @@ class EntryClassifier:
 
         return None
 
-    def _extract_isbn(self, entry: Dict[str, Any]) -> Optional[str]:
+    def _extract_isbn(self, entry: dict[str, Any]) -> str | None:
         """Extract ISBN from entry fields."""
         # Direct isbn field
         isbn = entry.get("isbn", "")
@@ -349,7 +349,7 @@ class EntryClassifier:
         except Exception:
             return False
 
-    def _is_working_paper(self, entry: Dict[str, Any], entry_type: str) -> bool:
+    def _is_working_paper(self, entry: dict[str, Any], entry_type: str) -> bool:
         """Check if entry is a working paper."""
         if entry_type in ("techreport", "unpublished"):
             return True
@@ -370,7 +370,7 @@ class EntryClassifier:
 
         return any(indicator in text_to_check for indicator in self.WORKING_PAPER_INDICATORS)
 
-    def _is_academic(self, entry: Dict[str, Any], entry_type: str) -> bool:
+    def _is_academic(self, entry: dict[str, Any], entry_type: str) -> bool:
         """Check if entry has academic indicators."""
         # Has DOI
         if entry.get("doi"):
@@ -399,7 +399,7 @@ class BaseVerifier(ABC):
     """Abstract base class for entry verifiers."""
 
     @abstractmethod
-    def verify(self, entry: Dict[str, Any], classification: ClassificationResult) -> FactCheckResult:
+    def verify(self, entry: dict[str, Any], classification: ClassificationResult) -> FactCheckResult:
         """Verify an entry and return a FactCheckResult."""
         pass
 
@@ -410,17 +410,17 @@ class BaseVerifier(ABC):
 
     def _make_result(
         self,
-        entry: Dict[str, Any],
+        entry: dict[str, Any],
         status: FactCheckStatus,
         category: EntryCategory,
         confidence: float = 0.0,
-        field_comparisons: Optional[Dict[str, FieldComparison]] = None,
-        best_match: Optional[PublishedRecord] = None,
-        api_sources_queried: Optional[List[str]] = None,
-        api_sources_with_hits: Optional[List[str]] = None,
-        errors: Optional[List[str]] = None,
-        url_check: Optional[URLCheckResult] = None,
-        book_match: Optional[BookRecord] = None,
+        field_comparisons: dict[str, FieldComparison] | None = None,
+        best_match: PublishedRecord | None = None,
+        api_sources_queried: list[str] | None = None,
+        api_sources_with_hits: list[str] | None = None,
+        errors: list[str] | None = None,
+        url_check: URLCheckResult | None = None,
+        book_match: BookRecord | None = None,
     ) -> FactCheckResult:
         """Create a FactCheckResult with common fields."""
         return FactCheckResult(
@@ -451,7 +451,7 @@ class WebVerifier(BaseVerifier):
     def supports(self, category: EntryCategory) -> bool:
         return category == EntryCategory.WEB_REFERENCE
 
-    def verify(self, entry: Dict[str, Any], classification: ClassificationResult) -> FactCheckResult:
+    def verify(self, entry: dict[str, Any], classification: ClassificationResult) -> FactCheckResult:
         """Verify a web reference by checking URL accessibility."""
         url = classification.extracted_url or self.classifier._extract_url(entry)
 
@@ -533,7 +533,7 @@ class WebVerifier(BaseVerifier):
         except Exception as e:
             return URLCheckResult(url=url, accessible=False, error=str(e))
 
-    def _verify_content(self, url: str, entry: Dict[str, Any]) -> Optional[float]:
+    def _verify_content(self, url: str, entry: dict[str, Any]) -> float | None:
         """Verify that page content matches entry metadata."""
         import requests
 
@@ -579,7 +579,7 @@ class BookVerifier(BaseVerifier):
     def supports(self, category: EntryCategory) -> bool:
         return category == EntryCategory.BOOK
 
-    def verify(self, entry: Dict[str, Any], classification: ClassificationResult) -> FactCheckResult:
+    def verify(self, entry: dict[str, Any], classification: ClassificationResult) -> FactCheckResult:
         """Verify a book entry using book APIs."""
         title = entry.get("title", "")
         author = entry.get("author", "")
@@ -593,10 +593,10 @@ class BookVerifier(BaseVerifier):
                 errors=["No title found for book search"],
             )
 
-        candidates: List[Tuple[float, BookRecord, str]] = []
-        sources_queried: List[str] = []
-        sources_with_hits: List[str] = []
-        errors: List[str] = []
+        candidates: list[tuple[float, BookRecord, str]] = []
+        sources_queried: list[str] = []
+        sources_with_hits: list[str] = []
+        errors: list[str] = []
 
         # Try Open Library
         sources_queried.append("openlibrary")
@@ -659,7 +659,7 @@ class BookVerifier(BaseVerifier):
             api_sources_with_hits=sources_with_hits,
         )
 
-    def _search_open_library(self, title: str, author: str, isbn: Optional[str]) -> List[BookRecord]:
+    def _search_open_library(self, title: str, author: str, isbn: str | None) -> list[BookRecord]:
         """Search Open Library for books."""
         results = []
 
@@ -702,7 +702,7 @@ class BookVerifier(BaseVerifier):
 
         return results
 
-    def _search_google_books(self, title: str, author: str, isbn: Optional[str]) -> List[BookRecord]:
+    def _search_google_books(self, title: str, author: str, isbn: str | None) -> list[BookRecord]:
         """Search Google Books for books."""
         results = []
 
@@ -759,7 +759,7 @@ class BookVerifier(BaseVerifier):
 
         return results
 
-    def _score_book_match(self, entry: Dict[str, Any], book: BookRecord) -> float:
+    def _score_book_match(self, entry: dict[str, Any], book: BookRecord) -> float:
         """Score how well a book matches the entry."""
         title_entry = normalize_title_for_match(entry.get("title", ""))
         title_book = normalize_title_for_match(book.title)
@@ -787,7 +787,7 @@ class WorkingPaperVerifier(BaseVerifier):
 
     def __init__(
         self,
-        crossref: "CrossrefClient",
+        crossref: CrossrefClient,
         config: WorkingPaperConfig,
         academic_config: FactCheckerConfig,
         logger: logging.Logger,
@@ -800,7 +800,7 @@ class WorkingPaperVerifier(BaseVerifier):
     def supports(self, category: EntryCategory) -> bool:
         return category == EntryCategory.WORKING_PAPER
 
-    def verify(self, entry: Dict[str, Any], classification: ClassificationResult) -> FactCheckResult:
+    def verify(self, entry: dict[str, Any], classification: ClassificationResult) -> FactCheckResult:
         """Verify a working paper entry."""
         title = entry.get("title", "")
         if not title:
@@ -811,10 +811,10 @@ class WorkingPaperVerifier(BaseVerifier):
                 errors=["No title found for working paper search"],
             )
 
-        sources_queried: List[str] = []
-        sources_with_hits: List[str] = []
-        errors: List[str] = []
-        candidates: List[Tuple[float, PublishedRecord]] = []
+        sources_queried: list[str] = []
+        sources_with_hits: list[str] = []
+        errors: list[str] = []
+        candidates: list[tuple[float, PublishedRecord]] = []
 
         # Search Crossref (often indexes working papers)
         if self.config.search_crossref:
@@ -872,7 +872,7 @@ class WorkingPaperVerifier(BaseVerifier):
             api_sources_with_hits=sources_with_hits,
         )
 
-    def _score_candidate(self, entry: Dict[str, Any], rec: PublishedRecord) -> float:
+    def _score_candidate(self, entry: dict[str, Any], rec: PublishedRecord) -> float:
         """Score a candidate record against the entry."""
         title_entry = normalize_title_for_match(entry.get("title", ""))
         title_rec = normalize_title_for_match(rec.title or "")
@@ -894,7 +894,7 @@ class CrossrefClient:
     def __init__(self, http: HttpClient):
         self.http = http
 
-    def search(self, query: str, rows: int = 10) -> List[Dict[str, Any]]:
+    def search(self, query: str, rows: int = 10) -> list[dict[str, Any]]:
         """Search Crossref for bibliographic records."""
         params = {"query.bibliographic": query, "rows": rows}
         try:
@@ -913,7 +913,7 @@ class DBLPClient:
     def __init__(self, http: HttpClient):
         self.http = http
 
-    def search(self, query: str, max_hits: int = 10) -> List[Dict[str, Any]]:
+    def search(self, query: str, max_hits: int = 10) -> list[dict[str, Any]]:
         """Search DBLP for bibliographic records."""
         params = {"q": query, "h": max_hits, "format": "json"}
         try:
@@ -937,7 +937,7 @@ class SemanticScholarClient:
     def __init__(self, http: HttpClient):
         self.http = http
 
-    def search(self, query: str, limit: int = 10) -> List[Dict[str, Any]]:
+    def search(self, query: str, limit: int = 10) -> list[dict[str, Any]]:
         """Search Semantic Scholar for papers."""
         params = {"query": query, "limit": limit, "fields": self.FIELDS}
         url = f"{S2_API}/paper/search"
@@ -972,13 +972,13 @@ class FactChecker:
         self.config = config
         self.logger = logger
 
-    def check_entry(self, entry: Dict[str, Any]) -> FactCheckResult:
+    def check_entry(self, entry: dict[str, Any]) -> FactCheckResult:
         """Fact-check a single bibliographic entry."""
         entry_key = entry.get("ID", "unknown")
         entry_type = entry.get("ENTRYTYPE", "misc").lower()
-        errors: List[str] = []
-        sources_queried: List[str] = []
-        sources_with_hits: List[str] = []
+        errors: list[str] = []
+        sources_queried: list[str] = []
+        sources_with_hits: list[str] = []
 
         title = entry.get("title", "")
         title_norm = normalize_title_for_match(title)
@@ -1035,14 +1035,14 @@ class FactChecker:
 
     def _query_all_sources(
         self,
-        entry: Dict[str, Any],
+        entry: dict[str, Any],
         query: str,
-        sources_queried: List[str],
-        sources_with_hits: List[str],
-        errors: List[str],
-    ) -> List[Tuple[float, PublishedRecord, str]]:
+        sources_queried: list[str],
+        sources_with_hits: list[str],
+        errors: list[str],
+    ) -> list[tuple[float, PublishedRecord, str]]:
         """Query all API sources and collect scored candidates."""
-        candidates: List[Tuple[float, PublishedRecord, str]] = []
+        candidates: list[tuple[float, PublishedRecord, str]] = []
         title_norm = normalize_title_for_match(entry.get("title", ""))
         authors_ref = authors_last_names(entry.get("author", ""), limit=3)
 
@@ -1090,7 +1090,7 @@ class FactChecker:
 
         return candidates
 
-    def _score_candidate(self, title_norm: str, authors_ref: List[str], rec: PublishedRecord) -> float:
+    def _score_candidate(self, title_norm: str, authors_ref: list[str], rec: PublishedRecord) -> float:
         """Score a candidate record against the entry."""
         title_b = normalize_title_for_match(rec.title or "")
         title_score = token_sort_ratio(title_norm, title_b) / 100.0
@@ -1100,9 +1100,9 @@ class FactChecker:
 
         return 0.7 * title_score + 0.3 * author_score
 
-    def _compare_all_fields(self, entry: Dict[str, Any], record: PublishedRecord) -> Dict[str, FieldComparison]:
+    def _compare_all_fields(self, entry: dict[str, Any], record: PublishedRecord) -> dict[str, FieldComparison]:
         """Compare all relevant fields between entry and record."""
-        comparisons: Dict[str, FieldComparison] = {}
+        comparisons: dict[str, FieldComparison] = {}
         cfg = self.config
 
         # Title
@@ -1175,8 +1175,8 @@ class FactChecker:
     def _determine_status(
         self,
         best_score: float,
-        comparisons: Dict[str, FieldComparison],
-        sources_with_hits: List[str],
+        comparisons: dict[str, FieldComparison],
+        sources_with_hits: list[str],
     ) -> FactCheckStatus:
         """Determine final status from score and comparisons."""
         if best_score < self.config.hallucination_max_score:
@@ -1211,7 +1211,7 @@ class AcademicVerifier(BaseVerifier):
     def supports(self, category: EntryCategory) -> bool:
         return category == EntryCategory.ACADEMIC
 
-    def verify(self, entry: Dict[str, Any], classification: ClassificationResult) -> FactCheckResult:
+    def verify(self, entry: dict[str, Any], classification: ClassificationResult) -> FactCheckResult:
         """Verify an academic entry using the existing FactChecker logic."""
         result = self.fact_checker.check_entry(entry)
         # Add category to result
@@ -1241,11 +1241,11 @@ class UnifiedFactChecker:
         dblp: DBLPClient,
         s2: SemanticScholarClient,
         config: FactCheckerConfig,
-        web_config: Optional[WebVerifierConfig] = None,
-        book_config: Optional[BookVerifierConfig] = None,
-        working_paper_config: Optional[WorkingPaperConfig] = None,
-        logger: Optional[logging.Logger] = None,
-        skip_categories: Optional[List[EntryCategory]] = None,
+        web_config: WebVerifierConfig | None = None,
+        book_config: BookVerifierConfig | None = None,
+        working_paper_config: WorkingPaperConfig | None = None,
+        logger: logging.Logger | None = None,
+        skip_categories: list[EntryCategory] | None = None,
     ):
         self.logger = logger or logging.getLogger("unified_fact_checker")
         self.classifier = EntryClassifier()
@@ -1253,7 +1253,7 @@ class UnifiedFactChecker:
 
         # Initialize verifiers
         academic_checker = FactChecker(crossref, dblp, s2, config, self.logger)
-        self.verifiers: Dict[EntryCategory, BaseVerifier] = {
+        self.verifiers: dict[EntryCategory, BaseVerifier] = {
             EntryCategory.ACADEMIC: AcademicVerifier(academic_checker),
             EntryCategory.WEB_REFERENCE: WebVerifier(http, web_config or WebVerifierConfig(), self.logger),
             EntryCategory.BOOK: BookVerifier(http, book_config or BookVerifierConfig(), self.logger),
@@ -1262,7 +1262,7 @@ class UnifiedFactChecker:
             ),
         }
 
-    def check_entry(self, entry: Dict[str, Any]) -> FactCheckResult:
+    def check_entry(self, entry: dict[str, Any]) -> FactCheckResult:
         """Fact-check a single entry using the appropriate verifier."""
         # Classify entry
         classification = self.classifier.classify(entry)
@@ -1314,11 +1314,11 @@ class UnifiedFactChecker:
 class FactCheckProcessor:
     """Batch processing and reporting for fact-checking."""
 
-    def __init__(self, checker: Union[FactChecker, UnifiedFactChecker], logger: logging.Logger):
+    def __init__(self, checker: FactChecker | UnifiedFactChecker, logger: logging.Logger):
         self.checker = checker
         self.logger = logger
 
-    def process_entries(self, entries: List[Dict[str, Any]]) -> List[FactCheckResult]:
+    def process_entries(self, entries: list[dict[str, Any]]) -> list[FactCheckResult]:
         """Process multiple entries and return results."""
         results = []
         for i, entry in enumerate(entries, 1):
@@ -1326,20 +1326,20 @@ class FactCheckProcessor:
             results.append(self.checker.check_entry(entry))
         return results
 
-    def generate_summary(self, results: List[FactCheckResult]) -> Dict[str, Any]:
+    def generate_summary(self, results: list[FactCheckResult]) -> dict[str, Any]:
         """Generate summary statistics from results."""
         counts = {s.value: 0 for s in FactCheckStatus}
         for r in results:
             counts[r.status.value] += 1
 
         # Count by category
-        category_counts: Dict[str, int] = {}
+        category_counts: dict[str, int] = {}
         for r in results:
             if r.category:
                 cat_name = r.category.value
                 category_counts[cat_name] = category_counts.get(cat_name, 0) + 1
 
-        field_mismatches: Dict[str, int] = {}
+        field_mismatches: dict[str, int] = {}
         for r in results:
             for name, c in r.field_comparisons.items():
                 if not c.matches:
@@ -1372,7 +1372,7 @@ class FactCheckProcessor:
             "problematic_count": sum(counts.get(s, 0) for s in problematic_statuses),
         }
 
-    def generate_json_report(self, results: List[FactCheckResult]) -> Dict[str, Any]:
+    def generate_json_report(self, results: list[FactCheckResult]) -> dict[str, Any]:
         """Generate full JSON report."""
         entries = []
         for r in results:
@@ -1432,7 +1432,7 @@ class FactCheckProcessor:
 
         return {"summary": summary, "entries": entries}
 
-    def generate_jsonl(self, results: List[FactCheckResult]) -> List[str]:
+    def generate_jsonl(self, results: list[FactCheckResult]) -> list[str]:
         """Generate JSONL format (one JSON object per line)."""
         lines = []
         for r in results:
@@ -1625,7 +1625,7 @@ def main() -> int:
     s2 = SemanticScholarClient(http)
 
     # Determine categories to skip
-    skip_categories: List[EntryCategory] = []
+    skip_categories: list[EntryCategory] = []
     if args.academic_only:
         skip_categories = [EntryCategory.WEB_REFERENCE, EntryCategory.BOOK, EntryCategory.WORKING_PAPER]
     else:

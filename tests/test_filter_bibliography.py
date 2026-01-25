@@ -5,15 +5,12 @@ Run with: pytest tests/test_filter_bibliography.py -v
 """
 
 import os
-import sys
 import tempfile
 from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
-from filter_bibliography import (
+from bibtex_updater.filter import (
     BibEntry,
     extract_citations_from_file,
     extract_citations_from_project,
@@ -442,7 +439,7 @@ class TestWriteBibFile:
 
         try:
             write_bib_file(entries, tmp_path)
-            with open(tmp_path, "r") as f:
+            with open(tmp_path) as f:
                 content = f.read()
             assert "@article{a," in content
             assert "@book{b," in content
