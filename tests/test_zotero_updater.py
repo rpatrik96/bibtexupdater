@@ -2,19 +2,14 @@
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
-from typing import Any, Dict
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-# Add project root to path so we can import zotero_updater
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
-# Mock pyzotero before importing zotero_updater
+# Mock pyzotero before importing zotero module
 with patch.dict("sys.modules", {"pyzotero": MagicMock(), "pyzotero.zotero": MagicMock()}):
-    from zotero_updater import (
+    from bibtex_updater.zotero import (
         UpdateResult,
         ZoteroPrePrintUpdater,
         is_zotero_preprint,
@@ -31,7 +26,7 @@ from bibtex_updater import PublishedRecord
 def make_zotero_item():
     """Factory fixture for creating Zotero items."""
 
-    def _make_item(**kwargs) -> Dict[str, Any]:
+    def _make_item(**kwargs) -> dict[str, Any]:
         data = {
             "key": kwargs.pop("key", "TESTKEY123"),
             "version": kwargs.pop("version", 1),
@@ -386,7 +381,7 @@ class TestPublishedPaperNotOverwritten:
 class TestProcessItemIdempotency:
     """Tests for process_item ensuring idempotency."""
 
-    @patch("zotero_updater.zotero.Zotero")
+    @patch("bibtex_updater.zotero.zotero.Zotero")
     def test_process_published_item_skipped(self, mock_zotero_class, published_zotero_item):
         """Processing a published item should return 'skipped' action."""
         mock_zotero = MagicMock()
@@ -406,7 +401,7 @@ class TestProcessItemIdempotency:
         # Verify update_item was never called
         mock_zotero.update_item.assert_not_called()
 
-    @patch("zotero_updater.zotero.Zotero")
+    @patch("bibtex_updater.zotero.zotero.Zotero")
     def test_published_item_not_modified(self, mock_zotero_class, make_zotero_item):
         """A published item should not be modified even if it has related arXiv entry."""
         mock_zotero = MagicMock()

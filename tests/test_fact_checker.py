@@ -7,8 +7,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from bib_utils import PublishedRecord
-from reference_fact_checker import (
+from bibtex_updater.fact_checker import (
     CrossrefClient,
     DBLPClient,
     FactChecker,
@@ -19,6 +18,7 @@ from reference_fact_checker import (
     FieldComparison,
     SemanticScholarClient,
 )
+from bibtex_updater.utils import PublishedRecord
 
 # ------------- Fixtures -------------
 
@@ -530,12 +530,12 @@ class TestEntryClassifier:
 
     @pytest.fixture
     def classifier(self):
-        from reference_fact_checker import EntryClassifier
+        from bibtex_updater.fact_checker import EntryClassifier
 
         return EntryClassifier()
 
     def test_classify_book(self, classifier):
-        from reference_fact_checker import EntryCategory
+        from bibtex_updater.fact_checker import EntryCategory
 
         entry = {
             "ENTRYTYPE": "book",
@@ -549,7 +549,7 @@ class TestEntryClassifier:
         assert "book" in result.reason.lower()
 
     def test_classify_inbook(self, classifier):
-        from reference_fact_checker import EntryCategory
+        from bibtex_updater.fact_checker import EntryCategory
 
         entry = {
             "ENTRYTYPE": "inbook",
@@ -561,7 +561,7 @@ class TestEntryClassifier:
         assert result.category == EntryCategory.BOOK
 
     def test_classify_web_reference_with_url(self, classifier):
-        from reference_fact_checker import EntryCategory
+        from bibtex_updater.fact_checker import EntryCategory
 
         entry = {
             "ENTRYTYPE": "misc",
@@ -575,7 +575,7 @@ class TestEntryClassifier:
         assert result.extracted_url == "https://example.com/blog"
 
     def test_classify_academic_url_as_academic(self, classifier):
-        from reference_fact_checker import EntryCategory
+        from bibtex_updater.fact_checker import EntryCategory
 
         entry = {
             "ENTRYTYPE": "misc",
@@ -588,7 +588,7 @@ class TestEntryClassifier:
         assert result.category == EntryCategory.ACADEMIC
 
     def test_classify_article_with_doi(self, classifier):
-        from reference_fact_checker import EntryCategory
+        from bibtex_updater.fact_checker import EntryCategory
 
         entry = {
             "ENTRYTYPE": "article",
@@ -601,7 +601,7 @@ class TestEntryClassifier:
         assert result.category == EntryCategory.ACADEMIC
 
     def test_classify_inproceedings(self, classifier):
-        from reference_fact_checker import EntryCategory
+        from bibtex_updater.fact_checker import EntryCategory
 
         entry = {
             "ENTRYTYPE": "inproceedings",
@@ -614,7 +614,7 @@ class TestEntryClassifier:
         assert result.category == EntryCategory.ACADEMIC
 
     def test_classify_working_paper_by_type(self, classifier):
-        from reference_fact_checker import EntryCategory
+        from bibtex_updater.fact_checker import EntryCategory
 
         entry = {
             "ENTRYTYPE": "techreport",
@@ -627,7 +627,7 @@ class TestEntryClassifier:
         assert result.category == EntryCategory.WORKING_PAPER
 
     def test_classify_working_paper_by_journal(self, classifier):
-        from reference_fact_checker import EntryCategory
+        from bibtex_updater.fact_checker import EntryCategory
 
         entry = {
             "ENTRYTYPE": "article",
@@ -641,7 +641,7 @@ class TestEntryClassifier:
         assert result.category == EntryCategory.WORKING_PAPER
 
     def test_classify_with_eprint_as_academic(self, classifier):
-        from reference_fact_checker import EntryCategory
+        from bibtex_updater.fact_checker import EntryCategory
 
         entry = {
             "ENTRYTYPE": "misc",
@@ -678,12 +678,12 @@ class TestWebVerifier:
 
     @pytest.fixture
     def web_verifier(self, fake_http, logger):
-        from reference_fact_checker import WebVerifier, WebVerifierConfig
+        from bibtex_updater.fact_checker import WebVerifier, WebVerifierConfig
 
         return WebVerifier(fake_http, WebVerifierConfig(), logger)
 
     def test_verify_returns_error_without_url(self, web_verifier):
-        from reference_fact_checker import ClassificationResult, EntryCategory, FactCheckStatus
+        from bibtex_updater.fact_checker import ClassificationResult, EntryCategory, FactCheckStatus
 
         entry = {
             "ENTRYTYPE": "misc",
@@ -705,12 +705,12 @@ class TestBookVerifier:
 
     @pytest.fixture
     def book_verifier(self, fake_http, logger):
-        from reference_fact_checker import BookVerifier, BookVerifierConfig
+        from bibtex_updater.fact_checker import BookVerifier, BookVerifierConfig
 
         return BookVerifier(fake_http, BookVerifierConfig(use_google_books=False), logger)
 
     def test_verify_returns_error_without_title(self, book_verifier):
-        from reference_fact_checker import ClassificationResult, EntryCategory, FactCheckStatus
+        from bibtex_updater.fact_checker import ClassificationResult, EntryCategory, FactCheckStatus
 
         entry = {
             "ENTRYTYPE": "book",
@@ -725,7 +725,7 @@ class TestBookVerifier:
         assert "No title found" in result.errors[0]
 
     def test_verify_returns_book_not_found_on_no_results(self, book_verifier, fake_http):
-        from reference_fact_checker import ClassificationResult, EntryCategory, FactCheckStatus
+        from bibtex_updater.fact_checker import ClassificationResult, EntryCategory, FactCheckStatus
 
         fake_http._request.return_value = MagicMock(status_code=200, json=lambda: {"docs": []})
         entry = {
@@ -747,7 +747,7 @@ class TestUnifiedFactChecker:
 
     @pytest.fixture
     def unified_checker(self, fake_http, fake_crossref, fake_dblp, fake_s2, logger):
-        from reference_fact_checker import UnifiedFactChecker
+        from bibtex_updater.fact_checker import UnifiedFactChecker
 
         return UnifiedFactChecker(
             http=fake_http,
@@ -759,7 +759,7 @@ class TestUnifiedFactChecker:
         )
 
     def test_classifies_and_delegates_book(self, unified_checker, fake_http):
-        from reference_fact_checker import EntryCategory
+        from bibtex_updater.fact_checker import EntryCategory
 
         fake_http._request.return_value = MagicMock(status_code=200, json=lambda: {"docs": []})
         entry = {
@@ -773,7 +773,7 @@ class TestUnifiedFactChecker:
         assert result.category == EntryCategory.BOOK
 
     def test_skip_categories(self, fake_http, fake_crossref, fake_dblp, fake_s2, logger):
-        from reference_fact_checker import EntryCategory, FactCheckStatus, UnifiedFactChecker
+        from bibtex_updater.fact_checker import EntryCategory, FactCheckStatus, UnifiedFactChecker
 
         checker = UnifiedFactChecker(
             http=fake_http,

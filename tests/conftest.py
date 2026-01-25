@@ -3,27 +3,26 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict
+from typing import Any
 
 import pytest
 
-from bibtex_updater import (
+from bibtex_updater.updater import (
     Detector,
     FieldChecker,
-    HttpClient,
     MissingFieldProcessor,
     PreprintDetection,
-    PublishedRecord,
     Resolver,
     Updater,
 )
+from bibtex_updater.utils import HttpClient, PublishedRecord
 
 
 @pytest.fixture
 def make_entry():
     """Factory fixture for creating BibTeX entries."""
 
-    def _make_entry(**kwargs) -> Dict[str, Any]:
+    def _make_entry(**kwargs) -> dict[str, Any]:
         entry = {
             "ENTRYTYPE": "article",
             "ID": kwargs.pop("ID", "testkey"),
@@ -211,7 +210,7 @@ def field_checker():
 def make_incomplete_entry(make_entry):
     """Factory fixture for creating incomplete BibTeX entries."""
 
-    def _make_incomplete(**kwargs) -> Dict[str, Any]:
+    def _make_incomplete(**kwargs) -> dict[str, Any]:
         # Start with minimal entry, then apply overrides
         entry = {
             "ENTRYTYPE": kwargs.pop("ENTRYTYPE", "article"),

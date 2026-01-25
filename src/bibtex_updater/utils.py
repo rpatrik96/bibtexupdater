@@ -19,7 +19,7 @@ import time
 import unicodedata
 from collections.abc import Iterable
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 import httpx
 
@@ -53,7 +53,7 @@ S2_API = "https://api.semanticscholar.org/graph/v1"
 # ------------- Text Normalization -------------
 
 
-def safe_lower(x: Optional[str]) -> str:
+def safe_lower(x: str | None) -> str:
     """Null-safe lowercase and strip."""
     return (x or "").lower().strip()
 
@@ -96,7 +96,7 @@ def normalize_title_for_match(title: str) -> str:
 # ------------- Author Handling -------------
 
 
-def split_authors_bibtex(author_field: str) -> List[str]:
+def split_authors_bibtex(author_field: str) -> list[str]:
     """Split BibTeX 'A and B and C' author string into individual names."""
     if not author_field:
         return []
@@ -120,7 +120,7 @@ def last_name_from_person(name: str) -> str:
     return last
 
 
-def authors_last_names(author_field: str, limit: int = 3) -> List[str]:
+def authors_last_names(author_field: str, limit: int = 3) -> list[str]:
     """Extract last names from BibTeX author field.
 
     Args:
@@ -135,7 +135,7 @@ def authors_last_names(author_field: str, limit: int = 3) -> List[str]:
     return [ln for ln in last_names if ln]
 
 
-def first_author_surname(entry: Dict[str, Any]) -> str:
+def first_author_surname(entry: dict[str, Any]) -> str:
     """Get the first author's surname from a BibTeX entry."""
     return authors_last_names(entry.get("author", ""), limit=1)[0] if entry.get("author") else ""
 
@@ -156,7 +156,7 @@ def jaccard_similarity(a: Iterable[str], b: Iterable[str]) -> float:
 # ------------- DOI & arXiv Utilities -------------
 
 
-def doi_normalize(doi: Optional[str]) -> Optional[str]:
+def doi_normalize(doi: str | None) -> str | None:
     """Normalize a DOI by removing URL prefix and lowercasing."""
     if not doi:
         return None
@@ -170,7 +170,7 @@ def doi_url(doi: str) -> str:
     return f"https://doi.org/{doi}"
 
 
-def extract_arxiv_id_from_text(text: str) -> Optional[str]:
+def extract_arxiv_id_from_text(text: str) -> str | None:
     """Extract arXiv ID from a text string (URL, eprint field, note, etc.)."""
     if not text:
         return None
@@ -192,7 +192,7 @@ class RateLimiter:
     def __init__(self, req_per_min: int) -> None:
         self.req_per_min = max(req_per_min, 1)
         self.lock = threading.Lock()
-        self.timestamps: List[float] = []
+        self.timestamps: list[float] = []
 
     def wait(self) -> None:
         """Block until a request can be made within the rate limit."""
@@ -213,10 +213,10 @@ class RateLimiter:
 class DiskCache:
     """Thread-safe on-disk JSON cache for API responses."""
 
-    def __init__(self, path: Optional[str]) -> None:
+    def __init__(self, path: str | None) -> None:
         self.path = path
         self.lock = threading.Lock()
-        self.data: Dict[str, Any] = {}
+        self.data: dict[str, Any] = {}
         if path and os.path.exists(path):
             try:
                 with open(path, encoding="utf-8") as f:
@@ -224,7 +224,7 @@ class DiskCache:
             except Exception:
                 self.data = {}
 
-    def get(self, key: str) -> Optional[Any]:
+    def get(self, key: str) -> Any | None:
         """Get a cached value by key."""
         if not self.path:
             return None
@@ -276,8 +276,8 @@ class HttpClient:
         self,
         method: str,
         url: str,
-        params: Optional[Dict[str, Any]] = None,
-        accept: Optional[str] = None,
+        params: dict[str, Any] | None = None,
+        accept: str | None = None,
     ) -> httpx.Response:
         """Make an HTTP request with caching and retries."""
         cache_key = None
@@ -318,24 +318,24 @@ class PublishedRecord:
     """A published bibliographic record from an API source."""
 
     doi: str
-    url: Optional[str] = None
-    title: Optional[str] = None
-    authors: List[Dict[str, str]] = field(default_factory=list)  # [{"given":..., "family":...}]
-    journal: Optional[str] = None
-    publisher: Optional[str] = None
-    year: Optional[int] = None
-    volume: Optional[str] = None
-    number: Optional[str] = None
-    pages: Optional[str] = None
-    type: Optional[str] = None
-    method: Optional[str] = None  # how found
+    url: str | None = None
+    title: str | None = None
+    authors: list[dict[str, str]] = field(default_factory=list)  # [{"given":..., "family":...}]
+    journal: str | None = None
+    publisher: str | None = None
+    year: int | None = None
+    volume: str | None = None
+    number: str | None = None
+    pages: str | None = None
+    type: str | None = None
+    method: str | None = None  # how found
     confidence: float = 0.0
 
 
 # ------------- API Response Converters -------------
 
 
-def crossref_message_to_record(msg: Dict[str, Any]) -> Optional[PublishedRecord]:
+def crossref_message_to_record(msg: dict[str, Any]) -> PublishedRecord | None:
     """Convert a Crossref works message to a PublishedRecord."""
     typ = msg.get("type")
     doi = doi_normalize(msg.get("DOI"))
@@ -392,7 +392,7 @@ def crossref_message_to_record(msg: Dict[str, Any]) -> Optional[PublishedRecord]
     )
 
 
-def dblp_hit_to_record(hit: Dict[str, Any]) -> Optional[PublishedRecord]:
+def dblp_hit_to_record(hit: dict[str, Any]) -> PublishedRecord | None:
     """Convert a DBLP hit to a PublishedRecord."""
     info = hit.get("info", {})
     title = info.get("title") or ""
@@ -400,7 +400,7 @@ def dblp_hit_to_record(hit: Dict[str, Any]) -> Optional[PublishedRecord]:
 
     # Parse authors
     authors_field = info.get("authors", {}).get("author")
-    authors_list: List[str] = []
+    authors_list: list[str] = []
     if isinstance(authors_field, list):
         for a in authors_field:
             if isinstance(a, dict):
@@ -461,7 +461,7 @@ def dblp_hit_to_record(hit: Dict[str, Any]) -> Optional[PublishedRecord]:
     )
 
 
-def s2_data_to_record(data: Dict[str, Any]) -> Optional[PublishedRecord]:
+def s2_data_to_record(data: dict[str, Any]) -> PublishedRecord | None:
     """Convert Semantic Scholar data to a PublishedRecord."""
     doi = doi_normalize(data.get("doi") or (data.get("externalIds") or {}).get("DOI"))
 
