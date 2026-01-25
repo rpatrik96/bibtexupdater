@@ -28,39 +28,37 @@ import datetime
 import json
 import logging
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
 
 import bibtexparser
+from rapidfuzz.fuzz import token_sort_ratio
 
 from bib_utils import (
-    # Text normalization
-    normalize_title_for_match,
-    strip_diacritics,
-    # Author handling
-    authors_last_names,
-    first_author_surname,
-    # Matching
-    jaccard_similarity,
-    # HTTP infrastructure
-    DiskCache,
-    RateLimiter,
-    HttpClient,
-    # Data classes
-    PublishedRecord,
     # API endpoints
     CROSSREF_API,
     DBLP_API_SEARCH,
     S2_API,
+    # HTTP infrastructure
+    DiskCache,
+    HttpClient,
+    # Data classes
+    PublishedRecord,
+    RateLimiter,
+    # Author handling
+    authors_last_names,
     # API converters
     crossref_message_to_record,
     dblp_hit_to_record,
+    first_author_surname,
+    # Matching
+    jaccard_similarity,
+    # Text normalization
+    normalize_title_for_match,
     s2_data_to_record,
+    strip_diacritics,
 )
-
-from rapidfuzz.fuzz import token_sort_ratio
-
 
 # ------------- Enums & Data Classes -------------
 
@@ -231,9 +229,7 @@ class FactChecker:
             )
 
         query = f"{title_norm} {first_author}".strip()
-        candidates = self._query_all_sources(
-            entry, query, sources_queried, sources_with_hits, errors
-        )
+        candidates = self._query_all_sources(entry, query, sources_queried, sources_with_hits, errors)
 
         if not candidates:
             status = FactCheckStatus.API_ERROR if errors else FactCheckStatus.NOT_FOUND
@@ -325,9 +321,7 @@ class FactChecker:
 
         return candidates
 
-    def _score_candidate(
-        self, title_norm: str, authors_ref: List[str], rec: PublishedRecord
-    ) -> float:
+    def _score_candidate(self, title_norm: str, authors_ref: List[str], rec: PublishedRecord) -> float:
         """Score a candidate record against the entry."""
         title_b = normalize_title_for_match(rec.title or "")
         title_score = token_sort_ratio(title_norm, title_b) / 100.0
@@ -337,9 +331,7 @@ class FactChecker:
 
         return 0.7 * title_score + 0.3 * author_score
 
-    def _compare_all_fields(
-        self, entry: Dict[str, Any], record: PublishedRecord
-    ) -> Dict[str, FieldComparison]:
+    def _compare_all_fields(self, entry: Dict[str, Any], record: PublishedRecord) -> Dict[str, FieldComparison]:
         """Compare all relevant fields between entry and record."""
         comparisons: Dict[str, FieldComparison] = {}
         cfg = self.config
@@ -348,10 +340,7 @@ class FactChecker:
         entry_title = entry.get("title", "")
         api_title = record.title or ""
         title_score = (
-            token_sort_ratio(
-                normalize_title_for_match(entry_title), normalize_title_for_match(api_title)
-            )
-            / 100.0
+            token_sort_ratio(normalize_title_for_match(entry_title), normalize_title_for_match(api_title)) / 100.0
         )
         comparisons["title"] = FieldComparison(
             "title",
@@ -366,9 +355,7 @@ class FactChecker:
         entry_names = authors_last_names(entry_authors, limit=10)
         api_names = [strip_diacritics(a.get("family", "")).lower() for a in record.authors]
         author_score = jaccard_similarity(entry_names, api_names)
-        api_authors_str = " and ".join(
-            f"{a.get('given', '')} {a.get('family', '')}".strip() for a in record.authors
-        )
+        api_authors_str = " and ".join(f"{a.get('given', '')} {a.get('family', '')}".strip() for a in record.authors)
         comparisons["author"] = FieldComparison(
             "author",
             entry_authors,
@@ -402,10 +389,7 @@ class FactChecker:
         api_venue = record.journal or ""
         if entry_venue and api_venue:
             venue_score = (
-                token_sort_ratio(
-                    normalize_title_for_match(entry_venue), normalize_title_for_match(api_venue)
-                )
-                / 100.0
+                token_sort_ratio(normalize_title_for_match(entry_venue), normalize_title_for_match(api_venue)) / 100.0
             )
         else:
             venue_score = 1.0 if not entry_venue else 0.0
@@ -460,9 +444,7 @@ class FactCheckProcessor:
         """Process multiple entries and return results."""
         results = []
         for i, entry in enumerate(entries, 1):
-            self.logger.info(
-                "Checking %d/%d: %s", i, len(entries), entry.get("ID", "?")
-            )
+            self.logger.info("Checking %d/%d: %s", i, len(entries), entry.get("ID", "?"))
             results.append(self.checker.check_entry(entry))
         return results
 
@@ -543,9 +525,7 @@ class FactCheckProcessor:
                         "key": r.entry_key,
                         "status": r.status.value,
                         "confidence": r.overall_confidence,
-                        "mismatched_fields": [
-                            n for n, c in r.field_comparisons.items() if not c.matches
-                        ],
+                        "mismatched_fields": [n for n, c in r.field_comparisons.items() if not c.matches],
                         "api_sources": r.api_sources_with_hits,
                         "errors": r.errors,
                     },
@@ -709,14 +689,9 @@ def main() -> int:
 
     # Exit code
     if args.strict:
-        problem_count = (
-            summary["status_counts"].get("not_found", 0)
-            + summary["status_counts"].get("hallucinated", 0)
-        )
+        problem_count = summary["status_counts"].get("not_found", 0) + summary["status_counts"].get("hallucinated", 0)
         if problem_count > 0:
-            logger.warning(
-                "Strict mode: %d NOT_FOUND or HALLUCINATED entries found", problem_count
-            )
+            logger.warning("Strict mode: %d NOT_FOUND or HALLUCINATED entries found", problem_count)
             return 4
 
     return 0

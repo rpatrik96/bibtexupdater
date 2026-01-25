@@ -53,38 +53,34 @@ from rapidfuzz.fuzz import token_sort_ratio
 from bib_utils import (
     # Constants
     ARXIV_API,
-    ARXIV_HOST_RE,
-    ARXIV_ID_RE,
     CROSSREF_API,
     DBLP_API_SEARCH,
     PREPRINT_HOSTS,
     S2_API,
-    # Text normalization
-    safe_lower,
-    strip_diacritics,
-    latex_to_plain,
-    normalize_title_for_match,
-    # Author handling
-    split_authors_bibtex,
-    last_name_from_person,
-    authors_last_names,
-    first_author_surname,
-    # Matching
-    jaccard_similarity,
-    # DOI/arXiv
-    doi_normalize,
-    doi_url,
-    extract_arxiv_id_from_text,
-    # HTTP infrastructure
-    RateLimiter,
     DiskCache,
     HttpClient,
     # Data classes
     PublishedRecord,
+    # HTTP infrastructure
+    RateLimiter,
+    authors_last_names,
     # API converters
     crossref_message_to_record,
     dblp_hit_to_record,
-    s2_data_to_record,
+    # DOI/arXiv
+    doi_normalize,
+    doi_url,
+    extract_arxiv_id_from_text,
+    first_author_surname,
+    # Matching
+    jaccard_similarity,
+    last_name_from_person,
+    latex_to_plain,
+    normalize_title_for_match,
+    safe_lower,
+    # Author handling
+    split_authors_bibtex,
+    strip_diacritics,
 )
 
 # External library: bibtexparser

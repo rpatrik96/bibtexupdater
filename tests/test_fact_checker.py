@@ -9,17 +9,16 @@ import pytest
 
 from bib_utils import PublishedRecord
 from reference_fact_checker import (
-    FactCheckStatus,
-    FieldComparison,
-    FactCheckResult,
-    FactCheckerConfig,
-    FactChecker,
-    FactCheckProcessor,
     CrossrefClient,
     DBLPClient,
+    FactChecker,
+    FactCheckerConfig,
+    FactCheckProcessor,
+    FactCheckResult,
+    FactCheckStatus,
+    FieldComparison,
     SemanticScholarClient,
 )
-
 
 # ------------- Fixtures -------------
 
@@ -118,9 +117,7 @@ class TestFactCheckerConfig:
         assert cfg.hallucination_max_score == 0.50
 
     def test_custom_values(self):
-        cfg = FactCheckerConfig(
-            title_threshold=0.85, year_tolerance=2, hallucination_max_score=0.40
-        )
+        cfg = FactCheckerConfig(title_threshold=0.85, year_tolerance=2, hallucination_max_score=0.40)
         assert cfg.title_threshold == 0.85
         assert cfg.year_tolerance == 2
         assert cfg.hallucination_max_score == 0.40
@@ -502,8 +499,7 @@ class TestDBLPClient:
 
     def test_search_handles_single_hit_as_dict(self, fake_http):
         fake_http._request.return_value = MagicMock(
-            status_code=200,
-            json=lambda: {"result": {"hits": {"hit": {"info": {"title": "Single"}}}}}
+            status_code=200, json=lambda: {"result": {"hits": {"hit": {"info": {"title": "Single"}}}}}
         )
         client = DBLPClient(fake_http)
         results = client.search("test")

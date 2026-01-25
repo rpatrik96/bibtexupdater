@@ -6,14 +6,12 @@ Core utility functions are tested in test_utils.py.
 
 from __future__ import annotations
 
-import pytest
-
 from bib_utils import (
+    DiskCache,
+    RateLimiter,
     crossref_message_to_record,
     dblp_hit_to_record,
     s2_data_to_record,
-    DiskCache,
-    RateLimiter,
 )
 
 

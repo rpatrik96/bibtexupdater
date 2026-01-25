@@ -11,7 +11,6 @@ HTTP infrastructure with caching and rate limiting, and API client utilities.
 from __future__ import annotations
 
 import json
-import logging
 import os
 import re
 import tempfile
@@ -40,9 +39,7 @@ ARXIV_ID_RE = re.compile(
     re.IGNORECASE | re.VERBOSE,
 )
 
-ARXIV_HOST_RE = re.compile(
-    r"https?://(?:www\.)?arxiv\.org/(?:abs|pdf)/(?P<id>[^?/]+)", re.IGNORECASE
-)
+ARXIV_HOST_RE = re.compile(r"https?://(?:www\.)?arxiv\.org/(?:abs|pdf)/(?P<id>[^?/]+)", re.IGNORECASE)
 
 PREPRINT_HOSTS = ("arxiv", "biorxiv", "medrxiv")
 
@@ -103,11 +100,7 @@ def split_authors_bibtex(author_field: str) -> List[str]:
     """Split BibTeX 'A and B and C' author string into individual names."""
     if not author_field:
         return []
-    parts = [
-        p.strip()
-        for p in re.split(r"\s+\band\b\s+", author_field, flags=re.IGNORECASE)
-        if p.strip()
-    ]
+    parts = [p.strip() for p in re.split(r"\s+\band\b\s+", author_field, flags=re.IGNORECASE) if p.strip()]
     return parts
 
 
@@ -244,9 +237,7 @@ class DiskCache:
             return
         with self.lock:
             self.data[key] = value
-            tmp = tempfile.NamedTemporaryFile(
-                "w", delete=False, encoding="utf-8", suffix=".json", prefix=".tmp_cache_"
-            )
+            tmp = tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8", suffix=".json", prefix=".tmp_cache_")
             try:
                 json.dump(self.data, tmp)
                 tmp.flush()
@@ -291,9 +282,7 @@ class HttpClient:
         """Make an HTTP request with caching and retries."""
         cache_key = None
         if self.cache:
-            cache_key = json.dumps(
-                {"m": method, "u": url, "p": params, "a": accept}, sort_keys=True
-            )
+            cache_key = json.dumps({"m": method, "u": url, "p": params, "a": accept}, sort_keys=True)
             cached = self.cache.get(cache_key)
             if cached is not None:
                 return httpx.Response(
@@ -308,14 +297,8 @@ class HttpClient:
                 headers = {"Accept": accept} if accept else {}
                 resp = self.client.request(method, url, params=params, headers=headers)
                 if resp.status_code in self.RETRYABLE_STATUS:
-                    raise httpx.HTTPStatusError(
-                        "Retryable status", request=resp.request, response=resp
-                    )
-                if (
-                    self.cache
-                    and cache_key
-                    and resp.headers.get("Content-Type", "").startswith("application/json")
-                ):
+                    raise httpx.HTTPStatusError("Retryable status", request=resp.request, response=resp)
+                if self.cache and cache_key and resp.headers.get("Content-Type", "").startswith("application/json"):
                     try:
                         self.cache.set(cache_key, resp.json())
                     except Exception:
