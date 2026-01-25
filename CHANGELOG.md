@@ -7,15 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed
-- Restructured project as a proper Python package with src-layout
-- Added CLI entry points: `bibtex-update`, `bibtex-check`, `bibtex-filter`, `bibtex-zotero`
-- Package now installable from PyPI as `bibtex-updater`
-
 ## [0.1.0] - 2025-01-25
 
 ### Added
-- Initial release
+- Initial release as PyPI package (`pip install bibtex-updater`)
+- Proper Python package with src-layout structure
+- CLI entry points: `bibtex-update`, `bibtex-check`, `bibtex-filter`, `bibtex-zotero`
 - `bibtex-update` command for upgrading preprints to published versions
   - Resolution via arXiv API, Crossref, DBLP, Semantic Scholar
   - Optional Google Scholar support via scholarly package
