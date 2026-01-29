@@ -818,7 +818,24 @@ def s2_data_to_record(data: dict[str, Any]) -> PublishedRecord | None:
     # Get venue
     venue = (data.get("publicationVenue") or {}).get("name") or data.get("venue")
 
+    # Reject arXiv/preprint venues
+    venue_lower = safe_lower(venue) if venue else ""
+    if re.search(r"arxiv|biorxiv|medrxiv", venue_lower):
+        return None
+
     pub_types = data.get("publicationTypes") or []
+    s2_type = pub_types[0].lower() if pub_types else ""
+
+    # Map Semantic Scholar types to standard types
+    # S2 uses: JournalArticle, Conference, Review, Book, BookSection, etc.
+    s2_type_map = {
+        "journalarticle": "journal-article",
+        "conference": "proceedings-article",
+        "book": "book",
+        "booksection": "book-chapter",
+        "review": "journal-article",
+    }
+    record_type = s2_type_map.get(s2_type, s2_type)
 
     return PublishedRecord(
         doi=doi or "",
@@ -827,7 +844,7 @@ def s2_data_to_record(data: dict[str, Any]) -> PublishedRecord | None:
         authors=authors,
         journal=venue,
         year=data.get("year"),
-        type=pub_types[0].lower() if pub_types else None,
+        type=record_type,
     )
 
 

@@ -266,6 +266,7 @@ class TestS2DataToRecord:
         assert rec.authors[0]["given"] == ""
 
     def test_publication_type_extracted(self):
+        """Test that S2 types are normalized to standard types."""
         data = {
             "doi": "10.1234/test",
             "title": "Test",
@@ -273,7 +274,19 @@ class TestS2DataToRecord:
         }
         rec = s2_data_to_record(data)
         assert rec is not None
-        assert rec.type == "journalarticle"
+        assert rec.type == "journal-article"  # Normalized from "journalarticle"
+
+    def test_conference_type_normalized(self):
+        """Test that S2 Conference type maps to proceedings-article."""
+        data = {
+            "doi": "10.1234/test",
+            "title": "Test",
+            "venue": "NeurIPS",
+            "publicationTypes": ["Conference"],
+        }
+        rec = s2_data_to_record(data)
+        assert rec is not None
+        assert rec.type == "proceedings-article"
 
     def test_no_publication_types(self):
         data = {
@@ -282,7 +295,7 @@ class TestS2DataToRecord:
         }
         rec = s2_data_to_record(data)
         assert rec is not None
-        assert rec.type is None
+        assert rec.type == ""  # Empty string when no types provided
 
     def test_publication_venue_name(self):
         data = {
