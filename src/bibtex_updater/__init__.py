@@ -26,6 +26,7 @@ from bibtex_updater._version import __version__
 
 # Core updater classes and functions
 from bibtex_updater.updater import (
+    AsyncResolver,
     BibLoader,
     BibWriter,
     Dedupe,
@@ -42,16 +43,27 @@ from bibtex_updater.updater import (
     Resolver,
     ScholarlyClient,
     Updater,
+    # Entry processing functions
+    prioritize_entries,
+    process_entries_optimized,
     process_entry,
+    process_entry_with_preload,
 )
 
 # Shared utilities
 from bibtex_updater.utils import (
     # Classes
+    AdaptiveRateLimiterRegistry,
+    AsyncHttpClient,
+    AsyncRateLimiter,
+    AsyncRateLimiterRegistry,
     DiskCache,
     HttpClient,
     PublishedRecord,
     RateLimiter,
+    RateLimiterRegistry,
+    ResolutionCache,
+    ResolutionCacheEntry,
     # Author handling
     authors_last_names,
     # API converters
@@ -78,6 +90,7 @@ __all__ = [
     # Version
     "__version__",
     # Core classes
+    "AsyncResolver",
     "BibLoader",
     "BibWriter",
     "Dedupe",
@@ -94,12 +107,23 @@ __all__ = [
     "Resolver",
     "ScholarlyClient",
     "Updater",
+    # Entry processing functions
+    "prioritize_entries",
+    "process_entries_optimized",
     "process_entry",
+    "process_entry_with_preload",
     # Utility classes
+    "AdaptiveRateLimiterRegistry",
+    "AsyncHttpClient",
+    "AsyncRateLimiter",
+    "AsyncRateLimiterRegistry",
     "DiskCache",
     "HttpClient",
     "PublishedRecord",
     "RateLimiter",
+    "RateLimiterRegistry",
+    "ResolutionCache",
+    "ResolutionCacheEntry",
     # Text normalization
     "latex_to_plain",
     "normalize_title_for_match",
