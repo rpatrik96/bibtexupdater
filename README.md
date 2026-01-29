@@ -125,9 +125,11 @@ For `filter_bibliography.py` only (no dependencies required):
 
 - **Multi-source resolution**: arXiv, Crossref, DBLP, Semantic Scholar, Google Scholar
 - **High accuracy**: Title and author fuzzy matching with confidence thresholds
-- **Batch processing**: Multiple files with concurrent workers
+- **Batch processing**: Multiple files with concurrent workers (default: 8)
 - **Deduplication**: Merge duplicates by DOI or normalized title+authors
-- **Caching**: On-disk cache to avoid repeated API calls
+- **Smart caching**: On-disk cache + semantic resolution cache with TTL
+- **Per-service rate limiting**: Optimized rate limits per API (Crossref, S2, DBLP, arXiv)
+- **Batch API support**: Faster bulk lookups via arXiv/S2/Crossref batch endpoints
 
 ### Zotero Updater (`bibtex-zotero`)
 
