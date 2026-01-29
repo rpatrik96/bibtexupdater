@@ -210,6 +210,155 @@ class RateLimiter:
             self.timestamps.append(time.time())
 
 
+class RateLimiterRegistry:
+    """Manages per-service rate limiters.
+
+    This allows different API services to have their own rate limits,
+    optimizing throughput while respecting each service's constraints.
+    """
+
+    DEFAULT_LIMITS = {
+        "crossref": 50,  # Crossref: 50/min polite pool
+        "semanticscholar": 100,  # S2: 100/min (1000 with API key)
+        "dblp": 30,  # DBLP: 30/min (conservative)
+        "arxiv": 30,  # arXiv: 30/min
+        "scholarly": 10,  # Scholar: very conservative
+    }
+
+    def __init__(self, limits: dict[str, int] | None = None) -> None:
+        """Initialize the registry with optional custom limits.
+
+        Args:
+            limits: Optional dict of service name to requests per minute.
+                   Overrides DEFAULT_LIMITS for specified services.
+        """
+        self._limits = {**self.DEFAULT_LIMITS, **(limits or {})}
+        self._limiters: dict[str, RateLimiter] = {}
+        self._lock = threading.Lock()
+
+    def get(self, service: str) -> RateLimiter:
+        """Get or create rate limiter for service.
+
+        Args:
+            service: Name of the API service (e.g., 'crossref', 'dblp')
+
+        Returns:
+            RateLimiter instance for the service
+        """
+        with self._lock:
+            if service not in self._limiters:
+                limit = self._limits.get(service, 30)  # Default 30/min
+                self._limiters[service] = RateLimiter(limit)
+            return self._limiters[service]
+
+    def wait(self, service: str) -> None:
+        """Wait for rate limit on specified service.
+
+        Args:
+            service: Name of the API service
+        """
+        self.get(service).wait()
+
+
+class AdaptiveRateLimiterRegistry(RateLimiterRegistry):
+    """Rate limiter registry that adapts based on API response headers.
+
+    This extends RateLimiterRegistry to dynamically adjust rate limits based on
+    feedback from API responses (e.g., X-RateLimit-Remaining headers or 429 responses).
+    """
+
+    def __init__(self, limits: dict[str, int] | None = None) -> None:
+        """Initialize the adaptive registry.
+
+        Args:
+            limits: Optional dict of service name to requests per minute.
+                   Overrides DEFAULT_LIMITS for specified services.
+        """
+        super().__init__(limits)
+        self._min_limits: dict[str, int] = {
+            k: max(5, v // 4) for k, v in self._limits.items()  # Minimum is 25% of default
+        }
+        self._backoff_until: dict[str, float] = {}  # Service -> timestamp when backoff ends
+
+    def adapt(self, service: str, response: Any) -> None:
+        """Adjust rate limit based on API feedback.
+
+        Call this after each API response to adapt the rate limit based on
+        headers like X-RateLimit-Remaining, X-RateLimit-Limit, or 429 responses.
+
+        Args:
+            service: Name of the API service
+            response: httpx.Response object from the API call
+        """
+        # Check for rate limit headers
+        remaining = response.headers.get("X-RateLimit-Remaining")
+        # Note: X-RateLimit-Limit and X-RateLimit-Reset are available but not currently used
+        # They could be used for more sophisticated adaptive logic in the future
+
+        if remaining is not None:
+            try:
+                remaining_int = int(remaining)
+                if remaining_int < 10:
+                    # Getting close to limit, slow down
+                    current_limit = self._limits.get(service, 30)
+                    new_limit = max(current_limit // 2, self._min_limits.get(service, 5))
+                    if new_limit != current_limit:
+                        self._limits[service] = new_limit
+                        # Recreate limiter with new limit
+                        with self._lock:
+                            self._limiters[service] = RateLimiter(new_limit)
+            except (ValueError, TypeError):
+                pass
+
+        # Handle 429 Too Many Requests
+        if hasattr(response, "status_code") and response.status_code == 429:
+            retry_after = response.headers.get("Retry-After")
+            if retry_after:
+                try:
+                    retry_seconds = int(retry_after)
+                    self._backoff_until[service] = time.time() + retry_seconds
+                except (ValueError, TypeError):
+                    # Default 60 second backoff
+                    self._backoff_until[service] = time.time() + 60.0
+            else:
+                # Default 60 second backoff
+                self._backoff_until[service] = time.time() + 60.0
+
+            # Also reduce the rate limit
+            current_limit = self._limits.get(service, 30)
+            new_limit = max(current_limit // 2, self._min_limits.get(service, 5))
+            self._limits[service] = new_limit
+            with self._lock:
+                self._limiters[service] = RateLimiter(new_limit)
+
+    def wait(self, service: str) -> None:
+        """Wait for rate limit, including any backoff period.
+
+        Args:
+            service: Name of the API service
+        """
+        # Check for backoff period
+        backoff_end = self._backoff_until.get(service, 0)
+        now = time.time()
+        if now < backoff_end:
+            time.sleep(backoff_end - now)
+
+        # Regular rate limiting
+        super().wait(service)
+
+    def reset_limit(self, service: str) -> None:
+        """Reset a service's rate limit to its default value.
+
+        Args:
+            service: Name of the API service
+        """
+        default = self.DEFAULT_LIMITS.get(service, 30)
+        self._limits[service] = default
+        with self._lock:
+            if service in self._limiters:
+                self._limiters[service] = RateLimiter(default)
+
+
 class DiskCache:
     """Thread-safe on-disk JSON cache for API responses."""
 
@@ -247,6 +396,142 @@ class DiskCache:
             os.replace(tmp.name, self.path)
 
 
+@dataclass
+class ResolutionCacheEntry:
+    """Cached resolution result for a preprint."""
+
+    arxiv_id: str | None
+    preprint_doi: str | None
+    resolved_doi: str | None  # None = no published version found
+    method: str | None  # Resolution method used (e.g., "arXiv->Semantic Scholar")
+    confidence: float
+    timestamp: float
+    status: str  # "resolved" or "no_match"
+    ttl_days: int = 30  # Re-check after 30 days
+
+
+class ResolutionCache:
+    """Semantic-level cache for preprint resolution results.
+
+    This cache stores resolution results at a semantic level, caching whether
+    a preprint has been resolved to a published version (and which one) or
+    whether no match was found. This is separate from the HTTP-level DiskCache
+    which caches raw API responses.
+
+    Features:
+    - Thread-safe implementation using locks
+    - TTL-based expiration (default 30 days)
+    - Atomic file writes using temp file + os.replace
+    - Caches both positive results (resolved) and negative results (no_match)
+    """
+
+    def __init__(self, path: str | None, ttl_days: int = 30) -> None:
+        """Initialize the resolution cache.
+
+        Args:
+            path: Path to the cache file. If None, caching is disabled.
+            ttl_days: Time-to-live in days for cache entries. Default 30 days.
+        """
+        self.path = path
+        self.ttl_days = ttl_days
+        self.lock = threading.Lock()
+        self.data: dict[str, dict[str, Any]] = {}
+        self._load()
+
+    def _load(self) -> None:
+        """Load cache from disk."""
+        if self.path and os.path.exists(self.path):
+            try:
+                with open(self.path, encoding="utf-8") as f:
+                    self.data = json.load(f)
+            except (OSError, json.JSONDecodeError):
+                self.data = {}
+
+    def _save(self) -> None:
+        """Save cache to disk atomically."""
+        if not self.path:
+            return
+        tmp = tempfile.NamedTemporaryFile(
+            "w", delete=False, encoding="utf-8", suffix=".json", prefix=".tmp_resolution_cache_"
+        )
+        try:
+            json.dump(self.data, tmp, indent=2)
+            tmp.flush()
+            os.fsync(tmp.fileno())
+        finally:
+            tmp.close()
+        os.replace(tmp.name, self.path)
+
+    def _make_key(self, arxiv_id: str | None, doi: str | None) -> str:
+        """Create cache key from identifiers."""
+        return f"arxiv:{arxiv_id or ''}_doi:{doi or ''}"
+
+    def get(self, arxiv_id: str | None, doi: str | None) -> ResolutionCacheEntry | None:
+        """Get cached resolution result if valid.
+
+        Args:
+            arxiv_id: The arXiv ID of the preprint (if available)
+            doi: The DOI of the preprint (if available)
+
+        Returns:
+            ResolutionCacheEntry if a valid cached result exists, None otherwise.
+        """
+        if not self.path:
+            return None
+        key = self._make_key(arxiv_id, doi)
+        with self.lock:
+            if key not in self.data:
+                return None
+            entry_data = self.data[key]
+            # Check TTL
+            age_days = (time.time() - entry_data["timestamp"]) / 86400
+            if age_days > entry_data.get("ttl_days", self.ttl_days):
+                return None  # Expired
+            return ResolutionCacheEntry(**entry_data)
+
+    def set(self, entry: ResolutionCacheEntry) -> None:
+        """Store resolution result.
+
+        Args:
+            entry: The ResolutionCacheEntry to store.
+        """
+        if not self.path:
+            return
+        key = self._make_key(entry.arxiv_id, entry.preprint_doi)
+        with self.lock:
+            # Convert dataclass to dict for JSON serialization
+            self.data[key] = {
+                "arxiv_id": entry.arxiv_id,
+                "preprint_doi": entry.preprint_doi,
+                "resolved_doi": entry.resolved_doi,
+                "method": entry.method,
+                "confidence": entry.confidence,
+                "timestamp": entry.timestamp,
+                "status": entry.status,
+                "ttl_days": entry.ttl_days,
+            }
+            self._save()
+
+    def set_no_match(self, arxiv_id: str | None, doi: str | None) -> None:
+        """Cache a negative result (no published version found).
+
+        Args:
+            arxiv_id: The arXiv ID of the preprint (if available)
+            doi: The DOI of the preprint (if available)
+        """
+        entry = ResolutionCacheEntry(
+            arxiv_id=arxiv_id,
+            preprint_doi=doi,
+            resolved_doi=None,
+            method=None,
+            confidence=0.0,
+            timestamp=time.time(),
+            status="no_match",
+            ttl_days=self.ttl_days,
+        )
+        self.set(entry)
+
+
 # ------------- HTTP Client -------------
 
 
@@ -259,18 +544,52 @@ class HttpClient:
         self,
         timeout: float,
         user_agent: str,
-        rate_limiter: RateLimiter,
+        rate_limiter: RateLimiter | RateLimiterRegistry,
         cache: DiskCache,
         verbose: bool = False,
     ):
+        """Initialize HTTP client.
+
+        Args:
+            timeout: Request timeout in seconds
+            user_agent: User-Agent header value
+            rate_limiter: Either a single RateLimiter (for backward compatibility)
+                         or a RateLimiterRegistry for per-service rate limiting
+            cache: DiskCache instance for caching responses
+            verbose: Enable verbose logging
+        """
         self.client = httpx.Client(
             timeout=httpx.Timeout(timeout),
             headers={"User-Agent": user_agent},
             follow_redirects=True,
         )
-        self.rate_limiter = rate_limiter
+        self._rate_limiter = rate_limiter
+        self._uses_registry = isinstance(rate_limiter, RateLimiterRegistry)
         self.cache = cache
         self.verbose = verbose
+
+    @property
+    def rate_limiter(self) -> RateLimiter | RateLimiterRegistry:
+        """Return the rate limiter for backward compatibility."""
+        return self._rate_limiter
+
+    def _get_limiter_for_service(self, service: str | None) -> RateLimiter:
+        """Get the appropriate rate limiter for a service.
+
+        Args:
+            service: Service name (e.g., 'crossref', 'dblp'). If None or
+                    if using a single RateLimiter, returns the default limiter.
+
+        Returns:
+            RateLimiter instance to use for rate limiting
+        """
+        if self._uses_registry and service:
+            return self._rate_limiter.get(service)  # type: ignore[union-attr]
+        elif self._uses_registry:
+            # Default to crossref if no service specified with registry
+            return self._rate_limiter.get("crossref")  # type: ignore[union-attr]
+        else:
+            return self._rate_limiter  # type: ignore[return-value]
 
     def _request(
         self,
@@ -278,11 +597,23 @@ class HttpClient:
         url: str,
         params: dict[str, Any] | None = None,
         accept: str | None = None,
+        json_body: dict[str, Any] | list[Any] | None = None,
+        service: str | None = None,
     ) -> httpx.Response:
-        """Make an HTTP request with caching and retries."""
+        """Make an HTTP request with caching and retries.
+
+        Args:
+            method: HTTP method (GET, POST, etc.)
+            url: Request URL
+            params: Query parameters
+            accept: Accept header value
+            json_body: JSON body for POST requests
+            service: Optional service name for per-service rate limiting
+                    (e.g., 'crossref', 'dblp', 'semanticscholar', 'arxiv')
+        """
         cache_key = None
         if self.cache:
-            cache_key = json.dumps({"m": method, "u": url, "p": params, "a": accept}, sort_keys=True)
+            cache_key = json.dumps({"m": method, "u": url, "p": params, "a": accept, "j": json_body}, sort_keys=True)
             cached = self.cache.get(cache_key)
             if cached is not None:
                 return httpx.Response(
@@ -291,11 +622,14 @@ class HttpClient:
                     headers={"X-From-Cache": "1"},
                 )
         backoff = 1.0
+        limiter = self._get_limiter_for_service(service)
         for _ in range(6):
-            self.rate_limiter.wait()
+            limiter.wait()
             try:
                 headers = {"Accept": accept} if accept else {}
-                resp = self.client.request(method, url, params=params, headers=headers)
+                if json_body is not None:
+                    headers["Content-Type"] = "application/json"
+                resp = self.client.request(method, url, params=params, headers=headers, json=json_body)
                 if resp.status_code in self.RETRYABLE_STATUS:
                     raise httpx.HTTPStatusError("Retryable status", request=resp.request, response=resp)
                 if self.cache and cache_key and resp.headers.get("Content-Type", "").startswith("application/json"):
@@ -489,3 +823,301 @@ def s2_data_to_record(data: dict[str, Any]) -> PublishedRecord | None:
         year=data.get("year"),
         type=pub_types[0].lower() if pub_types else None,
     )
+
+
+# ------------- Async Rate Limiting -------------
+
+
+class AsyncRateLimiter:
+    """Async-compatible rate limiter using sliding window.
+
+    This rate limiter uses an asyncio lock and sleep for non-blocking
+    rate limiting in async contexts. It maintains a sliding window of
+    timestamps to enforce the rate limit.
+    """
+
+    def __init__(self, req_per_min: int) -> None:
+        """Initialize the async rate limiter.
+
+        Args:
+            req_per_min: Maximum number of requests allowed per minute.
+                        Minimum value is 1.
+        """
+        import asyncio
+
+        self.req_per_min = max(req_per_min, 1)
+        self.lock = asyncio.Lock()
+        self.timestamps: list[float] = []
+
+    async def wait(self) -> None:
+        """Async wait until a request can be made within the rate limit.
+
+        This method will sleep asynchronously if the rate limit has been
+        exceeded, allowing other coroutines to run while waiting.
+        """
+        import asyncio
+
+        async with self.lock:
+            now = time.time()
+            window = 60.0
+            self.timestamps = [t for t in self.timestamps if now - t < window]
+
+            if len(self.timestamps) >= self.req_per_min:
+                earliest = min(self.timestamps)
+                sleep_for = window - (now - earliest) + 0.01
+                if sleep_for > 0:
+                    await asyncio.sleep(sleep_for)
+                    now = time.time()
+                    self.timestamps = [t for t in self.timestamps if now - t < window]
+
+            self.timestamps.append(now)
+
+
+class AsyncRateLimiterRegistry:
+    """Manages per-service async rate limiters.
+
+    This registry creates and manages AsyncRateLimiter instances for
+    different API services, allowing each service to have its own
+    rate limit configuration.
+    """
+
+    DEFAULT_LIMITS = {
+        "crossref": 50,  # Crossref: 50/min polite pool
+        "semanticscholar": 100,  # S2: 100/min (1000 with API key)
+        "dblp": 30,  # DBLP: 30/min (conservative)
+        "arxiv": 30,  # arXiv: 30/min
+        "scholarly": 10,  # Scholar: very conservative
+    }
+
+    def __init__(self, limits: dict[str, int] | None = None) -> None:
+        """Initialize the registry with optional custom limits.
+
+        Args:
+            limits: Optional dict of service name to requests per minute.
+                   Overrides DEFAULT_LIMITS for specified services.
+        """
+        self._limits = {**self.DEFAULT_LIMITS, **(limits or {})}
+        self._limiters: dict[str, AsyncRateLimiter] = {}
+
+    def get(self, service: str) -> AsyncRateLimiter:
+        """Get or create async rate limiter for service.
+
+        Args:
+            service: Name of the API service (e.g., 'crossref', 'dblp')
+
+        Returns:
+            AsyncRateLimiter instance for the service
+        """
+        if service not in self._limiters:
+            limit = self._limits.get(service, 30)  # Default 30/min
+            self._limiters[service] = AsyncRateLimiter(limit)
+        return self._limiters[service]
+
+    async def wait(self, service: str) -> None:
+        """Async wait for rate limit on specified service.
+
+        Args:
+            service: Name of the API service
+        """
+        await self.get(service).wait()
+
+
+# ------------- Async HTTP Client -------------
+
+
+class AsyncHttpClient:
+    """Async HTTP client with rate limiting, caching, and retry logic.
+
+    This client provides async HTTP requests with:
+    - Per-service rate limiting via AsyncRateLimiterRegistry
+    - Response caching via DiskCache
+    - Automatic retry with exponential backoff for transient failures
+    """
+
+    RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+
+    def __init__(
+        self,
+        rate_limiters: AsyncRateLimiterRegistry,
+        cache: DiskCache | None = None,
+        timeout: float = 20.0,
+        user_agent: str = "bibtex-updater/1.0 (async)",
+    ) -> None:
+        """Initialize the async HTTP client.
+
+        Args:
+            rate_limiters: AsyncRateLimiterRegistry for per-service rate limiting
+            cache: Optional DiskCache for caching responses
+            timeout: Request timeout in seconds
+            user_agent: User-Agent header value
+        """
+        self.rate_limiters = rate_limiters
+        self.cache = cache
+        self.timeout = timeout
+        self.user_agent = user_agent
+        self._client: httpx.AsyncClient | None = None
+
+    @property
+    def client(self) -> httpx.AsyncClient:
+        """Get or create the async HTTP client instance."""
+        if self._client is None:
+            self._client = httpx.AsyncClient(
+                timeout=httpx.Timeout(self.timeout),
+                headers={"User-Agent": self.user_agent},
+                follow_redirects=True,
+            )
+        return self._client
+
+    def _mock_response(self, data: Any) -> httpx.Response:
+        """Create a mock response from cached data.
+
+        Args:
+            data: Cached JSON data to wrap in a response
+
+        Returns:
+            httpx.Response with the cached data
+        """
+        return httpx.Response(
+            200,
+            content=json.dumps(data).encode("utf-8"),
+            headers={"Content-Type": "application/json", "X-From-Cache": "1"},
+        )
+
+    async def request(
+        self,
+        method: str,
+        url: str,
+        service: str = "default",
+        params: dict[str, Any] | None = None,
+        json_body: dict[str, Any] | list[Any] | None = None,
+        headers: dict[str, str] | None = None,
+        accept: str = "application/json",
+    ) -> httpx.Response:
+        """Make async HTTP request with rate limiting and retry.
+
+        Args:
+            method: HTTP method (GET, POST, etc.)
+            url: Request URL
+            service: Service name for rate limiting (e.g., 'crossref', 'dblp')
+            params: Query parameters
+            json_body: JSON body for POST requests
+            headers: Additional headers
+            accept: Accept header value
+
+        Returns:
+            httpx.Response object
+
+        Raises:
+            RuntimeError: If request fails after all retry attempts
+        """
+        import asyncio
+
+        # Check cache first for GET requests
+        cache_key = None
+        if method == "GET" and self.cache:
+            cache_key = json.dumps(
+                {"m": method, "u": url, "p": params, "a": accept},
+                sort_keys=True,
+            )
+            cached = self.cache.get(cache_key)
+            if cached is not None:
+                return self._mock_response(cached)
+
+        request_headers = {**(headers or {}), "Accept": accept}
+        if json_body is not None:
+            request_headers["Content-Type"] = "application/json"
+
+        backoff = 1.0
+
+        for attempt in range(6):
+            await self.rate_limiters.wait(service)
+            try:
+                resp = await self.client.request(
+                    method,
+                    url,
+                    params=params,
+                    json=json_body,
+                    headers=request_headers,
+                )
+                if resp.status_code in self.RETRYABLE_STATUS:
+                    raise httpx.HTTPStatusError(
+                        f"Status {resp.status_code}",
+                        request=resp.request,
+                        response=resp,
+                    )
+
+                # Cache successful JSON responses for GET requests
+                if (
+                    method == "GET"
+                    and self.cache
+                    and cache_key
+                    and "application/json" in resp.headers.get("content-type", "")
+                ):
+                    try:
+                        self.cache.set(cache_key, resp.json())
+                    except Exception:
+                        pass  # Ignore cache errors
+
+                return resp
+            except httpx.HTTPError:
+                if attempt < 5:
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, 16.0)
+
+        raise RuntimeError(f"Network failure after retries for {url}")
+
+    async def get(
+        self,
+        url: str,
+        service: str = "default",
+        params: dict[str, Any] | None = None,
+        accept: str = "application/json",
+    ) -> httpx.Response:
+        """Convenience method for GET requests.
+
+        Args:
+            url: Request URL
+            service: Service name for rate limiting
+            params: Query parameters
+            accept: Accept header value
+
+        Returns:
+            httpx.Response object
+        """
+        return await self.request("GET", url, service=service, params=params, accept=accept)
+
+    async def post(
+        self,
+        url: str,
+        service: str = "default",
+        params: dict[str, Any] | None = None,
+        json_body: dict[str, Any] | list[Any] | None = None,
+        accept: str = "application/json",
+    ) -> httpx.Response:
+        """Convenience method for POST requests.
+
+        Args:
+            url: Request URL
+            service: Service name for rate limiting
+            params: Query parameters
+            json_body: JSON body
+            accept: Accept header value
+
+        Returns:
+            httpx.Response object
+        """
+        return await self.request("POST", url, service=service, params=params, json_body=json_body, accept=accept)
+
+    async def close(self) -> None:
+        """Close the async HTTP client."""
+        if self._client is not None:
+            await self._client.aclose()
+            self._client = None
+
+    async def __aenter__(self) -> AsyncHttpClient:
+        """Enter async context manager."""
+        return self
+
+    async def __aexit__(self, *args: Any) -> None:
+        """Exit async context manager."""
+        await self.close()

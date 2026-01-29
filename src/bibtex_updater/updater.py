@@ -57,12 +57,17 @@ from bibtex_updater.utils import (
     DBLP_API_SEARCH,
     PREPRINT_HOSTS,
     S2_API,
+    # Async HTTP infrastructure
+    AsyncHttpClient,
     DiskCache,
     HttpClient,
     # Data classes
     PublishedRecord,
     # HTTP infrastructure
     RateLimiter,
+    # Resolution caching
+    ResolutionCache,
+    ResolutionCacheEntry,
     authors_last_names,
     # API converters
     crossref_message_to_record,
@@ -798,17 +803,22 @@ class Resolver:
     }
 
     def __init__(
-        self, http: HttpClient, logger: logging.Logger, scholarly_client: ScholarlyClient | None = None
+        self,
+        http: HttpClient,
+        logger: logging.Logger,
+        scholarly_client: ScholarlyClient | None = None,
+        resolution_cache: ResolutionCache | None = None,
     ) -> None:
         self.http = http
         self.logger = logger
         self.scholarly_client = scholarly_client
+        self.resolution_cache = resolution_cache
 
     # --- arXiv ---
     def arxiv_candidate_doi(self, arxiv_id: str) -> str | None:
         params = {"id_list": arxiv_id}
         try:
-            resp = self.http._request("GET", ARXIV_API, params=params, accept="application/atom+xml")
+            resp = self.http._request("GET", ARXIV_API, params=params, accept="application/atom+xml", service="arxiv")
             xml = resp.text
         except Exception as e:
             self.logger.debug("arXiv lookup failed for %s: %s", arxiv_id, e)
@@ -821,6 +831,64 @@ class Resolver:
             return doi_normalize(m.group(1))
         return None
 
+    def arxiv_batch_doi_lookup(self, arxiv_ids: list[str]) -> dict[str, str | None]:
+        """Fetch DOIs for multiple arXiv IDs in a single request (up to 100).
+
+        Args:
+            arxiv_ids: List of arXiv IDs to look up
+
+        Returns:
+            Dict mapping arXiv ID to DOI (or None if no DOI found)
+        """
+        if not arxiv_ids:
+            return {}
+
+        # arXiv API supports comma-separated IDs (max 100 per request)
+        params = {"id_list": ",".join(arxiv_ids[:100])}
+        try:
+            resp = self.http._request("GET", ARXIV_API, params=params, accept="application/atom+xml", service="arxiv")
+            xml = resp.text
+        except Exception as e:
+            self.logger.debug("arXiv batch lookup failed: %s", e)
+            return {}
+
+        results: dict[str, str | None] = {}
+
+        # Parse XML entries - each entry has an <id> tag with the arXiv URL
+        # and optionally a <arxiv:doi> or <doi> tag
+        entry_pattern = re.compile(r"<entry>(.*?)</entry>", re.DOTALL | re.IGNORECASE)
+        id_pattern = re.compile(r"<id>https?://arxiv\.org/abs/([^<]+)</id>", re.IGNORECASE)
+        doi_pattern = re.compile(r"<(?:arxiv:)?doi>([^<]+)</(?:arxiv:)?doi>", re.IGNORECASE)
+
+        for entry_match in entry_pattern.finditer(xml):
+            entry_xml = entry_match.group(1)
+
+            # Extract arXiv ID from the entry
+            id_match = id_pattern.search(entry_xml)
+            if not id_match:
+                continue
+
+            arxiv_id = id_match.group(1)
+            # Normalize arXiv ID (remove version suffix for matching)
+            arxiv_id_base = re.sub(r"v\d+$", "", arxiv_id)
+
+            # Extract DOI if present
+            doi_match = doi_pattern.search(entry_xml)
+            doi = doi_normalize(doi_match.group(1)) if doi_match else None
+
+            # Map both versioned and unversioned IDs
+            results[arxiv_id] = doi
+            if arxiv_id != arxiv_id_base:
+                results[arxiv_id_base] = doi
+
+        # Also map original input IDs to results
+        for input_id in arxiv_ids[:100]:
+            input_id_base = re.sub(r"v\d+$", "", input_id)
+            if input_id not in results and input_id_base in results:
+                results[input_id] = results[input_id_base]
+
+        return results
+
     # --- Crossref Works ---
     def crossref_get(self, doi: str) -> dict[str, Any] | None:
         doi = doi_normalize(doi) or ""
@@ -829,7 +897,7 @@ class Resolver:
         url = f"{CROSSREF_API}/{quote(doi, safe='')}"
         # url = f"{CROSSREF_API}/{httpx.utils.quote(doi, safe='')}"
         try:
-            resp = self.http._request("GET", url, accept="application/json")
+            resp = self.http._request("GET", url, accept="application/json", service="crossref")
             if resp.status_code != 200:
                 return None
             data = resp.json().get("message", {})
@@ -854,11 +922,66 @@ class Resolver:
             self.logger.debug("Crossref search failed '%s': %s", query, e)
             return []
 
+    def crossref_batch_lookup(self, dois: list[str]) -> dict[str, PublishedRecord | None]:
+        """Fetch multiple DOIs via Crossref filter query (up to 100).
+
+        Args:
+            dois: List of DOIs to look up
+
+        Returns:
+            Dict mapping DOI (lowercase) to PublishedRecord (or None if not found)
+        """
+        if not dois:
+            return {}
+
+        # Normalize DOIs and limit to 100
+        normalized_dois = [doi_normalize(d) for d in dois[:100] if doi_normalize(d)]
+        if not normalized_dois:
+            return {}
+
+        # Crossref supports filter with multiple DOIs
+        filter_str = ",".join(f"doi:{doi}" for doi in normalized_dois)
+        params: dict[str, Any] = {
+            "filter": filter_str,
+            "rows": 100,
+        }
+
+        try:
+            resp = self.http._request(
+                "GET",
+                CROSSREF_API,
+                params=params,
+                accept="application/json",
+                service="crossref",
+            )
+            if resp.status_code != 200:
+                self.logger.debug("Crossref batch lookup returned status %d", resp.status_code)
+                return {}
+            data = resp.json()
+        except Exception as e:
+            self.logger.debug("Crossref batch lookup failed: %s", e)
+            return {}
+
+        results: dict[str, PublishedRecord | None] = {}
+
+        for item in data.get("message", {}).get("items", []):
+            doi = doi_normalize(item.get("DOI"))
+            if doi:
+                record = crossref_message_to_record(item)
+                results[doi.lower()] = record
+
+        # Mark DOIs that weren't found as None
+        for doi in normalized_dois:
+            if doi.lower() not in results:
+                results[doi.lower()] = None
+
+        return results
+
     # --- DBLP ---
     def dblp_search(self, query: str, h: int = 25) -> list[dict[str, Any]]:
         params = {"q": query, "h": h, "format": "json"}
         try:
-            resp = self.http._request("GET", DBLP_API_SEARCH, params=params, accept="application/json")
+            resp = self.http._request("GET", DBLP_API_SEARCH, params=params, accept="application/json", service="dblp")
             if resp.status_code != 200:
                 return []
             data = resp.json()
@@ -880,7 +1003,9 @@ class Resolver:
         fields = "externalIds,doi,title,year,authors,venue,publicationTypes,publicationVenue,url"
         url = f"{S2_API}/paper/arXiv:{arxiv_id}"
         try:
-            resp = self.http._request("GET", url, params={"fields": fields}, accept="application/json")
+            resp = self.http._request(
+                "GET", url, params={"fields": fields}, accept="application/json", service="semanticscholar"
+            )
             if resp.status_code != 200:
                 return None
             msg = resp.json()
@@ -918,13 +1043,167 @@ class Resolver:
         params = {"query": query, "limit": limit, "fields": "title,authors,year,venue,publicationTypes,doi,url"}
         url = f"{S2_API}/paper/search"
         try:
-            resp = self.http._request("GET", url, params=params, accept="application/json")
+            resp = self.http._request("GET", url, params=params, accept="application/json", service="semanticscholar")
             if resp.status_code != 200:
                 return []
             return resp.json().get("data", []) or []
         except Exception as e:
             self.logger.debug("Semantic Scholar search failed '%s': %s", query, e)
             return []
+
+    def s2_batch_lookup(self, paper_ids: list[str]) -> dict[str, PublishedRecord | None]:
+        """Fetch papers via Semantic Scholar batch endpoint (up to 500 papers).
+
+        Args:
+            paper_ids: List of paper IDs (can be arXiv IDs like "arXiv:2301.00001",
+                      DOIs like "DOI:10.1234/...", or S2 paper IDs)
+
+        Returns:
+            Dict mapping input paper ID to PublishedRecord (or None if not found)
+        """
+        if not paper_ids:
+            return {}
+
+        S2_BATCH_URL = f"{S2_API}/paper/batch"
+        fields = "externalIds,doi,title,year,authors,venue,publicationTypes,publicationVenue,url,paperId"
+
+        try:
+            resp = self.http._request(
+                "POST",
+                S2_BATCH_URL,
+                json_body={"ids": paper_ids[:500]},
+                params={"fields": fields},
+                accept="application/json",
+                service="semanticscholar",
+            )
+            if resp.status_code != 200:
+                self.logger.debug("S2 batch lookup returned status %d", resp.status_code)
+                return {}
+            data = resp.json()
+        except Exception as e:
+            self.logger.debug("S2 batch lookup failed: %s", e)
+            return {}
+
+        results: dict[str, PublishedRecord | None] = {}
+
+        # Process results - S2 returns results in same order as input, with null for not found
+        for i, paper in enumerate(data):
+            if i >= len(paper_ids):
+                break
+
+            input_id = paper_ids[i]
+
+            if paper is None:
+                results[input_id] = None
+                continue
+
+            # Convert to PublishedRecord
+            doi = doi_normalize(paper.get("doi") or (paper.get("externalIds") or {}).get("DOI"))
+            pub_types = paper.get("publicationTypes") or []
+            is_journal = any(pt.lower() == "journalarticle" for pt in pub_types)
+
+            # Only include journal articles with DOIs
+            if not (doi and is_journal):
+                results[input_id] = None
+                continue
+
+            title = paper.get("title")
+            year = paper.get("year")
+            venue = (paper.get("publicationVenue") or {}).get("name") or paper.get("venue")
+            authors = [
+                {
+                    "given": (a.get("name") or "").split()[:-1] and " ".join((a.get("name") or "").split()[:-1]) or "",
+                    "family": (a.get("name") or "").split()[-1] if (a.get("name") or "").split() else "",
+                }
+                for a in (paper.get("authors") or [])
+            ]
+
+            record = PublishedRecord(
+                doi=doi,
+                url=doi_url(doi),
+                title=title,
+                authors=authors,
+                journal=venue,
+                year=year,
+                type="journal-article",
+                method="SemanticScholar(batch)",
+                confidence=0.95,
+            )
+            results[input_id] = record
+
+        return results
+
+    # --- Batch Pre-resolution ---
+    def batch_preload(
+        self, entries: list[dict[str, Any]], detections: list[PreprintDetection]
+    ) -> dict[str, dict[str, Any]]:
+        """Pre-fetch data for multiple entries using batch APIs.
+
+        This method performs batch lookups to reduce the number of API calls
+        when processing multiple preprint entries. It should be called before
+        individual entry processing.
+
+        Args:
+            entries: List of BibTeX entry dicts
+            detections: List of PreprintDetection results corresponding to entries
+
+        Returns:
+            Dict mapping entry keys to pre-fetched data:
+            {
+                "entry_key": {
+                    "s2_record": PublishedRecord | None,  # From S2 batch lookup
+                    "arxiv_doi": str | None,              # DOI from arXiv API
+                }
+            }
+        """
+        preloaded: dict[str, dict[str, Any]] = {}
+
+        # Collect arXiv IDs from preprint detections
+        arxiv_ids: list[str] = []
+        arxiv_entry_map: dict[str, str] = {}  # arxiv_id -> entry key
+
+        for entry, det in zip(entries, detections):
+            if det.is_preprint and det.arxiv_id:
+                entry_key = entry.get("ID", "")
+                if entry_key and det.arxiv_id not in arxiv_entry_map:
+                    arxiv_ids.append(det.arxiv_id)
+                    arxiv_entry_map[det.arxiv_id] = entry_key
+
+        if not arxiv_ids:
+            return preloaded
+
+        # Batch fetch from Semantic Scholar using arXiv IDs
+        s2_ids = [f"arXiv:{aid}" for aid in arxiv_ids]
+        self.logger.debug("Batch preload: fetching %d entries from Semantic Scholar", len(s2_ids))
+        s2_results = self.s2_batch_lookup(s2_ids)
+
+        for s2_id, record in s2_results.items():
+            # Extract arXiv ID from "arXiv:xxxx" format
+            arxiv_id = s2_id.replace("arXiv:", "") if s2_id.startswith("arXiv:") else s2_id
+            entry_key = arxiv_entry_map.get(arxiv_id)
+            if entry_key and record:
+                if entry_key not in preloaded:
+                    preloaded[entry_key] = {}
+                preloaded[entry_key]["s2_record"] = record
+
+        # Batch fetch DOIs from arXiv API
+        self.logger.debug("Batch preload: fetching %d DOIs from arXiv", len(arxiv_ids))
+        arxiv_dois = self.arxiv_batch_doi_lookup(arxiv_ids)
+
+        for arxiv_id, doi in arxiv_dois.items():
+            entry_key = arxiv_entry_map.get(arxiv_id)
+            if entry_key and doi:
+                if entry_key not in preloaded:
+                    preloaded[entry_key] = {}
+                preloaded[entry_key]["arxiv_doi"] = doi
+
+        self.logger.debug(
+            "Batch preload complete: %d entries with S2 records, %d with arXiv DOIs",
+            sum(1 for v in preloaded.values() if v.get("s2_record")),
+            sum(1 for v in preloaded.values() if v.get("arxiv_doi")),
+        )
+
+        return preloaded
 
     # --- Shared helpers ---
     @staticmethod
@@ -1014,6 +1293,70 @@ class Resolver:
         )
 
     def resolve(self, entry: dict[str, Any], detection: PreprintDetection) -> PublishedRecord | None:
+        # Check resolution cache first
+        if self.resolution_cache:
+            cached = self.resolution_cache.get(detection.arxiv_id, detection.doi)
+            if cached:
+                if cached.status == "no_match":
+                    self.logger.debug(
+                        "Resolution cache hit (no_match) for arxiv=%s, doi=%s",
+                        detection.arxiv_id,
+                        detection.doi,
+                    )
+                    return None
+                elif cached.status == "resolved" and cached.resolved_doi:
+                    self.logger.debug(
+                        "Resolution cache hit for arxiv=%s, doi=%s -> %s via %s",
+                        detection.arxiv_id,
+                        detection.doi,
+                        cached.resolved_doi,
+                        cached.method,
+                    )
+                    # Fetch the full record from Crossref using the cached DOI
+                    msg = self.crossref_get(cached.resolved_doi)
+                    if msg:
+                        rec = self._message_to_record(msg)
+                        if rec:
+                            rec.method = f"{cached.method}(cached)"
+                            rec.confidence = cached.confidence
+                            return rec
+
+        # Perform resolution and cache the result
+        result = self._resolve_uncached(entry, detection)
+
+        # Cache the result
+        if self.resolution_cache:
+            if result:
+                cache_entry = ResolutionCacheEntry(
+                    arxiv_id=detection.arxiv_id,
+                    preprint_doi=detection.doi,
+                    resolved_doi=result.doi,
+                    method=result.method,
+                    confidence=result.confidence,
+                    timestamp=time.time(),
+                    status="resolved",
+                    ttl_days=self.resolution_cache.ttl_days,
+                )
+                self.resolution_cache.set(cache_entry)
+                self.logger.debug(
+                    "Cached resolution: arxiv=%s, doi=%s -> %s via %s",
+                    detection.arxiv_id,
+                    detection.doi,
+                    result.doi,
+                    result.method,
+                )
+            else:
+                self.resolution_cache.set_no_match(detection.arxiv_id, detection.doi)
+                self.logger.debug(
+                    "Cached no_match: arxiv=%s, doi=%s",
+                    detection.arxiv_id,
+                    detection.doi,
+                )
+
+        return result
+
+    def _resolve_uncached(self, entry: dict[str, Any], detection: PreprintDetection) -> PublishedRecord | None:
+        """Internal resolution logic without caching."""
         # 1) arXiv -> DOI -> Crossref
         candidate_doi: str | None = None
         if detection.arxiv_id:
@@ -1213,6 +1556,494 @@ class Resolver:
         return None
 
 
+# ------------- Async Resolver -------------
+class AsyncResolver:
+    """Async resolver for bibliographic searches with parallel execution.
+
+    This class provides async versions of the Resolver methods, allowing
+    concurrent searches across multiple APIs (DBLP, Semantic Scholar, Crossref).
+    """
+
+    # Accepted publication types for upgrades (same as sync Resolver)
+    ACCEPTED_TYPES = {
+        "journal-article",
+        "proceedings-article",
+        "book-chapter",
+    }
+
+    ACCEPTED_S2_TYPES = {
+        "journalarticle",
+        "conference",
+    }
+
+    def __init__(
+        self,
+        http: AsyncHttpClient,
+        logger: logging.Logger,
+    ) -> None:
+        """Initialize the async resolver.
+
+        Args:
+            http: AsyncHttpClient instance for making HTTP requests
+            logger: Logger for debug/info messages
+        """
+
+        self.http: AsyncHttpClient = http
+        self.logger = logger
+
+    # --- Shared helpers (static, same as sync Resolver) ---
+    @staticmethod
+    def _message_to_record(msg: dict[str, Any]) -> PublishedRecord | None:
+        """Convert Crossref message to PublishedRecord."""
+        return crossref_message_to_record(msg)
+
+    @staticmethod
+    def _dblp_hit_to_record(hit: dict[str, Any]) -> PublishedRecord | None:
+        """Convert DBLP hit to PublishedRecord."""
+        return dblp_hit_to_record(hit)
+
+    @staticmethod
+    def _credible_journal_article(rec: PublishedRecord) -> bool:
+        """Check if a record is a credible journal article."""
+        if rec.type != "journal-article":
+            return False
+        if not rec.journal:
+            return False
+        j_lower = rec.journal.lower()
+        if any(host in j_lower for host in PREPRINT_HOSTS):
+            return False
+        if not rec.year:
+            return False
+        return bool(rec.volume or rec.number or rec.pages or rec.url)
+
+    @staticmethod
+    def _authors_to_bibtex_string(rec: PublishedRecord) -> str:
+        """Convert record authors to BibTeX author string."""
+        return Resolver._authors_to_bibtex_string(rec)
+
+    # --- Async API methods ---
+    async def arxiv_candidate_doi(self, arxiv_id: str) -> str | None:
+        """Fetch DOI from arXiv API for an arXiv ID.
+
+        Args:
+            arxiv_id: arXiv paper ID (e.g., '2301.00001')
+
+        Returns:
+            DOI if found, None otherwise
+        """
+        params = {"id_list": arxiv_id}
+        try:
+            resp = await self.http.get(
+                ARXIV_API,
+                service="arxiv",
+                params=params,
+                accept="application/atom+xml",
+            )
+            xml = resp.text
+        except Exception as e:
+            self.logger.debug("arXiv lookup failed for %s: %s", arxiv_id, e)
+            return None
+
+        m = re.search(r"<arxiv:doi>([^<]+)</arxiv:doi>", xml, flags=re.IGNORECASE)
+        if m:
+            return doi_normalize(m.group(1))
+        m = re.search(r"<doi>([^<]+)</doi>", xml, flags=re.IGNORECASE)
+        if m:
+            return doi_normalize(m.group(1))
+        return None
+
+    async def crossref_get(self, doi: str) -> dict[str, Any] | None:
+        """Fetch Crossref works data for a DOI.
+
+        Args:
+            doi: The DOI to look up
+
+        Returns:
+            Crossref works message dict if found, None otherwise
+        """
+        from urllib.parse import quote
+
+        doi = doi_normalize(doi) or ""
+        url = f"{CROSSREF_API}/{quote(doi, safe='')}"
+        try:
+            resp = await self.http.get(url, service="crossref", accept="application/json")
+            if resp.status_code != 200:
+                return None
+            data = resp.json().get("message", {})
+            return data
+        except Exception as e:
+            self.logger.debug("Crossref works failed for %s: %s", doi, e)
+            return None
+
+    async def crossref_search(
+        self,
+        query: str,
+        rows: int = 25,
+        filter_type: str | None = "journal-article",
+    ) -> list[dict[str, Any]]:
+        """Search Crossref by bibliographic query.
+
+        Args:
+            query: Bibliographic search query
+            rows: Maximum number of results
+            filter_type: Filter by document type (e.g., 'journal-article')
+
+        Returns:
+            List of Crossref work items
+        """
+        params: dict[str, Any] = {"query.bibliographic": query, "rows": rows}
+        if filter_type:
+            params["filter"] = f"type:{filter_type}"
+        try:
+            resp = await self.http.get(
+                CROSSREF_API,
+                service="crossref",
+                params=params,
+                accept="application/json",
+            )
+            if resp.status_code != 200:
+                return []
+            items = resp.json().get("message", {}).get("items", [])
+            return items
+        except Exception as e:
+            self.logger.debug("Crossref search failed '%s': %s", query, e)
+            return []
+
+    async def dblp_search(self, query: str, h: int = 25) -> list[dict[str, Any]]:
+        """Search DBLP by bibliographic query.
+
+        Args:
+            query: Bibliographic search query
+            h: Maximum number of results
+
+        Returns:
+            List of DBLP hit objects
+        """
+        params = {"q": query, "h": h, "format": "json"}
+        try:
+            resp = await self.http.get(
+                DBLP_API_SEARCH,
+                service="dblp",
+                params=params,
+                accept="application/json",
+            )
+            if resp.status_code != 200:
+                return []
+            data = resp.json()
+            hits = data.get("result", {}).get("hits", {}).get("hit", [])
+            if isinstance(hits, dict):
+                hits = [hits]
+            return hits
+        except Exception as e:
+            self.logger.debug("DBLP search failed '%s': %s", query, e)
+            return []
+
+    async def s2_search(self, query: str, limit: int = 20) -> list[dict[str, Any]]:
+        """Search Semantic Scholar by query.
+
+        Args:
+            query: Search query
+            limit: Maximum number of results
+
+        Returns:
+            List of Semantic Scholar paper data
+        """
+        params = {
+            "query": query,
+            "limit": limit,
+            "fields": "title,authors,year,venue,publicationTypes,doi,url",
+        }
+        url = f"{S2_API}/paper/search"
+        try:
+            resp = await self.http.get(
+                url,
+                service="semanticscholar",
+                params=params,
+                accept="application/json",
+            )
+            if resp.status_code != 200:
+                return []
+            return resp.json().get("data", []) or []
+        except Exception as e:
+            self.logger.debug("Semantic Scholar search failed '%s': %s", query, e)
+            return []
+
+    async def s2_from_arxiv(self, arxiv_id: str) -> PublishedRecord | None:
+        """Fetch published version info from Semantic Scholar using arXiv ID.
+
+        Args:
+            arxiv_id: arXiv paper ID
+
+        Returns:
+            PublishedRecord if a journal article is found, None otherwise
+        """
+        fields = "externalIds,doi,title,year,authors,venue,publicationTypes,publicationVenue,url"
+        url = f"{S2_API}/paper/arXiv:{arxiv_id}"
+        try:
+            resp = await self.http.get(
+                url,
+                service="semanticscholar",
+                params={"fields": fields},
+                accept="application/json",
+            )
+            if resp.status_code != 200:
+                return None
+            msg = resp.json()
+        except Exception as e:
+            self.logger.debug("Semantic Scholar arXiv lookup failed for %s: %s", arxiv_id, e)
+            return None
+
+        doi = doi_normalize(msg.get("doi") or (msg.get("externalIds") or {}).get("DOI"))
+        pub_types = msg.get("publicationTypes") or []
+        is_journal = any(pt.lower() == "journalarticle" for pt in pub_types)
+        if not (doi and is_journal):
+            return None
+
+        title = msg.get("title")
+        year = msg.get("year")
+        venue = (msg.get("publicationVenue") or {}).get("name") or msg.get("venue")
+        authors = [
+            {
+                "given": (a.get("name") or "").split()[:-1] and " ".join((a.get("name") or "").split()[:-1]) or "",
+                "family": (a.get("name") or "").split()[-1] if (a.get("name") or "").split() else "",
+            }
+            for a in (msg.get("authors") or [])
+        ]
+        return PublishedRecord(
+            doi=doi,
+            url=doi_url(doi),
+            title=title,
+            authors=authors,
+            journal=venue,
+            year=year,
+            type="journal-article",
+            method="SemanticScholar(arXiv)",
+            confidence=0.95,
+        )
+
+    # --- Parallel search ---
+    async def parallel_bibliographic_search(
+        self,
+        title: str,
+        authors: list[str],
+    ) -> PublishedRecord | None:
+        """Run DBLP, Semantic Scholar, and Crossref searches in parallel.
+
+        This method executes bibliographic searches against all three APIs
+        concurrently, then returns the highest confidence result that passes
+        the matching threshold.
+
+        Args:
+            title: Normalized title for matching
+            authors: List of author last names for matching
+
+        Returns:
+            Best matching PublishedRecord, or None if no good match found
+        """
+        import asyncio
+
+        if not title:
+            return None
+
+        query = f"{title} {authors[0] if authors else ''}".strip()
+        title_norm = title
+
+        async def dblp_search_task() -> list[tuple[float, PublishedRecord]]:
+            """Search DBLP and score results."""
+            candidates: list[tuple[float, PublishedRecord]] = []
+            try:
+                hits = await self.dblp_search(query, h=30)
+                for hit in hits:
+                    rec = self._dblp_hit_to_record(hit)
+                    if not rec:
+                        continue
+                    tb = normalize_title_for_match(rec.title or "")
+                    title_score = token_sort_ratio(title_norm, tb)
+                    blns = [strip_diacritics(a.get("family") or "").lower() for a in rec.authors][:3]
+                    auth_score = jaccard_similarity(authors[:3], blns)
+                    combined = 0.7 * (title_score / 100.0) + 0.3 * auth_score
+                    if combined >= 0.9 and self._credible_journal_article(rec):
+                        rec.method = "DBLP(search,parallel)"
+                        rec.confidence = combined
+                        candidates.append((combined, rec))
+            except Exception as e:
+                self.logger.debug("DBLP parallel search failed: %s", e)
+            return candidates
+
+        async def s2_search_task() -> list[tuple[float, PublishedRecord]]:
+            """Search Semantic Scholar and score results."""
+            candidates: list[tuple[float, PublishedRecord]] = []
+            try:
+                data = await self.s2_search(query, limit=25)
+                for item in data:
+                    doi = doi_normalize(item.get("doi"))
+                    pub_types = item.get("publicationTypes") or []
+                    is_journal = any(pt.lower() == "journalarticle" for pt in pub_types)
+                    if not (doi and is_journal):
+                        continue
+                    rec = PublishedRecord(
+                        doi=doi,
+                        url=doi_url(doi),
+                        title=item.get("title"),
+                        authors=[
+                            {
+                                "given": n.split()[:-1] and " ".join(n.split()[:-1]) or "",
+                                "family": (n.split()[-1] if n.split() else ""),
+                            }
+                            for n in [a.get("name", "") for a in (item.get("authors") or [])]
+                        ],
+                        journal=item.get("venue"),
+                        year=item.get("year"),
+                        type="journal-article",
+                    )
+                    tb = normalize_title_for_match(rec.title or "")
+                    title_score = token_sort_ratio(title_norm, tb)
+                    blns = [strip_diacritics(a.get("family") or "").lower() for a in rec.authors][:3]
+                    auth_score = jaccard_similarity(authors[:3], blns)
+                    combined = 0.7 * (title_score / 100.0) + 0.3 * auth_score
+                    if combined >= 0.9 and self._credible_journal_article(rec):
+                        rec.method = "SemanticScholar(search,parallel)"
+                        rec.confidence = combined
+                        candidates.append((combined, rec))
+            except Exception as e:
+                self.logger.debug("S2 parallel search failed: %s", e)
+            return candidates
+
+        async def crossref_search_task() -> list[tuple[float, PublishedRecord]]:
+            """Search Crossref and score results."""
+            candidates: list[tuple[float, PublishedRecord]] = []
+            try:
+                items = await self.crossref_search(query, rows=30, filter_type="journal-article")
+                for item in items:
+                    rec = self._message_to_record(item)
+                    if not rec or rec.type != "journal-article":
+                        continue
+                    tb = normalize_title_for_match(rec.title or "")
+                    title_score = token_sort_ratio(title_norm, tb)
+                    blns = [strip_diacritics(a.get("family") or "").lower() for a in rec.authors][:3]
+                    auth_score = jaccard_similarity(authors[:3], blns)
+                    combined = 0.7 * (title_score / 100.0) + 0.3 * auth_score
+                    if combined >= 0.9 and self._credible_journal_article(rec):
+                        rec.method = "Crossref(search,parallel)"
+                        rec.confidence = combined
+                        candidates.append((combined, rec))
+            except Exception as e:
+                self.logger.debug("Crossref parallel search failed: %s", e)
+            return candidates
+
+        # Run all searches concurrently
+        results = await asyncio.gather(
+            dblp_search_task(),
+            s2_search_task(),
+            crossref_search_task(),
+            return_exceptions=True,
+        )
+
+        # Collect all valid candidates from all sources
+        all_candidates: list[tuple[float, PublishedRecord]] = []
+        for result in results:
+            if isinstance(result, list):
+                all_candidates.extend(result)
+            elif isinstance(result, Exception):
+                self.logger.debug("Search task raised exception: %s", result)
+
+        if not all_candidates:
+            return None
+
+        # Sort by (confidence, metadata completeness) and return best
+        all_candidates.sort(
+            key=lambda x: (
+                x[0],
+                int(bool(x[1].pages)) + int(bool(x[1].volume)) + int(bool(x[1].number)),
+            ),
+            reverse=True,
+        )
+        return all_candidates[0][1]
+
+    async def resolve(
+        self,
+        entry: dict[str, Any],
+        detection: PreprintDetection,
+    ) -> PublishedRecord | None:
+        """Async resolve a preprint entry to its published version.
+
+        Uses a multi-stage resolution strategy:
+        1. Semantic Scholar arXiv lookup (if arXiv ID present)
+        2. arXiv API -> DOI -> Crossref lookup
+        3. Crossref relations (is-preprint-of)
+        4. Parallel bibliographic search (DBLP, S2, Crossref)
+        5. Relaxed Crossref search fallback
+
+        Args:
+            entry: BibTeX entry dict
+            detection: PreprintDetection result
+
+        Returns:
+            PublishedRecord if found, None otherwise
+        """
+        # 1) arXiv -> DOI -> Crossref
+        candidate_doi: str | None = None
+        if detection.arxiv_id:
+            # Semantic Scholar first (direct arXiv mapping is strong)
+            s2 = await self.s2_from_arxiv(detection.arxiv_id)
+            if s2 and self._credible_journal_article(s2):
+                return s2
+
+            candidate_doi = await self.arxiv_candidate_doi(detection.arxiv_id)
+            if candidate_doi:
+                msg = await self.crossref_get(candidate_doi)
+                if msg:
+                    rec = self._message_to_record(msg)
+                    if rec and rec.type == "journal-article" and self._credible_journal_article(rec):
+                        rec.method = "arXiv->Crossref(works)"
+                        rec.confidence = 1.0
+                        return rec
+                    # Check relations
+                    rel = msg.get("relation") or {}
+                    pre_of = rel.get("is-preprint-of") or []
+                    for node in pre_of:
+                        if node.get("id-type") == "doi" and node.get("id"):
+                            pub_doi = doi_normalize(node["id"])
+                            pub_msg = await self.crossref_get(pub_doi)
+                            rec2 = self._message_to_record(pub_msg or {})
+                            if rec2 and self._credible_journal_article(rec2):
+                                rec2.method = "arXiv->Crossref(relation)"
+                                rec2.confidence = 1.0
+                                return rec2
+
+        # 2) Crossref by DOI (preprint DOI or candidate)
+        for d in filter(None, (detection.doi, candidate_doi)):
+            msg = await self.crossref_get(d)
+            if msg:
+                rel = msg.get("relation") or {}
+                pre_of = rel.get("is-preprint-of") or []
+                for node in pre_of:
+                    if node.get("id-type") == "doi" and node.get("id"):
+                        pub_doi = doi_normalize(node["id"])
+                        pub_msg = await self.crossref_get(pub_doi)
+                        rec2 = self._message_to_record(pub_msg or {})
+                        if rec2 and self._credible_journal_article(rec2):
+                            rec2.method = "Crossref(relation)"
+                            rec2.confidence = 1.0
+                            return rec2
+                rec0 = self._message_to_record(msg)
+                if rec0 and self._credible_journal_article(rec0):
+                    rec0.method = "Crossref(works)"
+                    rec0.confidence = 1.0
+                    return rec0
+
+        # 3) Parallel bibliographic search (DBLP, S2, Crossref)
+        title = entry.get("title") or ""
+        title_norm = normalize_title_for_match(title)
+        if title_norm:
+            authors_ref = authors_last_names(entry.get("author", ""))
+            rec = await self.parallel_bibliographic_search(title_norm, authors_ref)
+            if rec:
+                return rec
+
+        return None
+
+
 # ------------- Updater -------------
 class Updater:
     PREPRINT_ONLY_FIELDS = {
@@ -1387,9 +2218,253 @@ class ProcessResult:
     message: str | None = None
 
 
+# ------------- Entry Prioritization -------------
+def prioritize_entries(
+    entries: list[dict[str, Any]], detector: Detector
+) -> list[tuple[int, dict[str, Any], PreprintDetection]]:
+    """Sort entries by resolution likelihood for optimal processing order.
+
+    Prioritizes entries based on available identifiers:
+    - Priority 4: Both arXiv ID and DOI available (best case)
+    - Priority 3: arXiv ID only (S2 direct match likely)
+    - Priority 2: DOI only (Crossref direct match likely)
+    - Priority 1: Bibliographic search only (slowest)
+
+    Args:
+        entries: List of BibTeX entry dicts
+        detector: Detector instance for preprint detection
+
+    Returns:
+        List of (priority, entry, detection) tuples sorted by priority descending.
+        Higher priority = more likely to resolve quickly.
+    """
+    prioritized: list[tuple[int, dict[str, Any], PreprintDetection]] = []
+
+    for entry in entries:
+        det = detector.detect(entry)
+        if not det.is_preprint:
+            continue  # Skip non-preprints
+
+        # Assign priority based on available identifiers
+        if det.arxiv_id and det.doi:
+            priority = 4  # Best case: both IDs available
+        elif det.arxiv_id:
+            priority = 3  # arXiv ID -> S2 direct match likely
+        elif det.doi:
+            priority = 2  # DOI -> Crossref direct match likely
+        else:
+            priority = 1  # Bibliographic search only (slowest)
+
+        prioritized.append((priority, entry, det))
+
+    # Sort by priority descending (highest priority first)
+    prioritized.sort(key=lambda x: x[0], reverse=True)
+    return prioritized
+
+
+def process_entry_with_preload(
+    entry: dict[str, Any],
+    detection: PreprintDetection,
+    preload_data: dict[str, Any],
+    resolver: Resolver,
+    updater: Updater,
+    logger: logging.Logger,
+) -> ProcessResult:
+    """Process single entry using pre-loaded data when available.
+
+    Args:
+        entry: BibTeX entry dict
+        detection: PreprintDetection result for this entry
+        preload_data: Pre-loaded API data (e.g., {'s2_record': PublishedRecord})
+        resolver: Resolver instance
+        updater: Updater instance
+        logger: Logger instance
+
+    Returns:
+        ProcessResult with the processing outcome
+    """
+    # Check for pre-loaded S2 result
+    if "s2_record" in preload_data:
+        record = preload_data["s2_record"]
+        if record and resolver._credible_journal_article(record):
+            new_entry = updater.update_entry(entry, record, detection)
+            changed = json.dumps(entry, sort_keys=True) != json.dumps(new_entry, sort_keys=True)
+            return ProcessResult(
+                original=entry,
+                updated=new_entry,
+                changed=changed,
+                action="upgraded",
+                method="batch:S2",
+                confidence=record.confidence,
+            )
+
+    # Fall back to regular resolution
+    record = resolver.resolve(entry, detection)
+    if not record:
+        return ProcessResult(
+            original=entry,
+            updated=entry,
+            changed=False,
+            action="failed",
+            message="No reliable published match found",
+        )
+
+    if record.type != "journal-article":
+        return ProcessResult(
+            original=entry,
+            updated=entry,
+            changed=False,
+            action="failed",
+            message="Candidate not a journal-article",
+        )
+
+    if not resolver._credible_journal_article(record):
+        return ProcessResult(
+            original=entry,
+            updated=entry,
+            changed=False,
+            action="failed",
+            message="Candidate lacks sufficient metadata",
+        )
+
+    new_entry = updater.update_entry(entry, record, detection)
+    changed = json.dumps(entry, sort_keys=True) != json.dumps(new_entry, sort_keys=True)
+    return ProcessResult(
+        original=entry,
+        updated=new_entry,
+        changed=changed,
+        action="upgraded",
+        method=record.method,
+        confidence=record.confidence,
+    )
+
+
+def process_entries_optimized(
+    entries: list[dict[str, Any]],
+    detector: Detector,
+    resolver: Resolver,
+    updater: Updater,
+    logger: logging.Logger,
+    max_workers: int = 8,
+) -> list[ProcessResult]:
+    """Process entries with prioritization and batch optimization.
+
+    Processing pipeline:
+    1. Detect and prioritize all entries by resolution likelihood
+    2. Batch pre-load data for high-priority entries (if resolver supports it)
+    3. Process entries in priority order with concurrent execution
+
+    Args:
+        entries: List of BibTeX entry dicts
+        detector: Detector instance for preprint detection
+        resolver: Resolver instance for finding published versions
+        updater: Updater instance for applying updates
+        logger: Logger instance
+        max_workers: Maximum concurrent workers (default 8)
+
+    Returns:
+        List of ProcessResult for all entries (including unchanged non-preprints)
+    """
+    # Build a map from entry to its original index for result ordering
+    entry_to_idx = {id(e): i for i, e in enumerate(entries)}
+
+    # Phase 1: Detect and prioritize preprints
+    prioritized = prioritize_entries(entries, detector)
+
+    if not prioritized:
+        # No preprints found, return unchanged results for all entries
+        return [ProcessResult(original=e, updated=e, changed=False, action="unchanged") for e in entries]
+
+    # Extract entries and detections in priority order
+    entries_sorted = [item[1] for item in prioritized]
+    detections = [item[2] for item in prioritized]
+
+    # Phase 2: Batch pre-load (if resolver supports it)
+    preloaded: dict[str, dict[str, Any]] = {}
+    if hasattr(resolver, "batch_preload"):
+        try:
+            preloaded = resolver.batch_preload(entries_sorted, detections)
+            logger.debug("Batch pre-loaded data for %d entries", len(preloaded))
+        except Exception as e:
+            logger.warning("Batch pre-load failed: %s", e)
+            preloaded = {}
+
+    # Phase 3: Process entries with pre-loaded data
+    preprint_results: dict[int, ProcessResult] = {}  # Map original index to result
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
+        future_to_entry: dict[concurrent.futures.Future, tuple[dict[str, Any], PreprintDetection]] = {}
+
+        for entry, det in zip(entries_sorted, detections):
+            entry_key = entry.get("ID", "")
+            preload_data = preloaded.get(entry_key, {})
+            future = ex.submit(
+                process_entry_with_preload,
+                entry,
+                det,
+                preload_data,
+                resolver,
+                updater,
+                logger,
+            )
+            future_to_entry[future] = (entry, det)
+
+        for future in concurrent.futures.as_completed(future_to_entry):
+            entry, _ = future_to_entry[future]
+            original_idx = entry_to_idx[id(entry)]
+            try:
+                result = future.result()
+                preprint_results[original_idx] = result
+            except Exception as e:
+                logger.error("Processing failed for %s: %s", entry.get("ID", "unknown"), e)
+                preprint_results[original_idx] = ProcessResult(
+                    original=entry,
+                    updated=entry,
+                    changed=False,
+                    action="failed",
+                    message=str(e),
+                )
+
+    # Build final results in original entry order
+    results: list[ProcessResult] = []
+    preprint_ids = {id(item[1]) for item in prioritized}
+
+    for i, entry in enumerate(entries):
+        if i in preprint_results:
+            results.append(preprint_results[i])
+        elif id(entry) in preprint_ids:
+            # This shouldn't happen, but handle gracefully
+            results.append(
+                ProcessResult(
+                    original=entry,
+                    updated=entry,
+                    changed=False,
+                    action="failed",
+                    message="Processing result lost",
+                )
+            )
+        else:
+            # Non-preprint entry
+            results.append(ProcessResult(original=entry, updated=entry, changed=False, action="unchanged"))
+
+    return results
+
+
 def process_entry(
     entry: dict[str, Any], detector: Detector, resolver: Resolver, updater: Updater, logger: logging.Logger
 ) -> ProcessResult:
+    """Process a single entry for preprint resolution (original non-optimized version).
+
+    Args:
+        entry: BibTeX entry dict
+        detector: Detector instance for preprint detection
+        resolver: Resolver instance for finding published versions
+        updater: Updater instance for applying updates
+        logger: Logger instance
+
+    Returns:
+        ProcessResult with the processing outcome
+    """
     det = detector.detect(entry)
     if not det.is_preprint:
         return ProcessResult(original=entry, updated=entry, changed=False, action="unchanged")
@@ -1437,9 +2512,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--dedupe", action="store_true", help="Merge duplicates by DOI or normalized title+authors")
     p.add_argument("--dry-run", action="store_true", help="Preview changes without writing files")
     p.add_argument("--report", help="Write JSONL report mapping original→updated")
-    p.add_argument("--cache", default=".cache.replace_preprints.json", help="On-disk cache file")
+    p.add_argument("--cache", default=".cache.replace_preprints.json", help="On-disk cache file for API responses")
+    p.add_argument(
+        "--resolution-cache",
+        default=".cache.resolution.json",
+        help="On-disk cache file for resolution results (default: .cache.resolution.json)",
+    )
+    p.add_argument(
+        "--resolution-cache-ttl",
+        type=int,
+        default=30,
+        help="TTL in days for resolution cache entries (default: 30)",
+    )
     p.add_argument("--rate-limit", type=int, default=45, help="Requests per minute (default 45)")
-    p.add_argument("--max-workers", type=int, default=4, help="Max concurrent workers")
+    p.add_argument("--max-workers", type=int, default=8, help="Max concurrent workers")
     p.add_argument("--timeout", type=float, default=20.0, help="HTTP timeout seconds")
     p.add_argument("--verbose", action="store_true", help="Verbose logging")
 
@@ -1643,6 +2729,9 @@ def main(argv: list[str] | None = None) -> int:
 
     rate_limiter = RateLimiter(args.rate_limit)
     cache = DiskCache(args.cache) if args.cache else DiskCache(None)
+    resolution_cache = (
+        ResolutionCache(args.resolution_cache, ttl_days=args.resolution_cache_ttl) if args.resolution_cache else None
+    )
     user_agent = "bib-preprint-upgrader/1.1 (mailto:you@example.com)"
     http = HttpClient(
         timeout=args.timeout, user_agent=user_agent, rate_limiter=rate_limiter, cache=cache, verbose=args.verbose
@@ -1664,7 +2753,7 @@ def main(argv: list[str] | None = None) -> int:
             logger.warning("Google Scholar fallback requested but scholarly package not available")
             scholarly_client = None
 
-    resolver = Resolver(http=http, logger=logger, scholarly_client=scholarly_client)
+    resolver = Resolver(http=http, logger=logger, scholarly_client=scholarly_client, resolution_cache=resolution_cache)
     detector = Detector()
     updater = Updater(keep_preprint_note=args.keep_preprint_note, rekey=args.rekey)
 
