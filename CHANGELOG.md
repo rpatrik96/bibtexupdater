@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Per-service rate limiting via `RateLimiterRegistry` for optimized API throughput
+- Semantic resolution caching via `ResolutionCache` with configurable TTL
+- Negative result caching to avoid re-querying known failures
+- Batch API support for faster bulk lookups:
+  - arXiv: up to 100 IDs per request
+  - Semantic Scholar: up to 500 papers via batch endpoint
+  - Crossref: filter queries for multiple DOIs
+- Async HTTP client (`AsyncHttpClient`) for parallel operations
+- Parallel bibliographic search via `AsyncResolver`
+- Entry prioritization (`prioritize_entries`) for confidence-based ordering
+- Adaptive rate limiting based on API response headers
+- New CLI arguments: `--resolution-cache`, `--resolution-cache-ttl`
+
+### Changed
+- Default max workers increased from 4 to 8 for better I/O overlap
+- Refactored `_resolve_uncached` into 6 modular stage methods (CC: 85 → 8)
+- Refactored `main()` into composable helper functions (CC: 74 → 4)
+
+### Improved
+- Test coverage: 341 → 360 tests (+19 new tests for stage methods)
+- CI/CD: Added Codecov coverage reporting
+
 ## [0.1.0] - 2025-01-25
 
 ### Added
