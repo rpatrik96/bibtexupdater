@@ -1282,6 +1282,29 @@ class Resolver:
             except (ValueError, TypeError):
                 pass
 
+        # Determine if this is a conference paper based on venue or entry type
+        venue_lower = safe_lower(venue) if venue else ""
+        entry_type = safe_lower(bib.get("ENTRYTYPE", ""))
+        is_conference = (
+            entry_type == "inproceedings"
+            or "conference" in venue_lower
+            or "proceedings" in venue_lower
+            or "advances in neural" in venue_lower  # NeurIPS
+            or "international conference" in venue_lower
+            or "icml" in venue_lower
+            or "iclr" in venue_lower
+            or "neurips" in venue_lower
+            or "nips" in venue_lower
+            or "aaai" in venue_lower
+            or "cvpr" in venue_lower
+            or "iccv" in venue_lower
+            or "eccv" in venue_lower
+            or "acl" in venue_lower
+            or "emnlp" in venue_lower
+            or "naacl" in venue_lower
+        )
+        record_type = "proceedings-article" if is_conference else ("journal-article" if venue else "unknown")
+
         return PublishedRecord(
             doi=doi,
             url=pub.get("pub_url"),
@@ -1292,7 +1315,7 @@ class Resolver:
             volume=bib.get("volume"),
             number=bib.get("number"),
             pages=bib.get("pages"),
-            type="journal-article" if venue else "unknown",
+            type=record_type,
             method="GoogleScholar(search)",
             confidence=0.0,
         )
