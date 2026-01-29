@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-01-29
+
+### Added
+- UV-enabled wrapper script (`scripts/bibtex-x`) for running without venv management (#16)
+- Conference paper support: NeurIPS, ICML, ICLR, AAAI, CVPR, etc. now resolve correctly (#19)
+
+### Fixed
+- Cross-device link error when output file is on different filesystem (#17)
+- Field ordering now consistent (author, title, booktitle, journal, year, etc.) (#18)
+- DBLP conference papers (`proceedings-article`) now accepted instead of filtered out (#19)
+- Semantic Scholar type normalization (`Conference` → `proceedings-article`) (#19)
+- Filter out CoRR (arXiv journal name in DBLP) from results (#19)
+- Google Scholar conference venue detection for ML conferences (#19)
+
+## [0.1.0+] - Unreleased improvements
+
 ### Added
 - Per-service rate limiting via `RateLimiterRegistry` for optimized API throughput
 - Semantic resolution caching via `ResolutionCache` with configurable TTL
@@ -61,5 +77,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Comprehensive test suite with pytest fixtures
 - MIT License
 
-[Unreleased]: https://github.com/rpatrik96/bibtexupdater/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/rpatrik96/bibtexupdater/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/rpatrik96/bibtexupdater/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/rpatrik96/bibtexupdater/releases/tag/v0.1.0
