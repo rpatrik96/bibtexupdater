@@ -769,9 +769,9 @@ def dblp_hit_to_record(hit: dict[str, Any]) -> PublishedRecord | None:
     pages = info.get("pages")
     typ = safe_lower(info.get("type"))
 
-    # Reject preprint venues
+    # Reject preprint venues (CoRR is arXiv's journal name in DBLP)
     venue_lower = safe_lower(venue) if venue else ""
-    if re.search(r"arxiv|biorxiv|medrxiv", venue_lower):
+    if re.search(r"arxiv|biorxiv|medrxiv|^corr$", venue_lower):
         return None
     if not venue or not year:
         return None
