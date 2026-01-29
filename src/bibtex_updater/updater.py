@@ -1356,204 +1356,463 @@ class Resolver:
         return result
 
     def _resolve_uncached(self, entry: dict[str, Any], detection: PreprintDetection) -> PublishedRecord | None:
-        """Internal resolution logic without caching."""
-        # 1) arXiv -> DOI -> Crossref
-        candidate_doi: str | None = None
-        if detection.arxiv_id:
-            # Semantic Scholar first (direct arXiv mapping is strong)
-            s2 = self.s2_from_arxiv(detection.arxiv_id)
-            if s2 and self._credible_journal_article(s2):
-                return s2
-            candidate_doi = self.arxiv_candidate_doi(detection.arxiv_id)
-            if candidate_doi:
-                msg = self.crossref_get(candidate_doi)
-                if msg:
-                    rec = self._message_to_record(msg)
-                    if rec and rec.type == "journal-article" and self._credible_journal_article(rec):
-                        rec.method = "arXiv->Crossref(works)"
-                        rec.confidence = 1.0
-                        return rec
-                    rel = msg.get("relation") or {}
-                    pre_of = rel.get("is-preprint-of") or []
-                    for node in pre_of:
-                        if node.get("id-type") == "doi" and node.get("id"):
-                            pub_doi = doi_normalize(node["id"])
-                            pub_msg = self.crossref_get(pub_doi)
-                            rec2 = self._message_to_record(pub_msg or {})
-                            if rec2 and self._credible_journal_article(rec2):
-                                rec2.method = "arXiv->Crossref(relation)"
-                                rec2.confidence = 1.0
-                                return rec2
+        """Internal resolution logic without caching.
 
-        # 2) Crossref by DOI (preprint DOI or candidate)
-        for d in filter(None, (detection.doi, candidate_doi)):
-            msg = self.crossref_get(d)
-            if msg:
-                rel = msg.get("relation") or {}
-                pre_of = rel.get("is-preprint-of") or []
-                for node in pre_of:
-                    if node.get("id-type") == "doi" and node.get("id"):
-                        pub_doi = doi_normalize(node["id"])
-                        pub_msg = self.crossref_get(pub_doi)
-                        rec2 = self._message_to_record(pub_msg or {})
-                        if rec2 and self._credible_journal_article(rec2):
-                            rec2.method = "Crossref(relation)"
-                            rec2.confidence = 1.0
-                            return rec2
-                rec0 = self._message_to_record(msg)
-                if rec0 and self._credible_journal_article(rec0):
-                    rec0.method = "Crossref(works)"
-                    rec0.confidence = 1.0
-                    return rec0
-
-        # 3) DBLP bibliographic search
+        Orchestrates a 6-stage resolution pipeline, returning early if any stage succeeds:
+        1. Direct lookup: arXiv -> Semantic Scholar / Crossref
+        2. Crossref relations: is-preprint-of links
+        3. DBLP bibliographic search
+        4. Semantic Scholar search
+        5. Crossref bibliographic search
+        6. Google Scholar fallback (opt-in)
+        """
+        # Normalize title once for stages 3-6
         title = entry.get("title") or ""
         title_norm = normalize_title_for_match(title)
-        if title_norm:
-            first_author = first_author_surname(entry)
-            dblp_query = f"{title_norm} {first_author}".strip()
-            hits = self.dblp_search(dblp_query, h=30)
-            if hits:
-                authors_ref = authors_last_names(entry.get("author", ""))
-                ta = title_norm
-                best: tuple[float, PublishedRecord] | None = None
-                for h in hits:
-                    rec = self._dblp_hit_to_record(h)
-                    if not rec:
-                        continue
-                    tb = normalize_title_for_match(rec.title or "")
-                    title_score = token_sort_ratio(ta, tb)  # 0..100
-                    blns = [strip_diacritics(a.get("family") or "").lower() for a in rec.authors][:3]
-                    auth_score = jaccard_similarity(authors_ref[:3], blns)
-                    combined = 0.7 * (title_score / 100.0) + 0.3 * auth_score
-                    if combined >= 0.9 and self._credible_journal_article(rec):
-                        rec.method = "DBLP(search)"
-                        rec.confidence = combined
-                        if (
-                            (best is None)
-                            or (combined > best[0])
-                            or (
-                                combined == best[0]
-                                and (int(bool(rec.pages)) + int(bool(rec.volume)) + int(bool(rec.number)))
-                                > (int(bool(best[1].pages)) + int(bool(best[1].volume)) + int(bool(best[1].number)))
-                            )
-                        ):
-                            best = (combined, rec)
-                if best:
-                    # If DBLP lacks DOI but we have URL, try to resolve Crossref by DOI when present
-                    if not best[1].doi and best[1].url:
-                        # nothing to add — keep URL
-                        pass
-                    return best[1]
 
-        # 4) Semantic Scholar search
-        if title_norm:
-            first_author = first_author_surname(entry)
-            s2_query = f"{title_norm} {first_author}".strip()
-            data = self.s2_search(s2_query, limit=25)
-            if data:
-                authors_ref = authors_last_names(entry.get("author", ""))
-                ta = title_norm
-                candidates: list[tuple[float, PublishedRecord]] = []
-                for item in data:
-                    doi = doi_normalize(item.get("doi"))
-                    pub_types = item.get("publicationTypes") or []
-                    is_journal = any(pt.lower() == "journalarticle" for pt in pub_types)
-                    if not (doi and is_journal):
-                        continue
-                    rec = PublishedRecord(
-                        doi=doi,
-                        url=doi_url(doi),
-                        title=item.get("title"),
-                        authors=[
-                            {
-                                "given": n.split()[:-1] and " ".join(n.split()[:-1]) or "",
-                                "family": (n.split()[-1] if n.split() else ""),
-                            }
-                            for n in [a.get("name", "") for a in (item.get("authors") or [])]
-                        ],
-                        journal=item.get("venue"),
-                        year=item.get("year"),
-                        type="journal-article",
-                    )
-                    tb = normalize_title_for_match(rec.title or "")
-                    title_score = token_sort_ratio(ta, tb)
-                    blns = [strip_diacritics(a.get("family") or "").lower() for a in rec.authors][:3]
-                    auth_score = jaccard_similarity(authors_ref[:3], blns)
-                    combined = 0.7 * (title_score / 100.0) + 0.3 * auth_score
-                    if combined >= 0.9 and self._credible_journal_article(rec):
-                        rec.method = "SemanticScholar(search)"
-                        rec.confidence = combined
-                        candidates.append((combined, rec))
-                if candidates:
-                    candidates.sort(
-                        key=lambda x: (x[0], int(bool(x[1].pages)) + int(bool(x[1].volume)) + int(bool(x[1].number))),
-                        reverse=True,
-                    )
-                    return candidates[0][1]
+        # Stage 1: Direct lookup (arXiv -> S2 -> Crossref)
+        result, candidate_doi = self._stage1_direct_lookup(detection)
+        if result:
+            return result
 
-        # 5) Crossref bibliographic search (final fallback)
-        if title_norm:
-            first_author = first_author_surname(entry)
-            query = f"{title_norm} {first_author}".strip()
-            items = self.crossref_search(query, rows=30, filter_type="journal-article")
-            if items:
-                title_a = title_norm
-                authors_a = authors_last_names(entry.get("author", ""))
+        # Stage 2: Crossref relations (is-preprint-of)
+        result = self._stage2_crossref_relations(detection, candidate_doi)
+        if result:
+            return result
 
-                def score_item(msg: dict[str, Any]) -> tuple[float, PublishedRecord]:
-                    rec = self._message_to_record(msg)
-                    if not rec or rec.type != "journal-article":
-                        return (0.0, PublishedRecord(doi=""))
-                    t = normalize_title_for_match(rec.title or "")
-                    title_score = token_sort_ratio(title_a, t)
-                    blns = [strip_diacritics(a.get("family") or "").lower() for a in rec.authors][:3]
-                    auth_score = jaccard_similarity(authors_a[:3], blns[:3])
-                    combined = 0.7 * (title_score / 100.0) + 0.3 * auth_score
-                    return (combined, rec)
+        # Stage 3: DBLP bibliographic search
+        result = self._stage3_dblp_search(entry, title_norm)
+        if result:
+            return result
 
-                candidates: list[tuple[float, PublishedRecord]] = [score_item(it) for it in items]
-                passing = [(s, r) for (s, r) in candidates if (s >= 0.9 and self._credible_journal_article(r))]
-                if not passing:
-                    candidates.sort(key=lambda x: x[0], reverse=True)
-                    top = candidates[0] if candidates else None
-                    if top and top[0] >= 0.85 and self._credible_journal_article(top[1]):
-                        rec = top[1]
-                        rec.method = "Crossref(search,relaxed)"
-                        rec.confidence = top[0]
-                        return rec
-                    return None
-                passing.sort(
-                    key=lambda x: (x[0], int(bool(x[1].pages)) + int(bool(x[1].volume)) + int(bool(x[1].number))),
-                    reverse=True,
-                )
-                score, best = passing[0]
-                best.method = "Crossref(search)"
-                best.confidence = score
-                return best
+        # Stage 4: Semantic Scholar search
+        result = self._stage4_s2_search(entry, title_norm)
+        if result:
+            return result
 
-        # 6) Google Scholar fallback (opt-in only)
-        if self.scholarly_client and title_norm:
-            first_author = first_author_surname(entry)
-            pub = self.scholarly_client.search(title_norm, first_author)
-            if pub:
-                rec = self._scholarly_to_record(pub)
-                if rec and rec.title:
-                    tb = normalize_title_for_match(rec.title)
-                    title_score = token_sort_ratio(title_norm, tb)
-                    authors_ref = authors_last_names(entry.get("author", ""))
-                    blns = [strip_diacritics(a.get("family") or "").lower() for a in rec.authors][:3]
-                    auth_score = jaccard_similarity(authors_ref[:3], blns)
-                    combined = 0.7 * (title_score / 100.0) + 0.3 * auth_score
-                    if combined >= 0.9 and self._credible_journal_article(rec):
-                        rec.method = "GoogleScholar(search)"
-                        rec.confidence = combined
-                        self.logger.debug(
-                            "Google Scholar match: %.2f (title=%.0f, auth=%.2f)", combined, title_score, auth_score
-                        )
-                        return rec
+        # Stage 5: Crossref bibliographic search
+        result = self._stage5_crossref_search(entry, title_norm)
+        if result:
+            return result
+
+        # Stage 6: Google Scholar fallback (opt-in only)
+        result = self._stage6_scholarly_search(entry, title_norm)
+        if result:
+            return result
 
         return None
+
+    def _stage1_direct_lookup(self, detection: PreprintDetection) -> tuple[PublishedRecord | None, str | None]:
+        """Stage 1: Direct lookup via arXiv -> Semantic Scholar / Crossref.
+
+        Attempts to find the published version using direct mappings:
+        - Semantic Scholar arXiv paper lookup
+        - arXiv metadata DOI -> Crossref works lookup
+        - arXiv metadata DOI -> Crossref is-preprint-of relation
+
+        Args:
+            detection: PreprintDetection with arxiv_id and/or doi
+
+        Returns:
+            Tuple of (PublishedRecord if found, candidate_doi from arXiv for later stages)
+        """
+        candidate_doi: str | None = None
+
+        if not detection.arxiv_id:
+            return None, None
+
+        # Semantic Scholar first (direct arXiv mapping is strong)
+        s2 = self.s2_from_arxiv(detection.arxiv_id)
+        if s2 and self._credible_journal_article(s2):
+            self.logger.debug("Stage 1: Found via Semantic Scholar arXiv lookup")
+            return s2, None
+
+        # Get DOI from arXiv metadata
+        candidate_doi = self.arxiv_candidate_doi(detection.arxiv_id)
+        if not candidate_doi:
+            return None, None
+
+        # Try Crossref lookup with the candidate DOI
+        msg = self.crossref_get(candidate_doi)
+        if not msg:
+            return None, candidate_doi
+
+        # Check if the candidate DOI points to a journal article
+        rec = self._message_to_record(msg)
+        if rec and rec.type == "journal-article" and self._credible_journal_article(rec):
+            rec.method = "arXiv->Crossref(works)"
+            rec.confidence = 1.0
+            self.logger.debug("Stage 1: Found via arXiv->Crossref(works)")
+            return rec, candidate_doi
+
+        # Check is-preprint-of relations in the candidate DOI
+        rec_rel = self._check_preprint_of_relations(msg, "arXiv->Crossref(relation)")
+        if rec_rel:
+            return rec_rel, candidate_doi
+
+        return None, candidate_doi
+
+    def _check_preprint_of_relations(self, msg: dict[str, Any], method_name: str) -> PublishedRecord | None:
+        """Check is-preprint-of relations in a Crossref message.
+
+        Args:
+            msg: Crossref message dict
+            method_name: Method name to set on the returned record
+
+        Returns:
+            PublishedRecord if a credible journal article is found, None otherwise
+        """
+        rel = msg.get("relation") or {}
+        pre_of = rel.get("is-preprint-of") or []
+        for node in pre_of:
+            if node.get("id-type") == "doi" and node.get("id"):
+                pub_doi = doi_normalize(node["id"])
+                pub_msg = self.crossref_get(pub_doi)
+                rec = self._message_to_record(pub_msg or {})
+                if rec and self._credible_journal_article(rec):
+                    rec.method = method_name
+                    rec.confidence = 1.0
+                    self.logger.debug("Found via %s", method_name)
+                    return rec
+        return None
+
+    def _stage2_crossref_relations(
+        self, detection: PreprintDetection, candidate_doi: str | None
+    ) -> PublishedRecord | None:
+        """Stage 2: Crossref is-preprint-of relation lookup.
+
+        Checks if the preprint DOI or candidate DOI has an is-preprint-of relation
+        pointing to the published version.
+
+        Args:
+            detection: PreprintDetection with arxiv_id and/or doi
+            candidate_doi: DOI from arXiv metadata (from stage 1)
+
+        Returns:
+            PublishedRecord if found, None otherwise
+        """
+        for d in filter(None, (detection.doi, candidate_doi)):
+            msg = self.crossref_get(d)
+            if not msg:
+                continue
+
+            # Check is-preprint-of relations
+            rec = self._check_preprint_of_relations(msg, "Crossref(relation)")
+            if rec:
+                self.logger.debug("Stage 2: Found via Crossref(relation)")
+                return rec
+
+            # Check if the DOI itself is a journal article
+            rec0 = self._message_to_record(msg)
+            if rec0 and self._credible_journal_article(rec0):
+                rec0.method = "Crossref(works)"
+                rec0.confidence = 1.0
+                self.logger.debug("Stage 2: Found via Crossref(works)")
+                return rec0
+
+        return None
+
+    def _stage3_dblp_search(self, entry: dict[str, Any], title_norm: str) -> PublishedRecord | None:
+        """Stage 3: DBLP bibliographic search.
+
+        Searches DBLP by title and first author, scoring candidates by title
+        and author similarity.
+
+        Args:
+            entry: BibTeX entry dict
+            title_norm: Normalized title for matching
+
+        Returns:
+            PublishedRecord if a credible match is found, None otherwise
+        """
+        if not title_norm:
+            return None
+
+        first_author = first_author_surname(entry)
+        dblp_query = f"{title_norm} {first_author}".strip()
+        hits = self.dblp_search(dblp_query, h=30)
+
+        if not hits:
+            return None
+
+        authors_ref = authors_last_names(entry.get("author", ""))
+        best: tuple[float, PublishedRecord] | None = None
+
+        for h in hits:
+            rec = self._dblp_hit_to_record(h)
+            if not rec:
+                continue
+
+            combined = self._compute_match_score(title_norm, rec, authors_ref)
+
+            if combined >= 0.9 and self._credible_journal_article(rec):
+                rec.method = "DBLP(search)"
+                rec.confidence = combined
+                if self._is_better_candidate(combined, rec, best):
+                    best = (combined, rec)
+
+        if best:
+            self.logger.debug("Stage 3: Found via DBLP(search) with score %.2f", best[0])
+            return best[1]
+
+        return None
+
+    def _compute_match_score(self, title_norm: str, rec: PublishedRecord, authors_ref: list[str]) -> float:
+        """Compute combined title and author match score.
+
+        Args:
+            title_norm: Normalized reference title
+            rec: Candidate PublishedRecord
+            authors_ref: Reference author last names
+
+        Returns:
+            Combined score (0.0 to 1.0)
+        """
+        tb = normalize_title_for_match(rec.title or "")
+        title_score = token_sort_ratio(title_norm, tb)  # 0..100
+        blns = [strip_diacritics(a.get("family") or "").lower() for a in rec.authors][:3]
+        auth_score = jaccard_similarity(authors_ref[:3], blns)
+        return 0.7 * (title_score / 100.0) + 0.3 * auth_score
+
+    def _stage4_s2_search(self, entry: dict[str, Any], title_norm: str) -> PublishedRecord | None:
+        """Stage 4: Semantic Scholar search.
+
+        Searches Semantic Scholar by title and first author, scoring candidates
+        by title and author similarity.
+
+        Args:
+            entry: BibTeX entry dict
+            title_norm: Normalized title for matching
+
+        Returns:
+            PublishedRecord if a credible match is found, None otherwise
+        """
+        if not title_norm:
+            return None
+
+        first_author = first_author_surname(entry)
+        s2_query = f"{title_norm} {first_author}".strip()
+        data = self.s2_search(s2_query, limit=25)
+
+        if not data:
+            return None
+
+        authors_ref = authors_last_names(entry.get("author", ""))
+        candidates: list[tuple[float, PublishedRecord]] = []
+
+        for item in data:
+            rec = self._s2_item_to_record(item)
+            if not rec:
+                continue
+
+            combined = self._compute_match_score(title_norm, rec, authors_ref)
+
+            if combined >= 0.9 and self._credible_journal_article(rec):
+                rec.method = "SemanticScholar(search)"
+                rec.confidence = combined
+                candidates.append((combined, rec))
+
+        if candidates:
+            candidates.sort(
+                key=lambda x: (
+                    x[0],
+                    int(bool(x[1].pages)) + int(bool(x[1].volume)) + int(bool(x[1].number)),
+                ),
+                reverse=True,
+            )
+            self.logger.debug(
+                "Stage 4: Found via SemanticScholar(search) with score %.2f",
+                candidates[0][0],
+            )
+            return candidates[0][1]
+
+        return None
+
+    def _s2_item_to_record(self, item: dict[str, Any]) -> PublishedRecord | None:
+        """Convert Semantic Scholar search item to PublishedRecord.
+
+        Args:
+            item: Semantic Scholar search result item
+
+        Returns:
+            PublishedRecord if item is a valid journal article with DOI, None otherwise
+        """
+        doi = doi_normalize(item.get("doi"))
+        pub_types = item.get("publicationTypes") or []
+        is_journal = any(pt.lower() == "journalarticle" for pt in pub_types)
+
+        if not (doi and is_journal):
+            return None
+
+        return PublishedRecord(
+            doi=doi,
+            url=doi_url(doi),
+            title=item.get("title"),
+            authors=[
+                {
+                    "given": n.split()[:-1] and " ".join(n.split()[:-1]) or "",
+                    "family": (n.split()[-1] if n.split() else ""),
+                }
+                for n in [a.get("name", "") for a in (item.get("authors") or [])]
+            ],
+            journal=item.get("venue"),
+            year=item.get("year"),
+            type="journal-article",
+        )
+
+    def _stage5_crossref_search(self, entry: dict[str, Any], title_norm: str) -> PublishedRecord | None:
+        """Stage 5: Crossref bibliographic search.
+
+        Searches Crossref by title and first author as a fallback when direct
+        lookups fail. Uses relaxed matching (0.85 threshold) if strict matching fails.
+
+        Args:
+            entry: BibTeX entry dict
+            title_norm: Normalized title for matching
+
+        Returns:
+            PublishedRecord if a credible match is found, None otherwise
+        """
+        if not title_norm:
+            return None
+
+        first_author = first_author_surname(entry)
+        query = f"{title_norm} {first_author}".strip()
+        items = self.crossref_search(query, rows=30, filter_type="journal-article")
+
+        if not items:
+            return None
+
+        authors_a = authors_last_names(entry.get("author", ""))
+        candidates = [self._score_crossref_item(item, title_norm, authors_a) for item in items]
+
+        # Filter passing candidates (score >= 0.9 and credible)
+        passing = [(s, r) for (s, r) in candidates if (s >= 0.9 and self._credible_journal_article(r))]
+
+        if not passing:
+            return self._try_relaxed_crossref_match(candidates)
+
+        # Sort by score, tie-break by metadata completeness
+        passing.sort(
+            key=lambda x: (
+                x[0],
+                int(bool(x[1].pages)) + int(bool(x[1].volume)) + int(bool(x[1].number)),
+            ),
+            reverse=True,
+        )
+        score, best = passing[0]
+        best.method = "Crossref(search)"
+        best.confidence = score
+        self.logger.debug("Stage 5: Found via Crossref(search) with score %.2f", score)
+        return best
+
+    def _try_relaxed_crossref_match(self, candidates: list[tuple[float, PublishedRecord]]) -> PublishedRecord | None:
+        """Try relaxed matching on Crossref candidates.
+
+        Args:
+            candidates: List of (score, record) tuples
+
+        Returns:
+            PublishedRecord if relaxed match found, None otherwise
+        """
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        top = candidates[0] if candidates else None
+        if top and top[0] >= 0.85 and self._credible_journal_article(top[1]):
+            rec = top[1]
+            rec.method = "Crossref(search,relaxed)"
+            rec.confidence = top[0]
+            self.logger.debug("Stage 5: Found via Crossref(search,relaxed) with score %.2f", top[0])
+            return rec
+        return None
+
+    def _score_crossref_item(
+        self, msg: dict[str, Any], title_norm: str, authors_ref: list[str]
+    ) -> tuple[float, PublishedRecord]:
+        """Score a Crossref search result for matching.
+
+        Args:
+            msg: Crossref message dict
+            title_norm: Normalized reference title
+            authors_ref: Reference author last names
+
+        Returns:
+            Tuple of (combined score, PublishedRecord)
+        """
+        rec = self._message_to_record(msg)
+        if not rec or rec.type != "journal-article":
+            return (0.0, PublishedRecord(doi=""))
+
+        combined = self._compute_match_score(title_norm, rec, authors_ref)
+        return (combined, rec)
+
+    def _stage6_scholarly_search(self, entry: dict[str, Any], title_norm: str) -> PublishedRecord | None:
+        """Stage 6: Google Scholar fallback (opt-in only).
+
+        Uses the scholarly library to search Google Scholar. Only enabled when
+        scholarly_client is configured.
+
+        Args:
+            entry: BibTeX entry dict
+            title_norm: Normalized title for matching
+
+        Returns:
+            PublishedRecord if a credible match is found, None otherwise
+        """
+        if not self.scholarly_client or not title_norm:
+            return None
+
+        first_author = first_author_surname(entry)
+        pub = self.scholarly_client.search(title_norm, first_author)
+
+        if not pub:
+            return None
+
+        rec = self._scholarly_to_record(pub)
+        if not rec or not rec.title:
+            return None
+
+        authors_ref = authors_last_names(entry.get("author", ""))
+        combined = self._compute_match_score(title_norm, rec, authors_ref)
+
+        if combined >= 0.9 and self._credible_journal_article(rec):
+            rec.method = "GoogleScholar(search)"
+            rec.confidence = combined
+            tb = normalize_title_for_match(rec.title)
+            title_score = token_sort_ratio(title_norm, tb)
+            self.logger.debug("Stage 6: Google Scholar match: %.2f (title=%.0f)", combined, title_score)
+            return rec
+
+        return None
+
+    @staticmethod
+    def _is_better_candidate(
+        score: float, rec: PublishedRecord, current_best: tuple[float, PublishedRecord] | None
+    ) -> bool:
+        """Check if a candidate is better than the current best.
+
+        Args:
+            score: Combined match score for the candidate
+            rec: Candidate PublishedRecord
+            current_best: Current best (score, record) tuple, or None
+
+        Returns:
+            True if candidate should replace current best
+        """
+        if current_best is None:
+            return True
+
+        if score > current_best[0]:
+            return True
+
+        if score == current_best[0]:
+            # Tie-break by metadata completeness
+            rec_completeness = int(bool(rec.pages)) + int(bool(rec.volume)) + int(bool(rec.number))
+            best_completeness = (
+                int(bool(current_best[1].pages)) + int(bool(current_best[1].volume)) + int(bool(current_best[1].number))
+            )
+            return rec_completeness > best_completeness
+
+        return False
 
 
 # ------------- Async Resolver -------------
@@ -2719,273 +2978,585 @@ def write_report_line(fh, res: ProcessResult, src_file: str | None = None) -> No
     fh.write(json.dumps(line, ensure_ascii=False) + "\n")
 
 
-def main(argv: list[str] | None = None) -> int:
-    args = build_arg_parser().parse_args(argv)
-    logger = init_logging(args.verbose)
+# ------------- Main function helper components -------------
 
+
+@dataclass
+class MainComponents:
+    """Container for main function components to simplify parameter passing."""
+
+    logger: logging.Logger
+    http: HttpClient
+    resolver: Resolver
+    detector: Detector
+    updater: Updater
+    loader: BibLoader
+    writer: BibWriter
+    field_processor: MissingFieldProcessor | None
+    args: argparse.Namespace
+
+
+def validate_arguments(args: argparse.Namespace, logger: logging.Logger) -> str | None:
+    """Validate parsed command-line arguments.
+
+    Args:
+        args: Parsed command-line arguments.
+        logger: Logger instance for error messages.
+
+    Returns:
+        Error message string if validation fails, None if validation passes.
+    """
     if not args.in_place and not args.output:
-        logger.error("Specify -o OUTPUT.bib or --in-place")
-        return 1
+        return "Specify -o OUTPUT.bib or --in-place"
+    return None
 
+
+def setup_http_client(args: argparse.Namespace) -> HttpClient:
+    """Create and configure the HTTP client with rate limiting and caching.
+
+    Args:
+        args: Parsed command-line arguments.
+
+    Returns:
+        Configured HttpClient instance.
+    """
     rate_limiter = RateLimiter(args.rate_limit)
     cache = DiskCache(args.cache) if args.cache else DiskCache(None)
-    resolution_cache = (
-        ResolutionCache(args.resolution_cache, ttl_days=args.resolution_cache_ttl) if args.resolution_cache else None
-    )
     user_agent = "bib-preprint-upgrader/1.1 (mailto:you@example.com)"
-    http = HttpClient(
+    return HttpClient(
         timeout=args.timeout, user_agent=user_agent, rate_limiter=rate_limiter, cache=cache, verbose=args.verbose
     )
 
-    # Google Scholar client (opt-in)
-    scholarly_client = None
-    if args.use_scholarly:
-        scholarly_client = ScholarlyClient(
-            proxy=args.scholarly_proxy,
-            delay=args.scholarly_delay,
-            logger=logger,
+
+def setup_scholarly_client(args: argparse.Namespace, logger: logging.Logger) -> ScholarlyClient | None:
+    """Set up Google Scholar client if enabled.
+
+    Args:
+        args: Parsed command-line arguments.
+        logger: Logger instance.
+
+    Returns:
+        ScholarlyClient instance if enabled and available, None otherwise.
+    """
+    if not args.use_scholarly:
+        return None
+
+    scholarly_client = ScholarlyClient(
+        proxy=args.scholarly_proxy,
+        delay=args.scholarly_delay,
+        logger=logger,
+    )
+    if scholarly_client._scholarly:
+        logger.info(
+            "Google Scholar fallback enabled (delay=%.1fs, proxy=%s)", args.scholarly_delay, args.scholarly_proxy
         )
-        if scholarly_client._scholarly:
-            logger.info(
-                "Google Scholar fallback enabled (delay=%.1fs, proxy=%s)", args.scholarly_delay, args.scholarly_proxy
-            )
-        else:
-            logger.warning("Google Scholar fallback requested but scholarly package not available")
-            scholarly_client = None
+        return scholarly_client
+    else:
+        logger.warning("Google Scholar fallback requested but scholarly package not available")
+        return None
 
-    resolver = Resolver(http=http, logger=logger, scholarly_client=scholarly_client, resolution_cache=resolution_cache)
-    detector = Detector()
-    updater = Updater(keep_preprint_note=args.keep_preprint_note, rekey=args.rekey)
 
-    # Field checking setup
+def setup_field_processor(
+    args: argparse.Namespace, resolver: Resolver, logger: logging.Logger
+) -> MissingFieldProcessor | None:
+    """Set up field checking/filling processor if enabled.
+
+    Args:
+        args: Parsed command-line arguments.
+        resolver: Resolver instance for field filling.
+        logger: Logger instance.
+
+    Returns:
+        MissingFieldProcessor if field checking enabled, None otherwise.
+    """
     field_check_enabled = args.check_fields or args.fill_fields
+    if not field_check_enabled:
+        return None
+
     field_fill_enabled = args.fill_fields
-    field_processor = None
-    if field_check_enabled:
-        field_checker = FieldChecker()
-        field_filler = FieldFiller(resolver=resolver, logger=logger) if field_fill_enabled else None
-        field_processor = MissingFieldProcessor(
-            checker=field_checker,
-            filler=field_filler,
-            fill_mode=args.field_fill_mode,
-            fill_enabled=field_fill_enabled,
-        )
-        mode_str = "fill" if field_fill_enabled else "check-only"
-        logger.info("Field checking enabled (mode: %s, fill_mode: %s)", mode_str, args.field_fill_mode)
+    field_checker = FieldChecker()
+    field_filler = FieldFiller(resolver=resolver, logger=logger) if field_fill_enabled else None
+    field_processor = MissingFieldProcessor(
+        checker=field_checker,
+        filler=field_filler,
+        fill_mode=args.field_fill_mode,
+        fill_enabled=field_fill_enabled,
+    )
+    mode_str = "fill" if field_fill_enabled else "check-only"
+    logger.info("Field checking enabled (mode: %s, fill_mode: %s)", mode_str, args.field_fill_mode)
+    return field_processor
 
-    loader = BibLoader()
-    writer = BibWriter()
 
-    # Read inputs
+def load_databases(
+    args: argparse.Namespace, loader: BibLoader, logger: logging.Logger
+) -> list[tuple[str, bibtexparser.bibdatabase.BibDatabase]] | None:
+    """Load all input BibTeX files.
+
+    Args:
+        args: Parsed command-line arguments.
+        loader: BibLoader instance.
+        logger: Logger instance.
+
+    Returns:
+        List of (path, database) tuples, or None if loading fails.
+    """
     databases: list[tuple[str, bibtexparser.bibdatabase.BibDatabase]] = []
     try:
         for path in args.inputs:
             db = loader.load_file(path)
             databases.append((path, db))
+        return databases
     except Exception as e:
         logger.error("Failed to read inputs: %s", e)
+        return None
+
+
+def process_entries_parallel(
+    entries: list[dict[str, Any]],
+    detector: Detector,
+    resolver: Resolver,
+    updater: Updater,
+    logger: logging.Logger,
+    max_workers: int,
+) -> list[ProcessResult]:
+    """Process entries in parallel for preprint upgrade.
+
+    Args:
+        entries: List of BibTeX entries.
+        detector: Preprint detector.
+        resolver: Resolver for finding published versions.
+        updater: Entry updater.
+        logger: Logger instance.
+        max_workers: Maximum number of parallel workers.
+
+    Returns:
+        List of ProcessResult objects (order may differ from input).
+    """
+    results: list[ProcessResult] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = [ex.submit(process_entry, entry, detector, resolver, updater, logger) for entry in entries]
+        for fut in concurrent.futures.as_completed(futures):
+            results.append(fut.result())
+    return results
+
+
+def apply_field_checking(
+    new_entries: list[dict[str, Any]],
+    results: list[ProcessResult],
+    field_processor: MissingFieldProcessor,
+) -> list[FieldCheckResult]:
+    """Apply field checking and filling to entries.
+
+    Args:
+        new_entries: List of entries to check (modified in place).
+        results: List of ProcessResult objects (modified in place).
+        field_processor: Field processor instance.
+
+    Returns:
+        List of FieldCheckResult objects.
+    """
+    field_results: list[FieldCheckResult] = []
+    for i, entry in enumerate(new_entries):
+        field_result = field_processor.process_entry(entry)
+        field_results.append(field_result)
+        if field_result.changed:
+            new_entries[i] = field_result.updated
+            # Update the ProcessResult to reflect field changes
+            if results[i].action != "upgraded":
+                results[i] = ProcessResult(
+                    original=results[i].original,
+                    updated=field_result.updated,
+                    changed=True,
+                    action="field_filled",
+                    method=None,
+                    confidence=0.0,
+                    message=None,
+                )
+    return field_results
+
+
+def write_output_and_report(
+    new_db: bibtexparser.bibdatabase.BibDatabase,
+    results: list[ProcessResult],
+    args: argparse.Namespace,
+    writer: BibWriter,
+    logger: logging.Logger,
+    output_path: str,
+    src_for_entry: list[str] | None = None,
+    merged_info: list[tuple[str, list[str]]] | None = None,
+    append_report: bool = False,
+) -> int:
+    """Write output file and optional report.
+
+    Args:
+        new_db: Database to write.
+        results: Processing results.
+        args: Parsed command-line arguments.
+        writer: BibWriter instance.
+        logger: Logger instance.
+        output_path: Path to write the output file.
+        src_for_entry: Optional list of source files for each entry.
+        merged_info: Optional dedupe merged info.
+        append_report: If True, append to report file; otherwise overwrite.
+
+    Returns:
+        0 on success, 1 on failure.
+    """
+    if args.dry_run:
+        for r in results:
+            if r.changed:
+                print(diff_entries(r.original, r.updated, r.original.get("ID")))
+        if args.dedupe and merged_info:
+            print(f"# Dedupe merged groups: {merged_info}")
+        return 0
+
+    try:
+        writer.dump_to_file(new_db, output_path)
+    except Exception as e:
+        logger.error("Failed to write %s: %s", output_path, e)
         return 1
 
-    if args.in_place:
-        overall_exit = 0
-        all_field_results: list[FieldCheckResult] = []
+    if args.report:
+        mode = "a" if append_report else "w"
+        with open(args.report, mode, encoding="utf-8") as fh:
+            for idx, res in enumerate(results):
+                src_file = src_for_entry[idx] if src_for_entry and idx < len(src_for_entry) else None
+                write_report_line(fh, res, src_file=src_file)
 
-        for path, db in databases:
-            results: list[ProcessResult] = []
-            field_results: list[FieldCheckResult] = []
+    return 0
 
-            # Step 1: Preprint upgrade (unless skipped)
-            if not args.skip_preprint_upgrade:
-                with concurrent.futures.ThreadPoolExecutor(max_workers=args.max_workers) as ex:
-                    futures = [
-                        ex.submit(process_entry, entry, detector, resolver, updater, logger) for entry in db.entries
-                    ]
-                    for fut in concurrent.futures.as_completed(futures):
-                        results.append(fut.result())
-                new_entries = [r.updated for r in results]
-            else:
-                # Skip preprint upgrade, use entries as-is
-                new_entries = list(db.entries)
-                results = [ProcessResult(original=e, updated=e, changed=False, action="skipped") for e in db.entries]
 
-            # Step 2: Field checking (if enabled)
-            if field_check_enabled and field_processor:
-                for i, entry in enumerate(new_entries):
-                    field_result = field_processor.process_entry(entry)
-                    field_results.append(field_result)
-                    if field_result.changed:
-                        new_entries[i] = field_result.updated
-                        # Update the ProcessResult to reflect field changes
-                        if results[i].action != "upgraded":
-                            results[i] = ProcessResult(
-                                original=results[i].original,
-                                updated=field_result.updated,
-                                changed=True,
-                                action="field_filled",
-                                method=None,
-                                confidence=0.0,
-                                message=None,
-                            )
-                all_field_results.extend(field_results)
+def handle_field_check_reporting(
+    field_results: list[FieldCheckResult],
+    field_processor: MissingFieldProcessor | None,
+    args: argparse.Namespace,
+    logger: logging.Logger,
+) -> int | None:
+    """Handle field check summary and reporting.
 
-            new_db = bibtexparser.bibdatabase.BibDatabase()
-            new_db.entries = new_entries
+    Args:
+        field_results: List of field check results.
+        field_processor: Field processor instance.
+        args: Parsed command-line arguments.
+        logger: Logger instance.
 
-            merged_info: list[tuple[str, list[str]]] = []
-            if args.dedupe:
-                new_db, merged_info = Dedupe().dedupe_db(new_db, logger)
+    Returns:
+        Exit code 3 if strict mode fails, None otherwise.
+    """
+    if not field_results:
+        return None
 
-            if args.dry_run:
-                for r in results:
-                    if r.changed:
-                        print(diff_entries(r.original, r.updated, r.original.get("ID")))
-                if args.dedupe and merged_info:
-                    print(f"# Dedupe merged groups: {merged_info}")
-            else:
-                try:
-                    writer.dump_to_file(new_db, path)
-                except Exception as e:
-                    logger.error("Failed to write %s: %s", path, e)
-                    overall_exit = 1
+    print_field_check_details(field_results, logger, verbose=args.verbose)
+    field_summary = summarize_field_check(field_results, logger)
 
-            if args.report:
-                with open(args.report, "a", encoding="utf-8") as fh:
-                    for res in results:
-                        write_report_line(fh, res, src_file=path)
+    if args.field_report and field_processor:
+        report_data = field_processor.generate_json_report(field_results)
+        with open(args.field_report, "w", encoding="utf-8") as fh:
+            json.dump(report_data, fh, indent=2, ensure_ascii=False)
+        logger.info("Field check report written to %s", args.field_report)
 
-            if not args.skip_preprint_upgrade:
-                summary = summarize(results, logger)
-                print_failures(results, logger)
-                if summary["failures"] > 0 and overall_exit == 0:
-                    overall_exit = 2
+    # Strict mode: exit with error if required fields missing
+    if args.strict_fields and field_summary["unfillable"] > 0:
+        logger.error(
+            "Strict mode: %d entries have required fields that could not be filled",
+            field_summary["unfillable"],
+        )
+        return 3
 
-        # Field check summary and reporting
-        if field_check_enabled and all_field_results:
-            print_field_check_details(all_field_results, logger, verbose=args.verbose)
-            field_summary = summarize_field_check(all_field_results, logger)
+    return None
 
-            if args.field_report:
-                report_data = field_processor.generate_json_report(all_field_results)
-                with open(args.field_report, "w", encoding="utf-8") as fh:
-                    json.dump(report_data, fh, indent=2, ensure_ascii=False)
-                logger.info("Field check report written to %s", args.field_report)
 
-            # Strict mode: exit with error if required fields missing
-            if args.strict_fields and field_summary["unfillable"] > 0:
-                logger.error(
-                    "Strict mode: %d entries have required fields that could not be filled",
-                    field_summary["unfillable"],
-                )
-                return 3
+def process_single_database_in_place(
+    path: str,
+    db: bibtexparser.bibdatabase.BibDatabase,
+    components: MainComponents,
+) -> tuple[int, list[ProcessResult], list[FieldCheckResult]]:
+    """Process a single database for in-place update.
 
-        return overall_exit
+    Args:
+        path: Path to the database file.
+        db: The BibTeX database.
+        components: MainComponents container.
 
+    Returns:
+        Tuple of (exit_code, results, field_results).
+    """
+    args = components.args
+    results: list[ProcessResult] = []
+    field_results: list[FieldCheckResult] = []
+
+    # Step 1: Preprint upgrade (unless skipped)
+    if not args.skip_preprint_upgrade:
+        results = process_entries_parallel(
+            db.entries,
+            components.detector,
+            components.resolver,
+            components.updater,
+            components.logger,
+            args.max_workers,
+        )
+        new_entries = [r.updated for r in results]
     else:
-        merged_db = bibtexparser.bibdatabase.BibDatabase()
-        merged_db.entries = []
-        src_for_entry: list[str] = []
-        for path, db in databases:
-            merged_db.entries.extend(db.entries)
-            src_for_entry.extend([path] * len(db.entries))
+        # Skip preprint upgrade, use entries as-is
+        new_entries = list(db.entries)
+        results = [ProcessResult(original=e, updated=e, changed=False, action="skipped") for e in db.entries]
 
-        results: list[ProcessResult] = []
-        field_results: list[FieldCheckResult] = []
+    # Step 2: Field checking (if enabled)
+    if components.field_processor:
+        field_results = apply_field_checking(new_entries, results, components.field_processor)
 
-        # Step 1: Preprint upgrade (unless skipped)
-        if not args.skip_preprint_upgrade:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=args.max_workers) as ex:
-                futures = [
-                    ex.submit(process_entry, entry, detector, resolver, updater, logger) for entry in merged_db.entries
-                ]
-                for fut in concurrent.futures.as_completed(futures):
-                    results.append(fut.result())
+    new_db = bibtexparser.bibdatabase.BibDatabase()
+    new_db.entries = new_entries
 
-            obj_map = {id(r.original): r for r in results}
-            ordered_results: list[ProcessResult] = []
-            for e in merged_db.entries:
-                r = obj_map.get(id(e))
-                ordered_results.append(
-                    r if r else ProcessResult(original=e, updated=e, changed=False, action="unchanged")
-                )
-            new_entries = [r.updated for r in ordered_results]
-        else:
-            # Skip preprint upgrade, use entries as-is
-            new_entries = list(merged_db.entries)
-            ordered_results = [
-                ProcessResult(original=e, updated=e, changed=False, action="skipped") for e in merged_db.entries
-            ]
+    merged_info: list[tuple[str, list[str]]] = []
+    if args.dedupe:
+        new_db, merged_info = Dedupe().dedupe_db(new_db, components.logger)
 
-        # Step 2: Field checking (if enabled)
-        if field_check_enabled and field_processor:
-            for i, entry in enumerate(new_entries):
-                field_result = field_processor.process_entry(entry)
-                field_results.append(field_result)
-                if field_result.changed:
-                    new_entries[i] = field_result.updated
-                    # Update the ProcessResult to reflect field changes
-                    if ordered_results[i].action != "upgraded":
-                        ordered_results[i] = ProcessResult(
-                            original=ordered_results[i].original,
-                            updated=field_result.updated,
-                            changed=True,
-                            action="field_filled",
-                            method=None,
-                            confidence=0.0,
-                            message=None,
-                        )
+    exit_code = write_output_and_report(
+        new_db, results, args, components.writer, components.logger, path, merged_info=merged_info, append_report=True
+    )
 
-        new_db = bibtexparser.bibdatabase.BibDatabase()
-        new_db.entries = new_entries
+    return exit_code, results, field_results
 
-        merged_info: list[tuple[str, list[str]]] = []
-        if args.dedupe:
-            new_db, merged_info = Dedupe().dedupe_db(new_db, logger)
 
-        if args.dry_run:
-            for r in ordered_results:
-                if r.changed:
-                    print(diff_entries(r.original, r.updated, r.original.get("ID")))
-            if args.dedupe and merged_info:
-                print(f"# Dedupe merged groups: {merged_info}")
-        else:
-            try:
-                writer.dump_to_file(new_db, args.output)
-            except Exception as e:
-                logger.error("Failed to write %s: %s", args.output, e)
-                return 1
+def process_in_place_mode(
+    databases: list[tuple[str, bibtexparser.bibdatabase.BibDatabase]],
+    components: MainComponents,
+) -> int:
+    """Process databases in in-place mode.
 
-        if args.report:
-            with open(args.report, "w", encoding="utf-8") as fh:
-                for idx, res in enumerate(ordered_results):
-                    write_report_line(fh, res, src_file=src_for_entry[idx] if idx < len(src_for_entry) else None)
+    Args:
+        databases: List of (path, database) tuples.
+        components: MainComponents container.
+
+    Returns:
+        Exit code (0=success, 2=some failures, 3=strict field failure).
+    """
+    args = components.args
+    overall_exit = 0
+    all_field_results: list[FieldCheckResult] = []
+
+    for path, db in databases:
+        exit_code, results, field_results = process_single_database_in_place(path, db, components)
+
+        if exit_code != 0:
+            overall_exit = 1
+
+        all_field_results.extend(field_results)
 
         if not args.skip_preprint_upgrade:
-            summary = summarize(ordered_results, logger)
-            print_failures(ordered_results, logger)
+            summary = summarize(results, components.logger)
+            print_failures(results, components.logger)
+            if summary["failures"] > 0 and overall_exit == 0:
+                overall_exit = 2
 
-        # Field check summary and reporting
-        if field_check_enabled and field_results:
-            print_field_check_details(field_results, logger, verbose=args.verbose)
-            field_summary = summarize_field_check(field_results, logger)
+    # Field check summary and reporting
+    if components.field_processor and all_field_results:
+        strict_exit = handle_field_check_reporting(
+            all_field_results, components.field_processor, args, components.logger
+        )
+        if strict_exit is not None:
+            return strict_exit
 
-            if args.field_report:
-                report_data = field_processor.generate_json_report(field_results)
-                with open(args.field_report, "w", encoding="utf-8") as fh:
-                    json.dump(report_data, fh, indent=2, ensure_ascii=False)
-                logger.info("Field check report written to %s", args.field_report)
+    return overall_exit
 
-            # Strict mode: exit with error if required fields missing
-            if args.strict_fields and field_summary["unfillable"] > 0:
-                logger.error(
-                    "Strict mode: %d entries have required fields that could not be filled",
-                    field_summary["unfillable"],
-                )
-                return 3
 
-        if not args.skip_preprint_upgrade:
-            if summary["failures"] > 0:
-                return 2
-        return 0
+def merge_databases(
+    databases: list[tuple[str, bibtexparser.bibdatabase.BibDatabase]],
+) -> tuple[bibtexparser.bibdatabase.BibDatabase, list[str]]:
+    """Merge multiple databases into one.
+
+    Args:
+        databases: List of (path, database) tuples.
+
+    Returns:
+        Tuple of (merged_database, src_for_entry list).
+    """
+    merged_db = bibtexparser.bibdatabase.BibDatabase()
+    merged_db.entries = []
+    src_for_entry: list[str] = []
+    for path, db in databases:
+        merged_db.entries.extend(db.entries)
+        src_for_entry.extend([path] * len(db.entries))
+    return merged_db, src_for_entry
+
+
+def order_results_by_entries(
+    results: list[ProcessResult],
+    entries: list[dict[str, Any]],
+) -> list[ProcessResult]:
+    """Order results to match entry order (parallel processing may reorder).
+
+    Args:
+        results: Unordered list of ProcessResult objects.
+        entries: Original entries in desired order.
+
+    Returns:
+        Results ordered to match entries.
+    """
+    obj_map = {id(r.original): r for r in results}
+    ordered_results: list[ProcessResult] = []
+    for e in entries:
+        r = obj_map.get(id(e))
+        ordered_results.append(r if r else ProcessResult(original=e, updated=e, changed=False, action="unchanged"))
+    return ordered_results
+
+
+def process_to_output_mode(
+    databases: list[tuple[str, bibtexparser.bibdatabase.BibDatabase]],
+    components: MainComponents,
+) -> int:
+    """Process databases and write to single output file.
+
+    Args:
+        databases: List of (path, database) tuples.
+        components: MainComponents container.
+
+    Returns:
+        Exit code (0=success, 1=write error, 2=some failures, 3=strict field failure).
+    """
+    args = components.args
+
+    # Merge all databases
+    merged_db, src_for_entry = merge_databases(databases)
+
+    field_results: list[FieldCheckResult] = []
+
+    # Step 1: Preprint upgrade (unless skipped)
+    if not args.skip_preprint_upgrade:
+        results = process_entries_parallel(
+            merged_db.entries,
+            components.detector,
+            components.resolver,
+            components.updater,
+            components.logger,
+            args.max_workers,
+        )
+        ordered_results = order_results_by_entries(results, merged_db.entries)
+        new_entries = [r.updated for r in ordered_results]
+    else:
+        # Skip preprint upgrade, use entries as-is
+        new_entries = list(merged_db.entries)
+        ordered_results = [
+            ProcessResult(original=e, updated=e, changed=False, action="skipped") for e in merged_db.entries
+        ]
+
+    # Step 2: Field checking (if enabled)
+    if components.field_processor:
+        field_results = apply_field_checking(new_entries, ordered_results, components.field_processor)
+
+    new_db = bibtexparser.bibdatabase.BibDatabase()
+    new_db.entries = new_entries
+
+    merged_info: list[tuple[str, list[str]]] = []
+    if args.dedupe:
+        new_db, merged_info = Dedupe().dedupe_db(new_db, components.logger)
+
+    exit_code = write_output_and_report(
+        new_db,
+        ordered_results,
+        args,
+        components.writer,
+        components.logger,
+        args.output,
+        src_for_entry=src_for_entry,
+        merged_info=merged_info,
+    )
+    if exit_code != 0:
+        return exit_code
+
+    summary = {"failures": 0}
+    if not args.skip_preprint_upgrade:
+        summary = summarize(ordered_results, components.logger)
+        print_failures(ordered_results, components.logger)
+
+    # Field check summary and reporting
+    if components.field_processor and field_results:
+        strict_exit = handle_field_check_reporting(field_results, components.field_processor, args, components.logger)
+        if strict_exit is not None:
+            return strict_exit
+
+    if not args.skip_preprint_upgrade and summary["failures"] > 0:
+        return 2
+
+    return 0
+
+
+def build_main_components(args: argparse.Namespace, logger: logging.Logger) -> MainComponents:
+    """Build all main function components from parsed arguments.
+
+    Args:
+        args: Parsed command-line arguments.
+        logger: Logger instance.
+
+    Returns:
+        MainComponents containing all initialized components.
+    """
+    # Build HTTP client
+    http = setup_http_client(args)
+
+    # Build resolution cache
+    resolution_cache = (
+        ResolutionCache(args.resolution_cache, ttl_days=args.resolution_cache_ttl) if args.resolution_cache else None
+    )
+
+    # Build scholarly client
+    scholarly_client = setup_scholarly_client(args, logger)
+
+    # Build resolver
+    resolver = Resolver(http=http, logger=logger, scholarly_client=scholarly_client, resolution_cache=resolution_cache)
+
+    # Build field processor
+    field_processor = setup_field_processor(args, resolver, logger)
+
+    return MainComponents(
+        logger=logger,
+        http=http,
+        resolver=resolver,
+        detector=Detector(),
+        updater=Updater(keep_preprint_note=args.keep_preprint_note, rekey=args.rekey),
+        loader=BibLoader(),
+        writer=BibWriter(),
+        field_processor=field_processor,
+        args=args,
+    )
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Main entry point for the BibTeX preprint updater.
+
+    Parses command-line arguments, sets up components, and orchestrates
+    the preprint-to-published resolution and optional field checking.
+
+    Args:
+        argv: Command-line arguments. If None, uses sys.argv.
+
+    Returns:
+        Exit code: 0=success, 1=error, 2=some failures, 3=strict field failure.
+    """
+    # Parse arguments and setup logging
+    args = build_arg_parser().parse_args(argv)
+    logger = init_logging(args.verbose)
+
+    # Validate arguments
+    validation_error = validate_arguments(args, logger)
+    if validation_error:
+        logger.error(validation_error)
+        return 1
+
+    # Build all components
+    components = build_main_components(args, logger)
+
+    # Load input databases
+    databases = load_databases(args, components.loader, logger)
+    if databases is None:
+        return 1
+
+    # Execute appropriate processing mode
+    if args.in_place:
+        return process_in_place_mode(databases, components)
+    else:
+        return process_to_output_mode(databases, components)
 
 
 # ------------- Tests (pytest style) -------------
