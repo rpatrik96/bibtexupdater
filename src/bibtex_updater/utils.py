@@ -769,17 +769,23 @@ def dblp_hit_to_record(hit: dict[str, Any]) -> PublishedRecord | None:
     pages = info.get("pages")
     typ = safe_lower(info.get("type"))
 
-    # Consider only journal-like entries
-    is_journal = ("journal" in typ) or (
-        venue and not re.search(r"proceedings|conference|arxiv|biorxiv|medrxiv", safe_lower(venue))
-    )
-    if not is_journal:
+    # Reject preprint venues (CoRR is arXiv's journal name in DBLP)
+    venue_lower = safe_lower(venue) if venue else ""
+    if re.search(r"arxiv|biorxiv|medrxiv|^corr$", venue_lower):
         return None
     if not venue or not year:
         return None
     # Accept if DOI present or at least URL present
     if not (doi or ee):
         return None
+
+    # Determine record type: journal-article or proceedings-article
+    is_conference = (
+        "conference" in typ
+        or "proceedings" in typ
+        or re.search(r"proceedings|conference|workshop|symposium", venue_lower)
+    )
+    record_type = "proceedings-article" if is_conference else "journal-article"
 
     return PublishedRecord(
         doi=doi or "",
@@ -791,7 +797,7 @@ def dblp_hit_to_record(hit: dict[str, Any]) -> PublishedRecord | None:
         volume=volume,
         number=number,
         pages=pages,
-        type="journal-article",
+        type=record_type,
     )
 
 
@@ -812,7 +818,24 @@ def s2_data_to_record(data: dict[str, Any]) -> PublishedRecord | None:
     # Get venue
     venue = (data.get("publicationVenue") or {}).get("name") or data.get("venue")
 
+    # Reject arXiv/preprint venues
+    venue_lower = safe_lower(venue) if venue else ""
+    if re.search(r"arxiv|biorxiv|medrxiv", venue_lower):
+        return None
+
     pub_types = data.get("publicationTypes") or []
+    s2_type = pub_types[0].lower() if pub_types else ""
+
+    # Map Semantic Scholar types to standard types
+    # S2 uses: JournalArticle, Conference, Review, Book, BookSection, etc.
+    s2_type_map = {
+        "journalarticle": "journal-article",
+        "conference": "proceedings-article",
+        "book": "book",
+        "booksection": "book-chapter",
+        "review": "journal-article",
+    }
+    record_type = s2_type_map.get(s2_type, s2_type)
 
     return PublishedRecord(
         doi=doi or "",
@@ -821,7 +844,7 @@ def s2_data_to_record(data: dict[str, Any]) -> PublishedRecord | None:
         authors=authors,
         journal=venue,
         year=data.get("year"),
-        type=pub_types[0].lower() if pub_types else None,
+        type=record_type,
     )
 
 

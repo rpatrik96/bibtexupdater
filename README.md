@@ -27,6 +27,20 @@ cd bibtexupdater
 pip install -e ".[dev]"
 ```
 
+### Using uv (No Installation)
+
+Run directly without managing virtual environments using [uv](https://docs.astral.sh/uv/):
+
+```bash
+# Run any command directly
+uv run --with "bibtex-updater[all]" bibtex-update references.bib -o updated.bib
+
+# Or use the provided wrapper script
+./scripts/bibtex-x update references.bib -o updated.bib
+./scripts/bibtex-x check references.bib
+./scripts/bibtex-x filter paper.tex -b references.bib -o filtered.bib
+```
+
 ## CLI Commands
 
 | Command | Description |

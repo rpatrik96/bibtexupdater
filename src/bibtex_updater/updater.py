@@ -1211,19 +1211,24 @@ class Resolver:
         """Convert Crossref message to PublishedRecord. Delegates to bib_utils."""
         return crossref_message_to_record(msg)
 
+    # Credible publication types (journal articles and conference proceedings)
+    CREDIBLE_TYPES = {"journal-article", "proceedings-article", "book-chapter"}
+
     @staticmethod
     def _credible_journal_article(rec: PublishedRecord) -> bool:
-        if rec.type != "journal-article":
+        """Check if record is a credible published venue (journal or conference)."""
+        if rec.type not in Resolver.CREDIBLE_TYPES:
             return False
         if not rec.journal:
             return False
-        # Reject if journal looks like a preprint venue (ensures idempotency)
+        # Reject if venue looks like a preprint venue (ensures idempotency)
         j_lower = rec.journal.lower()
         if any(host in j_lower for host in PREPRINT_HOSTS):
             return False
         if not rec.year:
             return False
-        return bool(rec.volume or rec.number or rec.pages or rec.url)
+        # Accept if has volume/number/pages (journals) OR url/doi (conferences)
+        return bool(rec.volume or rec.number or rec.pages or rec.url or rec.doi)
 
     @staticmethod
     def _authors_to_bibtex_string(rec: PublishedRecord) -> str:
@@ -1277,6 +1282,29 @@ class Resolver:
             except (ValueError, TypeError):
                 pass
 
+        # Determine if this is a conference paper based on venue or entry type
+        venue_lower = safe_lower(venue) if venue else ""
+        entry_type = safe_lower(bib.get("ENTRYTYPE", ""))
+        is_conference = (
+            entry_type == "inproceedings"
+            or "conference" in venue_lower
+            or "proceedings" in venue_lower
+            or "advances in neural" in venue_lower  # NeurIPS
+            or "international conference" in venue_lower
+            or "icml" in venue_lower
+            or "iclr" in venue_lower
+            or "neurips" in venue_lower
+            or "nips" in venue_lower
+            or "aaai" in venue_lower
+            or "cvpr" in venue_lower
+            or "iccv" in venue_lower
+            or "eccv" in venue_lower
+            or "acl" in venue_lower
+            or "emnlp" in venue_lower
+            or "naacl" in venue_lower
+        )
+        record_type = "proceedings-article" if is_conference else ("journal-article" if venue else "unknown")
+
         return PublishedRecord(
             doi=doi,
             url=pub.get("pub_url"),
@@ -1287,7 +1315,7 @@ class Resolver:
             volume=bib.get("volume"),
             number=bib.get("number"),
             pages=bib.get("pages"),
-            type="journal-article" if venue else "unknown",
+            type=record_type,
             method="GoogleScholar(search)",
             confidence=0.0,
         )
@@ -1861,10 +1889,13 @@ class AsyncResolver:
         """Convert DBLP hit to PublishedRecord."""
         return dblp_hit_to_record(hit)
 
+    # Credible publication types (journal articles and conference proceedings)
+    CREDIBLE_TYPES = {"journal-article", "proceedings-article", "book-chapter"}
+
     @staticmethod
     def _credible_journal_article(rec: PublishedRecord) -> bool:
-        """Check if a record is a credible journal article."""
-        if rec.type != "journal-article":
+        """Check if record is a credible published venue (journal or conference)."""
+        if rec.type not in AsyncResolver.CREDIBLE_TYPES:
             return False
         if not rec.journal:
             return False
@@ -1873,7 +1904,8 @@ class AsyncResolver:
             return False
         if not rec.year:
             return False
-        return bool(rec.volume or rec.number or rec.pages or rec.url)
+        # Accept if has volume/number/pages (journals) OR url/doi (conferences)
+        return bool(rec.volume or rec.number or rec.pages or rec.url or rec.doi)
 
     @staticmethod
     def _authors_to_bibtex_string(rec: PublishedRecord) -> str:
@@ -2344,13 +2376,20 @@ class Updater:
 
     def update_entry(self, entry: dict[str, Any], rec: PublishedRecord, detection: PreprintDetection) -> dict[str, Any]:
         new_entry = dict(entry)
-        new_entry["ENTRYTYPE"] = "article"
+        # Set entry type based on publication type (conference → inproceedings, else article)
+        is_conference = rec.type == "proceedings-article"
+        new_entry["ENTRYTYPE"] = "inproceedings" if is_conference else "article"
         if rec.title:
             new_entry["title"] = rec.title
         if rec.authors:
             new_entry["author"] = self._author_bibtex_from_record(rec)
         if rec.journal:
-            new_entry["journal"] = rec.journal
+            if is_conference:
+                new_entry["booktitle"] = rec.journal
+                new_entry.pop("journal", None)  # Remove journal field for inproceedings
+            else:
+                new_entry["journal"] = rec.journal
+                new_entry.pop("booktitle", None)  # Remove booktitle field for articles
         if rec.publisher:
             new_entry["publisher"] = rec.publisher
         if rec.year:

@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# bibtex-x: Run bibtex-updater tools via uv without managing venvs
+# Usage: bibtex-x {update|check|filter|zotero} [args...]
+#
+# Examples:
+#   bibtex-x update references.bib -o updated.bib
+#   bibtex-x check references.bib
+#   bibtex-x filter paper.tex -b references.bib -o filtered.bib
+
+set -euo pipefail
+
+PKG="bibtex-updater[all]"
+
+cmd="${1:-}"
+shift || true
+
+case "$cmd" in
+    update)
+        exe="bibtex-update"
+        ;;
+    check)
+        exe="bibtex-check"
+        ;;
+    filter)
+        exe="bibtex-filter"
+        ;;
+    zotero)
+        exe="bibtex-zotero"
+        ;;
+    -h|--help|"")
+        echo "Usage: $(basename "$0") {update|check|filter|zotero} [args...]"
+        echo ""
+        echo "Commands:"
+        echo "  update   Update preprints to published versions (bibtex-update)"
+        echo "  check    Fact-check bibliography entries (bibtex-check)"
+        echo "  filter   Filter bibliography to cited entries only (bibtex-filter)"
+        echo "  zotero   Sync with Zotero library (bibtex-zotero)"
+        echo ""
+        echo "Examples:"
+        echo "  $(basename "$0") update references.bib -o updated.bib"
+        echo "  $(basename "$0") check references.bib"
+        echo "  $(basename "$0") filter paper.tex -b references.bib -o filtered.bib"
+        exit 0
+        ;;
+    *)
+        echo "Error: Unknown command '$cmd'" >&2
+        echo "Run '$(basename "$0") --help' for usage" >&2
+        exit 2
+        ;;
+esac
+
+exec uv run --with "$PKG" "$exe" "$@"

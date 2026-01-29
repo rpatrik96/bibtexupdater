@@ -162,7 +162,8 @@ class TestDblpHitToRecord:
         assert rec is not None
         assert len(rec.authors) == 1
 
-    def test_conference_rejected(self):
+    def test_conference_accepted(self):
+        """Conference papers should be accepted with proceedings-article type."""
         hit = {
             "info": {
                 "title": "Conference Paper",
@@ -174,7 +175,11 @@ class TestDblpHitToRecord:
             }
         }
         rec = dblp_hit_to_record(hit)
-        assert rec is None
+        assert rec is not None
+        assert rec.type == "proceedings-article"
+        assert rec.title == "Conference Paper"
+        assert rec.journal == "Proceedings of Conference"
+        assert rec.year == 2021
 
     def test_no_venue_returns_none(self):
         hit = {
@@ -261,6 +266,7 @@ class TestS2DataToRecord:
         assert rec.authors[0]["given"] == ""
 
     def test_publication_type_extracted(self):
+        """Test that S2 types are normalized to standard types."""
         data = {
             "doi": "10.1234/test",
             "title": "Test",
@@ -268,7 +274,19 @@ class TestS2DataToRecord:
         }
         rec = s2_data_to_record(data)
         assert rec is not None
-        assert rec.type == "journalarticle"
+        assert rec.type == "journal-article"  # Normalized from "journalarticle"
+
+    def test_conference_type_normalized(self):
+        """Test that S2 Conference type maps to proceedings-article."""
+        data = {
+            "doi": "10.1234/test",
+            "title": "Test",
+            "venue": "NeurIPS",
+            "publicationTypes": ["Conference"],
+        }
+        rec = s2_data_to_record(data)
+        assert rec is not None
+        assert rec.type == "proceedings-article"
 
     def test_no_publication_types(self):
         data = {
@@ -277,7 +295,7 @@ class TestS2DataToRecord:
         }
         rec = s2_data_to_record(data)
         assert rec is not None
-        assert rec.type is None
+        assert rec.type == ""  # Empty string when no types provided
 
     def test_publication_venue_name(self):
         data = {
