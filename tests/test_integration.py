@@ -100,13 +100,13 @@ class TestProcessEntry:
             journal="arXiv preprint",
         )
         record = PublishedRecord(
-            doi="10.1000/j.test.123",
+            doi="",  # No DOI
             title="Incomplete Record",
             authors=[{"given": "Jane", "family": "Doe"}],
             journal="Some Journal",
             year=2021,
             type="journal-article",
-            # Missing volume, number, pages, url - fails credibility check
+            # Missing volume, number, pages, url, AND doi - fails credibility check
         )
         resolver = fake_resolver(record)
 

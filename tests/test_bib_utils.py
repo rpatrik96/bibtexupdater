@@ -162,7 +162,8 @@ class TestDblpHitToRecord:
         assert rec is not None
         assert len(rec.authors) == 1
 
-    def test_conference_rejected(self):
+    def test_conference_accepted(self):
+        """Conference papers should be accepted with proceedings-article type."""
         hit = {
             "info": {
                 "title": "Conference Paper",
@@ -174,7 +175,11 @@ class TestDblpHitToRecord:
             }
         }
         rec = dblp_hit_to_record(hit)
-        assert rec is None
+        assert rec is not None
+        assert rec.type == "proceedings-article"
+        assert rec.title == "Conference Paper"
+        assert rec.journal == "Proceedings of Conference"
+        assert rec.year == 2021
 
     def test_no_venue_returns_none(self):
         hit = {
