@@ -547,6 +547,7 @@ class HttpClient:
         rate_limiter: RateLimiter | RateLimiterRegistry,
         cache: DiskCache,
         verbose: bool = False,
+        s2_api_key: str | None = None,
     ):
         """Initialize HTTP client.
 
@@ -557,6 +558,7 @@ class HttpClient:
                          or a RateLimiterRegistry for per-service rate limiting
             cache: DiskCache instance for caching responses
             verbose: Enable verbose logging
+            s2_api_key: Optional Semantic Scholar API key for authenticated requests
         """
         self.client = httpx.Client(
             timeout=httpx.Timeout(timeout),
@@ -567,6 +569,7 @@ class HttpClient:
         self._uses_registry = isinstance(rate_limiter, RateLimiterRegistry)
         self.cache = cache
         self.verbose = verbose
+        self.s2_api_key = s2_api_key
 
     @property
     def rate_limiter(self) -> RateLimiter | RateLimiterRegistry:
@@ -629,6 +632,9 @@ class HttpClient:
                 headers = {"Accept": accept} if accept else {}
                 if json_body is not None:
                     headers["Content-Type"] = "application/json"
+                # Add Semantic Scholar API key if available
+                if service == "semanticscholar" and self.s2_api_key:
+                    headers["x-api-key"] = self.s2_api_key
                 resp = self.client.request(method, url, params=params, headers=headers, json=json_body)
                 if resp.status_code in self.RETRYABLE_STATUS:
                     raise httpx.HTTPStatusError("Retryable status", request=resp.request, response=resp)

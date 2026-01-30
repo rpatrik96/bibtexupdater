@@ -754,14 +754,14 @@ class Detector:
                 True,
                 reason="journal contains preprint host",
                 doi=doi,
-                arxiv_id=extract_arxiv_id_from_text(url or note or eprint),
+                arxiv_id=extract_arxiv_id_from_text(journal or url or note or eprint),
             )
         if howpub and self._has_preprint_host(howpub):
             return PreprintDetection(
                 True,
                 reason="howpublished contains preprint host",
                 doi=doi,
-                arxiv_id=extract_arxiv_id_from_text(url or note or eprint),
+                arxiv_id=extract_arxiv_id_from_text(howpub or url or note or eprint),
             )
 
         if doi and (doi.startswith("10.48550/arxiv") or doi.startswith("10.1101")):
@@ -801,6 +801,9 @@ class Resolver:
         "journalarticle",
         "conference",
     }
+
+    # Minimum match score for accepting a search result (aligned with FieldFiller)
+    MATCH_THRESHOLD = 0.85
 
     def __init__(
         self,
@@ -1573,7 +1576,7 @@ class Resolver:
 
             combined = self._compute_match_score(title_norm, rec, authors_ref)
 
-            if combined >= 0.9 and self._credible_journal_article(rec):
+            if combined >= self.MATCH_THRESHOLD and self._credible_journal_article(rec):
                 rec.method = "DBLP(search)"
                 rec.confidence = combined
                 if self._is_better_candidate(combined, rec, best):
@@ -1635,7 +1638,7 @@ class Resolver:
 
             combined = self._compute_match_score(title_norm, rec, authors_ref)
 
-            if combined >= 0.9 and self._credible_journal_article(rec):
+            if combined >= self.MATCH_THRESHOLD and self._credible_journal_article(rec):
                 rec.method = "SemanticScholar(search)"
                 rec.confidence = combined
                 candidates.append((combined, rec))
@@ -1714,8 +1717,8 @@ class Resolver:
         authors_a = authors_last_names(entry.get("author", ""))
         candidates = [self._score_crossref_item(item, title_norm, authors_a) for item in items]
 
-        # Filter passing candidates (score >= 0.9 and credible)
-        passing = [(s, r) for (s, r) in candidates if (s >= 0.9 and self._credible_journal_article(r))]
+        # Filter passing candidates (score >= MATCH_THRESHOLD and credible)
+        passing = [(s, r) for (s, r) in candidates if (s >= self.MATCH_THRESHOLD and self._credible_journal_article(r))]
 
         if not passing:
             return self._try_relaxed_crossref_match(candidates)
@@ -1802,7 +1805,7 @@ class Resolver:
         authors_ref = authors_last_names(entry.get("author", ""))
         combined = self._compute_match_score(title_norm, rec, authors_ref)
 
-        if combined >= 0.9 and self._credible_journal_article(rec):
+        if combined >= self.MATCH_THRESHOLD and self._credible_journal_article(rec):
             rec.method = "GoogleScholar(search)"
             rec.confidence = combined
             tb = normalize_title_for_match(rec.title)
@@ -1862,6 +1865,9 @@ class AsyncResolver:
         "journalarticle",
         "conference",
     }
+
+    # Minimum match score for accepting a search result (aligned with Resolver)
+    MATCH_THRESHOLD = 0.85
 
     def __init__(
         self,
@@ -2153,7 +2159,7 @@ class AsyncResolver:
                     blns = [strip_diacritics(a.get("family") or "").lower() for a in rec.authors][:3]
                     auth_score = jaccard_similarity(authors[:3], blns)
                     combined = 0.7 * (title_score / 100.0) + 0.3 * auth_score
-                    if combined >= 0.9 and self._credible_journal_article(rec):
+                    if combined >= self.MATCH_THRESHOLD and self._credible_journal_article(rec):
                         rec.method = "DBLP(search,parallel)"
                         rec.confidence = combined
                         candidates.append((combined, rec))
@@ -2192,7 +2198,7 @@ class AsyncResolver:
                     blns = [strip_diacritics(a.get("family") or "").lower() for a in rec.authors][:3]
                     auth_score = jaccard_similarity(authors[:3], blns)
                     combined = 0.7 * (title_score / 100.0) + 0.3 * auth_score
-                    if combined >= 0.9 and self._credible_journal_article(rec):
+                    if combined >= self.MATCH_THRESHOLD and self._credible_journal_article(rec):
                         rec.method = "SemanticScholar(search,parallel)"
                         rec.confidence = combined
                         candidates.append((combined, rec))
@@ -2214,7 +2220,7 @@ class AsyncResolver:
                     blns = [strip_diacritics(a.get("family") or "").lower() for a in rec.authors][:3]
                     auth_score = jaccard_similarity(authors[:3], blns)
                     combined = 0.7 * (title_score / 100.0) + 0.3 * auth_score
-                    if combined >= 0.9 and self._credible_journal_article(rec):
+                    if combined >= self.MATCH_THRESHOLD and self._credible_journal_article(rec):
                         rec.method = "Crossref(search,parallel)"
                         rec.confidence = combined
                         candidates.append((combined, rec))
@@ -2826,6 +2832,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=30,
         help="TTL in days for resolution cache entries (default: 30)",
     )
+    p.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Disable caching entirely (useful for fresh lookups)",
+    )
+    p.add_argument(
+        "--clear-cache",
+        action="store_true",
+        help="Clear existing cache files before running",
+    )
+    p.add_argument(
+        "--s2-api-key",
+        metavar="KEY",
+        help="Semantic Scholar API key (or set S2_API_KEY env var)",
+    )
     p.add_argument("--rate-limit", type=int, default=45, help="Requests per minute (default 45)")
     p.add_argument("--max-workers", type=int, default=8, help="Max concurrent workers")
     p.add_argument("--timeout", type=float, default=20.0, help="HTTP timeout seconds")
@@ -3064,10 +3085,21 @@ def setup_http_client(args: argparse.Namespace) -> HttpClient:
         Configured HttpClient instance.
     """
     rate_limiter = RateLimiter(args.rate_limit)
-    cache = DiskCache(args.cache) if args.cache else DiskCache(None)
+    # Handle cache options: --no-cache disables caching entirely
+    if getattr(args, "no_cache", False):
+        cache = DiskCache(None)
+    else:
+        cache = DiskCache(args.cache) if args.cache else DiskCache(None)
     user_agent = "bib-preprint-upgrader/1.1 (mailto:you@example.com)"
+    # Get S2 API key from args or environment variable
+    s2_api_key = getattr(args, "s2_api_key", None) or os.environ.get("S2_API_KEY")
     return HttpClient(
-        timeout=args.timeout, user_agent=user_agent, rate_limiter=rate_limiter, cache=cache, verbose=args.verbose
+        timeout=args.timeout,
+        user_agent=user_agent,
+        rate_limiter=rate_limiter,
+        cache=cache,
+        verbose=args.verbose,
+        s2_api_key=s2_api_key,
     )
 
 
@@ -3538,10 +3570,27 @@ def build_main_components(args: argparse.Namespace, logger: logging.Logger) -> M
     # Build HTTP client
     http = setup_http_client(args)
 
-    # Build resolution cache
-    resolution_cache = (
-        ResolutionCache(args.resolution_cache, ttl_days=args.resolution_cache_ttl) if args.resolution_cache else None
-    )
+    # Handle --clear-cache: remove existing cache files
+    if getattr(args, "clear_cache", False):
+        import os
+
+        for cache_file in [args.cache, args.resolution_cache]:
+            if cache_file and os.path.exists(cache_file):
+                try:
+                    os.remove(cache_file)
+                    logger.info("Cleared cache file: %s", cache_file)
+                except OSError as e:
+                    logger.warning("Failed to clear cache file %s: %s", cache_file, e)
+
+    # Build resolution cache (disabled if --no-cache)
+    if getattr(args, "no_cache", False):
+        resolution_cache = None
+    else:
+        resolution_cache = (
+            ResolutionCache(args.resolution_cache, ttl_days=args.resolution_cache_ttl)
+            if args.resolution_cache
+            else None
+        )
 
     # Build scholarly client
     scholarly_client = setup_scholarly_client(args, logger)
