@@ -1003,7 +1003,7 @@ class Resolver:
 
     # --- Semantic Scholar (safe alternative to Google Scholar scraping) ---
     def s2_from_arxiv(self, arxiv_id: str) -> PublishedRecord | None:
-        fields = "externalIds,doi,title,year,authors,venue,publicationTypes,publicationVenue,url"
+        fields = "externalIds,title,year,authors,venue,publicationTypes,publicationVenue,url"
         url = f"{S2_API}/paper/arXiv:{arxiv_id}"
         try:
             resp = self.http._request(
@@ -1043,7 +1043,7 @@ class Resolver:
         )
 
     def s2_search(self, query: str, limit: int = 20) -> list[dict[str, Any]]:
-        params = {"query": query, "limit": limit, "fields": "title,authors,year,venue,publicationTypes,doi,url"}
+        params = {"query": query, "limit": limit, "fields": "title,authors,year,venue,publicationTypes,externalIds,url"}
         url = f"{S2_API}/paper/search"
         try:
             resp = self.http._request("GET", url, params=params, accept="application/json", service="semanticscholar")
@@ -1068,7 +1068,7 @@ class Resolver:
             return {}
 
         S2_BATCH_URL = f"{S2_API}/paper/batch"
-        fields = "externalIds,doi,title,year,authors,venue,publicationTypes,publicationVenue,url,paperId"
+        fields = "externalIds,title,year,authors,venue,publicationTypes,publicationVenue,url,paperId"
 
         try:
             resp = self.http._request(
@@ -2048,7 +2048,7 @@ class AsyncResolver:
         params = {
             "query": query,
             "limit": limit,
-            "fields": "title,authors,year,venue,publicationTypes,doi,url",
+            "fields": "title,authors,year,venue,publicationTypes,externalIds,url",
         }
         url = f"{S2_API}/paper/search"
         try:
@@ -2074,7 +2074,7 @@ class AsyncResolver:
         Returns:
             PublishedRecord if a journal article is found, None otherwise
         """
-        fields = "externalIds,doi,title,year,authors,venue,publicationTypes,publicationVenue,url"
+        fields = "externalIds,title,year,authors,venue,publicationTypes,publicationVenue,url"
         url = f"{S2_API}/paper/arXiv:{arxiv_id}"
         try:
             resp = await self.http.get(
@@ -2353,9 +2353,10 @@ class Updater:
         "eprintclass",
     }
 
-    def __init__(self, keep_preprint_note: bool = False, rekey: bool = False) -> None:
+    def __init__(self, keep_preprint_note: bool = False, rekey: bool = False, mark_resolved: bool = False) -> None:
         self.keep_preprint_note = keep_preprint_note
         self.rekey = rekey
+        self.mark_resolved = mark_resolved
 
     @staticmethod
     def _author_bibtex_from_record(rec: PublishedRecord) -> str:
@@ -2428,6 +2429,13 @@ class Updater:
             new_entry["ID"] = self._generate_key(entry, rec)
         else:
             new_entry["ID"] = entry.get("ID")
+
+        # Add marker for resolved entries to skip in future runs
+        if self.mark_resolved:
+            if detection.arxiv_id:
+                new_entry["_resolved_from"] = f"arXiv:{detection.arxiv_id}"
+            elif detection.doi:
+                new_entry["_resolved_from"] = f"doi:{detection.doi}"
 
         return new_entry
 
@@ -2650,6 +2658,7 @@ def process_entries_optimized(
     updater: Updater,
     logger: logging.Logger,
     max_workers: int = 8,
+    force_recheck: bool = False,
 ) -> list[ProcessResult]:
     """Process entries with prioritization and batch optimization.
 
@@ -2665,6 +2674,7 @@ def process_entries_optimized(
         updater: Updater instance for applying updates
         logger: Logger instance
         max_workers: Maximum concurrent workers (default 8)
+        force_recheck: If True, ignore '_resolved_from' markers and recheck all entries
 
     Returns:
         List of ProcessResult for all entries (including unchanged non-preprints)
@@ -2672,8 +2682,26 @@ def process_entries_optimized(
     # Build a map from entry to its original index for result ordering
     entry_to_idx = {id(e): i for i, e in enumerate(entries)}
 
+    # Pre-filter: skip already-resolved entries unless force_recheck is enabled
+    skipped_resolved: dict[int, ProcessResult] = {}
+    entries_to_process = []
+    for i, entry in enumerate(entries):
+        if not force_recheck and "_resolved_from" in entry:
+            skipped_resolved[i] = ProcessResult(
+                original=entry,
+                updated=entry,
+                changed=False,
+                action="skipped_resolved",
+                message=f"Previously resolved from {entry['_resolved_from']}",
+            )
+        else:
+            entries_to_process.append(entry)
+
+    # Rebuild index map for entries we're actually processing
+    entry_to_idx = {id(e): i for i, e in enumerate(entries)}
+
     # Phase 1: Detect and prioritize preprints
-    prioritized = prioritize_entries(entries, detector)
+    prioritized = prioritize_entries(entries_to_process, detector)
 
     if not prioritized:
         # No preprints found, return unchanged results for all entries
@@ -2734,7 +2762,10 @@ def process_entries_optimized(
     preprint_ids = {id(item[1]) for item in prioritized}
 
     for i, entry in enumerate(entries):
-        if i in preprint_results:
+        if i in skipped_resolved:
+            # Entry was skipped because it has _resolved_from marker
+            results.append(skipped_resolved[i])
+        elif i in preprint_results:
             results.append(preprint_results[i])
         elif id(entry) in preprint_ids:
             # This shouldn't happen, but handle gracefully
@@ -2755,7 +2786,12 @@ def process_entries_optimized(
 
 
 def process_entry(
-    entry: dict[str, Any], detector: Detector, resolver: Resolver, updater: Updater, logger: logging.Logger
+    entry: dict[str, Any],
+    detector: Detector,
+    resolver: Resolver,
+    updater: Updater,
+    logger: logging.Logger,
+    force_recheck: bool = False,
 ) -> ProcessResult:
     """Process a single entry for preprint resolution (original non-optimized version).
 
@@ -2765,10 +2801,21 @@ def process_entry(
         resolver: Resolver instance for finding published versions
         updater: Updater instance for applying updates
         logger: Logger instance
+        force_recheck: If True, ignore '_resolved_from' markers and recheck all entries
 
     Returns:
         ProcessResult with the processing outcome
     """
+    # Skip already-resolved entries unless force-recheck is enabled
+    if not force_recheck and "_resolved_from" in entry:
+        return ProcessResult(
+            original=entry,
+            updated=entry,
+            changed=False,
+            action="skipped_resolved",
+            message=f"Previously resolved from {entry['_resolved_from']}",
+        )
+
     det = detector.detect(entry)
     if not det.is_preprint:
         return ProcessResult(original=entry, updated=entry, changed=False, action="unchanged")
@@ -2817,6 +2864,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     out.add_argument("--in-place", action="store_true", help="Edit files in place")
     p.add_argument("--keep-preprint-note", action="store_true", help="Keep a note pointing to arXiv id")
     p.add_argument("--rekey", action="store_true", help="Regenerate BibTeX keys as authorYearTitle")
+    p.add_argument(
+        "--mark-resolved",
+        action="store_true",
+        help="Add '_resolved_from' field to updated entries to skip them in future runs",
+    )
+    p.add_argument(
+        "--force-recheck",
+        action="store_true",
+        help="Ignore '_resolved_from' markers and recheck all entries",
+    )
     p.add_argument("--dedupe", action="store_true", help="Merge duplicates by DOI or normalized title+authors")
     p.add_argument("--dry-run", action="store_true", help="Preview changes without writing files")
     p.add_argument("--report", help="Write JSONL report mapping original→updated")
@@ -2846,6 +2903,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--s2-api-key",
         metavar="KEY",
         help="Semantic Scholar API key (or set S2_API_KEY env var)",
+    )
+    p.add_argument(
+        "--user-agent",
+        metavar="UA",
+        help="User-Agent header for API requests (or set BIBTEX_UPDATER_USER_AGENT env var). "
+        "Format: 'toolname/version (mailto:your@email.com)'",
     )
     p.add_argument("--rate-limit", type=int, default=45, help="Requests per minute (default 45)")
     p.add_argument("--max-workers", type=int, default=8, help="Max concurrent workers")
@@ -2915,21 +2978,34 @@ def summarize(results: list[ProcessResult], logger: logging.Logger) -> dict[str,
     total = len(results)
     upgraded = sum(1 for r in results if r.action == "upgraded")
     failed = sum(1 for r in results if r.action == "failed")
-    unchanged = total - upgraded - failed
-    logger.info(
-        "Summary: total=%d, detected_preprints=%d, upgraded=%d, unchanged=%d, failures=%d",
-        total,
-        upgraded + failed,
-        upgraded,
-        unchanged,
-        failed,
-    )
+    skipped_resolved = sum(1 for r in results if r.action == "skipped_resolved")
+    unchanged = total - upgraded - failed - skipped_resolved
+    if skipped_resolved > 0:
+        logger.info(
+            "Summary: total=%d, detected_preprints=%d, upgraded=%d, unchanged=%d, failures=%d, skipped_resolved=%d",
+            total,
+            upgraded + failed,
+            upgraded,
+            unchanged,
+            failed,
+            skipped_resolved,
+        )
+    else:
+        logger.info(
+            "Summary: total=%d, detected_preprints=%d, upgraded=%d, unchanged=%d, failures=%d",
+            total,
+            upgraded + failed,
+            upgraded,
+            unchanged,
+            failed,
+        )
     return {
         "total": total,
         "detected_preprints": upgraded + failed,
         "upgraded": upgraded,
         "unchanged": unchanged,
         "failures": failed,
+        "skipped_resolved": skipped_resolved,
     }
 
 
@@ -3090,7 +3166,12 @@ def setup_http_client(args: argparse.Namespace) -> HttpClient:
         cache = DiskCache(None)
     else:
         cache = DiskCache(args.cache) if args.cache else DiskCache(None)
-    user_agent = "bib-preprint-upgrader/1.1 (mailto:you@example.com)"
+    # Get user agent from args, env var, or use default
+    user_agent = (
+        getattr(args, "user_agent", None)
+        or os.environ.get("BIBTEX_UPDATER_USER_AGENT")
+        or "bib-preprint-upgrader/1.1 (mailto:you@example.com)"
+    )
     # Get S2 API key from args or environment variable
     s2_api_key = getattr(args, "s2_api_key", None) or os.environ.get("S2_API_KEY")
     return HttpClient(
@@ -3193,6 +3274,7 @@ def process_entries_parallel(
     updater: Updater,
     logger: logging.Logger,
     max_workers: int,
+    force_recheck: bool = False,
 ) -> list[ProcessResult]:
     """Process entries in parallel for preprint upgrade.
 
@@ -3203,13 +3285,16 @@ def process_entries_parallel(
         updater: Entry updater.
         logger: Logger instance.
         max_workers: Maximum number of parallel workers.
+        force_recheck: If True, ignore '_resolved_from' markers and recheck all entries.
 
     Returns:
         List of ProcessResult objects (order may differ from input).
     """
     results: list[ProcessResult] = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futures = [ex.submit(process_entry, entry, detector, resolver, updater, logger) for entry in entries]
+        futures = [
+            ex.submit(process_entry, entry, detector, resolver, updater, logger, force_recheck) for entry in entries
+        ]
         for fut in concurrent.futures.as_completed(futures):
             results.append(fut.result())
     return results
@@ -3369,6 +3454,7 @@ def process_single_database_in_place(
             components.updater,
             components.logger,
             args.max_workers,
+            force_recheck=getattr(args, "force_recheck", False),
         )
         new_entries = [r.updated for r in results]
     else:
@@ -3506,6 +3592,7 @@ def process_to_output_mode(
             components.updater,
             components.logger,
             args.max_workers,
+            force_recheck=getattr(args, "force_recheck", False),
         )
         ordered_results = order_results_by_entries(results, merged_db.entries)
         new_entries = [r.updated for r in ordered_results]
@@ -3606,7 +3693,11 @@ def build_main_components(args: argparse.Namespace, logger: logging.Logger) -> M
         http=http,
         resolver=resolver,
         detector=Detector(),
-        updater=Updater(keep_preprint_note=args.keep_preprint_note, rekey=args.rekey),
+        updater=Updater(
+            keep_preprint_note=args.keep_preprint_note,
+            rekey=args.rekey,
+            mark_resolved=getattr(args, "mark_resolved", False),
+        ),
         loader=BibLoader(),
         writer=BibWriter(),
         field_processor=field_processor,

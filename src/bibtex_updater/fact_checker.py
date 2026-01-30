@@ -932,7 +932,7 @@ class DBLPClient:
 class SemanticScholarClient:
     """Semantic Scholar API client."""
 
-    FIELDS = "title,authors,venue,year,publicationTypes,externalIds,doi,url"
+    FIELDS = "title,authors,venue,year,publicationTypes,externalIds,url"
 
     def __init__(self, http: HttpClient):
         self.http = http
