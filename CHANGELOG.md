@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `--no-cache` flag to disable caching entirely for fresh lookups
+- `--clear-cache` flag to clear existing cache files before running
+- `--s2-api-key` flag for Semantic Scholar API authentication (also reads `S2_API_KEY` env var)
+- `MATCH_THRESHOLD` constant (0.85) in `Resolver` and `AsyncResolver` for consistent matching
+
+### Fixed
+- arXiv ID extraction from `journal` and `howpublished` fields (major bug fix)
+  - Previously, entries like `journal={arXiv preprint arXiv:2310.15213}` would not extract
+    the arXiv ID, causing cache key collisions and missed API lookups
+  - Now correctly extracts arXiv IDs from all relevant fields
+- Match threshold consistency: lowered from hardcoded 0.9 to 0.85 across all search stages,
+  aligned with `FieldFiller.MATCH_THRESHOLD`
+
+### Improved
+- Real-world test shows 117% improvement in upgrade rate (12→26 papers) and 31% reduction
+  in failures (45→31) on a 162-entry bibliography
+
 ## [0.1.2] - 2026-01-30
 
 ### Fixed
