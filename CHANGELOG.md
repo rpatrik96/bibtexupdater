@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-01-30
+
+### Fixed
+- Conference papers now properly accepted in `process_entry` functions (#19)
+  - v0.1.1 fix was incomplete: `_credible_journal_article` was updated but
+    `process_entry` and `process_entry_with_preload` still had hardcoded checks
+  - "Attention Is All You Need" and similar NeurIPS/ICML papers now resolve correctly
+
 ## [0.1.1] - 2026-01-29
 
 ### Added
@@ -77,6 +85,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Comprehensive test suite with pytest fixtures
 - MIT License
 
-[Unreleased]: https://github.com/rpatrik96/bibtexupdater/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/rpatrik96/bibtexupdater/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/rpatrik96/bibtexupdater/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/rpatrik96/bibtexupdater/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/rpatrik96/bibtexupdater/releases/tag/v0.1.0
