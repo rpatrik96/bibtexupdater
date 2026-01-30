@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-01-30
+
 ### Added
 - `--no-cache` flag to disable caching entirely for fresh lookups
 - `--clear-cache` flag to clear existing cache files before running
@@ -103,7 +105,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Comprehensive test suite with pytest fixtures
 - MIT License
 
-[Unreleased]: https://github.com/rpatrik96/bibtexupdater/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/rpatrik96/bibtexupdater/compare/v0.1.3...HEAD
+[0.1.3]: https://github.com/rpatrik96/bibtexupdater/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/rpatrik96/bibtexupdater/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/rpatrik96/bibtexupdater/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/rpatrik96/bibtexupdater/releases/tag/v0.1.0
