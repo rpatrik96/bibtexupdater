@@ -174,7 +174,11 @@ class ScholarlyClient:
         self._last_request = time.time()
 
     def search(self, title: str, first_author: str) -> dict[str, Any] | None:
-        """Search Google Scholar and return filled publication or None."""
+        """Search Google Scholar and return filled publication or None.
+
+        If fill() fails (e.g., rate limiting), returns partial results with
+        a '_partial' flag set to True.
+        """
         if not self._scholarly:
             return None
         try:
@@ -185,8 +189,14 @@ class ScholarlyClient:
             pub = next(search_results, None)
             if pub:
                 self._rate_limit()
-                filled = self._scholarly.fill(pub)
-                return filled
+                try:
+                    filled = self._scholarly.fill(pub)
+                    return filled
+                except Exception as fill_err:
+                    # fill() failed (likely rate limited), return partial results
+                    self.logger.debug("Scholarly fill() failed: %s; using partial results", fill_err)
+                    pub["_partial"] = True
+                    return pub
         except StopIteration:
             self.logger.debug("Scholarly: no results found")
         except Exception as e:
@@ -1217,6 +1227,26 @@ class Resolver:
     # Credible publication types (journal articles and conference proceedings)
     CREDIBLE_TYPES = {"journal-article", "proceedings-article", "book-chapter"}
 
+    # Known conference venue patterns (for partial Google Scholar results)
+    KNOWN_CONFERENCE_VENUES = (
+        "advances in neural",  # NeurIPS
+        "international conference on machine learning",  # ICML
+        "international conference on learning representations",  # ICLR
+        "conference on neural information processing",  # NeurIPS alternate
+        "aaai conference",
+        "cvpr",
+        "computer vision and pattern recognition",
+        "iccv",
+        "international conference on computer vision",
+        "eccv",
+        "european conference on computer vision",
+        "acl",
+        "association for computational linguistics",
+        "emnlp",
+        "empirical methods in natural language",
+        "naacl",
+    )
+
     @staticmethod
     def _credible_journal_article(rec: PublishedRecord) -> bool:
         """Check if record is a credible published venue (journal or conference)."""
@@ -1231,7 +1261,14 @@ class Resolver:
         if not rec.year:
             return False
         # Accept if has volume/number/pages (journals) OR url/doi (conferences)
-        return bool(rec.volume or rec.number or rec.pages or rec.url or rec.doi)
+        if rec.volume or rec.number or rec.pages or rec.url or rec.doi:
+            return True
+        # For partial Google Scholar results, accept if venue matches a known conference
+        # (even without volume/pages/url, the venue match provides credibility)
+        if rec.method and "partial" in rec.method:
+            if any(venue in j_lower for venue in Resolver.KNOWN_CONFERENCE_VENUES):
+                return True
+        return False
 
     @staticmethod
     def _authors_to_bibtex_string(rec: PublishedRecord) -> str:
@@ -1308,6 +1345,10 @@ class Resolver:
         )
         record_type = "proceedings-article" if is_conference else ("journal-article" if venue else "unknown")
 
+        # Mark if this is from partial results (fill() failed)
+        is_partial = pub.get("_partial", False)
+        method = "GoogleScholar(search,partial)" if is_partial else "GoogleScholar(search)"
+
         return PublishedRecord(
             doi=doi,
             url=pub.get("pub_url"),
@@ -1319,7 +1360,7 @@ class Resolver:
             number=bib.get("number"),
             pages=bib.get("pages"),
             type=record_type,
-            method="GoogleScholar(search)",
+            method=method,
             confidence=0.0,
         )
 

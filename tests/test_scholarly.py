@@ -156,6 +156,27 @@ class TestScholarlyClientSearch:
         result = client.search("Paper", "Author")
         assert result is None
 
+    def test_search_returns_partial_results_when_fill_fails(self, caplog):
+        """Search should return partial results with _partial flag when fill() fails."""
+        mock_pub = {"bib": {"title": "Test Paper", "venue": "Advances in neural...", "pub_year": "2020"}}
+        mock_scholarly = MagicMock()
+        mock_scholarly.search_pubs.return_value = iter([mock_pub])
+        mock_scholarly.fill.side_effect = Exception("Cannot Fetch from Google Scholar")
+
+        client = ScholarlyClient.__new__(ScholarlyClient)
+        client._scholarly = mock_scholarly
+        client.delay = 0.0
+        client._last_request = 0.0
+        client.logger = logging.getLogger(__name__)
+
+        with caplog.at_level(logging.DEBUG):
+            result = client.search("Test Paper", "Author")
+
+        assert result is not None
+        assert result["_partial"] is True
+        assert result["bib"]["title"] == "Test Paper"
+        assert "fill() failed" in caplog.text
+
 
 class TestScholarlyToRecord:
     """Tests for Resolver._scholarly_to_record() conversion."""
@@ -309,6 +330,137 @@ class TestScholarlyToRecord:
 
         record = resolver._scholarly_to_record(pub)
         assert record.type == "unknown"
+
+    def test_partial_results_marked_in_method(self, resolver):
+        """Test that partial results have method marked with 'partial'."""
+        pub = {
+            "_partial": True,
+            "bib": {
+                "title": "Paper",
+                "author": "Author",
+                "venue": "Advances in neural information processing systems",
+                "pub_year": "2020",
+            },
+        }
+
+        record = resolver._scholarly_to_record(pub)
+        assert "partial" in record.method
+        assert record.method == "GoogleScholar(search,partial)"
+
+    def test_full_results_not_marked_partial(self, resolver):
+        """Test that full results don't have 'partial' in method."""
+        pub = {
+            "bib": {
+                "title": "Paper",
+                "author": "Author",
+                "venue": "Nature",
+                "pub_year": "2020",
+            },
+        }
+
+        record = resolver._scholarly_to_record(pub)
+        assert "partial" not in record.method
+        assert record.method == "GoogleScholar(search)"
+
+
+class TestCredibleJournalArticlePartialResults:
+    """Tests for _credible_journal_article with partial Google Scholar results."""
+
+    def test_partial_results_accepted_with_known_conference_venue(self):
+        """Partial results should be accepted if venue matches known conference."""
+        record = PublishedRecord(
+            doi=None,
+            url=None,  # No URL (partial result)
+            title="Learning with Differentiable Perturbed Optimizers",
+            authors=[{"given": "Quentin", "family": "Berthet"}],
+            journal="Advances in neural information processing systems",
+            year=2020,
+            volume=None,  # No volume (partial result)
+            number=None,
+            pages=None,  # No pages (partial result)
+            type="proceedings-article",
+            method="GoogleScholar(search,partial)",
+            confidence=0.0,
+        )
+
+        assert Resolver._credible_journal_article(record) is True
+
+    def test_partial_results_rejected_with_unknown_venue(self):
+        """Partial results should be rejected if venue is not a known conference."""
+        record = PublishedRecord(
+            doi=None,
+            url=None,
+            title="Some Paper",
+            authors=[{"given": "John", "family": "Doe"}],
+            journal="Unknown Journal",
+            year=2020,
+            volume=None,
+            number=None,
+            pages=None,
+            type="journal-article",
+            method="GoogleScholar(search,partial)",
+            confidence=0.0,
+        )
+
+        assert Resolver._credible_journal_article(record) is False
+
+    def test_full_results_still_require_volume_or_url(self):
+        """Full Google Scholar results still need volume/pages or url/doi."""
+        record = PublishedRecord(
+            doi=None,
+            url=None,
+            title="Some Paper",
+            authors=[{"given": "John", "family": "Doe"}],
+            journal="Advances in neural information processing systems",
+            year=2020,
+            volume=None,
+            number=None,
+            pages=None,
+            type="proceedings-article",
+            method="GoogleScholar(search)",  # Not partial
+            confidence=0.0,
+        )
+
+        # Full results without volume/pages/url/doi should be rejected
+        assert Resolver._credible_journal_article(record) is False
+
+    def test_partial_neurips_truncated_venue_accepted(self):
+        """Partial results with truncated NeurIPS venue should be accepted."""
+        record = PublishedRecord(
+            doi=None,
+            url=None,
+            title="Test Paper",
+            authors=[{"given": "Test", "family": "Author"}],
+            journal="Advances in neural...",  # Truncated venue from Google Scholar
+            year=2020,
+            volume=None,
+            number=None,
+            pages=None,
+            type="proceedings-article",
+            method="GoogleScholar(search,partial)",
+            confidence=0.0,
+        )
+
+        assert Resolver._credible_journal_article(record) is True
+
+    def test_partial_icml_venue_accepted(self):
+        """Partial results with ICML venue should be accepted."""
+        record = PublishedRecord(
+            doi=None,
+            url=None,
+            title="Test Paper",
+            authors=[{"given": "Test", "family": "Author"}],
+            journal="International Conference on Machine Learning",
+            year=2020,
+            volume=None,
+            number=None,
+            pages=None,
+            type="proceedings-article",
+            method="GoogleScholar(search,partial)",
+            confidence=0.0,
+        )
+
+        assert Resolver._credible_journal_article(record) is True
 
 
 class TestResolverStage6:
