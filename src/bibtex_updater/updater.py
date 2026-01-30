@@ -2607,13 +2607,13 @@ def process_entry_with_preload(
             message="No reliable published match found",
         )
 
-    if record.type != "journal-article":
+    if record.type not in Resolver.CREDIBLE_TYPES:
         return ProcessResult(
             original=entry,
             updated=entry,
             changed=False,
             action="failed",
-            message="Candidate not a journal-article",
+            message=f"Candidate type '{record.type}' not a credible publication venue",
         )
 
     if not resolver._credible_journal_article(record):
@@ -2773,9 +2773,13 @@ def process_entry(
             original=entry, updated=entry, changed=False, action="failed", message="No reliable published match found"
         )
 
-    if rec and rec.type != "journal-article":
+    if rec and rec.type not in Resolver.CREDIBLE_TYPES:
         return ProcessResult(
-            original=entry, updated=entry, changed=False, action="failed", message="Candidate not a journal-article"
+            original=entry,
+            updated=entry,
+            changed=False,
+            action="failed",
+            message=f"Candidate type '{rec.type}' not a credible publication venue",
         )
 
     if rec and not Resolver._credible_journal_article(rec):

@@ -72,8 +72,29 @@ class TestProcessEntry:
         assert not result.changed
         assert "No reliable published match" in result.message
 
-    def test_process_preprint_failed_not_journal_article(self, make_entry, detector, fake_resolver, updater, logger):
-        """Preprint should fail when candidate is not a journal article."""
+    def test_process_preprint_failed_not_credible_venue(self, make_entry, detector, fake_resolver, updater, logger):
+        """Preprint should fail when candidate is not a credible publication venue."""
+        entry = make_entry(
+            url="https://arxiv.org/abs/2001.01234",
+            journal="arXiv preprint",
+        )
+        record = PublishedRecord(
+            doi="10.1000/dataset.123",
+            title="Some Dataset",
+            authors=[{"given": "Jane", "family": "Doe"}],
+            journal="Data Repository",
+            year=2021,
+            type="dataset",  # Not a credible publication venue
+        )
+        resolver = fake_resolver(record)
+
+        result = process_entry(entry, detector, resolver, updater, logger)
+
+        assert result.action == "failed"
+        assert "not a credible publication venue" in result.message
+
+    def test_process_preprint_conference_accepted(self, make_entry, detector, fake_resolver, updater, logger):
+        """Conference papers (proceedings-article) should be accepted."""
         entry = make_entry(
             url="https://arxiv.org/abs/2001.01234",
             journal="arXiv preprint",
@@ -82,16 +103,18 @@ class TestProcessEntry:
             doi="10.1000/conf.123",
             title="Conference Paper",
             authors=[{"given": "Jane", "family": "Doe"}],
-            journal="Conference Proceedings",
+            journal="NeurIPS",
             year=2021,
-            type="proceedings-article",  # Not journal-article
+            type="proceedings-article",
+            method="test",
+            confidence=1.0,
         )
         resolver = fake_resolver(record)
 
         result = process_entry(entry, detector, resolver, updater, logger)
 
-        assert result.action == "failed"
-        assert "not a journal-article" in result.message
+        assert result.action == "upgraded"
+        assert result.changed
 
     def test_process_preprint_failed_insufficient_metadata(self, make_entry, detector, fake_resolver, updater, logger):
         """Preprint should fail when candidate lacks sufficient metadata."""
