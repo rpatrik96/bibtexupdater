@@ -13,6 +13,11 @@ citekey:
 year:
   {{date|format("YYYY")}}
 keywords:
+{%- if tags and tags.length > 0 %}
+{%- for tag in tags %}
+  - "[[{{tag.tag}}]]"
+{%- endfor %}
+{%- endif %}
 related:
 ---
 

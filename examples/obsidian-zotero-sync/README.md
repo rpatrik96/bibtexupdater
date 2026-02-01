@@ -26,6 +26,7 @@ These scripts trigger Zotero Integration imports using your paper template. They
 | `zotero-sync.md` | Interactive single-paper sync |
 | `zotero-bulk-sync.md` | Bulk import new papers |
 | `zotero-paper-template.md` | Example paper import template with color-coded annotations |
+| `zotero-enrich-keywords.md` | AI-powered keyword enrichment for paper notes |
 
 ## Installation
 
@@ -77,6 +78,62 @@ The included `zotero-paper-template.md` uses color-coded callouts for annotation
 | Pink (#e56eee) | Connection to literature |
 | Orange (#f19837) | Assumption |
 | Gray (#aaaaaa) | Wrong?! |
+
+## Auto-Keywording
+
+The sync templates support automatic `[[wikilink]]` keywords for better knowledge graph connectivity.
+
+### How It Works
+
+1. **Zotero Tags (Automatic)**: The paper template converts existing Zotero tags to `[[wikilinks]]` in frontmatter
+2. **AI Enrichment (Optional)**: Use `zotero-enrich-keywords.md` to generate additional topic keywords via AI
+
+### Zotero Tags → Wikilinks
+
+The paper template automatically includes Zotero tags as keywords:
+
+```yaml
+keywords:
+  - "[[machine-learning]]"
+  - "[[representation-learning]]"
+```
+
+Add tags in Zotero for best results.
+
+### AI Keyword Enrichment
+
+For papers without tags (or to add more keywords), use the AI enrichment script:
+
+**Prerequisites:**
+```bash
+pip install bibtex-updater[organizer-claude]  # or organizer-openai
+export ANTHROPIC_API_KEY="your-key"           # or OPENAI_API_KEY
+```
+
+**Templater Script:**
+1. Copy `zotero-enrich-keywords.md` to your Templates folder
+2. Configure the variables at the top of the script
+3. Run on any paper note to generate AI keywords
+
+**CLI Usage:**
+```bash
+# Single note
+bibtex-obsidian-keywords ~/Notes/Papers/@smith2024.md
+
+# All papers (dry run)
+bibtex-obsidian-keywords ~/Notes/Papers/ --dry-run
+
+# With existing topics file for consistency
+bibtex-obsidian-keywords ~/Notes/Papers/ --topics-file ~/Notes/topics.txt
+```
+
+**Configuration (`zotero-enrich-keywords.md`):**
+```javascript
+const AI_BACKEND = "claude";           // or "openai", "embedding"
+const MAX_KEYWORDS = 5;                // keywords per paper
+const MIN_EXISTING_THRESHOLD = 3;      // skip if already has enough
+const TOPICS_FILE = "";                // optional: path to topics list
+```
 
 ## Startup Automation (Optional)
 
