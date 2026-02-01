@@ -94,6 +94,7 @@ bibtex-check = "bibtex_updater.cli.fact_checker_cli:main"
 bibtex-filter = "bibtex_updater.cli.filter_cli:main"
 bibtex-zotero = "bibtex_updater.cli.zotero_cli:main"
 bibtex-zotero-organize = "bibtex_updater.cli.zotero_organizer_cli:main"
+bibtex-obsidian-keywords = "bibtex_updater.cli.obsidian_keywords_cli:main"
 
 [project.urls]
 Homepage = "https://github.com/rpatrik96/bibtexupdater"
