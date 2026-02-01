@@ -295,9 +295,7 @@ class CollectionManager:
 
         # Need to create
         if not self.create_collections:
-            raise ValueError(
-                f"Collection '{topic_name}' not found and creation disabled"
-            )
+            raise ValueError(f"Collection '{topic_name}' not found and creation disabled")
 
         # Determine parent collection
         parent_key = None

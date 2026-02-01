@@ -77,7 +77,7 @@ def print_summary(results: list[OrganizeResult], dry_run: bool) -> None:
     if organized or would_organize:
         action_label = "Would Organize" if dry_run else "Organized"
         print(f"\n--- {action_label} ---")
-        for r in (would_organize if dry_run else organized):
+        for r in would_organize if dry_run else organized:
             print(f"  [{r.item_key}] {r.title}")
             print(f"    Topics: {', '.join(r.topics)}")
             print(f"    Confidence: {r.confidence:.2f}" + (" (cached)" if r.cached else ""))
@@ -201,9 +201,7 @@ Environment Variables:
 
     # Build configuration (CLI args override file config)
     library_id = args.library_id or file_config.get("library_id") or os.environ.get("ZOTERO_LIBRARY_ID")
-    zotero_api_key = (
-        args.zotero_api_key or file_config.get("api_key") or os.environ.get("ZOTERO_API_KEY")
-    )
+    zotero_api_key = args.zotero_api_key or file_config.get("api_key") or os.environ.get("ZOTERO_API_KEY")
 
     if not library_id or not zotero_api_key:
         print("Error: ZOTERO_LIBRARY_ID and ZOTERO_API_KEY required", file=sys.stderr)

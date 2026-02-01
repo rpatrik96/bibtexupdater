@@ -27,17 +27,19 @@ class TestClaudeBackend:
         return {
             "content": [
                 {
-                    "text": json.dumps({
-                        "primary_topic": {
-                            "topic_id": "ABC123",
-                            "topic_name": "Machine Learning",
-                            "confidence": 0.85,
-                            "is_new": False,
-                        },
-                        "secondary_topics": [],
-                        "suggested_new_topics": [],
-                        "reasoning": "Test reasoning",
-                    })
+                    "text": json.dumps(
+                        {
+                            "primary_topic": {
+                                "topic_id": "ABC123",
+                                "topic_name": "Machine Learning",
+                                "confidence": 0.85,
+                                "is_new": False,
+                            },
+                            "secondary_topics": [],
+                            "suggested_new_topics": [],
+                            "reasoning": "Test reasoning",
+                        }
+                    )
                 }
             ],
             "usage": {"input_tokens": 100, "output_tokens": 50},
@@ -110,17 +112,19 @@ class TestOpenAIBackend:
             "choices": [
                 {
                     "message": {
-                        "content": json.dumps({
-                            "primary_topic": {
-                                "topic_id": "XYZ789",
-                                "topic_name": "Natural Language Processing",
-                                "confidence": 0.9,
-                                "is_new": False,
-                            },
-                            "secondary_topics": [],
-                            "suggested_new_topics": [],
-                            "reasoning": "Test reasoning",
-                        })
+                        "content": json.dumps(
+                            {
+                                "primary_topic": {
+                                    "topic_id": "XYZ789",
+                                    "topic_name": "Natural Language Processing",
+                                    "confidence": 0.9,
+                                    "is_new": False,
+                                },
+                                "secondary_topics": [],
+                                "suggested_new_topics": [],
+                                "reasoning": "Test reasoning",
+                            }
+                        )
                     }
                 }
             ],
@@ -194,9 +198,7 @@ class TestEmbeddingBackend:
 
     def test_estimate_cost_is_zero(self, config):
         """Test that embedding backend cost is always zero."""
-        with patch(
-            "bibtex_updater.organizer.backends.embedding_backend.EmbeddingClassifier._load_model"
-        ):
+        with patch("bibtex_updater.organizer.backends.embedding_backend.EmbeddingClassifier._load_model"):
             from bibtex_updater.organizer.backends.embedding_backend import EmbeddingClassifier
 
             classifier = EmbeddingClassifier(config)

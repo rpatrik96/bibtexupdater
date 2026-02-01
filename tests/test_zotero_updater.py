@@ -15,6 +15,7 @@ except ImportError:
     class PreConditionFailedError(Exception):
         pass
 
+
 # Mock pyzotero before importing zotero module
 with patch.dict("sys.modules", {"pyzotero": MagicMock(), "pyzotero.zotero": MagicMock()}):
     from bibtex_updater.zotero import (
@@ -763,9 +764,7 @@ class TestOutcomeTagging:
         )
 
         mock_zot = MagicMock()
-        mock_zot.item.return_value = {
-            "data": {"key": "ARXIV123", "version": 1, "tags": []}
-        }
+        mock_zot.item.return_value = {"data": {"key": "ARXIV123", "version": 1, "tags": []}}
         updater.zot = mock_zot
 
         # Mock the resolver to return None (no published version found)

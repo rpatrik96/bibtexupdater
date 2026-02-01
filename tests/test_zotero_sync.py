@@ -365,9 +365,7 @@ class TestZoteroSyncerMatching:
 class TestZoteroSyncerSyncOperations:
     """Tests for ZoteroSyncer sync operations."""
 
-    def test_sync_update_dry_run(
-        self, arxiv_zotero_item, sample_published_record, mock_zotero
-    ):
+    def test_sync_update_dry_run(self, arxiv_zotero_item, sample_published_record, mock_zotero):
         """Dry run should not apply updates."""
         with patch("pyzotero.zotero.Zotero", return_value=mock_zotero):
             syncer = ZoteroSyncer(
@@ -388,13 +386,9 @@ class TestZoteroSyncerSyncOperations:
             assert result.match_method == "arxiv_id"
             mock_zotero.update_item.assert_not_called()
 
-    def test_sync_update_applies_changes(
-        self, arxiv_zotero_item, sample_published_record, mock_zotero
-    ):
+    def test_sync_update_applies_changes(self, arxiv_zotero_item, sample_published_record, mock_zotero):
         """Non-dry-run should apply updates."""
-        mock_zotero.item.return_value = {
-            "data": {"key": "ARXIV123", "version": 1, "tags": []}
-        }
+        mock_zotero.item.return_value = {"data": {"key": "ARXIV123", "version": 1, "tags": []}}
 
         with patch("pyzotero.zotero.Zotero", return_value=mock_zotero):
             syncer = ZoteroSyncer(
@@ -436,9 +430,7 @@ class TestZoteroSyncerSyncOperations:
             assert len(results) == 1
             assert results[0].action == "would_update"
 
-    def test_sync_batch_handles_no_match(
-        self, make_bib_entry, sample_published_record, mock_zotero
-    ):
+    def test_sync_batch_handles_no_match(self, make_bib_entry, sample_published_record, mock_zotero):
         """sync_batch should handle entries with no Zotero match."""
         bib_entry = make_bib_entry(
             ID="nomatch2020",
@@ -586,10 +578,9 @@ class TestSummaryOutput:
 class TestErrorHandling:
     """Tests for error handling."""
 
-    def test_sync_update_handles_exception(
-        self, arxiv_zotero_item, sample_published_record, mock_zotero
-    ):
+    def test_sync_update_handles_exception(self, arxiv_zotero_item, sample_published_record, mock_zotero):
         """sync_update should handle exceptions gracefully."""
+
         # Create a proper PreConditionFailed exception class
         class PreConditionFailed(Exception):
             pass
@@ -599,9 +590,7 @@ class TestErrorHandling:
 
         # Use RuntimeError which is a proper exception class
         mock_zotero.update_item.side_effect = RuntimeError("API error")
-        mock_zotero.item.return_value = {
-            "data": {"key": "ARXIV123", "version": 1, "tags": []}
-        }
+        mock_zotero.item.return_value = {"data": {"key": "ARXIV123", "version": 1, "tags": []}}
 
         with patch("pyzotero.zotero.Zotero", return_value=mock_zotero):
             syncer = ZoteroSyncer(

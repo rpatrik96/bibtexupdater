@@ -1,6 +1,5 @@
 """Tests for classifier base classes and data structures."""
 
-
 from bibtex_updater.organizer.backends.base import (
     ClassificationResult,
     TopicPrediction,

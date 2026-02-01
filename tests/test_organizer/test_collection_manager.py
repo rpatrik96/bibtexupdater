@@ -119,9 +119,7 @@ class TestCollectionManager:
         key = manager.create_collection("Sub Topic", parent_key="ABC123")
 
         assert key == "NEW456"
-        mock_zotero.create_collections.assert_called_once_with([
-            {"name": "Sub Topic", "parentCollection": "ABC123"}
-        ])
+        mock_zotero.create_collections.assert_called_once_with([{"name": "Sub Topic", "parentCollection": "ABC123"}])
 
     def test_create_collection_disabled(self, mock_zotero):
         """Test that collection creation can be disabled."""
