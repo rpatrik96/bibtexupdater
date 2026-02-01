@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-02-01
+
+### Added
+- **Zotero Sync Integration** (`--zotero` flag for `bibtex-update`)
+  - Simultaneously sync upgraded entries to Zotero library when updating .bib files
+  - Matches bib entries to Zotero items by arXiv ID, DOI, or fuzzy title+author
+  - `--zotero-dry-run` to preview Zotero changes without applying
+  - `--zotero-collection` to limit sync to specific Zotero collection
+  - `--zotero-library-type` for user or group libraries
+- **Zotero Library Organizer** (`bibtex-zotero-organize` command)
+  - Automatically organize Zotero items into hierarchical collections based on research taxonomy
+  - Multiple classification backends: Claude, OpenAI, local embeddings
+  - Caching for classification results to reduce API calls
+  - Dry-run mode and batch processing with configurable limits
+- **Tag-based chunking for Zotero updates** (#25)
+  - `preprint-upgraded`, `preprint-checked`, `preprint-error` tags for tracking
+  - `--recheck` mode to retry previously checked items
+  - `--force` mode to reprocess all items regardless of tags
+
+### Changed
+- Extended `ProcessResult` dataclass with `arxiv_id` and `record` fields for Zotero sync
+
+### Dependencies
+- Added `pyyaml>=6.0` for taxonomy configuration (organizer)
+- Added optional `sentence-transformers>=2.2.0` for local embedding backend
+
 ## [0.1.4] - 2026-01-30
 
 ### Added
