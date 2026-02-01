@@ -65,9 +65,10 @@ python zotero_updater.py --collection ABCD1234
 
 ```
 usage: zotero_updater.py [-h] [--dry-run] [--collection COLLECTION]
-                          [--tag TAG] [--limit LIMIT] [--verbose]
-                          [--library-id LIBRARY_ID] [--api-key API_KEY]
-                          [--library-type {user,group}]
+                          [--tag TAG] [--limit LIMIT] [--offset OFFSET]
+                          [--exclude-tags TAGS] [--recheck] [--force]
+                          [--verbose] [--library-id LIBRARY_ID]
+                          [--api-key API_KEY] [--library-type {user,group}]
 ```
 
 | Option | Description |
@@ -76,12 +77,35 @@ usage: zotero_updater.py [-h] [--dry-run] [--collection COLLECTION]
 | `--collection` | Only process items in this collection (key) |
 | `--tag` | Only process items with this tag |
 | `--limit` | Maximum items to process (default: 100) |
+| `--offset` | Skip first N items (for pagination) |
+| `--exclude-tags` | Skip items with these tags (comma-separated, default: `preprint-upgraded,preprint-checked,preprint-error`) |
+| `--recheck` | Re-check items tagged as `preprint-checked` (previously not found) |
+| `--force` | Ignore existing tags and reprocess all items |
 | `--verbose, -v` | Verbose output |
 | `--library-id` | Zotero library ID (or set `ZOTERO_LIBRARY_ID`) |
 | `--api-key` | Zotero API key (or set `ZOTERO_API_KEY`) |
 | `--library-type` | Library type: `user` (default) or `group` |
 
 ## How It Works
+
+### Tag-Based Workflow
+
+The updater uses tags to track processing state, preventing repeated processing of the same items:
+
+| Tag | Meaning |
+|-----|---------|
+| `preprint-upgraded` | Successfully updated to published version |
+| `preprint-checked` | Checked but no published version found yet |
+| `preprint-error` | Resolution failed due to error |
+
+**Default behavior:** Items with any of these tags are automatically skipped. This makes the tool safe to run repeatedly—only new/untagged preprints are processed.
+
+**Workflow modes:**
+- **Normal mode** (default): Only processes untagged preprints
+- **Recheck mode** (`--recheck`): Re-checks items tagged `preprint-checked` (papers that may have been published since last check)
+- **Force mode** (`--force`): Ignores all tags and reprocesses everything
+
+**Concurrency safety:** The tool handles concurrent access gracefully using Zotero's optimistic locking. If two instances try to update the same item, version conflicts are automatically resolved with retry logic.
 
 ### Preprint Detection
 
@@ -176,19 +200,49 @@ python zotero_updater.py --collection ABCD1234 --dry-run
 python zotero_updater.py --library-type group --library-id 98765
 ```
 
+### Daily Check for New Preprints
+
+```bash
+# Automatically skips already-processed items (tagged with preprint-upgraded/checked/error)
+python zotero_updater.py --limit 50
+```
+
+### Monthly Re-Check of Unresolved Items
+
+```bash
+# Re-check items that had no publication last time (preprint-checked tag)
+python zotero_updater.py --recheck --limit 100
+```
+
+### Pagination for Large Libraries
+
+```bash
+# Process in batches using offset
+python zotero_updater.py --limit 100 --offset 0
+python zotero_updater.py --limit 100 --offset 100
+python zotero_updater.py --limit 100 --offset 200
+```
+
+### Force Reprocess Everything
+
+```bash
+# Ignore all tracking tags and reprocess all preprints
+python zotero_updater.py --force --limit 50
+```
+
 ## Output
 
 ### Update Results
 
 Each processed item returns one of these actions:
 
-| Action | Description |
-|--------|-------------|
-| `updated` | Successfully updated to published version |
-| `would_update` | Would update (dry-run mode) |
-| `not_found` | No published version found (may still be preprint-only) |
-| `skipped` | Not detected as preprint (already published) |
-| `error` | Error during processing |
+| Action | Description | Tag Added |
+|--------|-------------|-----------|
+| `updated` | Successfully updated to published version | `preprint-upgraded` |
+| `would_update` | Would update (dry-run mode) | None |
+| `not_found` | No published version found (may still be preprint-only) | `preprint-checked` |
+| `skipped` | Not detected as preprint (already published) | None |
+| `error` | Error during processing | `preprint-error` |
 
 ### Summary Report
 

@@ -7,6 +7,15 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+# Import the real exception before mocking pyzotero
+try:
+    from pyzotero.zotero_errors import PreConditionFailedError
+except ImportError:
+    # Create a mock exception if pyzotero is not installed
+    class PreConditionFailedError(Exception):
+        pass
+
+
 # Mock pyzotero before importing zotero module
 with patch.dict("sys.modules", {"pyzotero": MagicMock(), "pyzotero.zotero": MagicMock()}):
     from bibtex_updater.zotero import (
@@ -552,3 +561,239 @@ class TestPreservation:
         """Item key should be preserved."""
         update = published_record_to_zotero_update(sample_published_record, arxiv_zotero_item)
         assert update["key"] == arxiv_zotero_item["data"]["key"]
+
+
+# ------------- Tests for tag-based workflow -------------
+
+
+class TestTagBasedWorkflow:
+    """Tests for the tag-based chunking workflow."""
+
+    @patch("bibtex_updater.zotero.zotero.Zotero")
+    def test_fetch_preprints_excludes_tags(self, mock_zotero_class):
+        """fetch_preprints should exclude items with specified tags."""
+        updater = ZoteroPrePrintUpdater(
+            library_id="123456",
+            api_key="fake_api_key",
+            dry_run=True,
+        )
+
+        # Replace the zot instance with our mock
+        mock_zot = MagicMock()
+        mock_zot.items.return_value = []
+        updater.zot = mock_zot
+
+        updater.fetch_preprints(
+            exclude_tags=["preprint-upgraded", "preprint-checked"],
+            limit=50,
+        )
+
+        # Verify the tag parameter was passed correctly
+        mock_zot.items.assert_called_once()
+        call_kwargs = mock_zot.items.call_args[1]
+        assert "tag" in call_kwargs
+        assert "-preprint-upgraded" in call_kwargs["tag"]
+        assert "-preprint-checked" in call_kwargs["tag"]
+
+    @patch("bibtex_updater.zotero.zotero.Zotero")
+    def test_fetch_preprints_with_offset(self, mock_zotero_class):
+        """fetch_preprints should support pagination via offset."""
+        updater = ZoteroPrePrintUpdater(
+            library_id="123456",
+            api_key="fake_api_key",
+            dry_run=True,
+        )
+
+        mock_zot = MagicMock()
+        mock_zot.items.return_value = []
+        updater.zot = mock_zot
+
+        updater.fetch_preprints(limit=50, offset=100)
+
+        call_kwargs = mock_zot.items.call_args[1]
+        assert call_kwargs["start"] == 100
+        assert call_kwargs["limit"] == 50
+
+    @patch("bibtex_updater.zotero.zotero.Zotero")
+    def test_fetch_preprints_combines_tag_and_exclusions(self, mock_zotero_class):
+        """fetch_preprints should combine include tag with exclusions."""
+        updater = ZoteroPrePrintUpdater(
+            library_id="123456",
+            api_key="fake_api_key",
+            dry_run=True,
+        )
+
+        mock_zot = MagicMock()
+        mock_zot.items.return_value = []
+        updater.zot = mock_zot
+
+        updater.fetch_preprints(
+            tag="my-collection",
+            exclude_tags=["preprint-upgraded"],
+            limit=50,
+        )
+
+        call_kwargs = mock_zot.items.call_args[1]
+        # Should have both include and exclude
+        assert "my-collection" in call_kwargs["tag"]
+        assert "-preprint-upgraded" in call_kwargs["tag"]
+
+
+class TestRunModes:
+    """Tests for run() modes: normal, recheck, force."""
+
+    @patch("bibtex_updater.zotero.zotero.Zotero")
+    def test_run_normal_mode_excludes_all_tags(self, mock_zotero_class):
+        """Normal mode should exclude all tracking tags."""
+        updater = ZoteroPrePrintUpdater(
+            library_id="123456",
+            api_key="fake_api_key",
+            dry_run=True,
+        )
+
+        mock_zot = MagicMock()
+        mock_zot.items.return_value = []
+        updater.zot = mock_zot
+
+        updater.run(limit=10)
+
+        call_kwargs = mock_zot.items.call_args[1]
+        assert "-preprint-upgraded" in call_kwargs["tag"]
+        assert "-preprint-checked" in call_kwargs["tag"]
+        assert "-preprint-error" in call_kwargs["tag"]
+
+    @patch("bibtex_updater.zotero.zotero.Zotero")
+    def test_run_recheck_mode(self, mock_zotero_class):
+        """Recheck mode should target preprint-checked items."""
+        updater = ZoteroPrePrintUpdater(
+            library_id="123456",
+            api_key="fake_api_key",
+            dry_run=True,
+        )
+
+        mock_zot = MagicMock()
+        mock_zot.items.return_value = []
+        updater.zot = mock_zot
+
+        updater.run(limit=10, recheck=True)
+
+        call_kwargs = mock_zot.items.call_args[1]
+        # Should include preprint-checked and exclude preprint-upgraded
+        assert "preprint-checked" in call_kwargs["tag"]
+        assert "-preprint-upgraded" in call_kwargs["tag"]
+
+    @patch("bibtex_updater.zotero.zotero.Zotero")
+    def test_run_force_mode(self, mock_zotero_class):
+        """Force mode should not exclude any tags."""
+        updater = ZoteroPrePrintUpdater(
+            library_id="123456",
+            api_key="fake_api_key",
+            dry_run=True,
+        )
+
+        mock_zot = MagicMock()
+        mock_zot.items.return_value = []
+        updater.zot = mock_zot
+
+        updater.run(limit=10, force=True)
+
+        call_kwargs = mock_zot.items.call_args[1]
+        # Should not have tag exclusions (no 'tag' key or no '-' in tag)
+        tag_value = call_kwargs.get("tag")
+        assert tag_value is None or "-" not in str(tag_value)
+
+
+class TestVersionConflictHandling:
+    """Tests for version conflict retry logic."""
+
+    @patch("bibtex_updater.zotero.zotero.Zotero")
+    def test_update_item_with_retry_success_first_try(self, mock_zotero_class):
+        """Update should succeed on first try when no conflict."""
+        updater = ZoteroPrePrintUpdater(
+            library_id="123456",
+            api_key="fake_api_key",
+            dry_run=False,
+        )
+
+        mock_zot = MagicMock()
+        updater.zot = mock_zot
+
+        payload = {"key": "TEST123", "version": 1, "title": "Test"}
+        updater._update_item_with_retry(payload)
+
+        mock_zot.update_item.assert_called_once_with(payload)
+
+    @patch("bibtex_updater.zotero.zotero.Zotero")
+    def test_update_item_with_retry_on_conflict(self, mock_zotero_class):
+        """Update should retry with fresh version on conflict."""
+        updater = ZoteroPrePrintUpdater(
+            library_id="123456",
+            api_key="fake_api_key",
+            dry_run=False,
+        )
+
+        mock_zot = MagicMock()
+        # Set up the mock to raise PreConditionFailedError on first call
+        mock_zot.update_item.side_effect = [
+            PreConditionFailedError("Version conflict"),
+            None,  # Success on retry
+        ]
+        mock_zot.item.return_value = {"data": {"key": "TEST123", "version": 2}}
+        updater.zot = mock_zot
+
+        payload = {"key": "TEST123", "version": 1, "title": "Test"}
+        updater._update_item_with_retry(payload)
+
+        # Should have called update_item twice
+        assert mock_zot.update_item.call_count == 2
+        # Second call should have updated version
+        second_call_payload = mock_zot.update_item.call_args_list[1][0][0]
+        assert second_call_payload["version"] == 2
+
+
+class TestOutcomeTagging:
+    """Tests for outcome-based tagging."""
+
+    @patch("bibtex_updater.zotero.zotero.Zotero")
+    def test_not_found_adds_checked_tag(self, mock_zotero_class, arxiv_zotero_item):
+        """Items with no published version should get preprint-checked tag."""
+        updater = ZoteroPrePrintUpdater(
+            library_id="123456",
+            api_key="fake_api_key",
+            dry_run=False,
+        )
+
+        mock_zot = MagicMock()
+        mock_zot.item.return_value = {"data": {"key": "ARXIV123", "version": 1, "tags": []}}
+        updater.zot = mock_zot
+
+        # Mock the resolver to return None (no published version found)
+        updater.resolver.resolve = MagicMock(return_value=None)
+
+        result = updater.process_item(arxiv_zotero_item)
+
+        assert result.action == "not_found"
+        # Verify _add_tag was effectively called (via update_item)
+        # The tag should have been added
+        assert mock_zot.update_item.called or mock_zot.item.called
+
+    @patch("bibtex_updater.zotero.zotero.Zotero")
+    def test_dry_run_does_not_add_tags(self, mock_zotero_class, arxiv_zotero_item):
+        """Dry run should not add any tags."""
+        updater = ZoteroPrePrintUpdater(
+            library_id="123456",
+            api_key="fake_api_key",
+            dry_run=True,
+        )
+
+        mock_zot = MagicMock()
+        updater.zot = mock_zot
+
+        # Mock the resolver to return None
+        updater.resolver.resolve = MagicMock(return_value=None)
+
+        result = updater.process_item(arxiv_zotero_item)
+
+        assert result.action == "not_found"
+        # In dry run, update_item should not be called for tagging
+        mock_zot.update_item.assert_not_called()

@@ -53,9 +53,28 @@ scholarly = [
 zotero = [
     "pyzotero>=1.5.0",
 ]
+organizer = [
+    "pyzotero>=1.5.0",
+    "pyyaml>=6.0",
+]
+organizer-claude = [
+    "pyzotero>=1.5.0",
+    "pyyaml>=6.0",
+]
+organizer-openai = [
+    "pyzotero>=1.5.0",
+    "pyyaml>=6.0",
+]
+organizer-embedding = [
+    "pyzotero>=1.5.0",
+    "pyyaml>=6.0",
+    "sentence-transformers>=2.2.0",
+]
 all = [
     "scholarly>=1.7.0",
     "pyzotero>=1.5.0",
+    "pyyaml>=6.0",
+    "sentence-transformers>=2.2.0",
 ]
 dev = [
     "pytest>=8.0.0",
@@ -74,6 +93,7 @@ bibtex-update = "bibtex_updater.cli.updater_cli:main"
 bibtex-check = "bibtex_updater.cli.fact_checker_cli:main"
 bibtex-filter = "bibtex_updater.cli.filter_cli:main"
 bibtex-zotero = "bibtex_updater.cli.zotero_cli:main"
+bibtex-zotero-organize = "bibtex_updater.cli.zotero_organizer_cli:main"
 
 [project.urls]
 Homepage = "https://github.com/rpatrik96/bibtexupdater"

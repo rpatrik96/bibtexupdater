@@ -2569,6 +2569,9 @@ class ProcessResult:
     method: str | None = None
     confidence: float | None = None
     message: str | None = None
+    # Fields for Zotero sync integration
+    arxiv_id: str | None = None  # Original arXiv ID (for Zotero matching)
+    record: PublishedRecord | None = None  # Resolution result (for Zotero update)
 
 
 # ------------- Entry Prioritization -------------
@@ -2649,6 +2652,8 @@ def process_entry_with_preload(
                 action="upgraded",
                 method="batch:S2",
                 confidence=record.confidence,
+                arxiv_id=detection.arxiv_id,
+                record=record,
             )
 
     # Fall back to regular resolution
@@ -2660,6 +2665,7 @@ def process_entry_with_preload(
             changed=False,
             action="failed",
             message="No reliable published match found",
+            arxiv_id=detection.arxiv_id,
         )
 
     if record.type not in Resolver.CREDIBLE_TYPES:
@@ -2669,6 +2675,7 @@ def process_entry_with_preload(
             changed=False,
             action="failed",
             message=f"Candidate type '{record.type}' not a credible publication venue",
+            arxiv_id=detection.arxiv_id,
         )
 
     if not resolver._credible_journal_article(record):
@@ -2678,6 +2685,7 @@ def process_entry_with_preload(
             changed=False,
             action="failed",
             message="Candidate lacks sufficient metadata",
+            arxiv_id=detection.arxiv_id,
         )
 
     new_entry = updater.update_entry(entry, record, detection)
@@ -2689,6 +2697,8 @@ def process_entry_with_preload(
         action="upgraded",
         method=record.method,
         confidence=record.confidence,
+        arxiv_id=detection.arxiv_id,
+        record=record,
     )
 
 
@@ -2864,7 +2874,12 @@ def process_entry(
     rec = resolver.resolve(entry, det)
     if not rec:
         return ProcessResult(
-            original=entry, updated=entry, changed=False, action="failed", message="No reliable published match found"
+            original=entry,
+            updated=entry,
+            changed=False,
+            action="failed",
+            message="No reliable published match found",
+            arxiv_id=det.arxiv_id,
         )
 
     if rec and rec.type not in Resolver.CREDIBLE_TYPES:
@@ -2874,11 +2889,17 @@ def process_entry(
             changed=False,
             action="failed",
             message=f"Candidate type '{rec.type}' not a credible publication venue",
+            arxiv_id=det.arxiv_id,
         )
 
     if rec and not Resolver._credible_journal_article(rec):
         return ProcessResult(
-            original=entry, updated=entry, changed=False, action="failed", message="Candidate lacks sufficient metadata"
+            original=entry,
+            updated=entry,
+            changed=False,
+            action="failed",
+            message="Candidate lacks sufficient metadata",
+            arxiv_id=det.arxiv_id,
         )
 
     new_entry = updater.update_entry(entry, rec, det)
@@ -2890,6 +2911,8 @@ def process_entry(
         action="upgraded",
         method=rec.method,
         confidence=rec.confidence,
+        arxiv_id=det.arxiv_id,
+        record=rec,
     )
 
 
@@ -3006,6 +3029,41 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=5.0,
         help="Delay between Google Scholar requests in seconds (default: 5.0)",
     )
+
+    # Zotero sync options
+    zotero_group = p.add_argument_group("zotero", "Sync updates to Zotero library")
+    zotero_group.add_argument(
+        "--zotero",
+        action="store_true",
+        help="Enable syncing updates to Zotero library",
+    )
+    zotero_group.add_argument(
+        "--zotero-library-id",
+        metavar="ID",
+        help="Zotero library ID (or set ZOTERO_LIBRARY_ID env var)",
+    )
+    zotero_group.add_argument(
+        "--zotero-api-key",
+        metavar="KEY",
+        help="Zotero API key (or set ZOTERO_API_KEY env var)",
+    )
+    zotero_group.add_argument(
+        "--zotero-library-type",
+        choices=["user", "group"],
+        default="user",
+        help="Zotero library type (default: user)",
+    )
+    zotero_group.add_argument(
+        "--zotero-collection",
+        metavar="KEY",
+        help="Only sync items in this Zotero collection",
+    )
+    zotero_group.add_argument(
+        "--zotero-dry-run",
+        action="store_true",
+        help="Preview Zotero changes without applying (bib changes still apply)",
+    )
+
     return p
 
 
@@ -3537,6 +3595,7 @@ def process_in_place_mode(
     args = components.args
     overall_exit = 0
     all_field_results: list[FieldCheckResult] = []
+    all_results: list[ProcessResult] = []  # Collect all results for Zotero sync
 
     for path, db in databases:
         exit_code, results, field_results = process_single_database_in_place(path, db, components)
@@ -3545,12 +3604,17 @@ def process_in_place_mode(
             overall_exit = 1
 
         all_field_results.extend(field_results)
+        all_results.extend(results)
 
         if not args.skip_preprint_upgrade:
             summary = summarize(results, components.logger)
             print_failures(results, components.logger)
             if summary["failures"] > 0 and overall_exit == 0:
                 overall_exit = 2
+
+    # Zotero sync (if enabled)
+    if getattr(args, "zotero", False) and not args.skip_preprint_upgrade:
+        perform_zotero_sync(all_results, args, components.logger)
 
     # Field check summary and reporting
     if components.field_processor and all_field_results:
@@ -3673,6 +3737,10 @@ def process_to_output_mode(
         summary = summarize(ordered_results, components.logger)
         print_failures(ordered_results, components.logger)
 
+    # Zotero sync (if enabled)
+    if getattr(args, "zotero", False) and not args.skip_preprint_upgrade:
+        perform_zotero_sync(ordered_results, args, components.logger)
+
     # Field check summary and reporting
     if components.field_processor and field_results:
         strict_exit = handle_field_check_reporting(field_results, components.field_processor, args, components.logger)
@@ -3744,6 +3812,62 @@ def build_main_components(args: argparse.Namespace, logger: logging.Logger) -> M
         field_processor=field_processor,
         args=args,
     )
+
+
+def perform_zotero_sync(
+    results: list[ProcessResult],
+    args: argparse.Namespace,
+    logger: logging.Logger,
+) -> list:
+    """Perform Zotero sync for upgraded entries.
+
+    Args:
+        results: List of ProcessResult from bib processing
+        args: Parsed command-line arguments
+        logger: Logger instance
+
+    Returns:
+        List of ZoteroSyncResult objects
+    """
+    try:
+        from bibtex_updater.zotero_sync import ZoteroSyncer, print_zotero_sync_summary
+    except ImportError:
+        logger.error("Zotero sync requires pyzotero: pip install bibtex-updater[zotero]")
+        return []
+
+    # Get credentials from args or environment
+    library_id = args.zotero_library_id or os.environ.get("ZOTERO_LIBRARY_ID")
+    api_key = args.zotero_api_key or os.environ.get("ZOTERO_API_KEY")
+
+    if not library_id or not api_key:
+        logger.error("--zotero requires --zotero-library-id and --zotero-api-key (or env vars)")
+        logger.error("  Set ZOTERO_LIBRARY_ID and ZOTERO_API_KEY environment variables")
+        logger.error("  Or use --zotero-library-id and --zotero-api-key arguments")
+        logger.error("  Get your library ID and API key at: https://www.zotero.org/settings/keys")
+        return []
+
+    # Collect upgraded entries with their resolution data
+    upgraded = [(r.original, r.arxiv_id, r.record) for r in results if r.action == "upgraded" and r.record is not None]
+
+    if not upgraded:
+        logger.info("No upgraded entries to sync to Zotero")
+        return []
+
+    logger.info(f"Syncing {len(upgraded)} upgraded entries to Zotero...")
+
+    syncer = ZoteroSyncer(
+        library_id=library_id,
+        api_key=api_key,
+        library_type=args.zotero_library_type,
+        collection_key=args.zotero_collection,
+        dry_run=args.zotero_dry_run,
+        logger=logger,
+    )
+
+    zotero_results = syncer.sync_batch(upgraded)
+    print_zotero_sync_summary(zotero_results, logger)
+
+    return zotero_results
 
 
 def main(argv: list[str] | None = None) -> int:

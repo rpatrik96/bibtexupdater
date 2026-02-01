@@ -96,6 +96,30 @@ bibtex-zotero --dry-run
 bibtex-zotero
 ```
 
+### Sync BibTeX Updates to Zotero
+
+When updating a `.bib` file, you can simultaneously update matching entries in your Zotero library:
+
+```bash
+# Set Zotero credentials
+export ZOTERO_LIBRARY_ID="your_user_id"
+export ZOTERO_API_KEY="your_api_key"
+
+# Update bib file AND sync to Zotero
+bibtex-update references.bib -o updated.bib --zotero
+
+# Preview Zotero changes only (bib changes still apply)
+bibtex-update references.bib -o updated.bib --zotero --zotero-dry-run
+
+# Limit to a specific Zotero collection
+bibtex-update references.bib -o updated.bib --zotero --zotero-collection ABCD1234
+```
+
+The sync matches bib entries to Zotero items by:
+1. **arXiv ID** - Most reliable for preprints
+2. **DOI** - For preprints with DOIs (e.g., bioRxiv)
+3. **Title + Author** - Fuzzy matching as fallback
+
 ## Standalone Scripts
 
 For environments without pip (e.g., Overleaf), `filter_bibliography.py` can be used directly as it has no dependencies:
