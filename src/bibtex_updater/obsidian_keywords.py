@@ -145,6 +145,48 @@ def extract_existing_keywords(frontmatter: dict[str, Any]) -> list[str]:
     return result
 
 
+def split_compound_keywords(keywords: list[str]) -> list[str]:
+    """Split compound keywords into compositional parts.
+
+    AI backends may generate compound keywords like "machine learning - in context learning".
+    This function splits them into atomic parts for better knowledge graph connectivity.
+
+    Args:
+        keywords: List of keywords (possibly compound)
+
+    Returns:
+        List of atomic keywords with compounds split apart
+    """
+    # Separators that indicate compound keywords (ordered by specificity)
+    separators = [
+        " - ",  # Common dash separator
+        " – ",  # En-dash
+        " — ",  # Em-dash
+        " / ",  # Slash separator
+    ]
+
+    result = []
+    for kw in keywords:
+        parts = [kw]
+        # Try each separator
+        for sep in separators:
+            new_parts = []
+            for part in parts:
+                if sep in part:
+                    new_parts.extend(part.split(sep))
+                else:
+                    new_parts.append(part)
+            parts = new_parts
+
+        # Clean up and add non-empty parts
+        for part in parts:
+            cleaned = part.strip()
+            if cleaned and cleaned not in result:
+                result.append(cleaned)
+
+    return result
+
+
 def format_keywords_yaml(keywords: list[str]) -> str:
     """Format keywords as YAML list with [[wikilinks]].
 
@@ -231,12 +273,16 @@ class ObsidianKeywordGenerator:
     def generate_keywords(self, title: str, abstract: str) -> list[str]:
         """Generate keywords for a paper.
 
+        Keywords are made compositional - compound keywords like
+        "machine learning - in context learning" are split into
+        atomic parts ["machine learning", "in context learning"].
+
         Args:
             title: Paper title
             abstract: Paper abstract
 
         Returns:
-            List of generated keywords
+            List of generated keywords (compositional/atomic)
         """
         if not abstract and not title:
             return []
@@ -250,6 +296,9 @@ class ObsidianKeywordGenerator:
         keywords = []
         for topic in result.all_topics[: self.max_keywords]:
             keywords.append(topic.topic_name)
+
+        # Split compound keywords into compositional parts
+        keywords = split_compound_keywords(keywords)
 
         return keywords
 

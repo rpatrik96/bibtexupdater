@@ -153,6 +153,105 @@ class TestExtractExistingKeywords:
         assert keywords == []
 
 
+class TestSplitCompoundKeywords:
+    """Tests for splitting compound keywords into compositional parts."""
+
+    def test_split_dash_separator(self):
+        """Split keywords with dash separator."""
+        from bibtex_updater.obsidian_keywords import split_compound_keywords
+
+        keywords = ["machine learning - in context learning"]
+        result = split_compound_keywords(keywords)
+        assert "machine learning" in result
+        assert "in context learning" in result
+        assert len(result) == 2
+
+    def test_split_slash_separator(self):
+        """Split keywords with slash separator."""
+        from bibtex_updater.obsidian_keywords import split_compound_keywords
+
+        keywords = ["NLP / natural language processing"]
+        result = split_compound_keywords(keywords)
+        assert "NLP" in result
+        assert "natural language processing" in result
+
+    def test_split_en_dash_separator(self):
+        """Split keywords with en-dash separator."""
+        from bibtex_updater.obsidian_keywords import split_compound_keywords
+
+        keywords = ["deep learning – transformers"]
+        result = split_compound_keywords(keywords)
+        assert "deep learning" in result
+        assert "transformers" in result
+
+    def test_split_em_dash_separator(self):
+        """Split keywords with em-dash separator."""
+        from bibtex_updater.obsidian_keywords import split_compound_keywords
+
+        keywords = ["reinforcement learning — policy gradient"]
+        result = split_compound_keywords(keywords)
+        assert "reinforcement learning" in result
+        assert "policy gradient" in result
+
+    def test_no_split_atomic_keyword(self):
+        """Atomic keywords remain unchanged."""
+        from bibtex_updater.obsidian_keywords import split_compound_keywords
+
+        keywords = ["machine learning", "deep learning"]
+        result = split_compound_keywords(keywords)
+        assert result == ["machine learning", "deep learning"]
+
+    def test_split_multiple_compounds(self):
+        """Split multiple compound keywords."""
+        from bibtex_updater.obsidian_keywords import split_compound_keywords
+
+        keywords = ["AI - ML", "NLP / text"]
+        result = split_compound_keywords(keywords)
+        assert "AI" in result
+        assert "ML" in result
+        assert "NLP" in result
+        assert "text" in result
+        assert len(result) == 4
+
+    def test_deduplicate_after_split(self):
+        """Duplicates are removed after splitting."""
+        from bibtex_updater.obsidian_keywords import split_compound_keywords
+
+        keywords = ["machine learning - deep learning", "deep learning"]
+        result = split_compound_keywords(keywords)
+        assert result.count("deep learning") == 1
+
+    def test_empty_parts_filtered(self):
+        """Empty parts from splitting are filtered out."""
+        from bibtex_updater.obsidian_keywords import split_compound_keywords
+
+        keywords = ["topic -  - another"]  # Extra dashes
+        result = split_compound_keywords(keywords)
+        assert "" not in result
+        assert "topic" in result
+        assert "another" in result
+
+    def test_whitespace_trimmed(self):
+        """Whitespace is trimmed from split parts."""
+        from bibtex_updater.obsidian_keywords import split_compound_keywords
+
+        keywords = ["  machine learning  -  deep learning  "]
+        result = split_compound_keywords(keywords)
+        assert "machine learning" in result
+        assert "deep learning" in result
+        # No leading/trailing whitespace
+        for kw in result:
+            assert kw == kw.strip()
+
+    def test_preserve_order(self):
+        """Parts from same keyword maintain relative order."""
+        from bibtex_updater.obsidian_keywords import split_compound_keywords
+
+        keywords = ["first - second - third"]
+        result = split_compound_keywords(keywords)
+        assert result == ["first", "second", "third"]
+
+
 class TestFormatKeywordsYaml:
     """Tests for YAML formatting."""
 
