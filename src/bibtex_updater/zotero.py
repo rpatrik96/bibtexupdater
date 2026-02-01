@@ -258,16 +258,33 @@ class ZoteroPrePrintUpdater:
         self,
         collection_key: str | None = None,
         tag: str | None = None,
+        exclude_tags: list[str] | None = None,
         limit: int = 100,
+        offset: int = 0,
     ) -> list[dict[str, Any]]:
-        """Fetch items that look like preprints from Zotero."""
-        params = {"limit": limit, "itemType": "journalArticle || preprint"}
+        """Fetch items that look like preprints from Zotero.
+
+        Args:
+            collection_key: Only fetch from this collection
+            tag: Only fetch items with this tag
+            exclude_tags: Skip items with any of these tags
+            limit: Maximum items to fetch
+            offset: Skip first N items (for pagination)
+        """
+        params = {"limit": limit, "start": offset, "itemType": "journalArticle || preprint"}
+
+        # Build tag filter with exclusions
+        # Zotero API: tag=foo -bar -baz (include foo, exclude bar and baz)
+        tag_parts = []
+        if tag:
+            tag_parts.append(tag)
+        if exclude_tags:
+            tag_parts.extend(f"-{t}" for t in exclude_tags)
+        if tag_parts:
+            params["tag"] = " ".join(tag_parts)
 
         if collection_key:
             items = self.zot.collection_items(collection_key, **params)
-        elif tag:
-            params["tag"] = tag
-            items = self.zot.items(**params)
         else:
             items = self.zot.items(**params)
 
@@ -306,6 +323,9 @@ class ZoteroPrePrintUpdater:
             rec = self.resolver.resolve(entry, detection)
 
             if not rec:
+                # Tag as checked so we don't re-process next time
+                if not self.dry_run:
+                    self._add_tag(key, "preprint-checked")
                 return UpdateResult(
                     item_key=key,
                     title=title,
@@ -330,8 +350,8 @@ class ZoteroPrePrintUpdater:
                     confidence=rec.confidence,
                 )
 
-            # Apply update
-            self.zot.update_item(update_payload)
+            # Apply update (with retry on version conflict)
+            self._update_item_with_retry(update_payload)
 
             # Add tag to mark as processed
             self._add_tag(data["key"], "preprint-upgraded")
@@ -350,6 +370,9 @@ class ZoteroPrePrintUpdater:
 
         except Exception as e:
             self.logger.exception(f"Error processing {key}")
+            # Tag as error for tracking (unless dry_run)
+            if not self.dry_run:
+                self._add_tag(key, "preprint-error")
             return UpdateResult(
                 item_key=key,
                 title=title,
@@ -358,15 +381,36 @@ class ZoteroPrePrintUpdater:
                 old_journal=old_journal,
             )
 
+    def _update_item_with_retry(self, update_payload: dict[str, Any]) -> None:
+        """Update item with retry on version conflict.
+
+        Zotero uses optimistic locking - if another process updated the item,
+        we get a PreConditionFailedError. Refresh version and retry once.
+        """
+        try:
+            from pyzotero.zotero_errors import PreConditionFailedError
+        except ImportError:
+            # Fallback for older pyzotero versions
+            PreConditionFailedError = Exception
+
+        try:
+            self.zot.update_item(update_payload)
+        except PreConditionFailedError:
+            # Refresh version and retry once
+            key = update_payload["key"]
+            fresh = self.zot.item(key)
+            update_payload["version"] = fresh["data"]["version"]
+            self.zot.update_item(update_payload)
+
     def _add_tag(self, item_key: str, tag_name: str) -> None:
-        """Add a tag to an item."""
+        """Add a tag to an item (with retry on version conflict)."""
         try:
             item = self.zot.item(item_key)
             data = item.get("data", item)
             tags = data.get("tags", [])
             if not any(t.get("tag") == tag_name for t in tags):
                 tags.append({"tag": tag_name})
-                self.zot.update_item(
+                self._update_item_with_retry(
                     {
                         "key": data["key"],
                         "version": data["version"],
@@ -380,10 +424,49 @@ class ZoteroPrePrintUpdater:
         self,
         collection_key: str | None = None,
         tag: str | None = None,
+        exclude_tags: list[str] | None = None,
         limit: int = 100,
+        offset: int = 0,
+        recheck: bool = False,
+        force: bool = False,
     ) -> list[UpdateResult]:
-        """Run the update process."""
-        preprints = self.fetch_preprints(collection_key=collection_key, tag=tag, limit=limit)
+        """Run the update process.
+
+        Args:
+            collection_key: Only process items in this collection
+            tag: Only process items with this tag
+            exclude_tags: Skip items with any of these tags
+            limit: Maximum items to process
+            offset: Skip first N items (for pagination)
+            recheck: Re-check items tagged as preprint-checked
+            force: Ignore existing tags and reprocess all items
+        """
+        # Determine effective tag filter based on mode
+        if force:
+            # Force mode: ignore all tracking tags
+            effective_exclude = None
+            effective_tag = tag
+        elif recheck:
+            # Recheck mode: process items that were checked but not found
+            # Don't re-upgrade already upgraded items
+            effective_exclude = ["preprint-upgraded"]
+            effective_tag = "preprint-checked"
+        else:
+            # Normal mode: skip all already-processed items
+            effective_exclude = exclude_tags or [
+                "preprint-upgraded",
+                "preprint-checked",
+                "preprint-error",
+            ]
+            effective_tag = tag
+
+        preprints = self.fetch_preprints(
+            collection_key=collection_key,
+            tag=effective_tag,
+            exclude_tags=effective_exclude,
+            limit=limit,
+            offset=offset,
+        )
 
         results = []
         for i, item in enumerate(preprints, 1):
@@ -439,6 +522,22 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--collection", help="Only process items in this collection (key)")
     parser.add_argument("--tag", help="Only process items with this tag")
     parser.add_argument("--limit", type=int, default=100, help="Max items to process")
+    parser.add_argument("--offset", type=int, default=0, help="Skip first N items (for pagination)")
+    parser.add_argument(
+        "--exclude-tags",
+        default="preprint-upgraded,preprint-checked,preprint-error",
+        help="Skip items with these tags (comma-separated)",
+    )
+    parser.add_argument(
+        "--recheck",
+        action="store_true",
+        help="Re-check items tagged as preprint-checked (previously not found)",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Ignore existing tags and reprocess all items",
+    )
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
     parser.add_argument("--library-id", help="Zotero library ID (or set ZOTERO_LIBRARY_ID)")
     parser.add_argument("--api-key", help="Zotero API key (or set ZOTERO_API_KEY)")
@@ -464,10 +563,17 @@ def main(argv: list[str] | None = None) -> int:
         verbose=args.verbose,
     )
 
+    # Parse exclude tags
+    exclude_tags = [t.strip() for t in args.exclude_tags.split(",") if t.strip()]
+
     results = updater.run(
         collection_key=args.collection,
         tag=args.tag,
+        exclude_tags=exclude_tags,
         limit=args.limit,
+        offset=args.offset,
+        recheck=args.recheck,
+        force=args.force,
     )
 
     print_summary(results)
