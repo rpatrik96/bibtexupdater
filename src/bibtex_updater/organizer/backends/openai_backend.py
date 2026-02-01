@@ -82,7 +82,12 @@ IMPORTANT:
 - Use existing collection keys as topic_id when matching existing collections
 - Only suggest new topics if confidence for existing topics is below 0.5
 - Confidence should reflect how well the paper fits the topic
-- Return ONLY the JSON object, no additional text"""
+- Return ONLY the JSON object, no additional text
+- CRITICAL: Keep topic names ATOMIC (single concepts). If a paper spans multiple concepts,
+  return them as SEPARATE topics, not combined. For example, instead of
+  "Causal Inference in Machine Learning", return "Causal Inference" as primary and
+  "Machine Learning" as secondary. If you must combine concepts in a single topic name,
+  use " - " as separator (e.g., "Reinforcement Learning - Robotics")."""
 
 
 class OpenAIClassifier(AbstractClassifier):
