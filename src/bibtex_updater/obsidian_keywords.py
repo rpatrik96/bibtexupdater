@@ -111,7 +111,7 @@ def extract_title(frontmatter: dict[str, Any], content: str) -> str:
         Paper title
     """
     # Try aliases first (common pattern: second alias is title)
-    aliases = frontmatter.get("aliases", [])
+    aliases = frontmatter.get("aliases") or []
     if len(aliases) >= 2:
         return aliases[1]
 
@@ -132,7 +132,7 @@ def extract_existing_keywords(frontmatter: dict[str, Any]) -> list[str]:
     Returns:
         List of keyword strings (without [[ ]] wrappers)
     """
-    keywords = frontmatter.get("keywords", [])
+    keywords = frontmatter.get("keywords") or []
     if not keywords:
         return []
 
