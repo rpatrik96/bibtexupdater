@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-02-01
+
+### Added
+- **Auto-Keywording for Obsidian Notes** (`bibtex-obsidian-keywords` command)
+  - AI-powered keyword generation for paper notes using Claude, OpenAI, or local embeddings
+  - Generates `[[wikilinks]]` for better Obsidian knowledge graph connectivity
+  - `--dry-run` to preview changes without modifying files
+  - `--limit N` to process exactly N enrichable notes (skipped notes don't count)
+  - `--min-keywords N` to skip notes that already have enough keywords (saves API calls)
+  - `--backend` to choose AI provider (claude, openai, embedding)
+  - `--topics-file` to provide existing topics for consistent tagging
+- **Zotero tags → wikilinks** in paper template
+  - Existing Zotero tags automatically convert to `[[wikilinks]]` on import
+- **Templater enrichment script** (`zotero-enrich-keywords.md`)
+  - Post-import AI keyword enrichment directly in Obsidian
+
+### Changed
+- Improved abstract extraction regex to handle blank lines after callout headers
+
 ## [0.3.0] - 2026-02-01
 
 ### Added
