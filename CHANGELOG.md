@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-02-01
+
+### Added
+- **Obsidian Zotero Sync Templates** (`examples/obsidian-zotero-sync/`)
+  - Templater scripts for automating Zotero → Obsidian annotation extraction
+  - `zotero-sync.md`: Interactive single-paper sync (update current paper or import by citekey)
+  - `zotero-bulk-sync.md`: Bulk import new papers by comparing CSL-JSON export against existing notes
+  - `zotero-paper-template.md`: Example paper template with color-coded annotation callouts
+  - Comprehensive README with setup instructions for hotkeys and optional startup automation
+
+### Documentation
+- Added examples directory with reusable Obsidian templates
+- Color-coded annotation system: Summary (yellow), Important (red), Notation (green), Technical (blue), Contribution (purple), Literature (pink), Assumption (orange), Wrong (gray)
+
 ## [0.2.0] - 2026-02-01
 
 ### Added
