@@ -64,6 +64,8 @@ from bibtex_updater.utils import (
     RateLimiterRegistry,
     ResolutionCache,
     ResolutionCacheEntry,
+    # ACL Anthology
+    acl_anthology_bib_to_record,
     # Author handling
     authors_last_names,
     # API converters
@@ -72,6 +74,7 @@ from bibtex_updater.utils import (
     # DOI/arXiv utilities
     doi_normalize,
     doi_url,
+    extract_acl_anthology_id,
     extract_arxiv_id_from_text,
     first_author_surname,
     # Matching utilities
@@ -140,6 +143,9 @@ __all__ = [
     "doi_normalize",
     "doi_url",
     "extract_arxiv_id_from_text",
+    # ACL Anthology
+    "acl_anthology_bib_to_record",
+    "extract_acl_anthology_id",
     # API converters
     "crossref_message_to_record",
     "dblp_hit_to_record",
