@@ -224,15 +224,37 @@ def acl_anthology_bib_to_record(bib_text: str) -> PublishedRecord | None:
     if not bib_text or not bib_text.strip():
         return None
 
-    # Simple regex-based BibTeX parser (avoids dependency on bibtexparser for this)
+    # BibTeX field extractor that handles nested braces
     def _extract_field(field_name: str, text: str) -> str | None:
-        # Match field = {value} or field = "value"
-        pattern = rf'{field_name}\s*=\s*[{{"](.+?)[}}"]'
-        m = re.search(pattern, text, re.DOTALL | re.IGNORECASE)
-        if m:
-            val = m.group(1).strip()
-            # Clean up LaTeX artifacts
-            val = re.sub(r"\s+", " ", val)
+        # Find "field_name = " then extract the brace- or quote-delimited value
+        pattern = rf"{field_name}\s*=\s*"
+        m = re.search(pattern, text, re.IGNORECASE)
+        if not m:
+            return None
+        rest = text[m.end() :]
+        if not rest:
+            return None
+        delim = rest[0]
+        if delim == "{":
+            # Count brace depth to find matching close
+            depth = 0
+            for i, ch in enumerate(rest):
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        val = rest[1:i]  # strip outer braces
+                        val = re.sub(r"\s+", " ", val).strip()
+                        return val
+            return None
+        elif delim == '"':
+            # Find matching closing quote (ignore escaped quotes)
+            end = rest.find('"', 1)
+            if end == -1:
+                return None
+            val = rest[1:end]
+            val = re.sub(r"\s+", " ", val).strip()
             return val
         return None
 

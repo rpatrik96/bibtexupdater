@@ -359,6 +359,188 @@ class TestAclVenueCredibility:
         assert rec.type in Resolver.CREDIBLE_TYPES
 
 
+# ------------- Real ACL Anthology paper tests -------------
+
+# Real BibTeX from aclanthology.org for well-known papers
+
+BERT_BIB = r"""@inproceedings{devlin-etal-2019-bert,
+    title = "{BERT}: Pre-training of Deep Bidirectional Transformers for Language Understanding",
+    author = "Devlin, Jacob  and
+      Chang, Ming-Wei  and
+      Lee, Kenton  and
+      Toutanova, Kristina",
+    booktitle = "Proceedings of the 2019 Conference of the North {A}merican Chapter of the ACL",
+    month = jun,
+    year = "2019",
+    address = "Minneapolis, Minnesota",
+    publisher = "Association for Computational Linguistics",
+    url = "https://aclanthology.org/N19-1423/",
+    doi = "10.18653/v1/N19-1423",
+    pages = "4171--4186"
+}
+"""
+
+AUTOPROMPT_BIB = r"""@inproceedings{shin-etal-2020-autoprompt,
+    title = "{A}uto{P}rompt: Eliciting Knowledge from Language Models with Automatically Generated Prompts",
+    author = "Shin, Taylor  and
+      Razeghi, Yasaman  and
+      Logan IV, Robert L.  and
+      Wallace, Eric  and
+      Singh, Sameer",
+    booktitle = "Proceedings of the 2020 Conference on Empirical Methods in Natural Language Processing (EMNLP)",
+    month = nov,
+    year = "2020",
+    address = "Online",
+    publisher = "Association for Computational Linguistics",
+    url = "https://aclanthology.org/2020.emnlp-main.346/",
+    doi = "10.18653/v1/2020.emnlp-main.346",
+    pages = "4222--4235"
+}
+"""
+
+XLMR_BIB = r"""@inproceedings{conneau-etal-2020-unsupervised,
+    title = "Unsupervised Cross-lingual Representation Learning at Scale",
+    author = "Conneau, Alexis  and
+      Khandelwal, Kartikay  and
+      Goyal, Naman  and
+      Chaudhary, Vishrav  and
+      Wenzek, Guillaume  and
+      Guzm{\'a}n, Francisco  and
+      Grave, Edouard  and
+      Ott, Myle  and
+      Zettlemoyer, Luke  and
+      Stoyanov, Veselin",
+    booktitle = "Proceedings of the 58th Annual Meeting of the Association for Computational Linguistics",
+    month = jul,
+    year = "2020",
+    address = "Online",
+    publisher = "Association for Computational Linguistics",
+    url = "https://aclanthology.org/2020.acl-main.747/",
+    doi = "10.18653/v1/2020.acl-main.747",
+    pages = "8440--8451"
+}
+"""
+
+
+class TestRealAclPapers:
+    """Tests using real BibTeX from actual ACL Anthology papers."""
+
+    def test_bert_naacl2019(self):
+        """BERT (NAACL 2019) should parse correctly."""
+        rec = acl_anthology_bib_to_record(BERT_BIB)
+        assert rec is not None
+        assert "BERT" in rec.title
+        assert "Pre-training of Deep Bidirectional Transformers" in rec.title
+        assert rec.doi == "10.18653/v1/n19-1423"
+        assert rec.year == 2019
+        assert rec.pages == "4171--4186"
+        assert rec.type == "proceedings-article"
+        assert rec.publisher == "Association for Computational Linguistics"
+        assert len(rec.authors) == 4
+        assert rec.authors[0]["family"] == "Devlin"
+        assert rec.authors[0]["given"] == "Jacob"
+        assert rec.authors[3]["family"] == "Toutanova"
+
+    def test_bert_venue_is_naacl(self):
+        """BERT venue should reference NAACL."""
+        rec = acl_anthology_bib_to_record(BERT_BIB)
+        assert rec is not None
+        assert "North" in rec.journal
+        assert Resolver._credible_journal_article(rec)
+
+    def test_bert_doi_extraction(self):
+        """Should extract anthology ID from BERT's DOI."""
+        assert extract_acl_anthology_id("10.18653/v1/N19-1423") == "N19-1423"
+
+    def test_autoprompt_emnlp2020(self):
+        """AutoPrompt (EMNLP 2020) should parse correctly."""
+        rec = acl_anthology_bib_to_record(AUTOPROMPT_BIB)
+        assert rec is not None
+        assert "AutoPrompt" in rec.title or "auto" in rec.title.lower()
+        assert rec.doi == "10.18653/v1/2020.emnlp-main.346"
+        assert rec.year == 2020
+        assert rec.pages == "4222--4235"
+        assert rec.type == "proceedings-article"
+        assert len(rec.authors) == 5
+        assert rec.authors[0]["family"] == "Shin"
+        assert rec.authors[4]["family"] == "Singh"
+
+    def test_autoprompt_venue_is_emnlp(self):
+        """AutoPrompt venue should reference EMNLP."""
+        rec = acl_anthology_bib_to_record(AUTOPROMPT_BIB)
+        assert rec is not None
+        assert "Empirical Methods" in rec.journal
+        assert Resolver._credible_journal_article(rec)
+
+    def test_autoprompt_doi_extraction(self):
+        """Should extract anthology ID from AutoPrompt's DOI."""
+        aid = extract_acl_anthology_id("10.18653/v1/2020.emnlp-main.346")
+        assert aid == "2020.emnlp-main.346"
+
+    def test_xlmr_acl2020(self):
+        """XLM-R (ACL 2020) should parse correctly."""
+        rec = acl_anthology_bib_to_record(XLMR_BIB)
+        assert rec is not None
+        assert "Cross-lingual" in rec.title
+        assert rec.doi == "10.18653/v1/2020.acl-main.747"
+        assert rec.year == 2020
+        assert rec.pages == "8440--8451"
+        assert rec.type == "proceedings-article"
+        assert len(rec.authors) == 10
+        assert rec.authors[0]["family"] == "Conneau"
+        assert rec.authors[9]["family"] == "Stoyanov"
+
+    def test_xlmr_venue_is_acl(self):
+        """XLM-R venue should reference ACL."""
+        rec = acl_anthology_bib_to_record(XLMR_BIB)
+        assert rec is not None
+        assert "Association for Computational Linguistics" in rec.journal
+        assert Resolver._credible_journal_article(rec)
+
+    def test_xlmr_doi_extraction(self):
+        """Should extract anthology ID from XLM-R's DOI."""
+        aid = extract_acl_anthology_id("10.18653/v1/2020.acl-main.747")
+        assert aid == "2020.acl-main.747"
+
+    def test_xlmr_url_extraction(self):
+        """Should extract anthology ID from XLM-R's URL."""
+        aid = extract_acl_anthology_id("https://aclanthology.org/2020.acl-main.747/")
+        assert aid == "2020.acl-main.747"
+
+    def test_all_real_papers_are_credible(self):
+        """All real ACL papers should pass the credibility check."""
+        for bib in (BERT_BIB, AUTOPROMPT_BIB, XLMR_BIB):
+            rec = acl_anthology_bib_to_record(bib)
+            assert rec is not None, f"Failed to parse: {bib[:50]}"
+            assert Resolver._credible_journal_article(
+                rec
+            ), f"Not credible: {rec.title} (type={rec.type}, journal={rec.journal})"
+
+    def test_stage3b_with_real_bert_bib(self, fake_http, logger):
+        """Stage 3b should resolve a BERT preprint entry using real BibTeX."""
+        resolver = Resolver(http=fake_http, logger=logger, scholarly_client=None)
+        resolver.http._request = MagicMock(return_value=MockResponse(200, BERT_BIB))
+
+        entry = {
+            "ID": "devlin2018bert",
+            "ENTRYTYPE": "article",
+            "title": "BERT: Pre-training of Deep Bidirectional Transformers",
+            "author": "Devlin, Jacob and Chang, Ming-Wei and Lee, Kenton and Toutanova, Kristina",
+            "journal": "arXiv preprint arXiv:1810.04805",
+            "year": "2018",
+            "doi": "10.18653/v1/N19-1423",
+        }
+        title_norm = normalize_title_for_match(entry["title"])
+        result = resolver._stage3b_acl_anthology(entry, title_norm, candidate_doi=None)
+
+        assert result is not None
+        assert result.method == "ACLAnthology(doi)"
+        assert result.confidence == 1.0
+        assert result.doi == "10.18653/v1/n19-1423"
+        assert result.year == 2019
+        assert len(result.authors) == 4
+
+
 # ------------- Integration: resolve_uncached includes stage 3b -------------
 
 
