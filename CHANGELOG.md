@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-02-06
+
+### Added
+- **ACL Anthology as resolution source** for computational linguistics papers
+  - Automatically resolves papers from ACL, EMNLP, NAACL, EACL, AACL, CoNLL, COLING, and Findings venues
+  - New stage 3b in the resolution pipeline (between DBLP and Semantic Scholar)
+  - Zero overhead for non-NLP papers: only triggers when ACL DOI prefix (`10.18653/v1/`) or aclanthology.org URL is present
+  - `extract_acl_anthology_id()` utility for extracting Anthology IDs from DOIs and URLs
+  - `acl_anthology_bib_to_record()` for converting ACL Anthology BibTeX to `PublishedRecord`
+  - Rate limiting at 30 req/min for aclanthology.org
+  - Both sync (`Resolver`) and async (`AsyncResolver`) implementations
+- 9 new NLP venue patterns added to `KNOWN_CONFERENCE_VENUES` for credibility validation
+
+### Fixed
+- BibTeX field parser now correctly handles nested braces (e.g., `{BERT}`, `Guzm{\'a}n`)
+  - Replaced non-greedy regex with brace-depth-counting parser
+- Handle `None` values for aliases/keywords in Obsidian frontmatter
+
 ## [0.4.1] - 2026-02-01
 
 ### Fixed
@@ -188,7 +206,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Comprehensive test suite with pytest fixtures
 - MIT License
 
-[Unreleased]: https://github.com/rpatrik96/bibtexupdater/compare/v0.1.4...HEAD
+[Unreleased]: https://github.com/rpatrik96/bibtexupdater/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/rpatrik96/bibtexupdater/compare/v0.4.1...v0.5.0
+[0.4.1]: https://github.com/rpatrik96/bibtexupdater/compare/v0.4.0...v0.4.1
+[0.4.0]: https://github.com/rpatrik96/bibtexupdater/compare/v0.3.0...v0.4.0
+[0.3.0]: https://github.com/rpatrik96/bibtexupdater/compare/v0.2.0...v0.3.0
+[0.2.0]: https://github.com/rpatrik96/bibtexupdater/compare/v0.1.4...v0.2.0
 [0.1.4]: https://github.com/rpatrik96/bibtexupdater/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/rpatrik96/bibtexupdater/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/rpatrik96/bibtexupdater/compare/v0.1.1...v0.1.2
