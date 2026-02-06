@@ -48,6 +48,9 @@ CROSSREF_API = "https://api.crossref.org/works"
 ARXIV_API = "http://export.arxiv.org/api/query"
 DBLP_API_SEARCH = "https://dblp.org/search/publ/api"
 S2_API = "https://api.semanticscholar.org/graph/v1"
+ACL_ANTHOLOGY_URL = "https://aclanthology.org"
+ACL_DOI_PREFIX = "10.18653/v1/"
+ACL_ANTHOLOGY_ID_RE = re.compile(r"https?://aclanthology\.org/([A-Z0-9][\w.-]+?)(?:\.pdf|\.bib)?/?$", re.IGNORECASE)
 
 
 # ------------- Text Normalization -------------
@@ -183,6 +186,123 @@ def extract_arxiv_id_from_text(text: str) -> str | None:
     return None
 
 
+def extract_acl_anthology_id(doi_or_url: str) -> str | None:
+    """Extract ACL Anthology ID from a DOI or URL.
+
+    Handles:
+    - DOIs like '10.18653/v1/2022.acl-long.220'
+    - URLs like 'https://aclanthology.org/2022.acl-long.220'
+
+    Returns:
+        Anthology ID (e.g., '2022.acl-long.220') or None
+    """
+    if not doi_or_url:
+        return None
+    s = doi_or_url.strip()
+    # Check DOI prefix
+    doi_stripped = re.sub(r"^https?://(dx\.)?doi\.org/", "", s, flags=re.IGNORECASE)
+    if doi_stripped.lower().startswith(ACL_DOI_PREFIX):
+        anthology_id = doi_stripped[len(ACL_DOI_PREFIX) :]
+        if anthology_id:
+            return anthology_id
+    # Check URL
+    m = ACL_ANTHOLOGY_ID_RE.search(s)
+    if m:
+        return m.group(1)
+    return None
+
+
+def acl_anthology_bib_to_record(bib_text: str) -> PublishedRecord | None:
+    """Parse BibTeX text from ACL Anthology into a PublishedRecord.
+
+    Args:
+        bib_text: Raw BibTeX string from aclanthology.org/{id}.bib
+
+    Returns:
+        PublishedRecord or None if parsing fails
+    """
+    if not bib_text or not bib_text.strip():
+        return None
+
+    # Simple regex-based BibTeX parser (avoids dependency on bibtexparser for this)
+    def _extract_field(field_name: str, text: str) -> str | None:
+        # Match field = {value} or field = "value"
+        pattern = rf'{field_name}\s*=\s*[{{"](.+?)[}}"]'
+        m = re.search(pattern, text, re.DOTALL | re.IGNORECASE)
+        if m:
+            val = m.group(1).strip()
+            # Clean up LaTeX artifacts
+            val = re.sub(r"\s+", " ", val)
+            return val
+        return None
+
+    title = _extract_field("title", bib_text)
+    booktitle = _extract_field("booktitle", bib_text)
+    journal = _extract_field("journal", bib_text)
+    doi = doi_normalize(_extract_field("doi", bib_text))
+    url = _extract_field("url", bib_text)
+    year_str = _extract_field("year", bib_text)
+    pages = _extract_field("pages", bib_text)
+    publisher = _extract_field("publisher", bib_text)
+    volume = _extract_field("volume", bib_text)
+    number = _extract_field("number", bib_text)
+    author_str = _extract_field("author", bib_text)
+
+    if not title:
+        return None
+
+    year: int | None = None
+    if year_str:
+        try:
+            year = int(year_str)
+        except ValueError:
+            pass
+
+    # Parse authors: "Last, First and Last2, First2"
+    authors: list[dict[str, str]] = []
+    if author_str:
+        for part in re.split(r"\s+and\s+", author_str):
+            part = part.strip()
+            if not part:
+                continue
+            if "," in part:
+                pieces = part.split(",", 1)
+                authors.append({"given": pieces[1].strip(), "family": pieces[0].strip()})
+            else:
+                pieces = part.split()
+                if len(pieces) >= 2:
+                    authors.append({"given": " ".join(pieces[:-1]), "family": pieces[-1]})
+                elif pieces:
+                    authors.append({"given": "", "family": pieces[0]})
+
+    # Determine venue: prefer booktitle (conference), fall back to journal
+    venue = booktitle or journal
+
+    # Determine type from entry type in BibTeX
+    entry_type_match = re.match(r"@(\w+)\s*\{", bib_text.strip(), re.IGNORECASE)
+    entry_type = entry_type_match.group(1).lower() if entry_type_match else ""
+    if entry_type == "inproceedings" or booktitle:
+        record_type = "proceedings-article"
+    elif entry_type == "article":
+        record_type = "journal-article"
+    else:
+        record_type = "proceedings-article"  # ACL Anthology is predominantly proceedings
+
+    return PublishedRecord(
+        doi=doi or "",
+        url=url,
+        title=title,
+        authors=authors,
+        journal=venue,
+        publisher=publisher,
+        year=year,
+        volume=volume,
+        number=number,
+        pages=pages,
+        type=record_type,
+    )
+
+
 # ------------- Rate Limiting & Caching -------------
 
 
@@ -223,6 +343,7 @@ class RateLimiterRegistry:
         "dblp": 30,  # DBLP: 30/min (conservative)
         "arxiv": 30,  # arXiv: 30/min
         "scholarly": 10,  # Scholar: very conservative
+        "aclanthology": 30,  # ACL Anthology: 30/min (conservative)
     }
 
     def __init__(self, limits: dict[str, int] | None = None) -> None:
@@ -916,6 +1037,7 @@ class AsyncRateLimiterRegistry:
         "dblp": 30,  # DBLP: 30/min (conservative)
         "arxiv": 30,  # arXiv: 30/min
         "scholarly": 10,  # Scholar: very conservative
+        "aclanthology": 30,  # ACL Anthology: 30/min (conservative)
     }
 
     def __init__(self, limits: dict[str, int] | None = None) -> None:

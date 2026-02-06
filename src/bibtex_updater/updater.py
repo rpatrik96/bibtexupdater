@@ -51,39 +51,33 @@ from rapidfuzz.fuzz import token_sort_ratio
 
 # Shared utilities
 from bibtex_updater.utils import (
-    # Constants
+    ACL_ANTHOLOGY_URL,
     ARXIV_API,
     CROSSREF_API,
     DBLP_API_SEARCH,
     PREPRINT_HOSTS,
     S2_API,
-    # Async HTTP infrastructure
     AsyncHttpClient,
     DiskCache,
     HttpClient,
-    # Data classes
     PublishedRecord,
-    # HTTP infrastructure
     RateLimiter,
-    # Resolution caching
     ResolutionCache,
     ResolutionCacheEntry,
+    acl_anthology_bib_to_record,
     authors_last_names,
-    # API converters
     crossref_message_to_record,
     dblp_hit_to_record,
-    # DOI/arXiv
     doi_normalize,
     doi_url,
+    extract_acl_anthology_id,
     extract_arxiv_id_from_text,
     first_author_surname,
-    # Matching
     jaccard_similarity,
     last_name_from_person,
     latex_to_plain,
     normalize_title_for_match,
     safe_lower,
-    # Author handling
     split_authors_bibtex,
     strip_diacritics,
 )
@@ -1245,6 +1239,15 @@ class Resolver:
         "emnlp",
         "empirical methods in natural language",
         "naacl",
+        "north american chapter",  # NAACL full name
+        "european chapter",  # EACL
+        "eacl",
+        "aacl",  # Asia-Pacific ACL
+        "computational linguistics",  # COLING
+        "coling",
+        "conll",  # CoNLL
+        "conference on computational natural language",  # CoNLL full name
+        "findings of",  # Findings of ACL/EMNLP
     )
 
     @staticmethod
@@ -1430,10 +1433,11 @@ class Resolver:
     def _resolve_uncached(self, entry: dict[str, Any], detection: PreprintDetection) -> PublishedRecord | None:
         """Internal resolution logic without caching.
 
-        Orchestrates a 6-stage resolution pipeline, returning early if any stage succeeds:
+        Orchestrates a multi-stage resolution pipeline, returning early if any stage succeeds:
         1. Direct lookup: arXiv -> Semantic Scholar / Crossref
         2. Crossref relations: is-preprint-of links
         3. DBLP bibliographic search
+        3b. ACL Anthology lookup (DOI/URL-based)
         4. Semantic Scholar search
         5. Crossref bibliographic search
         6. Google Scholar fallback (opt-in)
@@ -1454,6 +1458,11 @@ class Resolver:
 
         # Stage 3: DBLP bibliographic search
         result = self._stage3_dblp_search(entry, title_norm)
+        if result:
+            return result
+
+        # Stage 3b: ACL Anthology lookup (DOI/URL-based)
+        result = self._stage3b_acl_anthology(entry, title_norm, candidate_doi)
         if result:
             return result
 
@@ -1626,6 +1635,69 @@ class Resolver:
         if best:
             self.logger.debug("Stage 3: Found via DBLP(search) with score %.2f", best[0])
             return best[1]
+
+        return None
+
+    # --- ACL Anthology ---
+    def acl_anthology_fetch(self, anthology_id: str) -> PublishedRecord | None:
+        """Fetch paper metadata from ACL Anthology by ID.
+
+        Args:
+            anthology_id: ACL Anthology paper ID (e.g., '2022.acl-long.220')
+
+        Returns:
+            PublishedRecord or None if fetch/parse fails
+        """
+        url = f"{ACL_ANTHOLOGY_URL}/{anthology_id}.bib"
+        try:
+            resp = self.http._request("GET", url, accept="text/plain", service="aclanthology")
+            if resp.status_code != 200:
+                self.logger.debug("ACL Anthology fetch failed for %s: HTTP %d", anthology_id, resp.status_code)
+                return None
+            return acl_anthology_bib_to_record(resp.text)
+        except Exception as e:
+            self.logger.debug("ACL Anthology fetch failed for %s: %s", anthology_id, e)
+            return None
+
+    def _stage3b_acl_anthology(
+        self, entry: dict[str, Any], title_norm: str, candidate_doi: str | None
+    ) -> PublishedRecord | None:
+        """Stage 3b: ACL Anthology lookup.
+
+        Checks if any available DOI or URL points to ACL Anthology, and if so,
+        fetches authoritative metadata directly. Falls back to title+author
+        matching against ACL Anthology when a DBLP hit had an aclanthology.org URL.
+
+        Args:
+            entry: BibTeX entry dict
+            title_norm: Normalized title for matching
+            candidate_doi: DOI from earlier stages (may be an ACL DOI)
+
+        Returns:
+            PublishedRecord if found, None otherwise
+        """
+        # Check if candidate_doi or entry DOI is an ACL DOI
+        for doi_source in filter(None, (candidate_doi, entry.get("doi"))):
+            anthology_id = extract_acl_anthology_id(doi_source)
+            if anthology_id:
+                rec = self.acl_anthology_fetch(anthology_id)
+                if rec and self._credible_journal_article(rec):
+                    rec.method = "ACLAnthology(doi)"
+                    rec.confidence = 1.0
+                    self.logger.debug("Stage 3b: Found via ACLAnthology(doi) for %s", anthology_id)
+                    return rec
+
+        # Check if entry URL points to ACL Anthology
+        for url_field in ("url", "ee"):
+            url_val = entry.get(url_field) or ""
+            anthology_id = extract_acl_anthology_id(url_val)
+            if anthology_id:
+                rec = self.acl_anthology_fetch(anthology_id)
+                if rec and self._credible_journal_article(rec):
+                    rec.method = "ACLAnthology(url)"
+                    rec.confidence = 1.0
+                    self.logger.debug("Stage 3b: Found via ACLAnthology(url) for %s", anthology_id)
+                    return rec
 
         return None
 
@@ -1958,6 +2030,27 @@ class AsyncResolver:
     def _authors_to_bibtex_string(rec: PublishedRecord) -> str:
         """Convert record authors to BibTeX author string."""
         return Resolver._authors_to_bibtex_string(rec)
+
+    # --- ACL Anthology (async) ---
+    async def acl_anthology_fetch(self, anthology_id: str) -> PublishedRecord | None:
+        """Fetch paper metadata from ACL Anthology by ID (async).
+
+        Args:
+            anthology_id: ACL Anthology paper ID (e.g., '2022.acl-long.220')
+
+        Returns:
+            PublishedRecord or None if fetch/parse fails
+        """
+        url = f"{ACL_ANTHOLOGY_URL}/{anthology_id}.bib"
+        try:
+            resp = await self.http.get(url, service="aclanthology", accept="text/plain")
+            if resp.status_code != 200:
+                self.logger.debug("ACL Anthology fetch failed for %s: HTTP %d", anthology_id, resp.status_code)
+                return None
+            return acl_anthology_bib_to_record(resp.text)
+        except Exception as e:
+            self.logger.debug("ACL Anthology fetch failed for %s: %s", anthology_id, e)
+            return None
 
     # --- Async API methods ---
     async def arxiv_candidate_doi(self, arxiv_id: str) -> str | None:
@@ -2369,6 +2462,25 @@ class AsyncResolver:
                     rec0.method = "Crossref(works)"
                     rec0.confidence = 1.0
                     return rec0
+
+        # 2b) ACL Anthology DOI/URL check
+        for doi_source in filter(None, (candidate_doi, entry.get("doi"))):
+            anthology_id = extract_acl_anthology_id(doi_source)
+            if anthology_id:
+                rec = await self.acl_anthology_fetch(anthology_id)
+                if rec and self._credible_journal_article(rec):
+                    rec.method = "ACLAnthology(doi)"
+                    rec.confidence = 1.0
+                    return rec
+        for url_field in ("url", "ee"):
+            url_val = entry.get(url_field) or ""
+            anthology_id = extract_acl_anthology_id(url_val)
+            if anthology_id:
+                rec = await self.acl_anthology_fetch(anthology_id)
+                if rec and self._credible_journal_article(rec):
+                    rec.method = "ACLAnthology(url)"
+                    rec.confidence = 1.0
+                    return rec
 
         # 3) Parallel bibliographic search (DBLP, S2, Crossref)
         title = entry.get("title") or ""
