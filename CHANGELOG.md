@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-02-08
+
+### Documentation
+- Updated README with all features from v0.2.0–v0.5.0
+  - Added `bibtex-zotero-organize` and `bibtex-obsidian-keywords` to CLI commands table
+  - Added ACL Anthology to multi-source resolution lists and feature descriptions
+  - Added Zotero Organizer and Obsidian Keywords feature sections
+  - Added resolution tracking (`--mark-resolved`) to feature list
+- Updated `docs/BIBTEX_UPDATER.md` with new CLI flags (`--no-cache`, `--clear-cache`, `--s2-api-key`, `--user-agent`, `--mark-resolved`, `--force-recheck`, `--resolution-cache`, `--resolution-cache-ttl`), ACL Anthology pipeline stage, and per-service rate limits
+- Updated `docs/ZOTERO_UPDATER.md` with ACL Anthology in resolution pipeline
+
 ## [0.5.0] - 2026-02-06
 
 ### Added
@@ -206,7 +217,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Comprehensive test suite with pytest fixtures
 - MIT License
 
-[Unreleased]: https://github.com/rpatrik96/bibtexupdater/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/rpatrik96/bibtexupdater/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/rpatrik96/bibtexupdater/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/rpatrik96/bibtexupdater/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/rpatrik96/bibtexupdater/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/rpatrik96/bibtexupdater/compare/v0.3.0...v0.4.0
