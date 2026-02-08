@@ -5,7 +5,7 @@ Automatically update preprint entries in your Zotero library to their published 
 ## Features
 
 - **Direct Zotero integration**: Fetches and updates items via Zotero API
-- **Multi-source resolution**: Uses the same resolution pipeline as bibtex_updater (arXiv, Crossref, DBLP, Semantic Scholar)
+- **Multi-source resolution**: Uses the same resolution pipeline as bibtex_updater (arXiv, Crossref, DBLP, ACL Anthology, Semantic Scholar)
 - **Preserves metadata**: Keeps notes, tags, and attachments intact
 - **Dry-run mode**: Preview changes before applying
 - **Filtering**: Process specific collections or tagged items only
@@ -123,6 +123,7 @@ For each detected preprint, the tool uses the bibtex_updater resolution pipeline
 1. **arXiv → Crossref**: Query arXiv API for DOI, look up in Crossref
 2. **Crossref Relations**: Check `is-preprint-of` links
 3. **DBLP Search**: Search by title and author
+3b. **ACL Anthology**: For NLP papers with ACL DOI prefix or aclanthology.org URLs
 4. **Semantic Scholar**: Query paper database
 5. **Crossref Search**: Bibliographic search by title/author
 

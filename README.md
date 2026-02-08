@@ -49,6 +49,8 @@ uv run --with "bibtex-updater[all]" bibtex-update references.bib -o updated.bib
 | `bibtex-check` | Validate references exist with correct metadata |
 | `bibtex-filter` | Filter to only cited entries |
 | `bibtex-zotero` | Update preprints in Zotero library |
+| `bibtex-zotero-organize` | Organize Zotero items into collections by research taxonomy |
+| `bibtex-obsidian-keywords` | AI-powered keyword generation for Obsidian paper notes |
 
 ## Quick Start
 
@@ -161,13 +163,15 @@ For `filter_bibliography.py` only (no dependencies required):
 
 ### BibTeX Updater (`bibtex-update`)
 
-- **Multi-source resolution**: arXiv, Crossref, DBLP, Semantic Scholar, Google Scholar
+- **Multi-source resolution**: arXiv, Crossref, DBLP, ACL Anthology, Semantic Scholar, Google Scholar
 - **High accuracy**: Title and author fuzzy matching with confidence thresholds
+- **ACL Anthology support**: Zero-overhead resolution for NLP papers (ACL, EMNLP, NAACL, etc.)
 - **Batch processing**: Multiple files with concurrent workers (default: 8)
 - **Deduplication**: Merge duplicates by DOI or normalized title+authors
 - **Smart caching**: On-disk cache + semantic resolution cache with TTL
-- **Per-service rate limiting**: Optimized rate limits per API (Crossref, S2, DBLP, arXiv)
+- **Per-service rate limiting**: Optimized rate limits per API (Crossref, S2, DBLP, ACL Anthology, arXiv)
 - **Batch API support**: Faster bulk lookups via arXiv/S2/Crossref batch endpoints
+- **Resolution tracking**: `--mark-resolved` tags updated entries to skip on re-runs
 
 ### Zotero Updater (`bibtex-zotero`)
 
@@ -176,6 +180,22 @@ For `filter_bibliography.py` only (no dependencies required):
 - **Preserves metadata**: Keeps notes, tags, and attachments intact
 - **Idempotent**: Already-published papers are automatically skipped
 - **Dry-run mode**: Preview changes before applying
+- **Tag-based chunking**: Track processing state with `preprint-upgraded`/`preprint-checked`/`preprint-error` tags
+
+### Zotero Organizer (`bibtex-zotero-organize`)
+
+- **AI-powered taxonomy**: Organize items into hierarchical collections automatically
+- **Multiple backends**: Claude, OpenAI, or local embeddings for classification
+- **Caching**: Classification results cached to reduce API calls
+- **Batch processing**: Configurable limits and dry-run mode
+
+### Obsidian Keywords (`bibtex-obsidian-keywords`)
+
+- **AI-powered keywords**: Generate `[[wikilinks]]` for Obsidian paper notes
+- **Multiple backends**: Claude, OpenAI, or local embeddings
+- **Smart skipping**: `--min-keywords` to skip notes that already have enough keywords
+- **Topics file**: Provide existing topics for consistent tagging across notes
+- **Dry-run mode**: Preview changes before modifying files
 
 ### Reference Fact-Checker (`bibtex-check`)
 
@@ -202,7 +222,7 @@ rate_limiter = RateLimiter(req_per_min=30)
 cache = DiskCache(".cache.json")
 http_client = HttpClient(
     timeout=30.0,
-    user_agent="bibtex-updater/0.1.0",
+    user_agent="bibtex-updater/0.5.0",
     rate_limiter=rate_limiter,
     cache=cache
 )

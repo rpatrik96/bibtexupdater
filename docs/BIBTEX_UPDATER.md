@@ -4,7 +4,7 @@ Automatically replace preprint BibTeX entries (arXiv, bioRxiv, medRxiv, etc.) wi
 
 ## Features
 
-- **Multi-source resolution**: Queries arXiv, Crossref, DBLP, Semantic Scholar, and optionally Google Scholar
+- **Multi-source resolution**: Queries arXiv, Crossref, DBLP, ACL Anthology, Semantic Scholar, and optionally Google Scholar
 - **High accuracy**: Uses title and author matching with configurable confidence thresholds
 - **Batch processing**: Process multiple .bib files with concurrent workers
 - **Deduplication**: Merge duplicate entries by DOI or normalized title+authors
@@ -71,7 +71,15 @@ usage: bibtex_updater.py [-h] [-o OUTPUT | --in-place] [--keep-preprint-note]
 | `--report` | Write JSONL report mapping original→updated |
 | `--cache` | On-disk cache file (default: .cache.replace_preprints.json) |
 | `--rate-limit` | Requests per minute (default 45) |
-| `--max-workers` | Max concurrent workers (default 4) |
+| `--no-cache` | Disable caching entirely for fresh lookups |
+| `--clear-cache` | Clear existing cache files before running |
+| `--s2-api-key` | Semantic Scholar API key (or set `S2_API_KEY`) |
+| `--user-agent` | Custom User-Agent for API requests (or set `BIBTEX_UPDATER_USER_AGENT`) |
+| `--mark-resolved` | Tag updated entries with `_resolved_from` field to skip on re-runs |
+| `--force-recheck` | Ignore `_resolved_from` markers and reprocess all entries |
+| `--resolution-cache` | Resolution cache file for semantic caching |
+| `--resolution-cache-ttl` | TTL for resolution cache entries |
+| `--max-workers` | Max concurrent workers (default 8) |
 | `--timeout` | HTTP timeout seconds (default 20.0) |
 | `--verbose` | Verbose logging |
 
@@ -85,11 +93,12 @@ usage: bibtex_updater.py [-h] [-o OUTPUT | --in-place] [--keep-preprint-note]
 
 ## How It Works
 
-The tool uses a 6-stage resolution pipeline to find published versions of preprints:
+The tool uses a multi-stage resolution pipeline to find published versions of preprints:
 
 1. **arXiv → Crossref**: For arXiv preprints, query the arXiv API for DOI, then look up in Crossref
 2. **Crossref Relations**: Check Crossref's `is-preprint-of` relation links
 3. **DBLP Search**: Search DBLP by title and author
+3b. **ACL Anthology**: For NLP papers with ACL DOI prefix (`10.18653/v1/`) or aclanthology.org URLs
 4. **Semantic Scholar**: Query Semantic Scholar's paper database
 5. **Crossref Search**: Bibliographic search in Crossref by title/author
 6. **Google Scholar** (opt-in): Fallback search via scholarly package
@@ -223,10 +232,12 @@ jobs:
 
 ## Rate Limiting
 
-The tool respects API rate limits:
+The tool respects API rate limits with per-service rate limiting:
 - **Crossref**: 45 requests/minute (polite pool)
 - **DBLP**: Built-in delays
-- **Semantic Scholar**: Automatic backoff
+- **ACL Anthology**: 30 requests/minute
+- **Semantic Scholar**: Automatic backoff (supports `--s2-api-key` for higher limits)
+- **arXiv**: Adaptive rate limiting based on response headers
 - **Google Scholar**: 5 second delay (configurable)
 
 Use `--rate-limit` to adjust the global rate limit.
