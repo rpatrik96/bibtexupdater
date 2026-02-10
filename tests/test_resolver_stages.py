@@ -128,7 +128,16 @@ class TestAsyncResolver:
         async_resolver_methods = {m for m in dir(AsyncResolver) if not m.startswith("_")}
 
         # AsyncResolver should have at least the same public interface
-        common_methods = {"resolve", "crossref_get", "crossref_search", "dblp_search", "s2_search"}
+        common_methods = {
+            "resolve",
+            "crossref_get",
+            "crossref_search",
+            "dblp_search",
+            "s2_search",
+            "openalex_from_arxiv",
+            "openalex_from_doi",
+            "europepmc_search_published",
+        }
         for method in common_methods:
             assert method in resolver_methods, f"Resolver missing {method}"
             assert method in async_resolver_methods, f"AsyncResolver missing {method}"
@@ -136,6 +145,10 @@ class TestAsyncResolver:
     def test_async_resolver_parallel_search_exists(self):
         """AsyncResolver should have parallel_bibliographic_search method."""
         assert hasattr(AsyncResolver, "parallel_bibliographic_search")
+
+    def test_async_resolver_has_biorxiv_detection(self):
+        """AsyncResolver should have _is_biorxiv_or_medrxiv helper."""
+        assert hasattr(AsyncResolver, "_is_biorxiv_or_medrxiv")
 
 
 class TestMainHelperFunctions:
