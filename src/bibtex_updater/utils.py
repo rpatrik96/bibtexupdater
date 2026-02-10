@@ -51,6 +51,8 @@ S2_API = "https://api.semanticscholar.org/graph/v1"
 ACL_ANTHOLOGY_URL = "https://aclanthology.org"
 ACL_DOI_PREFIX = "10.18653/v1/"
 ACL_ANTHOLOGY_ID_RE = re.compile(r"https?://aclanthology\.org/([A-Z0-9][\w.-]+?)(?:\.pdf|\.bib)?/?$", re.IGNORECASE)
+OPENALEX_API = "https://api.openalex.org"
+EUROPEPMC_API = "https://www.ebi.ac.uk/europepmc/webservices/rest"
 
 
 # ------------- Text Normalization -------------
@@ -366,6 +368,8 @@ class RateLimiterRegistry:
         "arxiv": 30,  # arXiv: 30/min
         "scholarly": 10,  # Scholar: very conservative
         "aclanthology": 30,  # ACL Anthology: 30/min (conservative)
+        "openalex": 100,  # OpenAlex: polite pool (~10 req/sec max)
+        "europepmc": 20,  # Europe PMC: conservative rate limit
     }
 
     def __init__(self, limits: dict[str, int] | None = None) -> None:
@@ -997,6 +1001,199 @@ def s2_data_to_record(data: dict[str, Any]) -> PublishedRecord | None:
     )
 
 
+def openalex_work_to_record(work: dict[str, Any]) -> PublishedRecord | None:
+    """Convert an OpenAlex work to a PublishedRecord.
+
+    OpenAlex tracks preprint-to-published version relationships. This function
+    extracts metadata from the published version of a work.
+
+    Args:
+        work: OpenAlex work object from API response
+
+    Returns:
+        PublishedRecord if the work is a published version, None otherwise
+    """
+    if not work:
+        return None
+
+    # Extract DOI (OpenAlex DOIs come as full URLs)
+    doi = doi_normalize(work.get("doi"))
+    if not doi:
+        return None
+
+    title = work.get("title")
+    year = work.get("publication_year")
+    work_type = work.get("type")
+
+    # Map OpenAlex type to our types
+    type_map = {
+        "article": "journal-article",
+        "proceedings-article": "proceedings-article",
+        "book-chapter": "book-chapter",
+    }
+    record_type = type_map.get(work_type, work_type)
+
+    # Reject posted-content (preprints)
+    if work_type == "posted-content":
+        return None
+
+    # Parse authors from authorships
+    authors: list[dict[str, str]] = []
+    for authorship in work.get("authorships", []):
+        author_obj = authorship.get("author", {})
+        display_name = author_obj.get("display_name", "")
+        if display_name:
+            parts = display_name.split()
+            if len(parts) >= 2:
+                authors.append({"given": " ".join(parts[:-1]), "family": parts[-1]})
+            elif parts:
+                authors.append({"given": "", "family": parts[0]})
+
+    # Get journal/venue from primary_location
+    primary_location = work.get("primary_location") or {}
+    source = primary_location.get("source") or {}
+    journal = source.get("display_name")
+    version = primary_location.get("version")
+
+    # Check all locations for a published version
+    has_published_version = version == "publishedVersion"
+    for loc in work.get("locations", []):
+        if loc.get("version") == "publishedVersion":
+            has_published_version = True
+            if not journal:
+                loc_source = loc.get("source") or {}
+                journal = loc_source.get("display_name")
+            break
+
+    # Reject if journal name contains preprint indicators
+    if journal:
+        journal_lower = safe_lower(journal)
+        if re.search(r"arxiv|biorxiv|medrxiv|preprint", journal_lower):
+            return None
+    elif record_type in ("journal-article", "proceedings-article"):
+        return None  # No journal name for what should be a published work
+
+    # Only accept if we have evidence of a published version
+    if record_type not in ("journal-article", "proceedings-article", "book-chapter"):
+        return None
+    if not has_published_version and record_type in ("journal-article", "proceedings-article"):
+        # For articles without explicit publishedVersion, require a real journal
+        if not journal:
+            return None
+
+    # Extract bibliographic info
+    biblio = work.get("biblio") or {}
+    volume = biblio.get("volume")
+    issue = biblio.get("issue")
+    first_page = biblio.get("first_page")
+    last_page = biblio.get("last_page")
+
+    pages = None
+    if first_page:
+        if last_page and last_page != first_page:
+            pages = f"{first_page}-{last_page}"
+        else:
+            pages = str(first_page)
+
+    publisher = source.get("host_organization_name")
+
+    return PublishedRecord(
+        doi=doi,
+        url=doi_url(doi) if doi else None,
+        title=title,
+        authors=authors,
+        journal=journal,
+        publisher=publisher,
+        year=year,
+        volume=volume,
+        number=issue,
+        pages=pages,
+        type=record_type,
+    )
+
+
+def europepmc_result_to_record(result: dict[str, Any]) -> PublishedRecord | None:
+    """Convert a Europe PMC search result to a PublishedRecord.
+
+    Europe PMC is particularly useful for bioRxiv/medRxiv preprint resolution
+    as it maintains active preprint-to-published linking for life sciences.
+
+    Args:
+        result: Europe PMC result object from search API
+
+    Returns:
+        PublishedRecord if the result is a published article, None otherwise
+    """
+    if not result:
+        return None
+
+    doi = doi_normalize(result.get("doi"))
+    title = result.get("title")
+    if not title:
+        return None
+
+    # Check source - we want published articles (MED=PubMed, PMC=PubMed Central)
+    source = result.get("source", "")
+    if source not in ("MED", "PMC", "AGR", "CBA", "CTX", "ETH", "HIR", "PAT"):
+        # Skip preprint sources
+        if source == "PPR":
+            return None
+
+    # Parse authors from authorString: "Smith J, Doe J, ..."
+    authors: list[dict[str, str]] = []
+    author_str = result.get("authorString", "")
+    if author_str:
+        # Remove trailing period if present
+        author_str = author_str.rstrip(".")
+        for author_part in author_str.split(","):
+            author_part = author_part.strip()
+            if not author_part:
+                continue
+            parts = author_part.split()
+            if len(parts) >= 2:
+                # Last token(s) are initials, first token(s) are family name
+                # Europe PMC format: "FamilyName Initials" e.g., "Smith JA"
+                # Check if last parts are initials (all uppercase, short)
+                family_parts = []
+                given_parts = []
+                for p in parts:
+                    if len(p) <= 3 and p.isupper():
+                        given_parts.append(p)
+                    else:
+                        family_parts.append(p)
+                family = " ".join(family_parts) if family_parts else parts[0]
+                given = " ".join(given_parts) if given_parts else parts[-1]
+                authors.append({"given": given, "family": family})
+            elif parts:
+                authors.append({"given": "", "family": parts[0]})
+
+    journal = result.get("journalTitle")
+    year_str = result.get("pubYear")
+    year = int(year_str) if year_str and year_str.isdigit() else None
+    volume = result.get("journalVolume")
+    issue = result.get("issue")
+    page_info = result.get("pageInfo")
+
+    # Reject if journal looks like a preprint server
+    if journal:
+        journal_lower = safe_lower(journal)
+        if re.search(r"arxiv|biorxiv|medrxiv|preprint", journal_lower):
+            return None
+
+    return PublishedRecord(
+        doi=doi or "",
+        url=doi_url(doi) if doi else None,
+        title=title,
+        authors=authors,
+        journal=journal,
+        year=year,
+        volume=volume,
+        number=issue,
+        pages=page_info,
+        type="journal-article",
+    )
+
+
 # ------------- Async Rate Limiting -------------
 
 
@@ -1060,6 +1257,8 @@ class AsyncRateLimiterRegistry:
         "arxiv": 30,  # arXiv: 30/min
         "scholarly": 10,  # Scholar: very conservative
         "aclanthology": 30,  # ACL Anthology: 30/min (conservative)
+        "openalex": 100,  # OpenAlex: polite pool (~10 req/sec max)
+        "europepmc": 20,  # Europe PMC: conservative rate limit
     }
 
     def __init__(self, limits: dict[str, int] | None = None) -> None:

@@ -52,6 +52,9 @@ from bibtex_updater.updater import (
 
 # Shared utilities
 from bibtex_updater.utils import (
+    # API constants
+    EUROPEPMC_API,
+    OPENALEX_API,
     # Classes
     AdaptiveRateLimiterRegistry,
     AsyncHttpClient,
@@ -74,6 +77,7 @@ from bibtex_updater.utils import (
     # DOI/arXiv utilities
     doi_normalize,
     doi_url,
+    europepmc_result_to_record,
     extract_acl_anthology_id,
     extract_arxiv_id_from_text,
     first_author_surname,
@@ -83,6 +87,7 @@ from bibtex_updater.utils import (
     # Text normalization
     latex_to_plain,
     normalize_title_for_match,
+    openalex_work_to_record,
     s2_data_to_record,
     safe_lower,
     split_authors_bibtex,
@@ -149,5 +154,10 @@ __all__ = [
     # API converters
     "crossref_message_to_record",
     "dblp_hit_to_record",
+    "europepmc_result_to_record",
+    "openalex_work_to_record",
     "s2_data_to_record",
+    # API constants
+    "EUROPEPMC_API",
+    "OPENALEX_API",
 ]

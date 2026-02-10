@@ -139,6 +139,7 @@ python filter_bibliography.py paper.tex -b references.bib -o filtered.bib
 | [docs/REFERENCE_FACT_CHECKER.md](docs/REFERENCE_FACT_CHECKER.md) | Full reference fact-checker documentation |
 | [docs/ZOTERO_UPDATER.md](docs/ZOTERO_UPDATER.md) | Full Zotero updater documentation |
 | [docs/FILTER_BIBLIOGRAPHY.md](docs/FILTER_BIBLIOGRAPHY.md) | Full filter documentation |
+| [docs/LANDSCAPE.md](docs/LANDSCAPE.md) | Databases, competing tools, and ecosystem landscape |
 | [examples/](examples/) | Example workflows and configuration files |
 
 ## Overleaf Integration
@@ -163,13 +164,13 @@ For `filter_bibliography.py` only (no dependencies required):
 
 ### BibTeX Updater (`bibtex-update`)
 
-- **Multi-source resolution**: arXiv, Crossref, DBLP, ACL Anthology, Semantic Scholar, Google Scholar
+- **Multi-source resolution**: arXiv, OpenAlex, Europe PMC, Crossref, DBLP, ACL Anthology, Semantic Scholar, Google Scholar
 - **High accuracy**: Title and author fuzzy matching with confidence thresholds
 - **ACL Anthology support**: Zero-overhead resolution for NLP papers (ACL, EMNLP, NAACL, etc.)
 - **Batch processing**: Multiple files with concurrent workers (default: 8)
 - **Deduplication**: Merge duplicates by DOI or normalized title+authors
 - **Smart caching**: On-disk cache + semantic resolution cache with TTL
-- **Per-service rate limiting**: Optimized rate limits per API (Crossref, S2, DBLP, ACL Anthology, arXiv)
+- **Per-service rate limiting**: Optimized rate limits per API (Crossref, S2, DBLP, ACL Anthology, arXiv, OpenAlex, Europe PMC)
 - **Batch API support**: Faster bulk lookups via arXiv/S2/Crossref batch endpoints
 - **Resolution tracking**: `--mark-resolved` tags updated entries to skip on re-runs
 

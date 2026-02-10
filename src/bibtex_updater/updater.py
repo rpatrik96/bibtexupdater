@@ -55,6 +55,8 @@ from bibtex_updater.utils import (
     ARXIV_API,
     CROSSREF_API,
     DBLP_API_SEARCH,
+    EUROPEPMC_API,
+    OPENALEX_API,
     PREPRINT_HOSTS,
     S2_API,
     AsyncHttpClient,
@@ -70,6 +72,7 @@ from bibtex_updater.utils import (
     dblp_hit_to_record,
     doi_normalize,
     doi_url,
+    europepmc_result_to_record,
     extract_acl_anthology_id,
     extract_arxiv_id_from_text,
     first_author_surname,
@@ -77,6 +80,7 @@ from bibtex_updater.utils import (
     last_name_from_person,
     latex_to_plain,
     normalize_title_for_match,
+    openalex_work_to_record,
     safe_lower,
     split_authors_bibtex,
     strip_diacritics,
@@ -1005,6 +1009,174 @@ class Resolver:
         """Convert DBLP hit to PublishedRecord. Delegates to bib_utils."""
         return dblp_hit_to_record(hit)
 
+    # --- OpenAlex ---
+    def openalex_from_arxiv(self, arxiv_id: str) -> PublishedRecord | None:
+        """Look up a published version via OpenAlex using arXiv ID.
+
+        OpenAlex has best-in-class preprint-to-published version tracking.
+
+        Args:
+            arxiv_id: arXiv ID (e.g., '2301.00001')
+
+        Returns:
+            PublishedRecord if a published version is found, None otherwise
+        """
+        url = f"{OPENALEX_API}/works/arxiv:{arxiv_id}"
+        try:
+            resp = self.http._request("GET", url, accept="application/json", service="openalex")
+            if resp.status_code != 200:
+                return None
+            work = resp.json()
+        except Exception as e:
+            self.logger.debug("OpenAlex arXiv lookup failed for %s: %s", arxiv_id, e)
+            return None
+
+        rec = openalex_work_to_record(work)
+        if rec and self._credible_journal_article(rec):
+            rec.method = "OpenAlex(arxiv)"
+            rec.confidence = 1.0
+            return rec
+        return None
+
+    def openalex_from_doi(self, doi: str) -> PublishedRecord | None:
+        """Look up a published version via OpenAlex using DOI.
+
+        Args:
+            doi: DOI to look up
+
+        Returns:
+            PublishedRecord if a published version is found, None otherwise
+        """
+        doi_norm = doi_normalize(doi)
+        if not doi_norm:
+            return None
+        url = f"{OPENALEX_API}/works/doi:{doi_norm}"
+        try:
+            resp = self.http._request("GET", url, accept="application/json", service="openalex")
+            if resp.status_code != 200:
+                return None
+            work = resp.json()
+        except Exception as e:
+            self.logger.debug("OpenAlex DOI lookup failed for %s: %s", doi_norm, e)
+            return None
+
+        rec = openalex_work_to_record(work)
+        if rec and self._credible_journal_article(rec):
+            rec.method = "OpenAlex(doi)"
+            rec.confidence = 1.0
+            return rec
+        return None
+
+    def _stage1b_openalex(self, detection: PreprintDetection, candidate_doi: str | None) -> PublishedRecord | None:
+        """Stage 1b: OpenAlex lookup for published version.
+
+        OpenAlex has best-in-class preprint-to-published version tracking
+        with 250M+ works across all disciplines.
+
+        Args:
+            detection: PreprintDetection with arxiv_id and/or doi
+            candidate_doi: DOI from arXiv metadata (from Stage 1)
+
+        Returns:
+            PublishedRecord if found, None otherwise
+        """
+        if detection.arxiv_id:
+            result = self.openalex_from_arxiv(detection.arxiv_id)
+            if result:
+                self.logger.debug("Stage 1b: Found via OpenAlex(arxiv)")
+                return result
+
+        doi_to_try = detection.doi or candidate_doi
+        if doi_to_try:
+            result = self.openalex_from_doi(doi_to_try)
+            if result:
+                self.logger.debug("Stage 1b: Found via OpenAlex(doi)")
+                return result
+
+        return None
+
+    # --- Europe PMC (bioRxiv/medRxiv specialist) ---
+    def _is_biorxiv_or_medrxiv(self, entry: dict[str, Any], detection: PreprintDetection) -> bool:
+        """Check if entry is a bioRxiv or medRxiv preprint."""
+        if detection.doi and detection.doi.startswith("10.1101/"):
+            return True
+        for field_name in ("journal", "note", "publisher"):
+            val = (entry.get(field_name) or "").lower()
+            if "biorxiv" in val or "medrxiv" in val:
+                return True
+        return False
+
+    def europepmc_search_published(self, title: str, first_author: str) -> PublishedRecord | None:
+        """Search Europe PMC for a published version of a paper.
+
+        Args:
+            title: Paper title
+            first_author: First author surname
+
+        Returns:
+            PublishedRecord if found, None otherwise
+        """
+        query = f'TITLE:"{title}" AUTH:"{first_author}" SRC:MED'
+        params: dict[str, Any] = {"query": query, "format": "json", "resultType": "core", "pageSize": "5"}
+        try:
+            resp = self.http._request(
+                "GET", f"{EUROPEPMC_API}/search", params=params, accept="application/json", service="europepmc"
+            )
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+        except Exception as e:
+            self.logger.debug("Europe PMC search failed: %s", e)
+            return None
+
+        results = data.get("resultList", {}).get("result", [])
+        if not results:
+            return None
+
+        return europepmc_result_to_record(results[0])
+
+    def _stage1c_europepmc(
+        self, entry: dict[str, Any], detection: PreprintDetection, title_norm: str
+    ) -> PublishedRecord | None:
+        """Stage 1c: Europe PMC lookup (bioRxiv/medRxiv only).
+
+        Europe PMC has excellent preprint-to-published linking for life science
+        papers. Studies show 7-37% of bioRxiv preprints have missing publication
+        links in the bioRxiv API itself.
+
+        Args:
+            entry: BibTeX entry dict
+            detection: PreprintDetection with doi
+            title_norm: Normalized title for matching
+
+        Returns:
+            PublishedRecord if found, None otherwise
+        """
+        if not self._is_biorxiv_or_medrxiv(entry, detection):
+            return None
+
+        if not title_norm:
+            return None
+
+        first_author = first_author_surname(entry)
+        if not first_author:
+            return None
+
+        rec = self.europepmc_search_published(entry.get("title", ""), first_author)
+        if not rec:
+            return None
+
+        authors_ref = authors_last_names(entry.get("author", ""))
+        combined = self._compute_match_score(title_norm, rec, authors_ref)
+
+        if combined >= self.MATCH_THRESHOLD and self._credible_journal_article(rec):
+            rec.method = "EuropePMC(search)"
+            rec.confidence = combined
+            self.logger.debug("Stage 1c: Found via EuropePMC(search) with score %.2f", combined)
+            return rec
+
+        return None
+
     # --- Semantic Scholar (safe alternative to Google Scholar scraping) ---
     def s2_from_arxiv(self, arxiv_id: str) -> PublishedRecord | None:
         fields = "externalIds,title,year,authors,venue,publicationTypes,publicationVenue,url"
@@ -1435,6 +1607,8 @@ class Resolver:
 
         Orchestrates a multi-stage resolution pipeline, returning early if any stage succeeds:
         1. Direct lookup: arXiv -> Semantic Scholar / Crossref
+        1b. OpenAlex lookup (preprint-to-published version tracking)
+        1c. Europe PMC lookup (bioRxiv/medRxiv only)
         2. Crossref relations: is-preprint-of links
         3. DBLP bibliographic search
         3b. ACL Anthology lookup (DOI/URL-based)
@@ -1448,6 +1622,16 @@ class Resolver:
 
         # Stage 1: Direct lookup (arXiv -> S2 -> Crossref)
         result, candidate_doi = self._stage1_direct_lookup(detection)
+        if result:
+            return result
+
+        # Stage 1b: OpenAlex lookup (preprint-to-published version tracking)
+        result = self._stage1b_openalex(detection, candidate_doi)
+        if result:
+            return result
+
+        # Stage 1c: Europe PMC lookup (bioRxiv/medRxiv only)
+        result = self._stage1c_europepmc(entry, detection, title_norm)
         if result:
             return result
 
@@ -2252,6 +2436,103 @@ class AsyncResolver:
             confidence=0.95,
         )
 
+    # --- OpenAlex (async) ---
+    async def openalex_from_arxiv(self, arxiv_id: str) -> PublishedRecord | None:
+        """Look up a published version via OpenAlex using arXiv ID (async).
+
+        Args:
+            arxiv_id: arXiv ID (e.g., '2301.00001')
+
+        Returns:
+            PublishedRecord if a published version is found, None otherwise
+        """
+        url = f"{OPENALEX_API}/works/arxiv:{arxiv_id}"
+        try:
+            resp = await self.http.get(url, service="openalex", accept="application/json")
+            if resp.status_code != 200:
+                return None
+            work = resp.json()
+        except Exception as e:
+            self.logger.debug("OpenAlex arXiv lookup failed for %s: %s", arxiv_id, e)
+            return None
+
+        rec = openalex_work_to_record(work)
+        if rec and self._credible_journal_article(rec):
+            rec.method = "OpenAlex(arxiv)"
+            rec.confidence = 1.0
+            return rec
+        return None
+
+    async def openalex_from_doi(self, doi: str) -> PublishedRecord | None:
+        """Look up a published version via OpenAlex using DOI (async).
+
+        Args:
+            doi: DOI to look up
+
+        Returns:
+            PublishedRecord if a published version is found, None otherwise
+        """
+        doi_norm = doi_normalize(doi)
+        if not doi_norm:
+            return None
+        url = f"{OPENALEX_API}/works/doi:{doi_norm}"
+        try:
+            resp = await self.http.get(url, service="openalex", accept="application/json")
+            if resp.status_code != 200:
+                return None
+            work = resp.json()
+        except Exception as e:
+            self.logger.debug("OpenAlex DOI lookup failed for %s: %s", doi_norm, e)
+            return None
+
+        rec = openalex_work_to_record(work)
+        if rec and self._credible_journal_article(rec):
+            rec.method = "OpenAlex(doi)"
+            rec.confidence = 1.0
+            return rec
+        return None
+
+    # --- Europe PMC (async) ---
+    async def europepmc_search_published(self, title: str, first_author: str) -> PublishedRecord | None:
+        """Search Europe PMC for a published version of a paper (async).
+
+        Args:
+            title: Paper title
+            first_author: First author surname
+
+        Returns:
+            PublishedRecord if found, None otherwise
+        """
+        query = f'TITLE:"{title}" AUTH:"{first_author}" SRC:MED'
+        params: dict[str, Any] = {"query": query, "format": "json", "resultType": "core", "pageSize": "5"}
+        try:
+            resp = await self.http.get(
+                f"{EUROPEPMC_API}/search", service="europepmc", params=params, accept="application/json"
+            )
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+        except Exception as e:
+            self.logger.debug("Europe PMC search failed: %s", e)
+            return None
+
+        results = data.get("resultList", {}).get("result", [])
+        if not results:
+            return None
+
+        return europepmc_result_to_record(results[0])
+
+    @staticmethod
+    def _is_biorxiv_or_medrxiv(entry: dict[str, Any], detection: PreprintDetection) -> bool:
+        """Check if entry is a bioRxiv or medRxiv preprint."""
+        if detection.doi and detection.doi.startswith("10.1101/"):
+            return True
+        for field_name in ("journal", "note", "publisher"):
+            val = (entry.get(field_name) or "").lower()
+            if "biorxiv" in val or "medrxiv" in val:
+                return True
+        return False
+
     # --- Parallel search ---
     async def parallel_bibliographic_search(
         self,
@@ -2400,6 +2681,8 @@ class AsyncResolver:
 
         Uses a multi-stage resolution strategy:
         1. Semantic Scholar arXiv lookup (if arXiv ID present)
+        1b. OpenAlex lookup (preprint-to-published version tracking)
+        1c. Europe PMC lookup (bioRxiv/medRxiv only)
         2. arXiv API -> DOI -> Crossref lookup
         3. Crossref relations (is-preprint-of)
         4. Parallel bibliographic search (DBLP, S2, Crossref)
@@ -2441,6 +2724,38 @@ class AsyncResolver:
                                 rec2.method = "arXiv->Crossref(relation)"
                                 rec2.confidence = 1.0
                                 return rec2
+
+        # 1b) OpenAlex lookup (preprint-to-published version tracking)
+        if detection.arxiv_id:
+            rec = await self.openalex_from_arxiv(detection.arxiv_id)
+            if rec:
+                self.logger.debug("Stage 1b: Found via OpenAlex(arxiv)")
+                return rec
+        doi_to_try = detection.doi or candidate_doi
+        if doi_to_try:
+            rec = await self.openalex_from_doi(doi_to_try)
+            if rec:
+                self.logger.debug("Stage 1b: Found via OpenAlex(doi)")
+                return rec
+
+        # 1c) Europe PMC lookup (bioRxiv/medRxiv only)
+        if self._is_biorxiv_or_medrxiv(entry, detection):
+            title_norm = normalize_title_for_match(entry.get("title") or "")
+            first_author = first_author_surname(entry)
+            if title_norm and first_author:
+                rec = await self.europepmc_search_published(entry.get("title", ""), first_author)
+                if rec:
+                    authors_ref = authors_last_names(entry.get("author", ""))
+                    tb = normalize_title_for_match(rec.title or "")
+                    title_score = token_sort_ratio(title_norm, tb)
+                    blns = [strip_diacritics(a.get("family") or "").lower() for a in rec.authors][:3]
+                    auth_score = jaccard_similarity(authors_ref[:3], blns)
+                    combined = 0.7 * (title_score / 100.0) + 0.3 * auth_score
+                    if combined >= self.MATCH_THRESHOLD and self._credible_journal_article(rec):
+                        rec.method = "EuropePMC(search)"
+                        rec.confidence = combined
+                        self.logger.debug("Stage 1c: Found via EuropePMC(search) with score %.2f", combined)
+                        return rec
 
         # 2) Crossref by DOI (preprint DOI or candidate)
         for d in filter(None, (detection.doi, candidate_doi)):
