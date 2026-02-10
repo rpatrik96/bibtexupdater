@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-02-10
+
+### Added
+- **OpenAlex as resolution source** (Stage 1b) for preprint-to-published version tracking
+  - 250M+ works across all disciplines with best-in-class version deduplication
+  - Looks up by arXiv ID first, falls back to DOI
+  - `openalex_work_to_record()` converter validates `publishedVersion` in locations, rejects preprint types/venues
+  - Rate limiting at 100 req/sec (OpenAlex polite pool)
+  - Both sync (`Resolver`) and async (`AsyncResolver`) implementations
+- **Europe PMC as resolution source** (Stage 1c) for bioRxiv/medRxiv preprints
+  - Life science specialist with preprint-to-published linking
+  - Only activates for bioRxiv/medRxiv entries (gated by `10.1101/` DOI prefix or journal name)
+  - Title+author search with `SRC:MED` filter and fuzzy match validation
+  - `europepmc_result_to_record()` converter with PPR (preprint) source rejection
+  - Rate limiting at 20 req/sec
+  - Both sync and async implementations
+- **Ecosystem landscape documentation** (`docs/LANDSCAPE.md`)
+  - Integrated databases with per-source details
+  - Evaluated-but-not-integrated databases with reasoning
+  - Competing tools (rebiber, reffix, PreprintResolver, bibcure, PreprintMatch, PaperMemory)
+  - Citation hallucination checkers and BibTeX cleanup tools
+- 31 new tests for OpenAlex and Europe PMC integrations (583 total)
+
 ## [0.5.1] - 2026-02-08
 
 ### Documentation
