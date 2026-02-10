@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-02-10
+
+### Documentation
+- Added animated GIFs to README for visual feature demonstration
+  - Hero pipeline animation showing all 9 resolution stages
+  - Before/after preprint-to-published transformation
+  - Zotero sync integration and AI collection organization
+  - Obsidian AI auto-keywording with knowledge graph
+  - Reference fact-checker with hallucination detection
+- GIF generation scripts in `scripts/` for reproducibility
+
 ## [0.6.0] - 2026-02-10
 
 ### Added
@@ -240,7 +251,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Comprehensive test suite with pytest fixtures
 - MIT License
 
-[Unreleased]: https://github.com/rpatrik96/bibtexupdater/compare/v0.5.1...HEAD
+[Unreleased]: https://github.com/rpatrik96/bibtexupdater/compare/v0.6.1...HEAD
+[0.6.1]: https://github.com/rpatrik96/bibtexupdater/compare/v0.6.0...v0.6.1
 [0.5.1]: https://github.com/rpatrik96/bibtexupdater/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/rpatrik96/bibtexupdater/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/rpatrik96/bibtexupdater/compare/v0.4.0...v0.4.1
