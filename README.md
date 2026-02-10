@@ -2,6 +2,8 @@
 
 Tools for managing BibTeX bibliographies: automatically update preprints to published versions, validate references against external databases, and filter to only cited references.
 
+![9-stage resolution pipeline](assets/pipeline.gif)
+
 ## Installation
 
 ### From PyPI (Recommended)
@@ -164,6 +166,8 @@ For `filter_bibliography.py` only (no dependencies required):
 
 ### BibTeX Updater (`bibtex-update`)
 
+![Preprint to published](assets/before-after.gif)
+
 - **Multi-source resolution**: arXiv, OpenAlex, Europe PMC, Crossref, DBLP, ACL Anthology, Semantic Scholar, Google Scholar
 - **High accuracy**: Title and author fuzzy matching with confidence thresholds
 - **ACL Anthology support**: Zero-overhead resolution for NLP papers (ACL, EMNLP, NAACL, etc.)
@@ -175,6 +179,8 @@ For `filter_bibliography.py` only (no dependencies required):
 - **Resolution tracking**: `--mark-resolved` tags updated entries to skip on re-runs
 
 ### Zotero Updater (`bibtex-zotero`)
+
+![Zotero integration](assets/zotero-sync.gif)
 
 - **Direct Zotero integration**: Fetches and updates items via Zotero API
 - **Same resolution pipeline**: Uses the same multi-source resolution
@@ -192,6 +198,8 @@ For `filter_bibliography.py` only (no dependencies required):
 
 ### Obsidian Keywords (`bibtex-obsidian-keywords`)
 
+![AI auto-keywording](assets/obsidian-keywords.gif)
+
 - **AI-powered keywords**: Generate `[[wikilinks]]` for Obsidian paper notes
 - **Multiple backends**: Claude, OpenAI, or local embeddings
 - **Smart skipping**: `--min-keywords` to skip notes that already have enough keywords
@@ -199,6 +207,8 @@ For `filter_bibliography.py` only (no dependencies required):
 - **Dry-run mode**: Preview changes before modifying files
 
 ### Reference Fact-Checker (`bibtex-check`)
+
+![Reference fact-checker](assets/fact-checker.gif)
 
 - **Multi-source validation**: Crossref, DBLP, Semantic Scholar
 - **Detailed mismatch detection**: Title, author, year, venue comparisons
