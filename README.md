@@ -21,17 +21,17 @@ pip install bibtex-updater[zotero]
 pip install bibtex-updater[all]
 ```
 
-### From Source
+### From Source (Recommended)
 
 ```bash
 git clone https://github.com/rpatrik96/bibtexupdater.git
 cd bibtexupdater
-pip install -e ".[dev]"
+uv sync --extra dev --extra all
 ```
 
 ### Using uv (No Installation)
 
-Run directly without managing virtual environments using [uv](https://docs.astral.sh/uv/):
+Run directly without cloning using [uv](https://docs.astral.sh/uv/):
 
 ```bash
 # Run any command directly
@@ -259,22 +259,22 @@ if detection.is_preprint:
 # Clone and install in development mode
 git clone https://github.com/rpatrik96/bibtexupdater.git
 cd bibtexupdater
-pip install -e ".[dev,all]"
+uv sync --extra dev --extra all
 
 # Run tests
-pytest tests/ -v
+uv run pytest tests/ -v
 
 # Run tests with coverage
-pytest tests/ -v --cov=bibtex_updater --cov-report=term-missing
+uv run pytest tests/ -v --cov=bibtex_updater --cov-report=term-missing
 
 # Code quality
 pre-commit run --all-files
 
 # Build package
-python -m build
+uv build
 
 # Check package
-twine check dist/*
+uv run twine check dist/*
 ```
 
 ## License

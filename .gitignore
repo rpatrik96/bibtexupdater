@@ -38,3 +38,4 @@ src/bibtex_updater/_version.py
 Thumbs.db
 CLAUDE.md
 .claude/
+uv.lock
