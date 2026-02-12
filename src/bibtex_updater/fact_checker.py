@@ -80,6 +80,15 @@ class FactCheckStatus(Enum):
     HALLUCINATED = "hallucinated"
     API_ERROR = "api_error"
 
+    # Pre-API validation statuses
+    FUTURE_DATE = "future_date"  # Year is in the future
+    INVALID_YEAR = "invalid_year"  # Year is missing, non-numeric, or implausible (<1800)
+    DOI_NOT_FOUND = "doi_not_found"  # DOI doesn't resolve (HTTP 404 from doi.org)
+
+    # Preprint-vs-published statuses
+    PREPRINT_ONLY = "preprint_only"  # Paper found only as preprint, not at claimed venue
+    PUBLISHED_VERSION_EXISTS = "published_version_exists"  # Informational: published version found
+
     # Web reference statuses
     URL_VERIFIED = "url_verified"  # URL accessible and content matches
     URL_ACCESSIBLE = "url_accessible"  # URL returns 200, no content check
@@ -139,6 +148,8 @@ class FactCheckerConfig:
     venue_threshold: float = 0.70
     hallucination_max_score: float = 0.50
     max_candidates_per_source: int = 10
+    check_years: bool = True
+    check_dois: bool = True
 
 
 # ------------- Entry Classification -------------
@@ -942,12 +953,115 @@ class SemanticScholarClient:
         params = {"query": query, "limit": limit, "fields": self.FIELDS}
         url = f"{S2_API}/paper/search"
         try:
-            resp = self.http._request("GET", url, params=params, accept="application/json")
+            resp = self.http._request("GET", url, params=params, accept="application/json", service="semanticscholar")
             if resp.status_code != 200:
                 return []
             return resp.json().get("data", []) or []
         except Exception:
             return []
+
+    def get_paper(self, paper_id: str) -> dict[str, Any] | None:
+        """Get paper details by S2 paper ID, DOI, or arXiv ID.
+
+        paper_id can be: S2 ID, "DOI:10.1234/...", "ARXIV:2301.00001", "CorpusId:12345".
+        """
+        fields = "title,authors,venue,year,publicationTypes,externalIds,publicationVenue,url"
+        url = f"{S2_API}/paper/{paper_id}"
+        params = {"fields": fields}
+        try:
+            resp = self.http._request("GET", url, params=params, accept="application/json", service="semanticscholar")
+            if resp.status_code != 200:
+                return None
+            return resp.json()
+        except Exception:
+            return None
+
+
+# ------------- Venue Matching -------------
+
+# Common venue name aliases for fuzzy matching
+VENUE_ALIASES: dict[str, set[str]] = {
+    "neurips": {
+        "nips",
+        "advances in neural information processing systems",
+        "neural information processing systems",
+    },
+    "icml": {
+        "international conference on machine learning",
+        "proceedings of the international conference on machine learning",
+    },
+    "iclr": {"international conference on learning representations"},
+    "aaai": {
+        "association for the advancement of artificial intelligence",
+        "proceedings of the aaai conference on artificial intelligence",
+    },
+    "cvpr": {
+        "computer vision and pattern recognition",
+        "ieee conference on computer vision and pattern recognition",
+        "ieee/cvf conference on computer vision and pattern recognition",
+    },
+    "iccv": {
+        "international conference on computer vision",
+        "ieee international conference on computer vision",
+        "ieee/cvf international conference on computer vision",
+    },
+    "eccv": {"european conference on computer vision"},
+    "acl": {
+        "association for computational linguistics",
+        "annual meeting of the association for computational linguistics",
+    },
+    "emnlp": {
+        "empirical methods in natural language processing",
+        "conference on empirical methods in natural language processing",
+    },
+    "naacl": {"north american chapter of the association for computational linguistics"},
+    "kdd": {"knowledge discovery and data mining"},
+    "ijcai": {"international joint conference on artificial intelligence"},
+    "uai": {"uncertainty in artificial intelligence"},
+    "aistats": {"artificial intelligence and statistics"},
+    "jmlr": {"journal of machine learning research"},
+    "tmlr": {"transactions on machine learning research"},
+}
+
+
+def normalize_venue(venue: str) -> str:
+    """Normalize a venue name for comparison."""
+    venue = venue.lower().strip()
+    for prefix in ["proceedings of the ", "proceedings of ", "proc. ", "in "]:
+        if venue.startswith(prefix):
+            venue = venue[len(prefix) :]
+    venue = re.sub(r"\b\d{4}\b", "", venue)
+    return " ".join(venue.split()).strip()
+
+
+def _find_canonical_venue(norm_venue: str) -> str | None:
+    """Find the canonical venue name for a normalized venue string."""
+    for canonical, aliases in VENUE_ALIASES.items():
+        all_names = {canonical} | aliases
+        if any(name in norm_venue or norm_venue in name for name in all_names if len(name) > 3):
+            return canonical
+    return None
+
+
+def venues_match(venue_a: str, venue_b: str, threshold: float = 0.70) -> tuple[bool, float]:
+    """Check if two venue names match, considering aliases. Returns (matches, score)."""
+    if not venue_a or not venue_b:
+        return (True, 1.0) if not venue_a else (False, 0.0)
+
+    norm_a = normalize_venue(venue_a)
+    norm_b = normalize_venue(venue_b)
+
+    # Check alias map first — if both map to known venues, use that
+    canonical_a = _find_canonical_venue(norm_a)
+    canonical_b = _find_canonical_venue(norm_b)
+    if canonical_a and canonical_b:
+        if canonical_a == canonical_b:
+            return (True, 0.95)
+        return (False, 0.0)  # Known different venues
+
+    # Fall back to fuzzy matching
+    score = token_sort_ratio(normalize_title_for_match(norm_a), normalize_title_for_match(norm_b)) / 100.0
+    return (score >= threshold, score)
 
 
 # ------------- Fact Checker Core -------------
@@ -971,6 +1085,73 @@ class FactChecker:
         self.s2 = s2
         self.config = config
         self.logger = logger
+
+    def _validate_year(self, entry: dict[str, Any]) -> FactCheckStatus | None:
+        """Pre-API year validation. Returns a status if year is invalid, None if OK."""
+        year_str = entry.get("year", "")
+        if not year_str:
+            return None
+        year_str = year_str.strip().strip("{}")
+        try:
+            year = int(year_str)
+        except ValueError:
+            return FactCheckStatus.INVALID_YEAR
+        if year > datetime.datetime.now().year:
+            return FactCheckStatus.FUTURE_DATE
+        if year < 1800:
+            return FactCheckStatus.INVALID_YEAR
+        return None
+
+    def _validate_doi(self, entry: dict[str, Any]) -> FactCheckStatus | None:
+        """Check if DOI resolves via HEAD request to doi.org."""
+        doi = entry.get("doi", "")
+        if not doi:
+            return None
+        doi = doi.strip()
+        if doi.startswith("http"):
+            doi = doi.replace("https://doi.org/", "").replace("http://doi.org/", "")
+        import requests
+
+        try:
+            resp = requests.head(
+                f"https://doi.org/{doi}",
+                timeout=10,
+                allow_redirects=True,
+                headers={"User-Agent": "BibtexFactChecker/1.0"},
+            )
+            if resp.status_code == 404:
+                return FactCheckStatus.DOI_NOT_FOUND
+        except Exception:
+            pass  # Network errors are not DOI validation failures
+        return None
+
+    def _check_preprint_status(self, entry: dict[str, Any], best_match: PublishedRecord) -> FactCheckStatus | None:
+        """Check if entry claims venue but paper is only a preprint."""
+        claimed_venue = entry.get("booktitle") or entry.get("journal") or ""
+        if not claimed_venue:
+            return None
+        claimed_lower = claimed_venue.lower()
+        if any(kw in claimed_lower for kw in ["arxiv", "biorxiv", "medrxiv", "preprint"]):
+            return None
+        paper_id = None
+        if entry.get("doi"):
+            paper_id = f"DOI:{entry['doi']}"
+        elif entry.get("eprint"):
+            paper_id = f"ARXIV:{entry['eprint']}"
+        if not paper_id:
+            return None
+        s2_data = self.s2.get_paper(paper_id)
+        if not s2_data:
+            return None
+        external_ids = s2_data.get("externalIds") or {}
+        venue = s2_data.get("venue") or ""
+        pub_venue = s2_data.get("publicationVenue")
+        has_doi = bool(external_ids.get("DOI"))
+        has_venue = bool(venue.strip()) or bool(pub_venue)
+        is_only_arxiv = external_ids.get("ArXiv") and not has_doi
+        if is_only_arxiv and not has_venue:
+            return FactCheckStatus.PREPRINT_ONLY
+        return None
 
     def check_entry(self, entry: dict[str, Any]) -> FactCheckResult:
         """Fact-check a single bibliographic entry."""
@@ -997,6 +1178,38 @@ class FactChecker:
                 errors=["No title available for search"],
             )
 
+        # Pre-API validation: year
+        if self.config.check_years:
+            year_status = self._validate_year(entry)
+            if year_status is not None:
+                return FactCheckResult(
+                    entry_key=entry_key,
+                    entry_type=entry_type,
+                    status=year_status,
+                    overall_confidence=0.0,
+                    field_comparisons={},
+                    best_match=None,
+                    api_sources_queried=[],
+                    api_sources_with_hits=[],
+                    errors=[f"Year validation failed: {entry.get('year', 'missing')}"],
+                )
+
+        # Pre-API validation: DOI
+        if self.config.check_dois:
+            doi_status = self._validate_doi(entry)
+            if doi_status is not None:
+                return FactCheckResult(
+                    entry_key=entry_key,
+                    entry_type=entry_type,
+                    status=doi_status,
+                    overall_confidence=0.0,
+                    field_comparisons={},
+                    best_match=None,
+                    api_sources_queried=["doi.org"],
+                    api_sources_with_hits=[],
+                    errors=[f"DOI does not resolve: {entry.get('doi', '')}"],
+                )
+
         query = f"{title_norm} {first_author}".strip()
         candidates = self._query_all_sources(entry, query, sources_queried, sources_with_hits, errors)
 
@@ -1020,6 +1233,12 @@ class FactChecker:
 
         field_comparisons = self._compare_all_fields(entry, best_match)
         status = self._determine_status(best_score, field_comparisons, sources_with_hits)
+
+        # Post-match: check preprint status
+        if status in (FactCheckStatus.VERIFIED, FactCheckStatus.VENUE_MISMATCH):
+            preprint_status = self._check_preprint_status(entry, best_match)
+            if preprint_status is not None:
+                status = preprint_status
 
         return FactCheckResult(
             entry_key=entry_key,
@@ -1153,21 +1372,16 @@ class FactChecker:
             f"Tolerance: ±{cfg.year_tolerance}",
         )
 
-        # Venue
+        # Venue (alias-aware matching)
         entry_venue = entry.get("journal") or entry.get("booktitle") or ""
         api_venue = record.journal or ""
-        if entry_venue and api_venue:
-            venue_score = (
-                token_sort_ratio(normalize_title_for_match(entry_venue), normalize_title_for_match(api_venue)) / 100.0
-            )
-        else:
-            venue_score = 1.0 if not entry_venue else 0.0
+        venue_matches, venue_score = venues_match(entry_venue, api_venue, cfg.venue_threshold)
         comparisons["venue"] = FieldComparison(
             "venue",
             entry_venue,
             api_venue,
             venue_score,
-            venue_score >= cfg.venue_threshold or not entry_venue,
+            venue_matches,
         )
 
         return comparisons
@@ -1318,12 +1532,41 @@ class FactCheckProcessor:
         self.checker = checker
         self.logger = logger
 
-    def process_entries(self, entries: list[dict[str, Any]]) -> list[FactCheckResult]:
-        """Process multiple entries and return results."""
+    def process_entries(self, entries: list[dict[str, Any]], jsonl_path: str | None = None) -> list[FactCheckResult]:
+        """Process multiple entries and return results.
+
+        If jsonl_path is provided, each result is flushed to the file immediately,
+        so partial results survive timeouts and crashes.
+        """
         results = []
-        for i, entry in enumerate(entries, 1):
-            self.logger.info("Checking %d/%d: %s", i, len(entries), entry.get("ID", "?"))
-            results.append(self.checker.check_entry(entry))
+        jsonl_file = None
+        try:
+            if jsonl_path:
+                jsonl_file = open(jsonl_path, "a")  # noqa: SIM115
+            for i, entry in enumerate(entries, 1):
+                self.logger.info("Checking %d/%d: %s", i, len(entries), entry.get("ID", "?"))
+                result = self.checker.check_entry(entry)
+                results.append(result)
+                if jsonl_file:
+                    jsonl_file.write(
+                        json.dumps(
+                            {
+                                "key": result.entry_key,
+                                "category": result.category.value if result.category else None,
+                                "status": result.status.value,
+                                "confidence": result.overall_confidence,
+                                "mismatched_fields": [n for n, c in result.field_comparisons.items() if not c.matches],
+                                "api_sources": result.api_sources_with_hits,
+                                "errors": result.errors,
+                            },
+                            ensure_ascii=False,
+                        )
+                        + "\n"
+                    )
+                    jsonl_file.flush()
+        finally:
+            if jsonl_file:
+                jsonl_file.close()
         return results
 
     def generate_summary(self, results: list[FactCheckResult]) -> dict[str, Any]:
@@ -1357,6 +1600,10 @@ class FactCheckProcessor:
             "url_content_mismatch",
             "book_not_found",
             "working_paper_not_found",
+            "future_date",
+            "invalid_year",
+            "doi_not_found",
+            "preprint_only",
         ]
 
         # Calculate verified rate including new verified statuses
@@ -1517,6 +1764,26 @@ Examples:
         default=45,
         help="Requests per minute limit (default: 45)",
     )
+    api_opts.add_argument(
+        "--s2-api-key",
+        metavar="KEY",
+        help="Semantic Scholar API key for higher rate limits (or set S2_API_KEY env var)",
+    )
+    api_opts.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Disable response caching",
+    )
+    api_opts.add_argument(
+        "--no-check-dois",
+        action="store_true",
+        help="Disable DOI resolution verification",
+    )
+    api_opts.add_argument(
+        "--no-check-years",
+        action="store_true",
+        help="Disable year validation (future dates, implausible years)",
+    )
 
     # Entry type filtering
     entry_types = p.add_argument_group("entry type filtering")
@@ -1602,13 +1869,20 @@ def main() -> int:
     logger.info("Total entries to check: %d", len(entries))
 
     # Setup HTTP infrastructure
-    cache = DiskCache(args.cache_file)
+    import os
+
+    s2_api_key = args.s2_api_key or os.environ.get("S2_API_KEY")
+    if s2_api_key:
+        logger.info("Using Semantic Scholar API key (authenticated rate limits)")
+
+    cache = DiskCache(args.cache_file) if not args.no_cache else None
     limiter = RateLimiter(args.rate_limit)
     http = HttpClient(
         timeout=20.0,
         user_agent="BibtexFactChecker/1.0 (mailto:factchecker@example.com)",
         rate_limiter=limiter,
         cache=cache,
+        s2_api_key=s2_api_key,
     )
 
     # Setup fact checker
@@ -1617,6 +1891,8 @@ def main() -> int:
         author_threshold=args.author_threshold,
         year_tolerance=args.year_tolerance,
         venue_threshold=args.venue_threshold,
+        check_dois=not args.no_check_dois,
+        check_years=not args.no_check_years,
     )
 
     # Setup API clients
@@ -1668,8 +1944,8 @@ def main() -> int:
 
     processor = FactCheckProcessor(checker, logger)
 
-    # Process entries
-    results = processor.process_entries(entries)
+    # Process entries (stream JSONL if path provided)
+    results = processor.process_entries(entries, jsonl_path=args.jsonl)
     summary = processor.generate_summary(results)
 
     # Print summary
@@ -1699,10 +1975,7 @@ def main() -> int:
         logger.info("JSON report written to %s", args.report)
 
     if args.jsonl:
-        with open(args.jsonl, "w", encoding="utf-8") as f:
-            for line in processor.generate_jsonl(results):
-                f.write(line + "\n")
-        logger.info("JSONL report written to %s", args.jsonl)
+        logger.info("JSONL report streamed to %s (%d entries)", args.jsonl, len(results))
 
     # Exit code
     if args.strict:

@@ -23,17 +23,28 @@ python reference_fact_checker.py references.bib --strict
 
 ## How It Works
 
-The fact-checker queries multiple bibliographic databases to verify each entry:
+The fact-checker runs a multi-stage verification pipeline:
 
-1. **Crossref** - Primary source for journal articles with DOIs
-2. **DBLP** - Computer science publications
-3. **Semantic Scholar** - Broad coverage across disciplines
+### Pre-API Validation (zero cost)
+1. **Year validation** — Flags future dates (`year > current_year`), implausible years (`< 1800`), and non-numeric years before making any API calls
+2. **DOI resolution** — HEAD request to `doi.org` catches fabricated DOIs (HTTP 404)
+
+### API Verification
+3. **Crossref** — Primary source for journal articles with DOIs
+4. **DBLP** — Computer science publications
+5. **Semantic Scholar** — Broad coverage across disciplines
+
+### Post-Match Analysis
+6. **Venue verification** — Alias-aware matching for 17 ML/AI venues (NeurIPS/NIPS, ICML, ICLR, CVPR, etc.); known-different venues always flagged
+7. **Preprint detection** — Queries S2 to detect entries claiming a venue when only an arXiv preprint exists
 
 For each entry, it:
-1. Searches all sources using title + first author
-2. Scores candidates using fuzzy title matching (70%) + author Jaccard similarity (30%)
-3. Compares fields against the best match
-4. Assigns a status based on match quality
+1. Runs pre-API checks (year, DOI) to catch obvious issues cheaply
+2. Searches all sources using title + first author
+3. Scores candidates using fuzzy title matching (70%) + author Jaccard similarity (30%)
+4. Compares fields against the best match with alias-aware venue matching
+5. Checks preprint-vs-published status via Semantic Scholar
+6. Assigns a status based on match quality
 
 ## Status Codes
 
