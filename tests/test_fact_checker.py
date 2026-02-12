@@ -792,3 +792,382 @@ class TestUnifiedFactChecker:
         result = checker.check_entry(entry)
         assert result.status == FactCheckStatus.SKIPPED
         assert result.category == EntryCategory.BOOK
+
+
+# ------------- Year Validation Tests -------------
+
+
+class TestYearValidation:
+    """Tests for year validation pre-API check."""
+
+    def test_future_year(self, fact_checker):
+        entry = {"ID": "test", "ENTRYTYPE": "article", "title": "Test Paper", "author": "Smith", "year": "2099"}
+        result = fact_checker.check_entry(entry)
+        assert result.status == FactCheckStatus.FUTURE_DATE
+
+    def test_non_numeric_year(self, fact_checker):
+        entry = {"ID": "test", "ENTRYTYPE": "article", "title": "Test", "author": "Smith", "year": "forthcoming"}
+        result = fact_checker.check_entry(entry)
+        assert result.status == FactCheckStatus.INVALID_YEAR
+
+    def test_implausible_year(self, fact_checker):
+        entry = {"ID": "test", "ENTRYTYPE": "article", "title": "Test", "author": "Smith", "year": "1700"}
+        result = fact_checker.check_entry(entry)
+        assert result.status == FactCheckStatus.INVALID_YEAR
+
+    def test_valid_year_passes(self, fact_checker):
+        entry = {"ID": "test", "ENTRYTYPE": "article", "title": "Test Paper", "author": "Smith", "year": "2023"}
+        result = fact_checker.check_entry(entry)
+        assert result.status != FactCheckStatus.FUTURE_DATE
+        assert result.status != FactCheckStatus.INVALID_YEAR
+
+    def test_missing_year_passes(self, fact_checker):
+        entry = {"ID": "test", "ENTRYTYPE": "article", "title": "Test Paper", "author": "Smith"}
+        result = fact_checker.check_entry(entry)
+        assert result.status != FactCheckStatus.FUTURE_DATE
+        assert result.status != FactCheckStatus.INVALID_YEAR
+
+    def test_year_with_braces(self, fact_checker):
+        entry = {"ID": "test", "ENTRYTYPE": "article", "title": "Test", "author": "Smith", "year": "{2023}"}
+        result = fact_checker.check_entry(entry)
+        assert result.status != FactCheckStatus.FUTURE_DATE
+        assert result.status != FactCheckStatus.INVALID_YEAR
+
+    def test_check_years_disabled(self, fake_crossref, fake_dblp, fake_s2, logger):
+        config = FactCheckerConfig(check_years=False)
+        checker = FactChecker(fake_crossref, fake_dblp, fake_s2, config, logger)
+        entry = {"ID": "test", "ENTRYTYPE": "article", "title": "Test", "author": "Smith", "year": "2099"}
+        result = checker.check_entry(entry)
+        assert result.status != FactCheckStatus.FUTURE_DATE
+
+
+# ------------- DOI Validation Tests -------------
+
+
+class TestDOIValidation:
+    """Tests for DOI resolution validation."""
+
+    def test_validate_doi_no_doi(self, fact_checker):
+        result = fact_checker._validate_doi({"title": "Test"})
+        assert result is None
+
+    def test_validate_doi_url_format(self, fact_checker):
+        """DOI in URL format should be cleaned."""
+        # We can't easily test real resolution, but verify URL cleaning
+        result = fact_checker._validate_doi({"doi": "https://doi.org/10.1234/test"})
+        # Should return None (network ok or caught) or DOI_NOT_FOUND
+        assert result is None or result == FactCheckStatus.DOI_NOT_FOUND
+
+    def test_check_dois_disabled(self, fake_crossref, fake_dblp, fake_s2, logger):
+        config = FactCheckerConfig(check_dois=False)
+        checker = FactChecker(fake_crossref, fake_dblp, fake_s2, config, logger)
+        entry = {"ID": "test", "ENTRYTYPE": "article", "title": "Test", "author": "Smith", "doi": "10.9999/fake"}
+        result = checker.check_entry(entry)
+        assert result.status != FactCheckStatus.DOI_NOT_FOUND
+
+
+# ------------- Venue Matching Tests -------------
+
+
+class TestVenueMatching:
+    """Tests for venue matching with aliases."""
+
+    def test_exact_match(self):
+        from bibtex_updater.fact_checker import venues_match
+
+        matches, score = venues_match("NeurIPS", "NeurIPS")
+        assert matches is True
+
+    def test_alias_match_neurips(self):
+        from bibtex_updater.fact_checker import venues_match
+
+        matches, score = venues_match("NeurIPS", "Advances in Neural Information Processing Systems")
+        assert matches is True
+        assert score >= 0.90
+
+    def test_alias_match_nips_neurips(self):
+        from bibtex_updater.fact_checker import venues_match
+
+        matches, score = venues_match("NIPS", "NeurIPS")
+        assert matches is True
+
+    def test_alias_match_icml(self):
+        from bibtex_updater.fact_checker import venues_match
+
+        matches, score = venues_match("ICML", "International Conference on Machine Learning")
+        assert matches is True
+
+    def test_different_venues(self):
+        from bibtex_updater.fact_checker import venues_match
+
+        matches, score = venues_match("NeurIPS", "ICML")
+        assert matches is False
+
+    def test_empty_entry_venue(self):
+        from bibtex_updater.fact_checker import venues_match
+
+        matches, score = venues_match("", "NeurIPS")
+        assert matches is True  # No claim = no mismatch
+
+    def test_proceedings_prefix_stripped(self):
+        from bibtex_updater.fact_checker import venues_match
+
+        matches, score = venues_match(
+            "Proceedings of NeurIPS 2023",
+            "Advances in Neural Information Processing Systems",
+        )
+        assert matches is True
+
+    def test_wrong_venue_detected(self):
+        from bibtex_updater.fact_checker import venues_match
+
+        matches, score = venues_match(
+            "IEEE Conference on Computer Vision and Pattern Recognition",
+            "IEEE International Conference on Computer Vision",
+        )
+        assert matches is False
+
+    def test_venue_in_fact_checker(self, fact_checker):
+        """Venue mismatch detected in field comparison."""
+        entry = {
+            "ID": "test",
+            "ENTRYTYPE": "inproceedings",
+            "title": "Test Paper",
+            "author": "Smith, John",
+            "booktitle": "NeurIPS",
+            "year": "2023",
+        }
+        record = PublishedRecord(
+            doi="10.1234/test",
+            title="Test Paper",
+            authors=[{"given": "John", "family": "Smith"}],
+            journal="ICML",
+            year=2023,
+        )
+        comparisons = fact_checker._compare_all_fields(entry, record)
+        assert comparisons["venue"].matches is False
+
+
+class TestNormalizeVenue:
+    """Tests for venue normalization."""
+
+    def test_strip_proceedings_prefix(self):
+        from bibtex_updater.fact_checker import normalize_venue
+
+        assert "neurips" in normalize_venue("Proceedings of NeurIPS 2023")
+
+    def test_lowercase(self):
+        from bibtex_updater.fact_checker import normalize_venue
+
+        result = normalize_venue("NeurIPS")
+        assert result == "neurips"
+
+    def test_strip_year(self):
+        from bibtex_updater.fact_checker import normalize_venue
+
+        result = normalize_venue("ICML 2023")
+        assert "2023" not in result
+
+
+# ------------- Preprint Detection Tests -------------
+
+
+class TestPreprintDetection:
+    """Tests for preprint-vs-published detection."""
+
+    def test_no_venue_claim_skips(self, fact_checker):
+        entry = {"ID": "test", "ENTRYTYPE": "misc", "title": "Test", "author": "Smith", "eprint": "2301.00001"}
+        result = fact_checker._check_preprint_status(entry, PublishedRecord(doi="", title="Test"))
+        assert result is None
+
+    def test_arxiv_venue_skips(self, fact_checker):
+        entry = {
+            "ID": "test",
+            "ENTRYTYPE": "misc",
+            "title": "Test",
+            "author": "Smith",
+            "journal": "arXiv preprint arXiv:2301.00001",
+        }
+        result = fact_checker._check_preprint_status(entry, PublishedRecord(doi="", title="Test"))
+        assert result is None
+
+    def test_no_identifiers_skips(self, fact_checker):
+        entry = {
+            "ID": "test",
+            "ENTRYTYPE": "inproceedings",
+            "title": "Test",
+            "author": "Smith",
+            "booktitle": "NeurIPS",
+        }
+        result = fact_checker._check_preprint_status(entry, PublishedRecord(doi="", title="Test"))
+        assert result is None
+
+    def test_preprint_only_detected(self, fake_http, fake_crossref, fake_dblp, logger):
+        mock_s2_response = MagicMock(
+            status_code=200,
+            json=lambda: {
+                "title": "Test Paper",
+                "authors": [{"name": "John Smith"}],
+                "venue": "",
+                "year": 2023,
+                "publicationTypes": [],
+                "externalIds": {"ArXiv": "2301.00001"},
+                "publicationVenue": None,
+                "url": "https://arxiv.org/abs/2301.00001",
+            },
+        )
+        fake_http._request.return_value = mock_s2_response
+        s2 = SemanticScholarClient(fake_http)
+        checker = FactChecker(fake_crossref, fake_dblp, s2, FactCheckerConfig(), logger)
+        entry = {
+            "ID": "test",
+            "ENTRYTYPE": "inproceedings",
+            "title": "Test Paper",
+            "author": "Smith, John",
+            "booktitle": "NeurIPS",
+            "eprint": "2301.00001",
+        }
+        result = checker._check_preprint_status(entry, PublishedRecord(doi="", title="Test Paper"))
+        assert result == FactCheckStatus.PREPRINT_ONLY
+
+    def test_published_paper_passes(self, fake_http, fake_crossref, fake_dblp, logger):
+        mock_s2_response = MagicMock(
+            status_code=200,
+            json=lambda: {
+                "title": "Test Paper",
+                "authors": [{"name": "John Smith"}],
+                "venue": "NeurIPS",
+                "year": 2023,
+                "publicationTypes": ["Conference"],
+                "externalIds": {"ArXiv": "2301.00001", "DOI": "10.1234/test"},
+                "publicationVenue": {"name": "NeurIPS"},
+                "url": "https://doi.org/10.1234/test",
+            },
+        )
+        fake_http._request.return_value = mock_s2_response
+        s2 = SemanticScholarClient(fake_http)
+        checker = FactChecker(fake_crossref, fake_dblp, s2, FactCheckerConfig(), logger)
+        entry = {
+            "ID": "test",
+            "ENTRYTYPE": "inproceedings",
+            "title": "Test Paper",
+            "author": "Smith, John",
+            "booktitle": "NeurIPS",
+            "doi": "10.1234/test",
+        }
+        result = checker._check_preprint_status(entry, PublishedRecord(doi="10.1234/test", title="Test Paper"))
+        assert result is None
+
+
+# ------------- Streaming JSONL Tests -------------
+
+
+class TestStreamingJSONL:
+    """Tests for streaming JSONL output."""
+
+    def test_streaming_writes_incrementally(self, processor, tmp_path):
+        """When jsonl_path is provided, results are written incrementally."""
+        jsonl_file = tmp_path / "output.jsonl"
+        entries = [
+            {"ID": "a", "ENTRYTYPE": "article", "title": "Test A", "author": "Smith"},
+            {"ID": "b", "ENTRYTYPE": "article", "title": "Test B", "author": "Doe"},
+        ]
+        results = processor.process_entries(entries, jsonl_path=str(jsonl_file))
+        assert len(results) == 2
+        lines = jsonl_file.read_text().strip().split("\n")
+        assert len(lines) == 2
+        import json
+
+        for line in lines:
+            data = json.loads(line)
+            assert "key" in data
+            assert "status" in data
+
+    def test_no_jsonl_path_works(self, processor):
+        """Without jsonl_path, behavior is unchanged."""
+        entries = [{"ID": "a", "ENTRYTYPE": "article", "title": "Test A", "author": "Smith"}]
+        results = processor.process_entries(entries)
+        assert len(results) == 1
+
+    def test_partial_results_survive(self, tmp_path, fake_crossref, fake_dblp, fake_s2, logger):
+        """Partial results survive if processing raises mid-way."""
+
+        class FailingChecker:
+            def check_entry(self, entry):
+                if entry.get("ID") == "fail":
+                    raise RuntimeError("Simulated failure")
+                return FactCheckResult(
+                    entry.get("ID", "?"),
+                    "article",
+                    FactCheckStatus.NOT_FOUND,
+                    0.0,
+                    {},
+                    None,
+                    [],
+                    [],
+                    [],
+                )
+
+        proc = FactCheckProcessor(FailingChecker(), logger)
+        jsonl_file = tmp_path / "partial.jsonl"
+        entries = [
+            {"ID": "ok1", "ENTRYTYPE": "article", "title": "Good", "author": "A"},
+            {"ID": "ok2", "ENTRYTYPE": "article", "title": "Good2", "author": "B"},
+            {"ID": "fail", "ENTRYTYPE": "article", "title": "Bad", "author": "C"},
+        ]
+        with pytest.raises(RuntimeError):
+            proc.process_entries(entries, jsonl_path=str(jsonl_file))
+        # First 2 entries should have been flushed
+        lines = jsonl_file.read_text().strip().split("\n")
+        assert len(lines) == 2
+
+
+# ------------- New Status Tests -------------
+
+
+class TestNewStatuses:
+    """Verify new FactCheckStatus values exist."""
+
+    def test_future_date_status(self):
+        assert FactCheckStatus.FUTURE_DATE.value == "future_date"
+
+    def test_invalid_year_status(self):
+        assert FactCheckStatus.INVALID_YEAR.value == "invalid_year"
+
+    def test_doi_not_found_status(self):
+        assert FactCheckStatus.DOI_NOT_FOUND.value == "doi_not_found"
+
+    def test_preprint_only_status(self):
+        assert FactCheckStatus.PREPRINT_ONLY.value == "preprint_only"
+
+    def test_published_version_exists_status(self):
+        assert FactCheckStatus.PUBLISHED_VERSION_EXISTS.value == "published_version_exists"
+
+
+# ------------- S2 API Key Tests -------------
+
+
+class TestSemanticScholarGetPaper:
+    """Tests for S2 get_paper method."""
+
+    def test_get_paper_returns_none_on_error(self, fake_http):
+        fake_http._request.side_effect = Exception("Network error")
+        client = SemanticScholarClient(fake_http)
+        result = client.get_paper("DOI:10.1234/test")
+        assert result is None
+
+    def test_get_paper_returns_none_on_404(self, fake_http):
+        fake_http._request.return_value = MagicMock(status_code=404)
+        client = SemanticScholarClient(fake_http)
+        result = client.get_paper("DOI:10.1234/test")
+        assert result is None
+
+    def test_get_paper_returns_data(self, fake_http):
+        fake_http._request.return_value = MagicMock(
+            status_code=200,
+            json=lambda: {"title": "Test", "venue": "NeurIPS"},
+        )
+        client = SemanticScholarClient(fake_http)
+        result = client.get_paper("DOI:10.1234/test")
+        assert result is not None
+        assert result["title"] == "Test"

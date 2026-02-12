@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-02-12
+
+### Added
+- **Pre-API year validation**: Entries with future years (`year > current_year`) flagged as `future_date`, implausible years (`< 1800`) or non-numeric years as `invalid_year` — zero API cost
+- **DOI resolution check**: HEAD request to `doi.org` catches fabricated DOIs (`doi_not_found` status) before expensive API lookups
+- **Alias-aware venue matching**: 17 ML/AI venue aliases (NeurIPS/NIPS, ICML, ICLR, CVPR, ICCV, etc.) with canonical name resolution; known-different venues always flagged as mismatches
+- **Preprint-vs-published detection**: Queries Semantic Scholar to detect entries claiming a venue (e.g., "NeurIPS") when only an arXiv preprint exists (`preprint_only` status)
+- **Streaming JSONL output**: Results flushed to `--jsonl` file after each entry; partial results survive timeouts, crashes, and Ctrl+C
+- **Semantic Scholar API key support** for `bibtex-check`: `--s2-api-key` flag and `S2_API_KEY` env var for authenticated rate limits (1 req/s vs shared pool)
+- **New CLI flags**: `--no-cache`, `--no-check-dois`, `--no-check-years`
+- **New status codes**: `future_date`, `invalid_year`, `doi_not_found`, `preprint_only`, `published_version_exists`
+
+### Changed
+- Venue comparison now uses `venues_match()` with alias map instead of raw fuzzy score — eliminates false matches between similar-named but distinct conferences (e.g., CVPR vs ICCV)
+- `process_entries()` accepts optional `jsonl_path` for streaming output
+- `FactCheckerConfig` gains `check_years` and `check_dois` boolean flags (both default `True`)
+
 ## [0.6.1] - 2026-02-10
 
 ### Documentation
