@@ -10,6 +10,7 @@ HTTP infrastructure with caching and rate limiting, and API client utilities.
 
 from __future__ import annotations
 
+import collections
 import json
 import os
 import re
@@ -337,22 +338,27 @@ class RateLimiter:
     def __init__(self, req_per_min: int) -> None:
         self.req_per_min = max(req_per_min, 1)
         self.lock = threading.Lock()
-        self.timestamps: list[float] = []
+        self.timestamps: collections.deque[float] = collections.deque()
 
     def wait(self) -> None:
         """Block until a request can be made within the rate limit."""
-        with self.lock:
-            now = time.time()
-            window = 60.0
-            self.timestamps = [t for t in self.timestamps if now - t < window]
-            if len(self.timestamps) >= self.req_per_min:
-                earliest = min(self.timestamps)
-                sleep_for = window - (now - earliest) + 0.01
-                if sleep_for > 0:
-                    time.sleep(sleep_for)
-                    now = time.time()
-                    self.timestamps = [t for t in self.timestamps if now - t < window]
-            self.timestamps.append(time.time())
+        window = 60.0
+        while True:
+            sleep_for = 0.0
+            with self.lock:
+                now = time.time()
+                cutoff = now - window
+                # O(1) popleft from deque (timestamps are chronological)
+                while self.timestamps and self.timestamps[0] < cutoff:
+                    self.timestamps.popleft()
+                if len(self.timestamps) < self.req_per_min:
+                    self.timestamps.append(time.time())
+                    return  # Slot acquired
+                # Need to wait — compute sleep duration but release lock first
+                sleep_for = window - (now - self.timestamps[0]) + 0.01
+            # Sleep WITHOUT holding the lock
+            if sleep_for > 0:
+                time.sleep(sleep_for)
 
 
 class RateLimiterRegistry:
@@ -1408,7 +1414,7 @@ class AsyncRateLimiter:
 
         self.req_per_min = max(req_per_min, 1)
         self.lock = asyncio.Lock()
-        self.timestamps: list[float] = []
+        self.timestamps: collections.deque[float] = collections.deque()
 
     async def wait(self) -> None:
         """Async wait until a request can be made within the rate limit.
@@ -1418,20 +1424,23 @@ class AsyncRateLimiter:
         """
         import asyncio
 
-        async with self.lock:
-            now = time.time()
-            window = 60.0
-            self.timestamps = [t for t in self.timestamps if now - t < window]
-
-            if len(self.timestamps) >= self.req_per_min:
-                earliest = min(self.timestamps)
-                sleep_for = window - (now - earliest) + 0.01
-                if sleep_for > 0:
-                    await asyncio.sleep(sleep_for)
-                    now = time.time()
-                    self.timestamps = [t for t in self.timestamps if now - t < window]
-
-            self.timestamps.append(now)
+        window = 60.0
+        while True:
+            sleep_for = 0.0
+            async with self.lock:
+                now = time.time()
+                cutoff = now - window
+                # O(1) popleft from deque (timestamps are chronological)
+                while self.timestamps and self.timestamps[0] < cutoff:
+                    self.timestamps.popleft()
+                if len(self.timestamps) < self.req_per_min:
+                    self.timestamps.append(time.time())
+                    return  # Slot acquired
+                # Need to wait — compute sleep duration but release lock first
+                sleep_for = window - (now - self.timestamps[0]) + 0.01
+            # Sleep WITHOUT holding the lock
+            if sleep_for > 0:
+                await asyncio.sleep(sleep_for)
 
 
 class AsyncRateLimiterRegistry:

@@ -1115,13 +1115,16 @@ class TestStreamingJSONL:
             {"ID": "ok2", "ENTRYTYPE": "article", "title": "Good2", "author": "B"},
             {"ID": "fail", "ENTRYTYPE": "article", "title": "Bad", "author": "C"},
         ]
-        # HIGH-5: No longer raises - logs error and continues
+        # Error recovery: failed entries get API_ERROR status instead of being dropped
         results = proc.process_entries(entries, jsonl_path=str(jsonl_file))
-        # Should return 2 successful results (failed entry is filtered out)
-        assert len(results) == 2
-        # All entries should have been flushed to JSONL
+        # All 3 entries should have results (failed entry gets API_ERROR)
+        assert len(results) == 3
+        error_results = [r for r in results if r.status == FactCheckStatus.API_ERROR]
+        assert len(error_results) == 1
+        assert error_results[0].entry_key == "fail"
+        # All entries should have been flushed to JSONL (including the error one)
         lines = jsonl_file.read_text().strip().split("\n")
-        assert len(lines) == 2
+        assert len(lines) == 3
 
 
 # ------------- New Status Tests -------------

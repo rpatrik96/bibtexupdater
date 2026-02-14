@@ -63,7 +63,7 @@ from bibtex_updater.utils import (
     DiskCache,
     HttpClient,
     PublishedRecord,
-    RateLimiter,
+    RateLimiterRegistry,
     ResolutionCache,
     ResolutionCacheEntry,
     acl_anthology_bib_to_record,
@@ -3686,7 +3686,18 @@ def setup_http_client(args: argparse.Namespace) -> HttpClient:
     Returns:
         Configured HttpClient instance.
     """
-    rate_limiter = RateLimiter(args.rate_limit)
+    # Scale per-service limits proportionally to --rate-limit
+    rate_scale = args.rate_limit / 45.0  # 45 is the default
+    s2_api_key = getattr(args, "s2_api_key", None) or os.environ.get("S2_API_KEY")
+    rate_limiter = RateLimiterRegistry(
+        {
+            "crossref": max(10, int(50 * rate_scale)),
+            "semanticscholar": 60 if s2_api_key else max(5, int(10 * rate_scale)),
+            "dblp": max(10, int(30 * rate_scale)),
+            "openlibrary": max(10, int(30 * rate_scale)),
+            "google_books": max(10, int(30 * rate_scale)),
+        }
+    )
     # Handle cache options: --no-cache disables caching entirely
     if getattr(args, "no_cache", False):
         cache = DiskCache(None)
@@ -3698,8 +3709,6 @@ def setup_http_client(args: argparse.Namespace) -> HttpClient:
         or os.environ.get("BIBTEX_UPDATER_USER_AGENT")
         or "bib-preprint-upgrader/1.1 (mailto:you@example.com)"
     )
-    # Get S2 API key from args or environment variable
-    s2_api_key = getattr(args, "s2_api_key", None) or os.environ.get("S2_API_KEY")
     return HttpClient(
         timeout=args.timeout,
         user_agent=user_agent,

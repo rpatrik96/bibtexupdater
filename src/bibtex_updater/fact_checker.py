@@ -1152,7 +1152,10 @@ class FactChecker:
                     f"https://doi.org/{doi}",
                     headers={"User-Agent": "BibtexFactChecker/1.0"},
                 )
-                if resp.status_code >= 400:
+                # Only 404/410 indicate a DOI that truly doesn't exist.
+                # Other 4xx (418 bot-detection, 403 access control, 429 rate limit)
+                # are publisher-side blocks, not evidence of an invalid DOI.
+                if resp.status_code in (404, 410):
                     return FactCheckStatus.DOI_NOT_FOUND
         except Exception:
             pass  # Network errors are not DOI validation failures
@@ -1772,7 +1775,9 @@ class FactCheckProcessor:
                     url = f"https://doi.org/{doi}"
 
                 resp = client.head(url, headers={"User-Agent": "BibtexFactChecker/1.0"})
-                return (entry_id, resp.status_code < 400)
+                # Only 404/410 mean the DOI doesn't exist.
+                # 418/403/429 are publisher bot-detection, not invalid DOIs.
+                return (entry_id, resp.status_code not in (404, 410))
             except Exception:
                 # Assume valid on error (don't penalize network issues)
                 return (entry_id, True)
@@ -1823,12 +1828,26 @@ class FactCheckProcessor:
             def _process_one(index: int, entry: dict[str, Any]) -> FactCheckResult:
                 """Process a single entry and write to JSONL if configured."""
                 self.logger.info("Checking %d/%d: %s", index + 1, len(entries), entry.get("ID", "?"))
-                # Pass pre-validated DOI results if checker is FactChecker
-                if isinstance(self.checker, FactChecker):
-                    result = self.checker.check_entry(entry, pre_validated_dois=pre_validated_dois)
-                else:
-                    # UnifiedFactChecker doesn't support pre_validated_dois yet
-                    result = self.checker.check_entry(entry)
+                try:
+                    # Pass pre-validated DOI results if checker is FactChecker
+                    if isinstance(self.checker, FactChecker):
+                        result = self.checker.check_entry(entry, pre_validated_dois=pre_validated_dois)
+                    else:
+                        # UnifiedFactChecker doesn't support pre_validated_dois yet
+                        result = self.checker.check_entry(entry)
+                except Exception as exc:
+                    self.logger.error("Exception checking entry %s: %s", entry.get("ID", "?"), exc)
+                    result = FactCheckResult(
+                        entry_key=entry.get("ID", "unknown"),
+                        entry_type=entry.get("ENTRYTYPE", "misc").lower(),
+                        status=FactCheckStatus.API_ERROR,
+                        overall_confidence=0.0,
+                        field_comparisons={},
+                        best_match=None,
+                        api_sources_queried=[],
+                        api_sources_with_hits=[],
+                        errors=[f"Exception: {exc}"],
+                    )
                 results[index] = result
 
                 if jsonl_file:
@@ -2185,13 +2204,15 @@ def main() -> int:
         logger.info("Using Semantic Scholar API key (authenticated rate limits)")
 
     cache = DiskCache(args.cache_file) if not args.no_cache else None
+    # Scale per-service limits proportionally to --rate-limit
+    rate_scale = args.rate_limit / 45.0  # 45 is the default
     limiter = RateLimiterRegistry(
         {
-            "crossref": 50,
-            "semanticscholar": 1000 if s2_api_key else 100,
-            "dblp": 30,
-            "openlibrary": 30,
-            "google_books": 30,
+            "crossref": max(10, int(50 * rate_scale)),
+            "semanticscholar": 60 if s2_api_key else max(5, int(10 * rate_scale)),
+            "dblp": max(10, int(30 * rate_scale)),
+            "openlibrary": max(10, int(30 * rate_scale)),
+            "google_books": max(10, int(30 * rate_scale)),
         }
     )
     http = HttpClient(
