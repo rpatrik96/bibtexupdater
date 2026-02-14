@@ -24,11 +24,13 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import datetime
 import json
 import logging
 import re
 import sys
+import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
@@ -36,8 +38,17 @@ from typing import Any
 from urllib.parse import urlparse
 
 import bibtexparser
+import httpx
 from rapidfuzz.fuzz import token_sort_ratio
 
+from bibtex_updater.calibration import calibrate_result
+from bibtex_updater.matching import (
+    EXPANDED_VENUE_ALIASES,
+    combined_author_score,
+    get_canonical_venue,
+    is_near_miss_title,
+    title_edit_distance,
+)
 from bibtex_updater.utils import (
     # API endpoints
     CROSSREF_API,
@@ -48,8 +59,7 @@ from bibtex_updater.utils import (
     HttpClient,
     # Data classes
     PublishedRecord,
-    RateLimiter,
-    # Author handling
+    RateLimiterRegistry,
     authors_last_names,
     # API converters
     crossref_message_to_record,
@@ -691,7 +701,9 @@ class BookVerifier(BaseVerifier):
         params = {"q": query, "limit": 5}
 
         try:
-            resp = self.http._request("GET", self.OPEN_LIBRARY_API, params=params, accept="application/json")
+            resp = self.http._request(
+                "GET", self.OPEN_LIBRARY_API, params=params, accept="application/json", service="openlibrary"
+            )
             if resp.status_code != 200:
                 return []
 
@@ -739,7 +751,9 @@ class BookVerifier(BaseVerifier):
             params["key"] = self.config.google_books_api_key
 
         try:
-            resp = self.http._request("GET", self.GOOGLE_BOOKS_API, params=params, accept="application/json")
+            resp = self.http._request(
+                "GET", self.GOOGLE_BOOKS_API, params=params, accept="application/json", service="google_books"
+            )
             if resp.status_code != 200:
                 return []
 
@@ -909,7 +923,7 @@ class CrossrefClient:
         """Search Crossref for bibliographic records."""
         params = {"query.bibliographic": query, "rows": rows}
         try:
-            resp = self.http._request("GET", CROSSREF_API, params=params, accept="application/json")
+            resp = self.http._request("GET", CROSSREF_API, params=params, accept="application/json", service="crossref")
             if resp.status_code != 200:
                 return []
             items = resp.json().get("message", {}).get("items", [])
@@ -928,7 +942,7 @@ class DBLPClient:
         """Search DBLP for bibliographic records."""
         params = {"q": query, "h": max_hits, "format": "json"}
         try:
-            resp = self.http._request("GET", DBLP_API_SEARCH, params=params, accept="application/json")
+            resp = self.http._request("GET", DBLP_API_SEARCH, params=params, accept="application/json", service="dblp")
             if resp.status_code != 200:
                 return []
             data = resp.json()
@@ -1035,7 +1049,11 @@ def normalize_venue(venue: str) -> str:
 
 
 def _find_canonical_venue(norm_venue: str) -> str | None:
-    """Find the canonical venue name for a normalized venue string."""
+    """Find the canonical venue name for a normalized venue string.
+
+    Note: This function is kept for backward compatibility.
+    New code should use get_canonical_venue() from matching.py which uses EXPANDED_VENUE_ALIASES.
+    """
     for canonical, aliases in VENUE_ALIASES.items():
         all_names = {canonical} | aliases
         if any(name in norm_venue or norm_venue in name for name in all_names if len(name) > 3):
@@ -1044,16 +1062,19 @@ def _find_canonical_venue(norm_venue: str) -> str | None:
 
 
 def venues_match(venue_a: str, venue_b: str, threshold: float = 0.70) -> tuple[bool, float]:
-    """Check if two venue names match, considering aliases. Returns (matches, score)."""
+    """Check if two venue names match, considering aliases. Returns (matches, score).
+
+    P2.5: Now uses EXPANDED_VENUE_ALIASES from matching.py for better venue coverage.
+    """
     if not venue_a or not venue_b:
         return (True, 1.0) if not venue_a else (False, 0.0)
 
     norm_a = normalize_venue(venue_a)
     norm_b = normalize_venue(venue_b)
 
-    # Check alias map first — if both map to known venues, use that
-    canonical_a = _find_canonical_venue(norm_a)
-    canonical_b = _find_canonical_venue(norm_b)
+    # P2.5: Use expanded venue aliases from matching.py
+    canonical_a = get_canonical_venue(norm_a, EXPANDED_VENUE_ALIASES)
+    canonical_b = get_canonical_venue(norm_b, EXPANDED_VENUE_ALIASES)
     if canonical_a and canonical_b:
         if canonical_a == canonical_b:
             return (True, 0.95)
@@ -1102,25 +1123,37 @@ class FactChecker:
             return FactCheckStatus.INVALID_YEAR
         return None
 
-    def _validate_doi(self, entry: dict[str, Any]) -> FactCheckStatus | None:
-        """Check if DOI resolves via HEAD request to doi.org."""
+    def _validate_doi(
+        self, entry: dict[str, Any], pre_validated: dict[str, bool] | None = None
+    ) -> FactCheckStatus | None:
+        """Check if DOI resolves via HEAD request to doi.org.
+
+        Args:
+            entry: BibTeX entry with potential DOI field
+            pre_validated: Optional dict mapping entry IDs to validation results from batch pre-check
+        """
+        entry_id = entry.get("ID", "")
+
+        # P1.3: Use pre-validated result if available
+        if pre_validated is not None and entry_id in pre_validated:
+            return None if pre_validated[entry_id] else FactCheckStatus.DOI_NOT_FOUND
+
         doi = entry.get("doi", "")
         if not doi:
             return None
         doi = doi.strip()
         if doi.startswith("http"):
             doi = doi.replace("https://doi.org/", "").replace("http://doi.org/", "")
-        import requests
 
+        # P1.5: Use httpx instead of requests for better async compatibility
         try:
-            resp = requests.head(
-                f"https://doi.org/{doi}",
-                timeout=10,
-                allow_redirects=True,
-                headers={"User-Agent": "BibtexFactChecker/1.0"},
-            )
-            if resp.status_code == 404:
-                return FactCheckStatus.DOI_NOT_FOUND
+            with httpx.Client(timeout=10.0, follow_redirects=True) as client:
+                resp = client.head(
+                    f"https://doi.org/{doi}",
+                    headers={"User-Agent": "BibtexFactChecker/1.0"},
+                )
+                if resp.status_code >= 400:
+                    return FactCheckStatus.DOI_NOT_FOUND
         except Exception:
             pass  # Network errors are not DOI validation failures
         return None
@@ -1153,8 +1186,13 @@ class FactChecker:
             return FactCheckStatus.PREPRINT_ONLY
         return None
 
-    def check_entry(self, entry: dict[str, Any]) -> FactCheckResult:
-        """Fact-check a single bibliographic entry."""
+    def check_entry(self, entry: dict[str, Any], pre_validated_dois: dict[str, bool] | None = None) -> FactCheckResult:
+        """Fact-check a single bibliographic entry.
+
+        Args:
+            entry: BibTeX entry to check
+            pre_validated_dois: Optional dict mapping entry IDs to DOI validation results
+        """
         entry_key = entry.get("ID", "unknown")
         entry_type = entry.get("ENTRYTYPE", "misc").lower()
         errors: list[str] = []
@@ -1194,9 +1232,9 @@ class FactChecker:
                     errors=[f"Year validation failed: {entry.get('year', 'missing')}"],
                 )
 
-        # Pre-API validation: DOI
+        # Pre-API validation: DOI (P1.3: uses batch pre-validation if available)
         if self.config.check_dois:
-            doi_status = self._validate_doi(entry)
+            doi_status = self._validate_doi(entry, pre_validated=pre_validated_dois)
             if doi_status is not None:
                 return FactCheckResult(
                     entry_key=entry_key,
@@ -1227,6 +1265,20 @@ class FactChecker:
                 errors=errors,
             )
 
+        # P2.4: Detect chimeric titles before sorting
+        if self._detect_chimeric_title(entry, candidates):
+            return FactCheckResult(
+                entry_key=entry_key,
+                entry_type=entry_type,
+                status=FactCheckStatus.HALLUCINATED,
+                overall_confidence=0.95,
+                field_comparisons={},
+                best_match=None,
+                api_sources_queried=sources_queried,
+                api_sources_with_hits=sources_with_hits,
+                errors=["Chimeric title detected: tokens borrowed from multiple different papers"],
+            )
+
         # Sort candidates by score descending
         candidates.sort(key=lambda x: x[0], reverse=True)
         best_score, best_match, source = candidates[0]
@@ -1240,11 +1292,24 @@ class FactChecker:
             if preprint_status is not None:
                 status = preprint_status
 
+        # P3.1+P3.2+P3.3: Use calibrated confidence instead of raw best_score
+        field_comp_dict = {
+            name: {"score": c.similarity_score, "matches": c.matches} for name, c in field_comparisons.items()
+        }
+        confidence = calibrate_result(
+            status=status.value,
+            best_match_score=best_score,
+            field_comparisons=field_comp_dict,
+            sources_queried=sources_queried,
+            sources_with_hits=sources_with_hits,
+            errors=errors,
+        )
+
         return FactCheckResult(
             entry_key=entry_key,
             entry_type=entry_type,
             status=status,
-            overall_confidence=best_score,
+            overall_confidence=confidence,
             field_comparisons=field_comparisons,
             best_match=best_match,
             api_sources_queried=sources_queried,
@@ -1260,52 +1325,95 @@ class FactChecker:
         sources_with_hits: list[str],
         errors: list[str],
     ) -> list[tuple[float, PublishedRecord, str]]:
-        """Query all API sources and collect scored candidates."""
+        """Query all API sources and collect scored candidates (parallel version with early exit).
+
+        P2.1: Early-exit optimization - if any source returns a very high-confidence match (>= 0.95),
+        cancel remaining searches.
+        """
         candidates: list[tuple[float, PublishedRecord, str]] = []
         title_norm = normalize_title_for_match(entry.get("title", ""))
         authors_ref = authors_last_names(entry.get("author", ""), limit=3)
 
-        # Crossref
-        sources_queried.append("crossref")
-        try:
-            items = self.crossref.search(query, rows=self.config.max_candidates_per_source)
-            if items:
-                sources_with_hits.append("crossref")
-                for item in items:
-                    rec = crossref_message_to_record(item)
-                    if rec:
-                        score = self._score_candidate(title_norm, authors_ref, rec)
-                        candidates.append((score, rec, "crossref"))
-        except Exception as e:
-            errors.append(f"Crossref: {e}")
+        HIGH_CONFIDENCE_THRESHOLD = 0.95
 
-        # DBLP
-        sources_queried.append("dblp")
-        try:
-            hits = self.dblp.search(query, max_hits=self.config.max_candidates_per_source)
-            if hits:
-                sources_with_hits.append("dblp")
-                for hit in hits:
-                    rec = dblp_hit_to_record(hit)
-                    if rec:
-                        score = self._score_candidate(title_norm, authors_ref, rec)
-                        candidates.append((score, rec, "dblp"))
-        except Exception as e:
-            errors.append(f"DBLP: {e}")
+        def _search_crossref() -> tuple[str, list[tuple[float, PublishedRecord, str]], bool, str | None]:
+            """Search Crossref API."""
+            local_candidates = []
+            had_hits = False
+            error = None
+            try:
+                items = self.crossref.search(query, rows=self.config.max_candidates_per_source)
+                if items:
+                    had_hits = True
+                    for item in items:
+                        rec = crossref_message_to_record(item)
+                        if rec:
+                            score = self._score_candidate(title_norm, authors_ref, rec)
+                            local_candidates.append((score, rec, "crossref"))
+            except Exception as e:
+                error = f"Crossref: {e}"
+            return ("crossref", local_candidates, had_hits, error)
 
-        # Semantic Scholar
-        sources_queried.append("semanticscholar")
-        try:
-            data = self.s2.search(query, limit=self.config.max_candidates_per_source)
-            if data:
-                sources_with_hits.append("semanticscholar")
-                for item in data:
-                    rec = s2_data_to_record(item)
-                    if rec:
-                        score = self._score_candidate(title_norm, authors_ref, rec)
-                        candidates.append((score, rec, "semanticscholar"))
-        except Exception as e:
-            errors.append(f"Semantic Scholar: {e}")
+        def _search_dblp() -> tuple[str, list[tuple[float, PublishedRecord, str]], bool, str | None]:
+            """Search DBLP API."""
+            local_candidates = []
+            had_hits = False
+            error = None
+            try:
+                hits = self.dblp.search(query, max_hits=self.config.max_candidates_per_source)
+                if hits:
+                    had_hits = True
+                    for hit in hits:
+                        rec = dblp_hit_to_record(hit)
+                        if rec:
+                            score = self._score_candidate(title_norm, authors_ref, rec)
+                            local_candidates.append((score, rec, "dblp"))
+            except Exception as e:
+                error = f"DBLP: {e}"
+            return ("dblp", local_candidates, had_hits, error)
+
+        def _search_s2() -> tuple[str, list[tuple[float, PublishedRecord, str]], bool, str | None]:
+            """Search Semantic Scholar API."""
+            local_candidates = []
+            had_hits = False
+            error = None
+            try:
+                data = self.s2.search(query, limit=self.config.max_candidates_per_source)
+                if data:
+                    had_hits = True
+                    for item in data:
+                        rec = s2_data_to_record(item)
+                        if rec:
+                            score = self._score_candidate(title_norm, authors_ref, rec)
+                            local_candidates.append((score, rec, "semanticscholar"))
+            except Exception as e:
+                error = f"Semantic Scholar: {e}"
+            return ("semanticscholar", local_candidates, had_hits, error)
+
+        # P2.1: Execute searches in parallel with early exit on high-confidence match
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+            futures = {
+                executor.submit(_search_crossref): "crossref",
+                executor.submit(_search_dblp): "dblp",
+                executor.submit(_search_s2): "s2",
+            }
+
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    source, cands, had_hits, error = future.result()
+                    sources_queried.append(source)
+                    candidates.extend(cands)
+                    if had_hits:
+                        sources_with_hits.append(source)
+                    if error:
+                        errors.append(error)
+
+                    # Note: With max_workers=3 and 3 tasks, all start immediately.
+                    # The break skips processing remaining future results but doesn't stop running tasks.
+                    if any(score >= HIGH_CONFIDENCE_THRESHOLD for score, _, _ in cands):
+                        break
+                except Exception:
+                    pass  # Errors already captured in individual search functions
 
         return candidates
 
@@ -1319,30 +1427,124 @@ class FactChecker:
 
         return 0.7 * title_score + 0.3 * author_score
 
+    def _detect_chimeric_title(
+        self, entry: dict[str, Any], candidates: list[tuple[float, PublishedRecord, str]]
+    ) -> bool:
+        """Detect chimeric titles via multi-source cross-validation.
+
+        P2.4: A chimeric title mixes tokens from multiple real papers. Detection:
+        - Group candidates by API source
+        - If different sources return different best-match titles, check if the
+          entry title borrows tokens from multiple real papers.
+
+        Returns:
+            True if chimeric title detected, False otherwise
+        """
+        if len(candidates) < 2:
+            return False
+
+        entry_title = normalize_title_for_match(entry.get("title", ""))
+        entry_tokens = set(entry_title.split())
+
+        # Filter out common ML/academic stopwords to reduce false positives
+        _TITLE_STOPWORDS = frozenset(
+            {
+                "a",
+                "an",
+                "the",
+                "of",
+                "for",
+                "in",
+                "on",
+                "with",
+                "and",
+                "via",
+                "using",
+                "from",
+                "to",
+                "by",
+                "its",
+                "is",
+                "are",
+                "at",
+                "as",
+                "learning",
+                "deep",
+                "neural",
+                "network",
+                "networks",
+                "model",
+                "models",
+                "training",
+                "data",
+                "based",
+                "approach",
+                "method",
+                "methods",
+            }
+        )
+        entry_tokens = entry_tokens - _TITLE_STOPWORDS
+
+        # Get best match title per source
+        by_source: dict[str, tuple[float, str]] = {}
+        for score, rec, source in candidates:
+            if source not in by_source or score > by_source[source][0]:
+                by_source[source] = (score, normalize_title_for_match(rec.title or ""))
+
+        if len(by_source) < 2:
+            return False
+
+        # Check if entry tokens are drawn from multiple different source titles
+        source_overlaps: dict[str, set[str]] = {}
+        for source, (_score, title) in by_source.items():
+            api_tokens = set(title.split()) - _TITLE_STOPWORDS
+            overlap = entry_tokens & api_tokens
+            if len(overlap) >= 4:  # Require >= 4 overlapping tokens (increased from 3)
+                source_overlaps[source] = overlap
+
+        if len(source_overlaps) >= 2:
+            # Check if different sources contribute different tokens
+            all_overlaps = list(source_overlaps.values())
+            for i in range(len(all_overlaps)):
+                for j in range(i + 1, len(all_overlaps)):
+                    unique_i = all_overlaps[i] - all_overlaps[j]
+                    unique_j = all_overlaps[j] - all_overlaps[i]
+                    if len(unique_i) >= 3 and len(unique_j) >= 3:  # Require >= 3 unique tokens (increased from 2)
+                        # Different sources contribute distinct token sets - likely chimeric
+                        return True
+
+        return False
+
     def _compare_all_fields(self, entry: dict[str, Any], record: PublishedRecord) -> dict[str, FieldComparison]:
         """Compare all relevant fields between entry and record."""
         comparisons: dict[str, FieldComparison] = {}
         cfg = self.config
 
-        # Title
+        # Title (P2.2: Near-miss detection)
         entry_title = entry.get("title", "")
         api_title = record.title or ""
         title_score = (
             token_sort_ratio(normalize_title_for_match(entry_title), normalize_title_for_match(api_title)) / 100.0
         )
+        # Detect near-miss: high fuzzy score but character-level differences
+        edit_dist = title_edit_distance(entry_title, api_title)
+        near_miss = is_near_miss_title(entry_title, api_title, title_score, cfg.title_threshold)
+        title_matches = title_score >= cfg.title_threshold and not near_miss
         comparisons["title"] = FieldComparison(
             "title",
             entry_title,
             api_title,
             title_score,
-            title_score >= cfg.title_threshold,
+            title_matches,
+            f"Edit distance: {edit_dist}" if near_miss else None,
         )
 
-        # Author
+        # Author (P2.3: Ordered author comparison)
         entry_authors = entry.get("author", "")
         entry_names = authors_last_names(entry_authors, limit=10)
         api_names = [strip_diacritics(a.get("family", "")).lower() for a in record.authors]
-        author_score = jaccard_similarity(entry_names, api_names)
+        # Use combined score (Jaccard + sequence similarity)
+        author_score = combined_author_score(entry_names, api_names, jaccard_weight=0.5, sequence_weight=0.5)
         api_authors_str = " and ".join(f"{a.get('given', '')} {a.get('family', '')}".strip() for a in record.authors)
         comparisons["author"] = FieldComparison(
             "author",
@@ -1392,7 +1594,10 @@ class FactChecker:
         comparisons: dict[str, FieldComparison],
         sources_with_hits: list[str],
     ) -> FactCheckStatus:
-        """Determine final status from score and comparisons."""
+        """Determine final status from score and comparisons.
+
+        P2.6: Venue mismatch is prioritized when title+author match.
+        """
         if best_score < self.config.hallucination_max_score:
             return FactCheckStatus.HALLUCINATED
 
@@ -1400,6 +1605,13 @@ class FactChecker:
 
         if not mismatches:
             return FactCheckStatus.VERIFIED
+
+        # P2.6: Prioritize venue mismatch when title+author match
+        if "venue" in mismatches:
+            title_ok = comparisons.get("title") and comparisons["title"].matches
+            author_ok = comparisons.get("author") and comparisons["author"].matches
+            if title_ok and author_ok:
+                return FactCheckStatus.VENUE_MISMATCH
 
         if len(mismatches) == 1:
             mismatch_map = {
@@ -1532,23 +1744,95 @@ class FactCheckProcessor:
         self.checker = checker
         self.logger = logger
 
-    def process_entries(self, entries: list[dict[str, Any]], jsonl_path: str | None = None) -> list[FactCheckResult]:
-        """Process multiple entries and return results.
+    def _batch_validate_dois(self, entries: list[dict[str, Any]]) -> dict[str, bool]:
+        """Pre-validate all DOIs via concurrent HEAD requests.
+
+        P1.3: Batch DOI pre-resolution - validates all DOIs in a single pass using
+        concurrent HEAD requests, avoiding per-entry DOI checks later.
+
+        Returns:
+            dict mapping entry_id -> is_valid (True/False)
+        """
+        dois: dict[str, str] = {}
+        for entry in entries:
+            doi = entry.get("doi", "").strip()
+            if doi:
+                dois[entry.get("ID", "")] = doi
+
+        if not dois:
+            return {}
+
+        def _check_doi(entry_id: str, doi: str, client: httpx.Client) -> tuple[str, bool]:
+            """Check a single DOI via HEAD request."""
+            try:
+                # Normalize DOI URL
+                if doi.startswith("http"):
+                    url = doi
+                else:
+                    url = f"https://doi.org/{doi}"
+
+                resp = client.head(url, headers={"User-Agent": "BibtexFactChecker/1.0"})
+                return (entry_id, resp.status_code < 400)
+            except Exception:
+                # Assume valid on error (don't penalize network issues)
+                return (entry_id, True)
+
+        results: dict[str, bool] = {}
+        # Execute DOI checks in parallel with shared httpx client
+        with httpx.Client(timeout=10.0, follow_redirects=True) as client:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=16) as executor:
+                futures = [executor.submit(_check_doi, eid, doi, client) for eid, doi in dois.items()]
+                for future in concurrent.futures.as_completed(futures):
+                    entry_id, is_valid = future.result()
+                    results[entry_id] = is_valid
+
+        return results
+
+    def process_entries(
+        self, entries: list[dict[str, Any]], jsonl_path: str | None = None, max_workers: int = 8
+    ) -> list[FactCheckResult]:
+        """Process multiple entries and return results (concurrent version).
 
         If jsonl_path is provided, each result is flushed to the file immediately,
         so partial results survive timeouts and crashes.
+
+        Args:
+            entries: List of BibTeX entries to process
+            jsonl_path: Optional path to write JSONL results as they complete
+            max_workers: Number of concurrent workers (default: 8)
         """
-        results = []
+
+        # P1.3: Batch DOI pre-resolution before main processing loop
+        self.logger.info("Pre-validating DOIs for %d entries...", len(entries))
+        pre_validated_dois = self._batch_validate_dois(entries)
+        if pre_validated_dois:
+            failed_count = sum(1 for valid in pre_validated_dois.values() if not valid)
+            self.logger.info(
+                "DOI pre-validation complete: %d checked, %d failed", len(pre_validated_dois), failed_count
+            )
+
+        results: list[FactCheckResult | None] = [None] * len(entries)  # Pre-allocate to preserve order
+
         jsonl_file = None
+        jsonl_lock = threading.Lock()
+
         try:
             if jsonl_path:
                 jsonl_file = open(jsonl_path, "a")  # noqa: SIM115
-            for i, entry in enumerate(entries, 1):
-                self.logger.info("Checking %d/%d: %s", i, len(entries), entry.get("ID", "?"))
-                result = self.checker.check_entry(entry)
-                results.append(result)
+
+            def _process_one(index: int, entry: dict[str, Any]) -> FactCheckResult:
+                """Process a single entry and write to JSONL if configured."""
+                self.logger.info("Checking %d/%d: %s", index + 1, len(entries), entry.get("ID", "?"))
+                # Pass pre-validated DOI results if checker is FactChecker
+                if isinstance(self.checker, FactChecker):
+                    result = self.checker.check_entry(entry, pre_validated_dois=pre_validated_dois)
+                else:
+                    # UnifiedFactChecker doesn't support pre_validated_dois yet
+                    result = self.checker.check_entry(entry)
+                results[index] = result
+
                 if jsonl_file:
-                    jsonl_file.write(
+                    line = (
                         json.dumps(
                             {
                                 "key": result.entry_key,
@@ -1563,11 +1847,29 @@ class FactCheckProcessor:
                         )
                         + "\n"
                     )
-                    jsonl_file.flush()
+                    with jsonl_lock:
+                        jsonl_file.write(line)
+                        jsonl_file.flush()
+
+                return result
+
+            # Process entries concurrently
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {executor.submit(_process_one, i, entry): i for i, entry in enumerate(entries)}
+                for future in concurrent.futures.as_completed(futures):
+                    try:
+                        future.result()
+                    except Exception as e:
+                        idx = futures[future]
+                        self.logger.error("Error processing entry %d: %s", idx + 1, e)
+                        # Don't re-raise — let other entries complete
+
         finally:
             if jsonl_file:
                 jsonl_file.close()
-        return results
+
+        # Filter out None values (from failed entries)
+        return [r for r in results if r is not None]
 
     def generate_summary(self, results: list[FactCheckResult]) -> dict[str, Any]:
         """Generate summary statistics from results."""
@@ -1784,6 +2086,13 @@ Examples:
         action="store_true",
         help="Disable year validation (future dates, implausible years)",
     )
+    api_opts.add_argument(
+        "--workers",
+        type=int,
+        default=8,
+        metavar="N",
+        help="Number of concurrent workers for parallel processing (default: 8)",
+    )
 
     # Entry type filtering
     entry_types = p.add_argument_group("entry type filtering")
@@ -1876,7 +2185,15 @@ def main() -> int:
         logger.info("Using Semantic Scholar API key (authenticated rate limits)")
 
     cache = DiskCache(args.cache_file) if not args.no_cache else None
-    limiter = RateLimiter(args.rate_limit)
+    limiter = RateLimiterRegistry(
+        {
+            "crossref": 50,
+            "semanticscholar": 1000 if s2_api_key else 100,
+            "dblp": 30,
+            "openlibrary": 30,
+            "google_books": 30,
+        }
+    )
     http = HttpClient(
         timeout=20.0,
         user_agent="BibtexFactChecker/1.0 (mailto:factchecker@example.com)",
@@ -1945,7 +2262,7 @@ def main() -> int:
     processor = FactCheckProcessor(checker, logger)
 
     # Process entries (stream JSONL if path provided)
-    results = processor.process_entries(entries, jsonl_path=args.jsonl)
+    results = processor.process_entries(entries, jsonl_path=args.jsonl, max_workers=args.workers)
     summary = processor.generate_summary(results)
 
     # Print summary

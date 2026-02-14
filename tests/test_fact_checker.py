@@ -1115,9 +1115,11 @@ class TestStreamingJSONL:
             {"ID": "ok2", "ENTRYTYPE": "article", "title": "Good2", "author": "B"},
             {"ID": "fail", "ENTRYTYPE": "article", "title": "Bad", "author": "C"},
         ]
-        with pytest.raises(RuntimeError):
-            proc.process_entries(entries, jsonl_path=str(jsonl_file))
-        # First 2 entries should have been flushed
+        # HIGH-5: No longer raises - logs error and continues
+        results = proc.process_entries(entries, jsonl_path=str(jsonl_file))
+        # Should return 2 successful results (failed entry is filtered out)
+        assert len(results) == 2
+        # All entries should have been flushed to JSONL
         lines = jsonl_file.read_text().strip().split("\n")
         assert len(lines) == 2
 
