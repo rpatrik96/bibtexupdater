@@ -1145,18 +1145,17 @@ class FactChecker:
         if doi.startswith("http"):
             doi = doi.replace("https://doi.org/", "").replace("http://doi.org/", "")
 
-        # P1.5: Use httpx instead of requests for better async compatibility
+        # Reuse the shared httpx.Client to avoid per-entry TCP/TLS overhead
         try:
-            with httpx.Client(timeout=10.0, follow_redirects=True) as client:
-                resp = client.head(
-                    f"https://doi.org/{doi}",
-                    headers={"User-Agent": "BibtexFactChecker/1.0"},
-                )
-                # Only 404/410 indicate a DOI that truly doesn't exist.
-                # Other 4xx (418 bot-detection, 403 access control, 429 rate limit)
-                # are publisher-side blocks, not evidence of an invalid DOI.
-                if resp.status_code in (404, 410):
-                    return FactCheckStatus.DOI_NOT_FOUND
+            resp = self.crossref.http.client.head(
+                f"https://doi.org/{doi}",
+                headers={"User-Agent": "BibtexFactChecker/1.0"},
+            )
+            # Only 404/410 indicate a DOI that truly doesn't exist.
+            # Other 4xx (418 bot-detection, 403 access control, 429 rate limit)
+            # are publisher-side blocks, not evidence of an invalid DOI.
+            if resp.status_code in (404, 410):
+                return FactCheckStatus.DOI_NOT_FOUND
         except Exception:
             pass  # Network errors are not DOI validation failures
         return None
@@ -1783,13 +1782,21 @@ class FactCheckProcessor:
                 return (entry_id, True)
 
         results: dict[str, bool] = {}
-        # Execute DOI checks in parallel with shared httpx client
-        with httpx.Client(timeout=10.0, follow_redirects=True) as client:
+        # Reuse shared httpx.Client if available (avoids TCP/TLS overhead)
+        if isinstance(self.checker, FactChecker):
+            client = self.checker.crossref.http.client
+        else:
+            client = httpx.Client(timeout=10.0, follow_redirects=True)
+        try:
             with concurrent.futures.ThreadPoolExecutor(max_workers=16) as executor:
                 futures = [executor.submit(_check_doi, eid, doi, client) for eid, doi in dois.items()]
                 for future in concurrent.futures.as_completed(futures):
                     entry_id, is_valid = future.result()
                     results[entry_id] = is_valid
+        finally:
+            # Only close if we created the client ourselves
+            if not isinstance(self.checker, FactChecker):
+                client.close()
 
         return results
 

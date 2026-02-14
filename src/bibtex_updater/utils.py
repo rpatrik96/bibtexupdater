@@ -13,6 +13,7 @@ from __future__ import annotations
 import collections
 import json
 import os
+import random
 import re
 import sqlite3
 import tempfile
@@ -356,9 +357,10 @@ class RateLimiter:
                     return  # Slot acquired
                 # Need to wait — compute sleep duration but release lock first
                 sleep_for = window - (now - self.timestamps[0]) + 0.01
-            # Sleep WITHOUT holding the lock
+            # Sleep WITHOUT holding the lock; add jitter to prevent
+            # synchronized wake-ups across threads (burst-stall pattern)
             if sleep_for > 0:
-                time.sleep(sleep_for)
+                time.sleep(sleep_for + random.uniform(0, 0.5))
 
 
 class RateLimiterRegistry:
@@ -909,6 +911,7 @@ class HttpClient:
             timeout=httpx.Timeout(timeout),
             headers={"User-Agent": user_agent},
             follow_redirects=True,
+            limits=httpx.Limits(max_connections=50, max_keepalive_connections=20),
         )
         self._rate_limiter = rate_limiter
         self._uses_registry = isinstance(rate_limiter, RateLimiterRegistry)
@@ -1438,9 +1441,10 @@ class AsyncRateLimiter:
                     return  # Slot acquired
                 # Need to wait — compute sleep duration but release lock first
                 sleep_for = window - (now - self.timestamps[0]) + 0.01
-            # Sleep WITHOUT holding the lock
+            # Sleep WITHOUT holding the lock; add jitter to prevent
+            # synchronized wake-ups across coroutines (burst-stall pattern)
             if sleep_for > 0:
-                await asyncio.sleep(sleep_for)
+                await asyncio.sleep(sleep_for + random.uniform(0, 0.5))
 
 
 class AsyncRateLimiterRegistry:
