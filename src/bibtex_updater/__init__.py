@@ -67,6 +67,7 @@ from bibtex_updater.utils import (
     RateLimiterRegistry,
     ResolutionCache,
     ResolutionCacheEntry,
+    SqliteCache,
     # ACL Anthology
     acl_anthology_bib_to_record,
     # Author handling
@@ -132,6 +133,7 @@ __all__ = [
     "RateLimiterRegistry",
     "ResolutionCache",
     "ResolutionCacheEntry",
+    "SqliteCache",
     # Text normalization
     "latex_to_plain",
     "normalize_title_for_match",

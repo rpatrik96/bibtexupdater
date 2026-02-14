@@ -10,9 +10,12 @@ HTTP infrastructure with caching and rate limiting, and API client utilities.
 
 from __future__ import annotations
 
+import collections
 import json
 import os
+import random
 import re
+import sqlite3
 import tempfile
 import threading
 import time
@@ -336,22 +339,28 @@ class RateLimiter:
     def __init__(self, req_per_min: int) -> None:
         self.req_per_min = max(req_per_min, 1)
         self.lock = threading.Lock()
-        self.timestamps: list[float] = []
+        self.timestamps: collections.deque[float] = collections.deque()
 
     def wait(self) -> None:
         """Block until a request can be made within the rate limit."""
-        with self.lock:
-            now = time.time()
-            window = 60.0
-            self.timestamps = [t for t in self.timestamps if now - t < window]
-            if len(self.timestamps) >= self.req_per_min:
-                earliest = min(self.timestamps)
-                sleep_for = window - (now - earliest) + 0.01
-                if sleep_for > 0:
-                    time.sleep(sleep_for)
-                    now = time.time()
-                    self.timestamps = [t for t in self.timestamps if now - t < window]
-            self.timestamps.append(time.time())
+        window = 60.0
+        while True:
+            sleep_for = 0.0
+            with self.lock:
+                now = time.time()
+                cutoff = now - window
+                # O(1) popleft from deque (timestamps are chronological)
+                while self.timestamps and self.timestamps[0] < cutoff:
+                    self.timestamps.popleft()
+                if len(self.timestamps) < self.req_per_min:
+                    self.timestamps.append(time.time())
+                    return  # Slot acquired
+                # Need to wait — compute sleep duration but release lock first
+                sleep_for = window - (now - self.timestamps[0]) + 0.01
+            # Sleep WITHOUT holding the lock; add jitter to prevent
+            # synchronized wake-ups across threads (burst-stall pattern)
+            if sleep_for > 0:
+                time.sleep(sleep_for + random.uniform(0, 0.5))
 
 
 class RateLimiterRegistry:
@@ -509,8 +518,9 @@ class AdaptiveRateLimiterRegistry(RateLimiterRegistry):
 class DiskCache:
     """Thread-safe on-disk JSON cache for API responses."""
 
-    def __init__(self, path: str | None) -> None:
+    def __init__(self, path: str | None, max_age_days: int = 30) -> None:
         self.path = path
+        self.max_age_days = max_age_days
         self.lock = threading.Lock()
         self.data: dict[str, Any] = {}
         if path and os.path.exists(path):
@@ -541,6 +551,196 @@ class DiskCache:
             finally:
                 tmp.close()
             os.replace(tmp.name, self.path)
+
+    def has(self, key: str) -> bool:
+        """Check if a key exists in the cache."""
+        if not self.path:
+            return False
+        with self.lock:
+            return key in self.data
+
+
+class SqliteCache:
+    """Thread-safe SQLite-backed cache for API responses.
+
+    Drop-in replacement for DiskCache with:
+    - Thread-safe concurrent reads/writes via SQLite WAL mode
+    - No full-file rewrite on every insert
+    - Automatic expiry of stale entries
+    """
+
+    def __init__(self, path: str | None, max_age_days: int = 30) -> None:
+        """Initialize the SQLite cache.
+
+        Args:
+            path: Path to the cache file. If None, caching is disabled.
+                 Will use .db extension instead of .json.
+            max_age_days: Maximum age of cache entries in days. Default 30 days.
+        """
+        self.path = path
+        self.max_age_days = max_age_days
+        self._local = threading.local()
+
+        if path:
+            # Convert .json path to .db path if needed
+            if path.endswith(".json"):
+                self.path = path[:-5] + ".db"
+
+            # Initialize database
+            self._init_db()
+
+    def _init_db(self) -> None:
+        """Initialize the database schema."""
+        if not self.path:
+            return
+
+        # Ensure directory exists
+        parent = os.path.dirname(self.path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+
+        # Create connection with WAL mode for concurrent access
+        conn = sqlite3.connect(self.path, check_same_thread=False)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS cache (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                timestamp REAL NOT NULL
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_timestamp ON cache(timestamp)")
+        conn.commit()
+        conn.close()
+
+    def _get_connection(self) -> sqlite3.Connection:
+        """Get or create a thread-local database connection."""
+        if not self.path:
+            raise RuntimeError("Cannot create connection: path is None")
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = sqlite3.connect(self.path, check_same_thread=False)
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            self._local.conn = conn
+        return conn
+
+    def get(self, key: str) -> Any | None:
+        """Get a cached value by key.
+
+        Args:
+            key: Cache key
+
+        Returns:
+            Cached value or None if not found or expired
+        """
+        if not self.path:
+            return None
+
+        conn = self._get_connection()
+        cursor = conn.execute("SELECT value, timestamp FROM cache WHERE key = ?", (key,))
+        row = cursor.fetchone()
+
+        if row is None:
+            return None
+
+        value_json, timestamp = row
+
+        # Check expiry
+        age_days = (time.time() - timestamp) / 86400
+        if age_days > self.max_age_days:
+            # Delete expired entry
+            conn.execute("DELETE FROM cache WHERE key = ?", (key,))
+            conn.commit()
+            return None
+
+        try:
+            return json.loads(value_json)
+        except json.JSONDecodeError:
+            return None
+
+    def set(self, key: str, value: Any) -> None:
+        """Set a cached value.
+
+        Args:
+            key: Cache key
+            value: Value to cache
+        """
+        if not self.path:
+            return
+
+        conn = self._get_connection()
+        value_json = json.dumps(value)
+        timestamp = time.time()
+
+        conn.execute(
+            "INSERT OR REPLACE INTO cache (key, value, timestamp) VALUES (?, ?, ?)", (key, value_json, timestamp)
+        )
+        conn.commit()
+
+    def has(self, key: str) -> bool:
+        """Check if a key exists in the cache (and is not expired).
+
+        Args:
+            key: Cache key
+
+        Returns:
+            True if key exists and is not expired, False otherwise
+        """
+        if not self.path:
+            return False
+
+        conn = self._get_connection()
+        cursor = conn.execute("SELECT timestamp FROM cache WHERE key = ?", (key,))
+        row = cursor.fetchone()
+
+        if row is None:
+            return False
+
+        timestamp = row[0]
+        age_days = (time.time() - timestamp) / 86400
+        if age_days > self.max_age_days:
+            # Delete expired entry
+            conn.execute("DELETE FROM cache WHERE key = ?", (key,))
+            conn.commit()
+            return False
+
+        return True
+
+    def clear_expired(self) -> int:
+        """Delete all expired entries from the cache.
+
+        Returns:
+            Number of deleted entries
+        """
+        if not self.path:
+            return 0
+
+        conn = self._get_connection()
+        cutoff_timestamp = time.time() - (self.max_age_days * 86400)
+
+        cursor = conn.execute("DELETE FROM cache WHERE timestamp < ?", (cutoff_timestamp,))
+        deleted_count = cursor.rowcount
+        conn.commit()
+
+        return deleted_count
+
+    def close(self) -> None:
+        """Close the database connection."""
+        conn = getattr(self._local, "conn", None)
+        if conn is not None:
+            conn.close()
+            self._local.conn = None
+
+    def __del__(self) -> None:
+        """Cleanup: close connection when object is destroyed."""
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
 @dataclass
@@ -692,7 +892,7 @@ class HttpClient:
         timeout: float,
         user_agent: str,
         rate_limiter: RateLimiter | RateLimiterRegistry,
-        cache: DiskCache,
+        cache: DiskCache | SqliteCache,
         verbose: bool = False,
         s2_api_key: str | None = None,
     ):
@@ -703,7 +903,7 @@ class HttpClient:
             user_agent: User-Agent header value
             rate_limiter: Either a single RateLimiter (for backward compatibility)
                          or a RateLimiterRegistry for per-service rate limiting
-            cache: DiskCache instance for caching responses
+            cache: DiskCache or SqliteCache instance for caching responses
             verbose: Enable verbose logging
             s2_api_key: Optional Semantic Scholar API key for authenticated requests
         """
@@ -711,6 +911,7 @@ class HttpClient:
             timeout=httpx.Timeout(timeout),
             headers={"User-Agent": user_agent},
             follow_redirects=True,
+            limits=httpx.Limits(max_connections=50, max_keepalive_connections=20),
         )
         self._rate_limiter = rate_limiter
         self._uses_registry = isinstance(rate_limiter, RateLimiterRegistry)
@@ -1026,12 +1227,12 @@ def openalex_work_to_record(work: dict[str, Any]) -> PublishedRecord | None:
     work_type = work.get("type")
 
     # Map OpenAlex type to our types
-    type_map = {
+    type_map: dict[str, str] = {
         "article": "journal-article",
         "proceedings-article": "proceedings-article",
         "book-chapter": "book-chapter",
     }
-    record_type = type_map.get(work_type, work_type)
+    record_type = type_map.get(work_type, work_type) if work_type else work_type
 
     # Reject posted-content (preprints)
     if work_type == "posted-content":
@@ -1216,7 +1417,7 @@ class AsyncRateLimiter:
 
         self.req_per_min = max(req_per_min, 1)
         self.lock = asyncio.Lock()
-        self.timestamps: list[float] = []
+        self.timestamps: collections.deque[float] = collections.deque()
 
     async def wait(self) -> None:
         """Async wait until a request can be made within the rate limit.
@@ -1226,20 +1427,24 @@ class AsyncRateLimiter:
         """
         import asyncio
 
-        async with self.lock:
-            now = time.time()
-            window = 60.0
-            self.timestamps = [t for t in self.timestamps if now - t < window]
-
-            if len(self.timestamps) >= self.req_per_min:
-                earliest = min(self.timestamps)
-                sleep_for = window - (now - earliest) + 0.01
-                if sleep_for > 0:
-                    await asyncio.sleep(sleep_for)
-                    now = time.time()
-                    self.timestamps = [t for t in self.timestamps if now - t < window]
-
-            self.timestamps.append(now)
+        window = 60.0
+        while True:
+            sleep_for = 0.0
+            async with self.lock:
+                now = time.time()
+                cutoff = now - window
+                # O(1) popleft from deque (timestamps are chronological)
+                while self.timestamps and self.timestamps[0] < cutoff:
+                    self.timestamps.popleft()
+                if len(self.timestamps) < self.req_per_min:
+                    self.timestamps.append(time.time())
+                    return  # Slot acquired
+                # Need to wait — compute sleep duration but release lock first
+                sleep_for = window - (now - self.timestamps[0]) + 0.01
+            # Sleep WITHOUT holding the lock; add jitter to prevent
+            # synchronized wake-ups across coroutines (burst-stall pattern)
+            if sleep_for > 0:
+                await asyncio.sleep(sleep_for + random.uniform(0, 0.5))
 
 
 class AsyncRateLimiterRegistry:
@@ -1311,7 +1516,7 @@ class AsyncHttpClient:
     def __init__(
         self,
         rate_limiters: AsyncRateLimiterRegistry,
-        cache: DiskCache | None = None,
+        cache: DiskCache | SqliteCache | None = None,
         timeout: float = 20.0,
         user_agent: str = "bibtex-updater/1.0 (async)",
     ) -> None:
@@ -1319,7 +1524,7 @@ class AsyncHttpClient:
 
         Args:
             rate_limiters: AsyncRateLimiterRegistry for per-service rate limiting
-            cache: Optional DiskCache for caching responses
+            cache: Optional DiskCache or SqliteCache for caching responses
             timeout: Request timeout in seconds
             user_agent: User-Agent header value
         """
