@@ -60,12 +60,12 @@ from bibtex_updater.utils import (
     PREPRINT_HOSTS,
     S2_API,
     AsyncHttpClient,
-    DiskCache,
     HttpClient,
     PublishedRecord,
     RateLimiterRegistry,
     ResolutionCache,
     ResolutionCacheEntry,
+    SqliteCache,
     acl_anthology_bib_to_record,
     authors_last_names,
     crossref_message_to_record,
@@ -924,7 +924,7 @@ class Resolver:
         if filter_type:
             params["filter"] = f"type:{filter_type}"
         try:
-            resp = self.http._request("GET", CROSSREF_API, params=params, accept="application/json")
+            resp = self.http._request("GET", CROSSREF_API, params=params, accept="application/json", service="crossref")
             if resp.status_code != 200:
                 return []
             items = resp.json().get("message", {}).get("items", [])
@@ -3691,18 +3691,20 @@ def setup_http_client(args: argparse.Namespace) -> HttpClient:
     s2_api_key = getattr(args, "s2_api_key", None) or os.environ.get("S2_API_KEY")
     rate_limiter = RateLimiterRegistry(
         {
+            "arxiv": max(10, int(30 * rate_scale)),
             "crossref": max(10, int(50 * rate_scale)),
             "semanticscholar": 60 if s2_api_key else max(5, int(10 * rate_scale)),
             "dblp": max(10, int(30 * rate_scale)),
-            "openlibrary": max(10, int(30 * rate_scale)),
-            "google_books": max(10, int(30 * rate_scale)),
+            "openalex": max(10, int(50 * rate_scale)),
+            "europepmc": max(10, int(30 * rate_scale)),
+            "aclanthology": max(10, int(30 * rate_scale)),
         }
     )
     # Handle cache options: --no-cache disables caching entirely
     if getattr(args, "no_cache", False):
-        cache = DiskCache(None)
+        cache = SqliteCache(None)
     else:
-        cache = DiskCache(args.cache) if args.cache else DiskCache(None)
+        cache = SqliteCache(args.cache) if args.cache else SqliteCache(None)
     # Get user agent from args, env var, or use default
     user_agent = (
         getattr(args, "user_agent", None)

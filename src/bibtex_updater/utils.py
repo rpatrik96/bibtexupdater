@@ -890,7 +890,7 @@ class HttpClient:
         timeout: float,
         user_agent: str,
         rate_limiter: RateLimiter | RateLimiterRegistry,
-        cache: DiskCache,
+        cache: DiskCache | SqliteCache,
         verbose: bool = False,
         s2_api_key: str | None = None,
     ):
@@ -901,7 +901,7 @@ class HttpClient:
             user_agent: User-Agent header value
             rate_limiter: Either a single RateLimiter (for backward compatibility)
                          or a RateLimiterRegistry for per-service rate limiting
-            cache: DiskCache instance for caching responses
+            cache: DiskCache or SqliteCache instance for caching responses
             verbose: Enable verbose logging
             s2_api_key: Optional Semantic Scholar API key for authenticated requests
         """
@@ -1512,7 +1512,7 @@ class AsyncHttpClient:
     def __init__(
         self,
         rate_limiters: AsyncRateLimiterRegistry,
-        cache: DiskCache | None = None,
+        cache: DiskCache | SqliteCache | None = None,
         timeout: float = 20.0,
         user_agent: str = "bibtex-updater/1.0 (async)",
     ) -> None:
@@ -1520,7 +1520,7 @@ class AsyncHttpClient:
 
         Args:
             rate_limiters: AsyncRateLimiterRegistry for per-service rate limiting
-            cache: Optional DiskCache for caching responses
+            cache: Optional DiskCache or SqliteCache for caching responses
             timeout: Request timeout in seconds
             user_agent: User-Agent header value
         """

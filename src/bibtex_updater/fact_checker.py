@@ -54,12 +54,12 @@ from bibtex_updater.utils import (
     CROSSREF_API,
     DBLP_API_SEARCH,
     S2_API,
-    # HTTP infrastructure
-    DiskCache,
     HttpClient,
     # Data classes
     PublishedRecord,
     RateLimiterRegistry,
+    SqliteCache,
+    # HTTP infrastructure
     authors_last_names,
     # API converters
     crossref_message_to_record,
@@ -2203,7 +2203,7 @@ def main() -> int:
     if s2_api_key:
         logger.info("Using Semantic Scholar API key (authenticated rate limits)")
 
-    cache = DiskCache(args.cache_file) if not args.no_cache else None
+    cache = SqliteCache(args.cache_file) if not args.no_cache else None
     # Scale per-service limits proportionally to --rate-limit
     rate_scale = args.rate_limit / 45.0  # 45 is the default
     limiter = RateLimiterRegistry(

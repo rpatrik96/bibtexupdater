@@ -34,10 +34,10 @@ from typing import Any
 # Import from bibtex_updater package
 from bibtex_updater.updater import Detector, Resolver
 from bibtex_updater.utils import (
-    DiskCache,
     HttpClient,
     PublishedRecord,
-    RateLimiter,
+    RateLimiterRegistry,
+    SqliteCache,
     doi_normalize,
     doi_url,
     extract_arxiv_id_from_text,
@@ -241,8 +241,16 @@ class ZoteroPrePrintUpdater:
         logging.basicConfig(level=level, format="%(levelname)s: %(message)s")
 
         # Set up HTTP client and resolver (reuse bibtex_updater infrastructure)
-        rate_limiter = RateLimiter(req_per_min=45)
-        cache = DiskCache(".cache.zotero_updater.json")
+        rate_limiter = RateLimiterRegistry(
+            {
+                "crossref": 50,
+                "semanticscholar": 60,
+                "dblp": 30,
+                "openlibrary": 30,
+                "google_books": 30,
+            }
+        )
+        cache = SqliteCache(".cache.zotero_updater.json")
         user_agent = "zotero-preprint-updater/1.0 (mailto:you@example.com)"
         self.http = HttpClient(
             timeout=20.0,
