@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-02-14
+
+### Performance
+- **Migrated from DiskCache to SqliteCache** — eliminated O(N²) bottleneck in cache operations
+- **Added rate limiter jitter** — prevents burst-stall pattern by randomizing request timing (±10% variance)
+- **Increased HTTP connection pool limits** — 50 max connections, 20 keepalive (up from 10/10 defaults)
+- **Reuse shared HTTP client for DOI validation** — eliminates redundant connection overhead
+
+### Fixed
+- **Per-service rate limiting with RateLimiterRegistry** — consistent rate limiting across all modules (updater, fact checker, filter, Zotero)
+- **Correct service names in updater rate limiter configuration** — fixed mismatched service identifiers
+- **Added missing service parameter in crossref search** — ensures proper rate limit application
+
 ## [0.7.0] - 2026-02-12
 
 ### Added
@@ -268,7 +281,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Comprehensive test suite with pytest fixtures
 - MIT License
 
-[Unreleased]: https://github.com/rpatrik96/bibtexupdater/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/rpatrik96/bibtexupdater/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/rpatrik96/bibtexupdater/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/rpatrik96/bibtexupdater/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/rpatrik96/bibtexupdater/compare/v0.6.0...v0.6.1
 [0.5.1]: https://github.com/rpatrik96/bibtexupdater/compare/v0.5.0...v0.5.1
