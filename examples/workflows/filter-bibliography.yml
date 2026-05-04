@@ -34,7 +34,7 @@ jobs:
 
       - name: Download filter script
         run: |
-          curl -fsSL https://raw.githubusercontent.com/rpatrik96/bibtexupdater/main/filter_bibliography.py -o filter_bibliography.py
+          curl -fsSL https://raw.githubusercontent.com/<anon>/bibtexupdater/main/filter_bibliography.py -o filter_bibliography.py
 
       - name: Filter bibliography
         run: |

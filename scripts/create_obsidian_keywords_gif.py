@@ -147,7 +147,7 @@ def main():
         draw_frame(fig, ax, states[i])
 
     anim = FuncAnimation(fig, animate, frames=len(states), interval=200)
-    out = "/Users/patrik.reizinger/Documents/GitHub/bibtexupdater/assets/obsidian-keywords.gif"
+    out = "./assets/obsidian-keywords.gif"
     os.makedirs(os.path.dirname(out), exist_ok=True)
     print(f"Generating {len(states)} frames...")
     anim.save(out, writer=PillowWriter(fps=5), dpi=DPI)

@@ -10,7 +10,7 @@ readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.10"
 authors = [
-    { name = "Patrik Reizinger" }
+    { name = "Anonymous" }
 ]
 keywords = [
     "bibtex",
@@ -97,11 +97,11 @@ bibtex-zotero-organize = "bibtex_updater.cli.zotero_organizer_cli:main"
 bibtex-obsidian-keywords = "bibtex_updater.cli.obsidian_keywords_cli:main"
 
 [project.urls]
-Homepage = "https://github.com/rpatrik96/bibtexupdater"
-Documentation = "https://github.com/rpatrik96/bibtexupdater#readme"
-Repository = "https://github.com/rpatrik96/bibtexupdater.git"
-Issues = "https://github.com/rpatrik96/bibtexupdater/issues"
-Changelog = "https://github.com/rpatrik96/bibtexupdater/blob/main/CHANGELOG.md"
+Homepage = "https://anonymous.4open.science/r/bibtexupdater"
+Documentation = "https://anonymous.4open.science/r/bibtexupdater"
+Repository = "https://anonymous.4open.science/r/bibtexupdater"
+Issues = "https://anonymous.4open.science/r/bibtexupdater"
+Changelog = "https://anonymous.4open.science/r/bibtexupdater/CHANGELOG.md"
 
 [tool.hatch.version]
 source = "vcs"

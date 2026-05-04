@@ -209,7 +209,7 @@ Edit .bib in Overleaf → Sync to GitHub → Action runs → Updated .bib commit
 
    jobs:
      update:
-       uses: rpatrik96/bibtexupdater/.github/workflows/reusable-bib-update.yml@main
+       uses: <anon>/bibtexupdater/.github/workflows/reusable-bib-update.yml@main
        with:
          bib_files: 'references.bib'
          dedupe: true
@@ -222,7 +222,7 @@ Edit .bib in Overleaf → Sync to GitHub → Action runs → Updated .bib commit
 ```yaml
 jobs:
   update:
-    uses: rpatrik96/bibtexupdater/.github/workflows/reusable-bib-update.yml@main
+    uses: <anon>/bibtexupdater/.github/workflows/reusable-bib-update.yml@main
     with:
       bib_files: '*.bib'           # Files to process (default: *.bib)
       dedupe: true                  # Remove duplicates (default: true)

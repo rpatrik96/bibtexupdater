@@ -17,7 +17,7 @@ Filter your bibliography to include only cited references from your LaTeX docume
 No installation needed! Just download the script:
 
 ```bash
-curl -O https://raw.githubusercontent.com/rpatrik96/bibtexupdater/main/filter_bibliography.py
+curl -O https://anonymous.4open.science/api/repo/bibtexupdater/file/filter_bibliography.py
 ```
 
 ## CLI Usage

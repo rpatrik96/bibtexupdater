@@ -24,7 +24,7 @@ pip install bibtex-updater[all]
 ### From Source (Recommended)
 
 ```bash
-git clone https://github.com/rpatrik96/bibtexupdater.git
+git clone https://anonymous.4open.science/r/bibtexupdater
 cd bibtexupdater
 uv sync --extra dev --extra all
 ```
@@ -257,7 +257,7 @@ if detection.is_preprint:
 
 ```bash
 # Clone and install in development mode
-git clone https://github.com/rpatrik96/bibtexupdater.git
+git clone https://anonymous.4open.science/r/bibtexupdater
 cd bibtexupdater
 uv sync --extra dev --extra all
 

@@ -259,7 +259,7 @@ def draw_frame(fig, ax, n_lit):
         ax.text(
             5.5,
             0.15,
-            "pip install bibtex-updater    |    github.com/rpatrik96/bibtexupdater",
+            "pip install bibtex-updater    |    anonymous.4open.science/r/bibtexupdater",
             fontsize=11,
             color=ACCENT_COLOR,
             ha="center",
@@ -304,7 +304,7 @@ def main():
 
     anim = FuncAnimation(fig, animate, frames=len(frames), interval=180)
 
-    out = "/Users/patrik.reizinger/Documents/GitHub/bibtexupdater/assets/pipeline.gif"
+    out = "./assets/pipeline.gif"
     import os
 
     os.makedirs(os.path.dirname(out), exist_ok=True)

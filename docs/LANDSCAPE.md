@@ -341,7 +341,7 @@ These tools help with formatting, organizing, and maintaining BibTeX files, comp
 
 For evaluating citation verification tools and comparing resolution accuracy, see:
 
-**HALLMARK** - https://github.com/rpatrik96/hallmark
+**HALLMARK** - https://anonymous.4open.science/r/hallmark
 
 A benchmark dataset and evaluation framework for citation hallucination detection. Includes bibtexupdater as a baseline tool alongside other validators. Provides ground-truth labeled data for testing whether a reference checker correctly identifies fabricated citations vs. real-but-mislabeled citations vs. correct citations.
 
@@ -352,7 +352,7 @@ HALLMARK is useful for:
 
 ## Contributing
 
-If you know of a database or tool that should be listed here, please open an issue or pull request at https://github.com/rpatrik96/bibtexupdater.
+If you know of a database or tool that should be listed here, please open an issue or pull request at https://anonymous.4open.science/r/bibtexupdater.
 
 Relevant information to include:
 - API endpoint and authentication requirements

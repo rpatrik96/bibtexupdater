@@ -179,7 +179,7 @@ def main():
         draw_frame(fig, ax, states[i])
 
     anim = FuncAnimation(fig, animate, frames=len(states), interval=200)
-    out = "/Users/patrik.reizinger/Documents/GitHub/bibtexupdater/assets/zotero-sync.gif"
+    out = "./assets/zotero-sync.gif"
     os.makedirs(os.path.dirname(out), exist_ok=True)
     print(f"Generating {len(states)} frames...")
     anim.save(out, writer=PillowWriter(fps=5), dpi=DPI)

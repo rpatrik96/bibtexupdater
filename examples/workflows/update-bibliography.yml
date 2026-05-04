@@ -20,7 +20,7 @@ on:
 
 jobs:
   update:
-    uses: rpatrik96/bibtexupdater/.github/workflows/reusable-bib-update.yml@main
+    uses: <anon>/bibtexupdater/.github/workflows/reusable-bib-update.yml@main
     with:
       bib_files: 'references.bib'  # Adjust to your .bib file name
       dedupe: true

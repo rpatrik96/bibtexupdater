@@ -38,8 +38,8 @@ jobs:
 
       - name: Download fact-checker
         run: |
-          curl -fsSL https://raw.githubusercontent.com/rpatrik96/bibtexupdater/main/reference_fact_checker.py -o reference_fact_checker.py
-          curl -fsSL https://raw.githubusercontent.com/rpatrik96/bibtexupdater/main/bib_utils.py -o bib_utils.py
+          curl -fsSL https://raw.githubusercontent.com/<anon>/bibtexupdater/main/reference_fact_checker.py -o reference_fact_checker.py
+          curl -fsSL https://raw.githubusercontent.com/<anon>/bibtexupdater/main/bib_utils.py -o bib_utils.py
 
       - name: Validate references
         id: validate
