@@ -40,6 +40,8 @@ import difflib
 import json
 import logging
 import os
+import errno
+import shutil
 import re
 import sys
 import tempfile
@@ -130,7 +132,14 @@ class BibWriter:
             os.fsync(tmp.fileno())
         finally:
             tmp.close()
-        os.replace(tmp.name, path)
+        try: # replace fails if tmp file and destination are not on the same file system
+            os.replace(tmp.name, path)
+        except OSError as e:
+            if e.errno == errno.EXDEV:
+                shutil.copyfile(tmp.name, path)
+                os.unlink(tmp.name)
+            else:
+                raise e
 
 
 # ------------- Google Scholar Client (optional) -------------

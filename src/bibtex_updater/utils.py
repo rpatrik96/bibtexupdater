@@ -13,6 +13,8 @@ from __future__ import annotations
 import collections
 import json
 import os
+import errno
+import shutil
 import random
 import re
 import sqlite3
@@ -550,7 +552,14 @@ class DiskCache:
                 os.fsync(tmp.fileno())
             finally:
                 tmp.close()
-            os.replace(tmp.name, self.path)
+            try: # replace fails if tmp file and destination are not on the same file system
+                os.replace(tmp.name, self.path)
+            except OSError as e:
+                if e.errno == errno.EXDEV:
+                    shutil.copyfile(tmp.name, self.path)
+                    os.unlink(tmp.name)
+                else:
+                    raise e
 
     def has(self, key: str) -> bool:
         """Check if a key exists in the cache."""
@@ -807,7 +816,14 @@ class ResolutionCache:
             os.fsync(tmp.fileno())
         finally:
             tmp.close()
-        os.replace(tmp.name, self.path)
+        try: # replace fails if tmp file and destination are not on the same file system
+            os.replace(tmp.name, self.path)
+        except OSError as e:
+            if e.errno == errno.EXDEV:
+                shutil.copyfile(tmp.name, self.path)
+                os.unlink(tmp.name)
+            else:
+                raise e
 
     def _make_key(self, arxiv_id: str | None, doi: str | None) -> str:
         """Create cache key from identifiers."""
