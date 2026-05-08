@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-05-08
+
+### Added
+- **Cascading source verification** (`--cascade`): explicit CrossRef → Semantic Scholar → OpenAlex order with high-confidence short-circuit. Adds OpenAlex as a fourth source via the new `OpenAlexClient` in `bibtex_updater.sources`. Inspired by [CheckIfExist (Abbonato 2026)](https://arxiv.org/abs/2602.15871) Algorithm 1.
+- **Top-K candidate retrieval** (`--top-k N`): per-source top-K results re-ranked by RapidFuzz Levenshtein title similarity before expensive cross-checks (default 3, capped at 10).
+- **Cross-source author intersection**: `cross_source_author_intersection()` cross-validates author family names across sources. `confirmed = ∩` of normalized names; `suspect = union \ confirmed`. Multi-source bonus `β_ms ∈ [0, 10]` when ≥2 sources confirm the same authors. Catches `swapped_authors` / chimeric citation hallucinations.
+- **Numeric `confidence_score`** (0–100): additive in the JSONL output. Two formulas — Case A asymmetric for the high-title-low-author chimeric case (`S_title − 0.5 × (100 − S_author)`), Case B average + bonus otherwise — with explicit penalty constants (`PENALTY_TITLE_MISMATCH`, `PENALTY_AUTHOR_MISMATCH`, etc.) at module level for override without auto-fitting.
+- **Rich `VerificationResult`**: per-entry struct with `similarity_breakdown`, `confirmed_authors`, `suspect_authors`, `sources_consulted`, `sources_confirmed`, `issues`, `matched_metadata`. Built via `build_verification_result()` from a classic `FactCheckResult` — purely additive, no schema break.
+- **Non-generative-AI mode** (`--non-generative` CLI flag and `BIBTEX_CHECK_NON_GENERATIVE=1` env var): refuses to load any LLM backend at runtime. Forward-compat guard for [ACL ARR](https://aclrollingreview.org/reviewerguidelines#q-can-i-use-generative-ai) and [ICML 2026](https://icml.cc/Conferences/2026/LLM-Policy) LLM-in-review policy compliance. Inspired by [HalluCiteChecker (Sakai et al. 2026)](https://arxiv.org/abs/2604.26835).
+- **CLI flags**: `--cascade`, `--top-k N`, `--openalex-mailto EMAIL`, `--non-generative`.
+- **New module** `bibtex_updater.sources` exposing `OpenAlexClient`, `select_top_k_by_title_similarity`, `cross_source_author_intersection`, and the cascade tuning constants.
+
+### Changed
+- `FactCheckerConfig` gains `cascade_mode`, `top_k`, `cascade_low_confidence`, `cascade_high_confidence`, `openalex_mailto`. All default to legacy parallel-search behavior unless `--cascade` is set.
+- `FactChecker.API_SOURCES` now includes `openalex` (used in cascade mode only).
+
+### Backward compatibility
+- All existing JSONL output keys retained. New `confidence_score` is additive.
+- Default behavior unchanged unless `--cascade` is set.
+- All 673 pre-existing tests pass; +35 new tests in `tests/test_cascade_sources.py`.
+
 ## [0.7.0] - 2026-02-12
 
 ### Added

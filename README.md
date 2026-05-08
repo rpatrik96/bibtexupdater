@@ -210,11 +210,39 @@ For `filter_bibliography.py` only (no dependencies required):
 
 ![Reference fact-checker](assets/fact-checker.gif)
 
-- **Multi-source validation**: Crossref, DBLP, Semantic Scholar
+- **Multi-source validation**: Crossref, DBLP, Semantic Scholar, OpenAlex
 - **Detailed mismatch detection**: Title, author, year, venue comparisons
 - **Hallucination detection**: Identifies likely fabricated references
 - **Structured reports**: JSON and JSONL output formats
 - **CI/CD integration**: Strict mode with exit codes for automation
+
+#### Cascading verification (`--cascade`)
+
+Inspired by [Abbonato 2026 (CheckIfExist)](https://arxiv.org/abs/2602.15871), the cascade explicitly orders sources CrossRef → Semantic Scholar → OpenAlex and short-circuits as soon as one source produces a high-confidence match. Combined with top-K candidate retrieval and cross-source author intersection, it catches `swapped_authors` / chimeric citations that single-source verification misses.
+
+```bash
+# Cascading verification with top-3 candidates per source
+bibtex-check references.bib --cascade --top-k 3 --jsonl out.jsonl
+
+# Polite OpenAlex pool (recommended)
+bibtex-check references.bib --cascade --openalex-mailto you@example.com
+```
+
+A 0–100 numeric `confidence_score` (additive in the JSONL output) summarizes per-field similarity with explicit penalty/bonus contributions:
+
+- Multi-source bonus: `+10` when ≥2 sources confirm the same authors
+- Penalties: title-mismatch `-20`, author-mismatch `-20`, journal-mismatch `-15`, fabricated-author `-10` each (capped at `-20`)
+- Asymmetric formula for the high-title-low-author chimeric case: `confidence = S_title − 0.5 × (100 − S_author)`
+
+#### Non-generative-AI mode (`--non-generative`)
+
+For venue-policy compliance ([ACL ARR](https://aclrollingreview.org/reviewerguidelines#q-can-i-use-generative-ai), [ICML 2026](https://icml.cc/Conferences/2026/LLM-Policy)) the `--non-generative` flag (or `BIBTEX_CHECK_NON_GENERATIVE=1` env var) refuses to load any LLM backend at runtime. Today the package has no LLM backends, so this is a forward-compat guard plus a startup banner:
+
+```bash
+bibtex-check references.bib --non-generative --strict
+# bibtex-check running in non-generative mode (no LLM calls).
+# Compliant with ICML 2026 / ACL ARR LLM-in-review policies.
+```
 
 ### Filter Bibliography (`bibtex-filter`)
 
