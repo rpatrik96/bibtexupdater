@@ -315,3 +315,65 @@ class TestMatcherThresholds:
 
         # Should still be reasonably high
         assert title_score >= 0.8
+
+
+class TestAtomicReplace:
+    """Tests for atomic_replace cross-device fallback."""
+
+    def test_same_filesystem(self, tmp_path):
+        """Standard case: src and dst on the same filesystem — atomic os.replace."""
+        from bibtex_updater.utils import atomic_replace
+
+        src = tmp_path / "src.txt"
+        dst = tmp_path / "dst.txt"
+        src.write_text("hello")
+
+        atomic_replace(str(src), str(dst))
+
+        assert dst.read_text() == "hello"
+        assert not src.exists()
+
+    def test_exdev_fallback(self, tmp_path, monkeypatch):
+        """When os.replace raises EXDEV, fall back to copy + unlink."""
+        import errno
+        import os
+
+        from bibtex_updater.utils import atomic_replace
+
+        src = tmp_path / "src.txt"
+        dst = tmp_path / "dst.txt"
+        src.write_text("payload")
+
+        def fake_replace(s, d):
+            raise OSError(errno.EXDEV, "Invalid cross-device link")
+
+        monkeypatch.setattr(os, "replace", fake_replace)
+
+        atomic_replace(str(src), str(dst))
+
+        assert dst.read_text() == "payload"
+        assert not src.exists()
+
+    def test_non_exdev_oserror_propagates(self, tmp_path, monkeypatch):
+        """OSErrors other than EXDEV should propagate, not silently fall back."""
+        import errno
+        import os
+
+        import pytest
+
+        from bibtex_updater.utils import atomic_replace
+
+        src = tmp_path / "src.txt"
+        dst = tmp_path / "dst.txt"
+        src.write_text("payload")
+
+        def fake_replace(s, d):
+            raise OSError(errno.EACCES, "Permission denied")
+
+        monkeypatch.setattr(os, "replace", fake_replace)
+
+        with pytest.raises(OSError) as excinfo:
+            atomic_replace(str(src), str(dst))
+        assert excinfo.value.errno == errno.EACCES
+        # Source must remain untouched on failure.
+        assert src.exists()

@@ -11,12 +11,12 @@ HTTP infrastructure with caching and rate limiting, and API client utilities.
 from __future__ import annotations
 
 import collections
+import errno
 import json
 import os
-import errno
-import shutil
 import random
 import re
+import shutil
 import sqlite3
 import tempfile
 import threading
@@ -58,6 +58,27 @@ ACL_DOI_PREFIX = "10.18653/v1/"
 ACL_ANTHOLOGY_ID_RE = re.compile(r"https?://aclanthology\.org/([A-Z0-9][\w.-]+?)(?:\.pdf|\.bib)?/?$", re.IGNORECASE)
 OPENALEX_API = "https://api.openalex.org"
 EUROPEPMC_API = "https://www.ebi.ac.uk/europepmc/webservices/rest"
+
+
+# ------------- Atomic File Replace -------------
+
+
+def atomic_replace(src: str, dst: str) -> None:
+    """Atomically move src to dst, with a copy+unlink fallback on cross-device errors.
+
+    os.replace is atomic on the same filesystem but raises OSError EXDEV when
+    src and dst live on different filesystems — common when $TMPDIR is on
+    tmpfs and dst is on disk. In that case we fall back to a non-atomic
+    shutil.copyfile + os.unlink.
+    """
+    try:
+        os.replace(src, dst)
+    except OSError as e:
+        if e.errno == errno.EXDEV:
+            shutil.copyfile(src, dst)
+            os.unlink(src)
+        else:
+            raise
 
 
 # ------------- Text Normalization -------------
@@ -434,7 +455,8 @@ class AdaptiveRateLimiterRegistry(RateLimiterRegistry):
         """
         super().__init__(limits)
         self._min_limits: dict[str, int] = {
-            k: max(5, v // 4) for k, v in self._limits.items()  # Minimum is 25% of default
+            k: max(5, v // 4)
+            for k, v in self._limits.items()  # Minimum is 25% of default
         }
         self._backoff_until: dict[str, float] = {}  # Service -> timestamp when backoff ends
 
@@ -552,14 +574,7 @@ class DiskCache:
                 os.fsync(tmp.fileno())
             finally:
                 tmp.close()
-            try: # replace fails if tmp file and destination are not on the same file system
-                os.replace(tmp.name, self.path)
-            except OSError as e:
-                if e.errno == errno.EXDEV:
-                    shutil.copyfile(tmp.name, self.path)
-                    os.unlink(tmp.name)
-                else:
-                    raise e
+            atomic_replace(tmp.name, self.path)
 
     def has(self, key: str) -> bool:
         """Check if a key exists in the cache."""
@@ -816,14 +831,7 @@ class ResolutionCache:
             os.fsync(tmp.fileno())
         finally:
             tmp.close()
-        try: # replace fails if tmp file and destination are not on the same file system
-            os.replace(tmp.name, self.path)
-        except OSError as e:
-            if e.errno == errno.EXDEV:
-                shutil.copyfile(tmp.name, self.path)
-                os.unlink(tmp.name)
-            else:
-                raise e
+        atomic_replace(tmp.name, self.path)
 
     def _make_key(self, arxiv_id: str | None, doi: str | None) -> str:
         """Create cache key from identifiers."""

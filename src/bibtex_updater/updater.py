@@ -40,8 +40,6 @@ import difflib
 import json
 import logging
 import os
-import errno
-import shutil
 import re
 import sys
 import tempfile
@@ -69,6 +67,7 @@ from bibtex_updater.utils import (
     ResolutionCacheEntry,
     SqliteCache,
     acl_anthology_bib_to_record,
+    atomic_replace,
     authors_last_names,
     crossref_message_to_record,
     dblp_hit_to_record,
@@ -132,14 +131,7 @@ class BibWriter:
             os.fsync(tmp.fileno())
         finally:
             tmp.close()
-        try: # replace fails if tmp file and destination are not on the same file system
-            os.replace(tmp.name, path)
-        except OSError as e:
-            if e.errno == errno.EXDEV:
-                shutil.copyfile(tmp.name, path)
-                os.unlink(tmp.name)
-            else:
-                raise e
+        atomic_replace(tmp.name, path)
 
 
 # ------------- Google Scholar Client (optional) -------------
@@ -4512,9 +4504,9 @@ def test_update_preserves_author_list():
     # Verify the last names match using the project's comparison functions
     original_last_names = set(authors_last_names(entry["author"]))
     updated_last_names = set(authors_last_names(updated["author"]))
-    assert (
-        original_last_names == updated_last_names
-    ), f"Author last names changed: {original_last_names} -> {updated_last_names}"
+    assert original_last_names == updated_last_names, (
+        f"Author last names changed: {original_last_names} -> {updated_last_names}"
+    )
 
 
 def test_update_preserves_title():
