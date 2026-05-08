@@ -49,6 +49,18 @@ from bibtex_updater.matching import (
     is_near_miss_title,
     title_edit_distance,
 )
+from bibtex_updater.sources import (
+    CASCADE_HIGH_CONFIDENCE,
+    CASCADE_LOW_CONFIDENCE,
+    DEFAULT_OPENALEX_MAILTO,
+    DEFAULT_TOP_K,
+    MAX_TOP_K,
+    AuthorIntersectionResult,
+    OpenAlexClient,
+    cross_source_author_intersection,
+    openalex_work_to_candidate_record,
+    select_top_k_by_title_similarity,
+)
 from bibtex_updater.utils import (
     # API endpoints
     CROSSREF_API,
@@ -72,6 +84,94 @@ from bibtex_updater.utils import (
     s2_data_to_record,
     strip_diacritics,
 )
+
+# ------------- Numeric confidence tunables (CheckIfExist, Abbonato 2026) -------------
+#
+# Penalties / bonuses are intentionally module-level constants so callers and
+# tests can override them without poking into class internals. Do NOT auto-fit
+# these -- the values are taken from the published reference.
+
+#: Title mismatch penalty (subtracted from numeric confidence, 0-100 scale).
+PENALTY_TITLE_MISMATCH: float = 20.0
+
+#: Author mismatch penalty.
+PENALTY_AUTHOR_MISMATCH: float = 20.0
+
+#: Journal/venue mismatch penalty (paper allows -10..-20 range; pick midpoint).
+PENALTY_JOURNAL_MISMATCH: float = 15.0
+
+#: Per-fabricated-author penalty.
+PENALTY_PER_FABRICATED_AUTHOR: float = 10.0
+
+#: Cap on cumulative fabricated-author penalty.
+PENALTY_FABRICATED_AUTHOR_CAP: float = 20.0
+
+#: Threshold above which the asymmetric high-title/low-author Case A applies.
+CASE_A_TITLE_THRESHOLD: float = 80.0
+
+#: Author similarity threshold below which Case A applies.
+CASE_A_AUTHOR_THRESHOLD: float = 90.0
+
+#: Multi-source confirmation bonus (β_ms in the paper, 0..10).
+MULTI_SOURCE_BONUS: float = 10.0
+
+
+# ------------- Non-generative-AI mode -------------
+#
+# When ``NON_GENERATIVE_MODE`` is enabled (CLI flag ``--non-generative`` or env
+# var ``BIBTEX_CHECK_NON_GENERATIVE=1``), bibtex-check refuses to import any
+# LLM-based backend. Today the package has no LLM backends, so the gate is a
+# forward-compat guard plus a banner for venue-policy compliance
+# (ACL ARR Apr-2026 LLM-in-review policy, ICML 2026 restrictions).
+
+NON_GENERATIVE_MODE: bool = False
+
+#: Substrings that, if present in a module name, mark it as an LLM backend.
+_LLM_BACKEND_MARKERS: tuple[str, ...] = (
+    "openai",
+    "anthropic",
+    "llm",
+    "huggingface",
+    "transformers",
+    "ollama",
+)
+
+
+def set_non_generative_mode(enabled: bool) -> None:
+    """Toggle the global ``NON_GENERATIVE_MODE`` flag."""
+    global NON_GENERATIVE_MODE
+    NON_GENERATIVE_MODE = bool(enabled)
+
+
+def is_non_generative_mode() -> bool:
+    """Return the current non-generative-mode flag (env var falls through)."""
+    import os
+
+    if NON_GENERATIVE_MODE:
+        return True
+    return os.environ.get("BIBTEX_CHECK_NON_GENERATIVE", "").strip() in {"1", "true", "yes", "on"}
+
+
+def assert_no_llm_backend(module_name: str) -> None:
+    """Refuse to import an LLM-style backend when non-generative mode is on.
+
+    Args:
+        module_name: Name of the backend module being imported.
+
+    Raises:
+        RuntimeError: If non-generative mode is active and ``module_name``
+            looks like an LLM backend.
+    """
+    if not is_non_generative_mode():
+        return
+    lower = (module_name or "").lower()
+    if any(marker in lower for marker in _LLM_BACKEND_MARKERS):
+        raise RuntimeError(
+            "bibtex-check is in non-generative-AI mode (--non-generative or "
+            "BIBTEX_CHECK_NON_GENERATIVE=1); refusing to load LLM backend "
+            f"{module_name!r}. Disable the flag if you really need it."
+        )
+
 
 # ------------- Enums & Data Classes -------------
 
@@ -160,6 +260,170 @@ class FactCheckerConfig:
     max_candidates_per_source: int = 10
     check_years: bool = True
     check_dois: bool = True
+    # CheckIfExist additions (Item 1 + 2): explicit cascading + top-K retrieval
+    cascade_mode: bool = False
+    top_k: int = DEFAULT_TOP_K
+    cascade_low_confidence: float = CASCADE_LOW_CONFIDENCE
+    cascade_high_confidence: float = CASCADE_HIGH_CONFIDENCE
+    openalex_mailto: str = DEFAULT_OPENALEX_MAILTO
+
+
+# ------------- Item 5: Rich VerificationResult -------------
+
+
+@dataclass
+class VerificationResult:
+    """Rich per-entry verification result with similarity breakdown.
+
+    This is the structured output for callers that want everything the
+    fact-checker computed -- per-field similarity scores, confirmed/suspect
+    authors, and the source provenance. The classic ``FactCheckResult`` is
+    still produced and serialized to JSONL for backward compatibility; this
+    type is purely additive.
+    """
+
+    bibtex_key: str
+    status: str
+    confidence_score: float
+    similarity_breakdown: dict[str, float]
+    confirmed_authors: list[str]
+    suspect_authors: list[str]
+    sources_consulted: list[str]
+    sources_confirmed: list[str]
+    issues: list[str]
+    matched_metadata: dict[str, str] | None = None
+
+
+# ------------- Item 4: Numeric confidence (0-100) -------------
+
+
+def compute_numeric_confidence(
+    title_score: float,
+    author_score: float,
+    journal_score: float,
+    year_score: float,
+    issues: list[str],
+    multi_source_bonus: float = 0.0,
+    fabricated_author_count: int = 0,
+) -> float:
+    """Compute the CheckIfExist numeric confidence in [0, 100].
+
+    All similarity inputs are 0-100 scale.
+
+    - Case A (asymmetric, real-paper-fake-authors detector):
+      ``S_title > CASE_A_TITLE_THRESHOLD AND S_author < CASE_A_AUTHOR_THRESHOLD``
+      => ``confidence = S_title - 0.5 * (100 - S_author)``
+    - Case B (default):
+      ``confidence = mean(S_title, S_author, S_journal, S_year) + β_ms``
+
+    Then explicit penalties for any reported issues are applied.
+
+    Args:
+        title_score: 0-100.
+        author_score: 0-100.
+        journal_score: 0-100.
+        year_score: 0-100.
+        issues: List of issue tags (``"title_mismatch"``, ``"author_mismatch"``,
+            ``"journal_mismatch"`` / ``"venue_mismatch"``).
+        multi_source_bonus: ``β_ms`` from cross-source author intersection.
+        fabricated_author_count: Number of "suspect" authors flagged.
+
+    Returns:
+        Float in ``[0.0, 100.0]``.
+    """
+    bonus = max(0.0, min(float(multi_source_bonus), 10.0))
+
+    # Case A: high-title-low-author asymmetric
+    if title_score > CASE_A_TITLE_THRESHOLD and author_score < CASE_A_AUTHOR_THRESHOLD:
+        confidence = title_score - 0.5 * (100.0 - author_score)
+    else:
+        confidence = (title_score + author_score + journal_score + year_score) / 4.0 + bonus
+
+    # Issue-based penalties (constants, not auto-fit)
+    issue_set = {i.lower() for i in (issues or [])}
+    if "title_mismatch" in issue_set:
+        confidence -= PENALTY_TITLE_MISMATCH
+    if "author_mismatch" in issue_set:
+        confidence -= PENALTY_AUTHOR_MISMATCH
+    if "journal_mismatch" in issue_set or "venue_mismatch" in issue_set:
+        confidence -= PENALTY_JOURNAL_MISMATCH
+
+    # Per-fabricated-author penalty, capped
+    if fabricated_author_count > 0:
+        fab_penalty = min(
+            PENALTY_PER_FABRICATED_AUTHOR * float(fabricated_author_count),
+            PENALTY_FABRICATED_AUTHOR_CAP,
+        )
+        confidence -= fab_penalty
+
+    return max(0.0, min(100.0, confidence))
+
+
+def build_verification_result(
+    fc_result: FactCheckResult,
+    intersection: AuthorIntersectionResult | None = None,
+    source_records: dict[str, PublishedRecord | None] | None = None,
+) -> VerificationResult:
+    """Assemble a rich :class:`VerificationResult` from a :class:`FactCheckResult`.
+
+    Item 5: callers that want per-field similarity scores plus the cross-source
+    author intersection get them here without the legacy JSONL output changing.
+
+    Args:
+        fc_result: The classic fact-check result from ``FactChecker.check_entry``.
+        intersection: Optional cross-source author intersection -- normally
+            ``FactChecker.last_author_intersection`` from the same run.
+        source_records: Optional ``source_name -> PublishedRecord`` mapping --
+            normally ``FactChecker.last_source_records``.
+
+    Returns:
+        :class:`VerificationResult`. The numeric ``confidence_score`` falls
+        back to ``getattr(fc_result, "confidence_score", overall_confidence*100)``
+        so older paths still get a sensible score.
+    """
+    # Per-field similarity breakdown (0-100 scale, more useful for display).
+    breakdown: dict[str, float] = {}
+    issues: list[str] = []
+    for name, comp in fc_result.field_comparisons.items():
+        breakdown[name] = float(comp.similarity_score) * 100.0
+        if not comp.matches:
+            issues.append(f"{name}_mismatch")
+
+    confidence_score = float(getattr(fc_result, "confidence_score", fc_result.overall_confidence * 100.0))
+
+    confirmed = list(intersection.confirmed) if intersection else []
+    suspect = list(intersection.suspect) if intersection else []
+    if suspect:
+        issues.append("potential_fabricated_authors")
+
+    sources_consulted = list(fc_result.api_sources_queried)
+    sources_confirmed = list(fc_result.api_sources_with_hits)
+
+    matched: dict[str, str] | None = None
+    if fc_result.best_match is not None:
+        matched = {
+            "title": fc_result.best_match.title or "",
+            "doi": fc_result.best_match.doi or "",
+            "journal": fc_result.best_match.journal or "",
+            "year": str(fc_result.best_match.year) if fc_result.best_match.year else "",
+        }
+
+    # Annotate with source records if provided -- useful for debugging.
+    if source_records:
+        sources_consulted = sorted({*sources_consulted, *source_records.keys()})
+
+    return VerificationResult(
+        bibtex_key=fc_result.entry_key,
+        status=fc_result.status.value,
+        confidence_score=confidence_score,
+        similarity_breakdown=breakdown,
+        confirmed_authors=confirmed,
+        suspect_authors=suspect,
+        sources_consulted=sources_consulted,
+        sources_confirmed=sources_confirmed,
+        issues=issues,
+        matched_metadata=matched,
+    )
 
 
 # ------------- Entry Classification -------------
@@ -1091,7 +1355,7 @@ def venues_match(venue_a: str, venue_b: str, threshold: float = 0.70) -> tuple[b
 class FactChecker:
     """Validates bibliographic entries against external APIs."""
 
-    API_SOURCES = ["crossref", "dblp", "semanticscholar"]
+    API_SOURCES = ["crossref", "dblp", "semanticscholar", "openalex"]
 
     def __init__(
         self,
@@ -1100,12 +1364,23 @@ class FactChecker:
         s2: SemanticScholarClient,
         config: FactCheckerConfig,
         logger: logging.Logger,
+        openalex: OpenAlexClient | None = None,
     ):
         self.crossref = crossref
         self.dblp = dblp
         self.s2 = s2
         self.config = config
         self.logger = logger
+        # OpenAlex client is optional; tests can pass a fake. The cascade falls
+        # back to creating a default client if not provided but only when
+        # cascade_mode is on -- otherwise legacy parallel-search keeps current
+        # CrossRef/DBLP/S2 behavior.
+        self.openalex: OpenAlexClient | None = openalex
+        # The most recent cross-source author intersection (set by check_entry).
+        self.last_author_intersection: AuthorIntersectionResult | None = None
+        # Per-source records from the most recent check (used by the rich
+        # VerificationResult builder).
+        self.last_source_records: dict[str, PublishedRecord | None] = {}
 
     def _validate_year(self, entry: dict[str, Any]) -> FactCheckStatus | None:
         """Pre-API year validation. Returns a status if year is invalid, None if OK."""
@@ -1251,10 +1526,16 @@ class FactChecker:
                 )
 
         query = f"{title_norm} {first_author}".strip()
-        candidates = self._query_all_sources(entry, query, sources_queried, sources_with_hits, errors)
+        # Item 1: explicit cascade vs. legacy parallel search.
+        if self.config.cascade_mode:
+            candidates = self._query_cascade(entry, query, sources_queried, sources_with_hits, errors)
+        else:
+            candidates = self._query_all_sources(entry, query, sources_queried, sources_with_hits, errors)
 
         if not candidates:
             status = FactCheckStatus.API_ERROR if errors else FactCheckStatus.NOT_FOUND
+            self.last_author_intersection = None
+            self.last_source_records = {}
             return FactCheckResult(
                 entry_key=entry_key,
                 entry_type=entry_type,
@@ -1269,6 +1550,8 @@ class FactChecker:
 
         # P2.4: Detect chimeric titles before sorting
         if self._detect_chimeric_title(entry, candidates):
+            self.last_author_intersection = None
+            self.last_source_records = {}
             return FactCheckResult(
                 entry_key=entry_key,
                 entry_type=entry_type,
@@ -1283,7 +1566,20 @@ class FactChecker:
 
         # Sort candidates by score descending
         candidates.sort(key=lambda x: x[0], reverse=True)
-        best_score, best_match, source = candidates[0]
+        best_score, best_match, _source = candidates[0]
+
+        # Item 3: cross-source author intersection -- pick the best record from
+        # each source and intersect their author lists. Stored on the checker
+        # so callers can build a rich VerificationResult without re-querying.
+        best_per_source: dict[str, PublishedRecord | None] = {}
+        for _cand_score, cand_rec, cand_source in candidates:
+            current = best_per_source.get(cand_source)
+            if current is None:
+                best_per_source[cand_source] = cand_rec
+            # The list is already sorted desc; first entry per source wins.
+        self.last_source_records = best_per_source
+        intersection = cross_source_author_intersection(best_per_source, multi_source_bonus=MULTI_SOURCE_BONUS)
+        self.last_author_intersection = intersection
 
         field_comparisons = self._compare_all_fields(entry, best_match)
         status = self._determine_status(best_score, field_comparisons, sources_with_hits)
@@ -1307,7 +1603,36 @@ class FactChecker:
             errors=errors,
         )
 
-        return FactCheckResult(
+        # Item 4: numeric (0-100) confidence with explicit penalties/bonuses.
+        # Stored alongside the legacy ``overall_confidence`` (0-1 calibrated)
+        # via the ``confidence_score`` attribute so existing JSONL output keys
+        # remain untouched.
+        title_pct = (field_comparisons["title"].similarity_score if "title" in field_comparisons else 0.0) * 100.0
+        author_pct = (field_comparisons["author"].similarity_score if "author" in field_comparisons else 0.0) * 100.0
+        venue_pct = (field_comparisons["venue"].similarity_score if "venue" in field_comparisons else 0.0) * 100.0
+        year_pct = (field_comparisons["year"].similarity_score if "year" in field_comparisons else 0.0) * 100.0
+
+        issues: list[str] = []
+        if "title" in field_comparisons and not field_comparisons["title"].matches:
+            issues.append("title_mismatch")
+        if "author" in field_comparisons and not field_comparisons["author"].matches:
+            issues.append("author_mismatch")
+        if "venue" in field_comparisons and not field_comparisons["venue"].matches:
+            issues.append("venue_mismatch")
+        if "year" in field_comparisons and not field_comparisons["year"].matches:
+            issues.append("year_mismatch")
+
+        numeric_conf = compute_numeric_confidence(
+            title_score=title_pct,
+            author_score=author_pct,
+            journal_score=venue_pct,
+            year_score=year_pct,
+            issues=issues,
+            multi_source_bonus=intersection.bonus,
+            fabricated_author_count=len(intersection.suspect),
+        )
+
+        result = FactCheckResult(
             entry_key=entry_key,
             entry_type=entry_type,
             status=status,
@@ -1318,6 +1643,10 @@ class FactChecker:
             api_sources_with_hits=sources_with_hits,
             errors=errors,
         )
+        # Stash the numeric (0-100) confidence as an attribute -- additive only,
+        # not part of the JSONL schema so existing consumers keep working.
+        result.confidence_score = numeric_conf  # type: ignore[attr-defined]
+        return result
 
     def _query_all_sources(
         self,
@@ -1418,6 +1747,104 @@ class FactChecker:
                     pass  # Errors already captured in individual search functions
 
         return candidates
+
+    def _query_cascade(
+        self,
+        entry: dict[str, Any],
+        query: str,
+        sources_queried: list[str],
+        sources_with_hits: list[str],
+        errors: list[str],
+    ) -> list[tuple[float, PublishedRecord, str]]:
+        """Cascading source order: CrossRef -> Semantic Scholar -> OpenAlex.
+
+        Item 1 (CheckIfExist Algorithm 1, Abbonato 2026). Each step retrieves
+        ``config.top_k`` candidates and re-ranks them by Levenshtein title
+        similarity (Item 2). The cascade short-circuits as soon as a source
+        returns a candidate at or above ``cascade_high_confidence``.
+
+        Returns:
+            List of ``(score, record, source_name)`` tuples, possibly from
+            multiple sources if intermediate matches were below threshold.
+        """
+        title_norm = normalize_title_for_match(entry.get("title", ""))
+        authors_ref = authors_last_names(entry.get("author", ""), limit=3)
+        top_k = max(1, min(int(self.config.top_k), MAX_TOP_K))
+
+        all_candidates: list[tuple[float, PublishedRecord, str]] = []
+
+        def _ingest(source_name: str, records: list[PublishedRecord]) -> float:
+            """Score + add records under ``source_name``; return best score."""
+            best_local = 0.0
+            ranked = select_top_k_by_title_similarity(entry.get("title", ""), records, k=top_k)
+            for _title_score, rec in ranked:
+                score = self._score_candidate(title_norm, authors_ref, rec)
+                all_candidates.append((score, rec, source_name))
+                if score > best_local:
+                    best_local = score
+            return best_local
+
+        # ----- Step 1: CrossRef -----
+        sources_queried.append("crossref")
+        try:
+            cr_items = self.crossref.search(query, rows=top_k)
+        except Exception as exc:
+            cr_items = []
+            errors.append(f"Crossref: {exc}")
+        cr_records: list[PublishedRecord] = []
+        for item in cr_items or []:
+            rec = crossref_message_to_record(item)
+            if rec:
+                cr_records.append(rec)
+        if cr_records:
+            sources_with_hits.append("crossref")
+        best_cr = _ingest("crossref", cr_records)
+        if best_cr >= self.config.cascade_high_confidence:
+            return all_candidates
+
+        # ----- Step 2: Semantic Scholar (preprint coverage) -----
+        sources_queried.append("semanticscholar")
+        try:
+            s2_data = self.s2.search(query, limit=top_k)
+        except Exception as exc:
+            s2_data = []
+            errors.append(f"Semantic Scholar: {exc}")
+        s2_records: list[PublishedRecord] = []
+        for item in s2_data or []:
+            rec = s2_data_to_record(item)
+            if rec:
+                s2_records.append(rec)
+        if s2_records:
+            sources_with_hits.append("semanticscholar")
+        best_s2 = _ingest("semanticscholar", s2_records)
+        best_so_far = max(best_cr, best_s2)
+        if best_so_far >= self.config.cascade_high_confidence:
+            return all_candidates
+
+        # ----- Step 3: OpenAlex (aggregator catch-all) -----
+        if self.openalex is None:
+            # Lazily build a default OpenAlex client; reuses the shared HTTP
+            # client when one is reachable through the Crossref client.
+            shared_http = getattr(self.crossref, "http", None)
+            self.openalex = OpenAlexClient(
+                http=shared_http,
+                mailto=self.config.openalex_mailto,
+            )
+        sources_queried.append("openalex")
+        try:
+            oa_items = self.openalex.search(query, limit=top_k)
+        except Exception as exc:
+            oa_items = []
+            errors.append(f"OpenAlex: {exc}")
+        oa_records: list[PublishedRecord] = []
+        for item in oa_items or []:
+            rec = openalex_work_to_candidate_record(item)
+            if rec:
+                oa_records.append(rec)
+        if oa_records:
+            sources_with_hits.append("openalex")
+        _ingest("openalex", oa_records)
+        return all_candidates
 
     def _score_candidate(self, title_norm: str, authors_ref: list[str], rec: PublishedRecord) -> float:
         """Score a candidate record against the entry."""
@@ -1865,6 +2292,8 @@ class FactCheckProcessor:
                                 "category": result.category.value if result.category else None,
                                 "status": result.status.value,
                                 "confidence": result.overall_confidence,
+                                # Additive: 0-100 numeric confidence (Item 4).
+                                "confidence_score": float(getattr(result, "confidence_score", 0.0)),
                                 "mismatched_fields": [n for n, c in result.field_comparisons.items() if not c.matches],
                                 "api_sources": result.api_sources_with_hits,
                                 "errors": result.errors,
@@ -1957,6 +2386,8 @@ class FactCheckProcessor:
                 "category": r.category.value if r.category else None,
                 "status": r.status.value,
                 "confidence": r.overall_confidence,
+                # Additive: 0-100 numeric confidence (Item 4).
+                "confidence_score": float(getattr(r, "confidence_score", 0.0)),
                 "field_comparisons": {
                     name: {
                         "entry_value": c.entry_value,
@@ -2018,6 +2449,8 @@ class FactCheckProcessor:
                         "category": r.category.value if r.category else None,
                         "status": r.status.value,
                         "confidence": r.overall_confidence,
+                        # Additive: 0-100 numeric confidence (Item 4).
+                        "confidence_score": float(getattr(r, "confidence_score", 0.0)),
                         "mismatched_fields": [n for n, c in r.field_comparisons.items() if not c.matches],
                         "api_sources": r.api_sources_with_hits,
                         "errors": r.errors,
@@ -2170,6 +2603,39 @@ Examples:
         help="Disable Google Books API (use Open Library only)",
     )
 
+    # CheckIfExist additions
+    cascade_opts = p.add_argument_group("cascading source order (CheckIfExist)")
+    cascade_opts.add_argument(
+        "--cascade",
+        action="store_true",
+        help="Use explicit CrossRef -> Semantic Scholar -> OpenAlex cascade (Item 1).",
+    )
+    cascade_opts.add_argument(
+        "--top-k",
+        type=int,
+        default=DEFAULT_TOP_K,
+        metavar="N",
+        help=f"Top-K candidates per source (default: {DEFAULT_TOP_K}, max: {MAX_TOP_K}).",
+    )
+    cascade_opts.add_argument(
+        "--openalex-mailto",
+        default=DEFAULT_OPENALEX_MAILTO,
+        metavar="EMAIL",
+        help="OpenAlex polite-pool email (default: %(default)s).",
+    )
+
+    # Non-generative-AI mode (venue policy compliance)
+    policy = p.add_argument_group("policy / compliance")
+    policy.add_argument(
+        "--non-generative",
+        action="store_true",
+        help=(
+            "Run in non-generative-AI mode (no LLM calls). Compliant with "
+            "ICML 2026 / ACL ARR LLM-in-review policies. Also settable via "
+            "BIBTEX_CHECK_NON_GENERATIVE=1."
+        ),
+    )
+
     return p
 
 
@@ -2181,6 +2647,18 @@ def main() -> int:
     level = logging.DEBUG if args.verbose else logging.INFO
     logging.basicConfig(level=level, format="%(levelname)s: %(message)s")
     logger = logging.getLogger("fact_checker")
+
+    # Item 6: non-generative-AI mode (CLI flag wins; env var also honored).
+    import os as _os
+
+    env_flag = _os.environ.get("BIBTEX_CHECK_NON_GENERATIVE", "").strip() in {"1", "true", "yes", "on"}
+    if args.non_generative or env_flag:
+        set_non_generative_mode(True)
+        sys.stderr.write(
+            "bibtex-check running in non-generative mode (no LLM calls). "
+            "Compliant with ICML 2026 / ACL ARR LLM-in-review policies.\n"
+        )
+        logger.info("non-generative-AI mode active")
 
     # Load entries from all BibTeX files
     entries = []
@@ -2231,6 +2709,7 @@ def main() -> int:
     )
 
     # Setup fact checker
+    top_k = max(1, min(int(args.top_k), MAX_TOP_K))
     config = FactCheckerConfig(
         title_threshold=args.title_threshold,
         author_threshold=args.author_threshold,
@@ -2238,6 +2717,9 @@ def main() -> int:
         venue_threshold=args.venue_threshold,
         check_dois=not args.no_check_dois,
         check_years=not args.no_check_years,
+        cascade_mode=bool(args.cascade),
+        top_k=top_k,
+        openalex_mailto=args.openalex_mailto,
     )
 
     # Setup API clients
@@ -2312,6 +2794,19 @@ def main() -> int:
     logger.info("Verified rate: %.1f%%", summary["verified_rate"] * 100)
     if summary["problematic_count"] > 0:
         logger.warning("Problematic entries: %d", summary["problematic_count"])
+
+    # Item 4: numeric confidence summary in the text report.
+    numeric_scores = [float(getattr(r, "confidence_score", 0.0)) for r in results]
+    if numeric_scores:
+        mean_score = sum(numeric_scores) / len(numeric_scores)
+        min_score = min(numeric_scores)
+        max_score = max(numeric_scores)
+        logger.info(
+            "Numeric confidence (0-100): mean=%.1f, min=%.1f, max=%.1f",
+            mean_score,
+            min_score,
+            max_score,
+        )
 
     # Write reports
     if args.report:

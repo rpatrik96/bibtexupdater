@@ -24,6 +24,20 @@ Example usage:
 
 from bibtex_updater._version import __version__
 
+# Cascading-source helpers and verification primitives (CheckIfExist, Abbonato 2026)
+from bibtex_updater.sources import (
+    CASCADE_HIGH_CONFIDENCE,
+    CASCADE_LOW_CONFIDENCE,
+    DEFAULT_OPENALEX_MAILTO,
+    DEFAULT_TOP_K,
+    MAX_TOP_K,
+    AuthorIntersectionResult,
+    OpenAlexClient,
+    cross_source_author_intersection,
+    openalex_work_to_candidate_record,
+    select_top_k_by_title_similarity,
+)
+
 # Core updater classes and functions
 from bibtex_updater.updater import (
     AsyncResolver,
@@ -98,6 +112,17 @@ from bibtex_updater.utils import (
 __all__ = [
     # Version
     "__version__",
+    # Cascading-source primitives (CheckIfExist, Abbonato 2026)
+    "AuthorIntersectionResult",
+    "CASCADE_HIGH_CONFIDENCE",
+    "CASCADE_LOW_CONFIDENCE",
+    "DEFAULT_OPENALEX_MAILTO",
+    "DEFAULT_TOP_K",
+    "MAX_TOP_K",
+    "OpenAlexClient",
+    "cross_source_author_intersection",
+    "openalex_work_to_candidate_record",
+    "select_top_k_by_title_similarity",
     # Core classes
     "AsyncResolver",
     "BibLoader",
