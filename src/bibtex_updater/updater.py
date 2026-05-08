@@ -4504,9 +4504,9 @@ def test_update_preserves_author_list():
     # Verify the last names match using the project's comparison functions
     original_last_names = set(authors_last_names(entry["author"]))
     updated_last_names = set(authors_last_names(updated["author"]))
-    assert original_last_names == updated_last_names, (
-        f"Author last names changed: {original_last_names} -> {updated_last_names}"
-    )
+    assert (
+        original_last_names == updated_last_names
+    ), f"Author last names changed: {original_last_names} -> {updated_last_names}"
 
 
 def test_update_preserves_title():

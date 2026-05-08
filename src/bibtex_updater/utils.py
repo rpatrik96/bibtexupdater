@@ -455,8 +455,7 @@ class AdaptiveRateLimiterRegistry(RateLimiterRegistry):
         """
         super().__init__(limits)
         self._min_limits: dict[str, int] = {
-            k: max(5, v // 4)
-            for k, v in self._limits.items()  # Minimum is 25% of default
+            k: max(5, v // 4) for k, v in self._limits.items()  # Minimum is 25% of default
         }
         self._backoff_until: dict[str, float] = {}  # Service -> timestamp when backoff ends
 
