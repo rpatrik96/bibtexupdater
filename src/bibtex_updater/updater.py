@@ -102,7 +102,15 @@ except Exception:  # pragma: no cover
 # ------------- IO Helpers -------------
 class BibLoader:
     def __init__(self) -> None:
-        self.parser = BibTexParser(common_strings=True)
+        # ignore_nonstandard_types defaults to True in bibtexparser, which
+        # SILENTLY DROPS biblatex entry types such as @online, @software,
+        # @dataset, @patent, @electronic, @thesis at parse time. Disabling it
+        # keeps these entries so they are resolved, written, and reported.
+        # Trade-off: disabling the filter also retains typo'd/unknown entry
+        # types (e.g. @junk) instead of dropping them; we accept that over
+        # silent data loss, since a stray bad type is visible and fixable
+        # whereas a vanished entry is not.
+        self.parser = BibTexParser(common_strings=True, ignore_nonstandard_types=False)
         self.parser.customization = None
 
     def load_file(self, path: str) -> bibtexparser.bibdatabase.BibDatabase:
@@ -3645,6 +3653,68 @@ def write_report_line(fh, res: ProcessResult, src_file: str | None = None) -> No
     fh.write(json.dumps(line, ensure_ascii=False) + "\n")
 
 
+# Matches a BibTeX entry header: @type{ key , ... — captures the citation key.
+# Anchored to the start of a logical line (optional leading whitespace only) so
+# the scan does not false-positive on (a) full-line ``%`` comments — the comment
+# marker precedes ``@`` on the line — or (b) a ``@type{key,`` substring sitting
+# inside a field value, which is never at column ~0.
+_ENTRY_KEY_RE = re.compile(r"(?m)^[ \t]*@\w+\s*\{\s*([^,\s]+)\s*,")
+
+
+def detect_dropped_keys(raw_text: str, parsed_ids: set[str]) -> list[str]:
+    """Find entry keys declared in raw BibTeX text but missing from the parsed DB.
+
+    Defense-in-depth against silent data loss: even with
+    ``ignore_nonstandard_types=False`` the parser still skips genuinely
+    malformed entries without naming them. This compares the citation keys
+    declared in the source text against the IDs that actually made it into the
+    database.
+
+    Args:
+        raw_text: The raw BibTeX file contents.
+        parsed_ids: The set of entry IDs present in the parsed database.
+
+    Returns:
+        Declared keys absent from ``parsed_ids``, in declaration order, deduped.
+    """
+    dropped: list[str] = []
+    seen: set[str] = set()
+    for match in _ENTRY_KEY_RE.finditer(raw_text):
+        key = match.group(1)
+        if key in parsed_ids or key in seen:
+            continue
+        seen.add(key)
+        dropped.append(key)
+    return dropped
+
+
+def write_dropped_report_line(fh, key: str, src_file: str | None = None) -> None:
+    """Write a JSONL report row for a dropped (unparseable) entry.
+
+    Emits exactly the same schema as :func:`write_report_line` so the report
+    stays consistent for downstream consumers, with ``action="dropped"`` and
+    only the original key populated.
+
+    Args:
+        fh: Open writable file handle.
+        key: The dropped citation key.
+        src_file: Source file the entry was declared in.
+    """
+    line = {
+        "file": src_file,
+        "key_old": key,
+        "key_new": None,
+        "doi_old": None,
+        "doi_new": None,
+        "action": "dropped",
+        "method": None,
+        "confidence": None,
+        "title_old": "",
+        "title_new": None,
+    }
+    fh.write(json.dumps(line, ensure_ascii=False) + "\n")
+
+
 # ------------- Main function helper components -------------
 
 
@@ -3795,10 +3865,28 @@ def load_databases(
         List of (path, database) tuples, or None if loading fails.
     """
     databases: list[tuple[str, bibtexparser.bibdatabase.BibDatabase]] = []
+    dropped: list[tuple[str, str]] = []  # (src_file, dropped_key)
     try:
         for path in args.inputs:
             db = loader.load_file(path)
             databases.append((path, db))
+
+            # Defense-in-depth: detect entries declared in the source file but
+            # missing from the parsed DB (genuinely malformed entries the parser
+            # skips silently). Name every dropped citation key so the loss is
+            # never silent again.
+            try:
+                with open(path, encoding="utf-8") as f:
+                    raw_text = f.read()
+            except OSError:
+                raw_text = ""
+            parsed_ids = {e.get("ID") for e in db.entries if e.get("ID")}
+            for key in detect_dropped_keys(raw_text, parsed_ids):
+                logger.warning("Dropped unparseable entry '%s' from %s (not added to database)", key, path)
+                dropped.append((path, key))
+
+        # Thread dropped keys to the report writer (consumed when --report set).
+        args._dropped_entries = dropped
         return databases
     except Exception as e:
         logger.error("Failed to read inputs: %s", e)
@@ -3920,6 +4008,14 @@ def write_output_and_report(
             for idx, res in enumerate(results):
                 src_file = src_for_entry[idx] if src_for_entry and idx < len(src_for_entry) else None
                 write_report_line(fh, res, src_file=src_file)
+
+            # Append an audit row per dropped (unparseable) entry so the loss is
+            # recorded, not just logged. Emit once even across multi-file
+            # in-place runs to avoid duplicate rows.
+            if not getattr(args, "_dropped_reported", False):
+                for src_file, key in getattr(args, "_dropped_entries", []) or []:
+                    write_dropped_report_line(fh, key, src_file=src_file)
+                args._dropped_reported = True
 
     return 0
 
