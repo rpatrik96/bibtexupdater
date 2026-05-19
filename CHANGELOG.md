@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Silent data loss on non-standard BibTeX entry types**: `BibLoader` constructed `BibTexParser(common_strings=True)` without `ignore_nonstandard_types=False`. Because bibtexparser defaults `ignore_nonstandard_types=True`, biblatex entry types (`@online`, `@software`, `@dataset`, `@patent`, `@electronic`, `@thesis`, …) were silently dropped at parse time — never entering the database, never resolved, written, or reported (a real run lost `@online{nanda2025pragmatic}`, 177→176 entries). The parser now passes `ignore_nonstandard_types=False`, so these entries are retained and round-trip through `BibWriter` unchanged. (Accepted trade-off: this also retains typo'd/unknown entry types such as `@junk` instead of dropping them — a visible, fixable artifact is preferable to silent data loss.)
+- **Dropped-entry audit trail**: added a defense-in-depth safety net for entries the parser still skips silently (genuinely malformed input). A new pure helper `detect_dropped_keys(raw_text, parsed_ids)` compares declared `@key` markers against parsed IDs; `load_databases` now logs a `WARNING` naming each dropped citation key and its file, and — when `--report` is set — emits one JSONL row per dropped key via the new `write_dropped_report_line` using the existing report schema with `action="dropped"`. Existing report rows and their ordering are unchanged.
+
 ## [0.9.0] - 2026-05-08
 
 ### Added
