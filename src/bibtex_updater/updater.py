@@ -804,6 +804,36 @@ class Detector:
         return PreprintDetection(False)
 
 
+def _s2_record_is_still_preprint(msg: dict[str, Any], doi: str | None) -> bool:
+    """Detect S2-from-arXiv payloads that only tag a preprint with a published venue.
+
+    Semantic Scholar's arXiv-keyed lookup can return a record whose
+    ``publicationVenue.name`` is the *published* venue (e.g. an ICLR
+    conference) while the rest of the payload is still the arXiv preprint:
+    ``externalIds.DOI`` is an arXiv DOI (``10.48550/arXiv...``), ``year`` /
+    ``publicationDate`` are the preprint's, and ``journal.name`` is "ArXiv".
+    Building a ``PublishedRecord`` from such a payload yields an internally
+    inconsistent upgrade (published venue + arXiv DOI + preprint year), and
+    also breaks ``--force-recheck`` idempotency because the retained arXiv DOI
+    re-triggers preprint detection.
+
+    Returns ``True`` when the resolved record is fundamentally still the arXiv
+    version and must be rejected so the resolution cascade falls through to a
+    source carrying the real published record (DBLP / OpenReview).
+
+    The preprint-DOI prefix check mirrors ``Detector.detect`` exactly: both
+    ``10.48550/arxiv`` (arXiv) and ``10.1101`` (bioRxiv/medRxiv) count as
+    preprint DOIs. The journal-name preprint-host check reuses
+    ``PREPRINT_HOSTS`` exactly as ``Resolver._credible_journal_article`` does.
+    """
+    if doi and doi.lower().startswith(("10.48550/arxiv", "10.1101")):
+        return True
+    journal_name = ((msg.get("journal") or {}).get("name") or "").lower()
+    if journal_name and any(host in journal_name for host in PREPRINT_HOSTS):
+        return True
+    return False
+
+
 # ------------- Resolver & Matching -------------
 class Resolver:
     # Accepted publication types for upgrades (includes ML conference papers)
@@ -1188,7 +1218,7 @@ class Resolver:
 
     # --- Semantic Scholar (safe alternative to Google Scholar scraping) ---
     def s2_from_arxiv(self, arxiv_id: str) -> PublishedRecord | None:
-        fields = "externalIds,title,year,authors,venue,publicationTypes,publicationVenue,url"
+        fields = "externalIds,title,year,authors,venue,publicationTypes,publicationVenue,journal,url"
         url = f"{S2_API}/paper/arXiv:{arxiv_id}"
         try:
             resp = self.http._request(
@@ -1204,6 +1234,17 @@ class Resolver:
         pub_types = msg.get("publicationTypes") or []
         is_journal = any(pt.lower() == "journalarticle" for pt in pub_types)
         if not (doi and is_journal):
+            return None
+        # Reject records that are still the arXiv preprint under a published
+        # venue label (arXiv DOI/year mixed with a published venue): fall
+        # through to DBLP for the real published record.
+        if _s2_record_is_still_preprint(msg, doi):
+            self.logger.debug(
+                "S2 arXiv record for %s still a preprint (doi=%s, journal=%s); rejecting",
+                arxiv_id,
+                doi,
+                (msg.get("journal") or {}).get("name"),
+            )
             return None
         title = msg.get("title")
         year = msg.get("year")
@@ -1253,7 +1294,7 @@ class Resolver:
             return {}
 
         S2_BATCH_URL = f"{S2_API}/paper/batch"
-        fields = "externalIds,title,year,authors,venue,publicationTypes,publicationVenue,url,paperId"
+        fields = "externalIds,title,year,authors,venue,publicationTypes,publicationVenue,journal,url,paperId"
 
         try:
             resp = self.http._request(
@@ -1292,6 +1333,19 @@ class Resolver:
 
             # Only include journal articles with DOIs
             if not (doi and is_journal):
+                results[input_id] = None
+                continue
+
+            # Reject records that are still the arXiv preprint under a
+            # published venue label (arXiv DOI/year mixed with a published
+            # venue): fall through to DBLP for the real published record.
+            if _s2_record_is_still_preprint(paper, doi):
+                self.logger.debug(
+                    "S2 batch record %s still a preprint (doi=%s, journal=%s); rejecting",
+                    input_id,
+                    doi,
+                    (paper.get("journal") or {}).get("name"),
+                )
                 results[input_id] = None
                 continue
 
@@ -2401,7 +2455,7 @@ class AsyncResolver:
         Returns:
             PublishedRecord if a journal article is found, None otherwise
         """
-        fields = "externalIds,title,year,authors,venue,publicationTypes,publicationVenue,url"
+        fields = "externalIds,title,year,authors,venue,publicationTypes,publicationVenue,journal,url"
         url = f"{S2_API}/paper/arXiv:{arxiv_id}"
         try:
             resp = await self.http.get(
@@ -2421,6 +2475,18 @@ class AsyncResolver:
         pub_types = msg.get("publicationTypes") or []
         is_journal = any(pt.lower() == "journalarticle" for pt in pub_types)
         if not (doi and is_journal):
+            return None
+
+        # Reject records that are still the arXiv preprint under a published
+        # venue label (arXiv DOI/year mixed with a published venue): fall
+        # through to DBLP for the real published record.
+        if _s2_record_is_still_preprint(msg, doi):
+            self.logger.debug(
+                "S2 arXiv record for %s still a preprint (doi=%s, journal=%s); rejecting",
+                arxiv_id,
+                doi,
+                (msg.get("journal") or {}).get("name"),
+            )
             return None
 
         title = msg.get("title")

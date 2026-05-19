@@ -290,3 +290,222 @@ class TestResolverMixinMethods:
         assert "Smith" in author_str
         assert "Doe" in author_str
         assert " and " in author_str
+
+
+# Exact failing S2 arXiv payload for arXiv:2406.14302 ("Identifiable
+# Exchangeable Mechanisms ..."): S2 keeps the arXiv preprint DOI + 2024 year
+# while reporting the *published* ICLR venue via publicationVenue. The record
+# is internally inconsistent and must NOT be used to upgrade the entry.
+IEM_S2_ARXIV_PAYLOAD = {
+    "paperId": "deadbeef",
+    "title": "Identifiable Exchangeable Mechanisms for Causal Structure and " "Representation Learning",
+    "year": 2024,
+    "publicationDate": "2024-06-20",
+    "externalIds": {"ArXiv": "2406.14302", "DOI": "10.48550/arXiv.2406.14302"},
+    "venue": "International Conference on Learning Representations",
+    "publicationTypes": ["JournalArticle"],
+    "publicationVenue": {"name": "International Conference on Learning Representations"},
+    "journal": {"name": "ArXiv"},
+    "url": "https://www.semanticscholar.org/paper/deadbeef",
+    "authors": [
+        {"name": "Patrik Reizinger"},
+        {"name": "Siyuan Guo"},
+    ],
+}
+
+# A genuinely published S2 arXiv payload: real publisher DOI + a real
+# (non-preprint) journal name. This must still be accepted.
+GENUINE_S2_ARXIV_PAYLOAD = {
+    "paperId": "cafef00d",
+    "title": "A Genuinely Published Paper",
+    "year": 2023,
+    "publicationDate": "2023-05-01",
+    "externalIds": {"ArXiv": "2301.00001", "DOI": "10.1162/neco_a_01567"},
+    "venue": "Neural Computation",
+    "publicationTypes": ["JournalArticle"],
+    "publicationVenue": {"name": "Neural Computation"},
+    "journal": {"name": "Neural Computation"},
+    "url": "https://www.semanticscholar.org/paper/cafef00d",
+    "authors": [
+        {"name": "Jane Doe"},
+        {"name": "John Smith"},
+    ],
+}
+
+
+# A bioRxiv preprint that S2 tagged with a published venue but left under a
+# bioRxiv DOI, with NO journal object at all (so only the DOI arm of the guard
+# can catch it). Mirrors Detector.detect, which treats 10.1101 as a preprint
+# DOI just like 10.48550/arxiv.
+BIORXIV_S2_ARXIV_PAYLOAD = {
+    "paperId": "b10b10b1",
+    "title": "A bioRxiv Preprint Tagged With a Published Venue",
+    "year": 2024,
+    "publicationDate": "2024-01-15",
+    "externalIds": {"ArXiv": "2401.99999", "DOI": "10.1101/2024.01.15.575678"},
+    "venue": "Nature Methods",
+    "publicationTypes": ["JournalArticle"],
+    "publicationVenue": {"name": "Nature Methods"},
+    "url": "https://www.semanticscholar.org/paper/b10b10b1",
+    "authors": [
+        {"name": "Patrik Reizinger"},
+        {"name": "Siyuan Guo"},
+    ],
+}
+
+
+def _resp(payload, status_code=200):
+    """Build a MagicMock HTTP response mirroring tests/test_cascade_sources.py."""
+    return MagicMock(status_code=status_code, json=lambda: payload)
+
+
+class TestS2FromArxivPreprintGuard:
+    """S2 arXiv builders must reject records that only tag a preprint with a
+    published venue while still carrying the arXiv DOI/year (the resolution
+    cascade should then fall through to DBLP for the real published record).
+    """
+
+    @pytest.fixture
+    def resolver(self, logger):
+        # MagicMock http (not FakeHttpClient, which raises on _request).
+        return Resolver(http=MagicMock(), logger=logger, scholarly_client=None)
+
+    # --- 1. Reject case: sync Resolver.s2_from_arxiv ---
+    def test_s2_from_arxiv_rejects_preprint_with_published_venue(self, resolver):
+        resolver.http._request.return_value = _resp(IEM_S2_ARXIV_PAYLOAD)
+        assert resolver.s2_from_arxiv("2406.14302") is None
+
+    # --- 1b. Reject case: bioRxiv-DOI-only payload (only the DOI arm can
+    #          catch it; no journal.name). Mirrors Detector.detect's 10.1101. ---
+    def test_s2_from_arxiv_rejects_biorxiv_doi_with_published_venue(self, resolver):
+        resolver.http._request.return_value = _resp(BIORXIV_S2_ARXIV_PAYLOAD)
+        assert resolver.s2_from_arxiv("2401.99999") is None
+
+    def test_async_s2_from_arxiv_rejects_biorxiv_doi_with_published_venue(self, logger):
+        async def _run():
+            http = MagicMock()
+
+            async def _get(*args, **kwargs):
+                return _resp(BIORXIV_S2_ARXIV_PAYLOAD)
+
+            http.get = _get
+            ares = AsyncResolver(http=http, logger=logger)
+            return await ares.s2_from_arxiv("2401.99999")
+
+        assert asyncio.run(_run()) is None
+
+    # --- 2. Non-regression: genuine published S2 record still accepted ---
+    def test_s2_from_arxiv_accepts_genuine_published_record(self, resolver):
+        resolver.http._request.return_value = _resp(GENUINE_S2_ARXIV_PAYLOAD)
+        rec = resolver.s2_from_arxiv("2301.00001")
+        assert rec is not None
+        assert rec.doi == "10.1162/neco_a_01567"
+        assert rec.journal == "Neural Computation"
+        assert rec.year == 2023
+
+    # --- 3a. Reject case: s2_batch_lookup ---
+    def test_s2_batch_lookup_rejects_preprint_with_published_venue(self, resolver):
+        resolver.http._request.return_value = _resp([IEM_S2_ARXIV_PAYLOAD])
+        results = resolver.s2_batch_lookup(["arXiv:2406.14302"])
+        assert results["arXiv:2406.14302"] is None
+
+    def test_s2_batch_lookup_accepts_genuine_published_record(self, resolver):
+        resolver.http._request.return_value = _resp([GENUINE_S2_ARXIV_PAYLOAD])
+        results = resolver.s2_batch_lookup(["arXiv:2301.00001"])
+        rec = results["arXiv:2301.00001"]
+        assert rec is not None
+        assert rec.doi == "10.1162/neco_a_01567"
+        assert rec.journal == "Neural Computation"
+
+    # --- 3b. Reject case: AsyncResolver.s2_from_arxiv ---
+    def test_async_s2_from_arxiv_rejects_preprint_with_published_venue(self, logger):
+        async def _run():
+            http = MagicMock()
+
+            async def _get(*args, **kwargs):
+                return _resp(IEM_S2_ARXIV_PAYLOAD)
+
+            http.get = _get
+            ares = AsyncResolver(http=http, logger=logger)
+            return await ares.s2_from_arxiv("2406.14302")
+
+        assert asyncio.run(_run()) is None
+
+    def test_async_s2_from_arxiv_accepts_genuine_published_record(self, logger):
+        async def _run():
+            http = MagicMock()
+
+            async def _get(*args, **kwargs):
+                return _resp(GENUINE_S2_ARXIV_PAYLOAD)
+
+            http.get = _get
+            ares = AsyncResolver(http=http, logger=logger)
+            return await ares.s2_from_arxiv("2301.00001")
+
+        rec = asyncio.run(_run())
+        assert rec is not None
+        assert rec.doi == "10.1162/neco_a_01567"
+
+    # --- 4a. Stage-1 short-circuit no longer fires for the reject payload ---
+    def test_stage1_does_not_short_circuit_on_preprint_venue(self, resolver):
+        """With the reject payload from S2 and no arXiv->Crossref DOI, Stage 1
+        must return (None, ...) so the cascade continues to DBLP."""
+
+        def _dispatch(method, url, *args, **kwargs):
+            if "semanticscholar" in url or "/paper/arXiv:" in url:
+                return _resp(IEM_S2_ARXIV_PAYLOAD)
+            # arXiv API: no published <arxiv:doi> -> candidate_doi is None
+            return MagicMock(status_code=200, text="<feed></feed>")
+
+        resolver.http._request.side_effect = _dispatch
+        detection = PreprintDetection(is_preprint=True, reason="eprint arXiv", arxiv_id="2406.14302", doi=None)
+        rec, candidate_doi = resolver._stage1_direct_lookup(detection)
+        assert rec is None
+
+    # --- 4b. Cascade falls through to DBLP -> correct ICLR-2025 record ---
+    def test_cascade_falls_through_to_dblp_iclr_2025(self, resolver):
+        """End-to-end: S2 yields the reject payload, arXiv has no published
+        DOI, OpenAlex misses, but DBLP returns the real ICLR-2025 record.
+        The resolved record must have year=2025, an ICLR venue, and NO
+        10.48550/arxiv DOI."""
+
+        dblp_hit = {
+            "info": {
+                "title": "Identifiable Exchangeable Mechanisms for Causal " "Structure and Representation Learning",
+                "authors": {
+                    "author": [
+                        {"text": "Patrik Reizinger"},
+                        {"text": "Siyuan Guo"},
+                    ]
+                },
+                "venue": "International Conference on Learning Representations",
+                "year": "2025",
+                "type": "Conference and Workshop Papers",
+                "ee": "https://openreview.net/forum?id=k03mB41vyM",
+            }
+        }
+
+        def _dispatch(method, url, *args, **kwargs):
+            if "/paper/arXiv:" in url or "semanticscholar" in url:
+                return _resp(IEM_S2_ARXIV_PAYLOAD)
+            if "dblp.org" in url:
+                return _resp({"result": {"hits": {"hit": [dblp_hit]}}})
+            if "export.arxiv.org" in url:
+                return MagicMock(status_code=200, text="<feed></feed>")
+            # OpenAlex / Crossref / everything else: miss
+            return MagicMock(status_code=404, json=lambda: {})
+
+        resolver.http._request.side_effect = _dispatch
+        entry = {
+            "ID": "iem2024",
+            "ENTRYTYPE": "article",
+            "title": "Identifiable Exchangeable Mechanisms for Causal " "Structure and Representation Learning",
+            "author": "Reizinger, Patrik and Guo, Siyuan",
+            "year": "2024",
+        }
+        detection = PreprintDetection(is_preprint=True, reason="eprint arXiv", arxiv_id="2406.14302", doi=None)
+        rec = resolver.resolve(entry, detection)
+        assert rec is not None
+        assert rec.year == 2025
+        assert "learning representations" in (rec.journal or "").lower()
+        assert "10.48550/arxiv" not in (rec.doi or "").lower()
