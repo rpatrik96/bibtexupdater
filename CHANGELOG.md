@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.10.0] - 2026-05-26
+## [0.9.1] - 2026-05-26
 
 ### Added
 - **Authoritative arXiv-by-ID verification in `bibtex-check`**: the academic verifier previously matched entries purely by title/author text search against Crossref/DBLP/Semantic Scholar. Brand-new arXiv-only preprints are not yet indexed by those aggregators, so the search returned unrelated records and the entry was reported `HALLUCINATED` (or `NOT_FOUND`) with a nonsense best match — e.g. all five real Feb–Apr 2026 hallucination-benchmark preprints (`HalluHard` arXiv:2602.01031, `HalluCitation` arXiv:2601.18724, …) were flagged as fabricated. `FactChecker` now extracts the arXiv ID from the `eprint`/`archivePrefix` fields or an `arxiv.org/abs/<id>` URL and fetches the authoritative record from the arXiv export API (new `ArxivClient` + `arxiv_atom_to_record` Atom parser), adding it as a scored verification candidate before the empty/chimeric checks. Valid preprints now verify instead of false-flagging; entries without an arXiv identifier never hit the arXiv client. The lookup is wired through `UnifiedFactChecker`; the `FactChecker(..., arxiv=...)` parameter is optional, so existing callers and tests are unaffected. +7 tests in `tests/test_arxiv_id_lookup.py`.
