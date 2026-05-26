@@ -23,6 +23,8 @@ htmlcov/
 # Cache files
 .cache.replace_preprints.json
 *.cache
+.cache.*.db
+.smoke-cache.json
 
 # Build
 dist/
