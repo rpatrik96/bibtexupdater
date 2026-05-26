@@ -22,6 +22,7 @@ import tempfile
 import threading
 import time
 import unicodedata
+import xml.etree.ElementTree as ET
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any
@@ -1222,6 +1223,79 @@ def s2_data_to_record(data: dict[str, Any]) -> PublishedRecord | None:
         journal=venue,
         year=data.get("year"),
         type=record_type,
+    )
+
+
+_ATOM_NS = {
+    "atom": "http://www.w3.org/2005/Atom",
+    "arxiv": "http://arxiv.org/schemas/atom",
+}
+
+
+def arxiv_atom_to_record(xml: str) -> PublishedRecord | None:
+    """Convert an arXiv Atom API response (``id_list`` query) to a PublishedRecord.
+
+    The arXiv export API returns the authoritative record for a given arXiv ID,
+    even for very recent papers that Crossref/DBLP/Semantic Scholar have not yet
+    indexed. For a bad/unknown ID arXiv still answers ``200`` with a single
+    sentinel ``Error`` entry; that case returns ``None``.
+
+    Args:
+        xml: Raw Atom feed text from ``http://export.arxiv.org/api/query``.
+
+    Returns:
+        PublishedRecord for the first real entry, or ``None`` if the feed has no
+        usable entry or cannot be parsed.
+    """
+    try:
+        root = ET.fromstring(xml)
+    except ET.ParseError:
+        return None
+
+    entry = root.find("atom:entry", _ATOM_NS)
+    if entry is None:
+        return None
+
+    # arXiv signals bad IDs with an entry whose <id> points at the errors doc.
+    id_el = entry.find("atom:id", _ATOM_NS)
+    entry_id = (id_el.text or "").strip() if id_el is not None else ""
+    if "/api/errors" in entry_id:
+        return None
+
+    title_el = entry.find("atom:title", _ATOM_NS)
+    title = re.sub(r"\s+", " ", (title_el.text or "").strip()) if title_el is not None else ""
+    if not title:
+        return None
+
+    authors: list[dict[str, str]] = []
+    for author_el in entry.findall("atom:author", _ATOM_NS):
+        name_el = author_el.find("atom:name", _ATOM_NS)
+        name = (name_el.text or "").strip() if name_el is not None else ""
+        parts = name.split()
+        if len(parts) >= 2:
+            authors.append({"given": " ".join(parts[:-1]), "family": parts[-1]})
+        elif parts:
+            authors.append({"given": "", "family": parts[0]})
+
+    year: int | None = None
+    published_el = entry.find("atom:published", _ATOM_NS)
+    if published_el is not None and published_el.text:
+        m = re.match(r"\s*(\d{4})", published_el.text)
+        if m:
+            year = int(m.group(1))
+
+    doi_el = entry.find("arxiv:doi", _ATOM_NS)
+    doi = doi_normalize(doi_el.text) if doi_el is not None and doi_el.text else ""
+
+    return PublishedRecord(
+        doi=doi or "",
+        url=entry_id or None,
+        title=title,
+        authors=authors,
+        journal=None,
+        year=year,
+        type="preprint",
+        method="arXiv(id_list)",
     )
 
 

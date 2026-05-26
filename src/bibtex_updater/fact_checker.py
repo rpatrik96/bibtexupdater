@@ -63,6 +63,7 @@ from bibtex_updater.sources import (
 )
 from bibtex_updater.utils import (
     # API endpoints
+    ARXIV_API,
     CROSSREF_API,
     DBLP_API_SEARCH,
     S2_API,
@@ -71,9 +72,9 @@ from bibtex_updater.utils import (
     PublishedRecord,
     RateLimiterRegistry,
     SqliteCache,
-    # HTTP infrastructure
-    authors_last_names,
     # API converters
+    arxiv_atom_to_record,
+    authors_last_names,
     crossref_message_to_record,
     dblp_hit_to_record,
     first_author_surname,
@@ -1255,6 +1256,29 @@ class SemanticScholarClient:
             return None
 
 
+class ArxivClient:
+    """arXiv export API client for authoritative lookup by arXiv ID.
+
+    Unlike Crossref/DBLP/Semantic Scholar, arXiv has the record for any valid
+    arXiv ID immediately, so this is the reliable source for brand-new preprints
+    that the aggregators have not indexed yet.
+    """
+
+    def __init__(self, http: HttpClient):
+        self.http = http
+
+    def fetch_atom(self, arxiv_id: str) -> str | None:
+        """Fetch the raw Atom feed for a single arXiv ID, or None on failure."""
+        params = {"id_list": arxiv_id}
+        try:
+            resp = self.http._request("GET", ARXIV_API, params=params, accept="application/atom+xml", service="arxiv")
+            if resp.status_code != 200:
+                return None
+            return resp.text
+        except Exception:
+            return None
+
+
 # ------------- Venue Matching -------------
 
 # Common venue name aliases for fuzzy matching
@@ -1365,12 +1389,16 @@ class FactChecker:
         config: FactCheckerConfig,
         logger: logging.Logger,
         openalex: OpenAlexClient | None = None,
+        arxiv: ArxivClient | None = None,
     ):
         self.crossref = crossref
         self.dblp = dblp
         self.s2 = s2
         self.config = config
         self.logger = logger
+        # Authoritative lookup-by-arXiv-ID source. Optional so existing callers
+        # and tests that don't need preprint verification keep working.
+        self.arxiv: ArxivClient | None = arxiv
         # OpenAlex client is optional; tests can pass a fake. The cascade falls
         # back to creating a default client if not provided but only when
         # cascade_mode is on -- otherwise legacy parallel-search keeps current
@@ -1532,6 +1560,11 @@ class FactChecker:
         else:
             candidates = self._query_all_sources(entry, query, sources_queried, sources_with_hits, errors)
 
+        # Authoritative arXiv-by-ID lookup. Added as an extra candidate so valid
+        # but not-yet-indexed preprints verify instead of being flagged
+        # HALLUCINATED/NOT_FOUND from a failed title search.
+        candidates.extend(self._query_arxiv_by_id(entry, sources_queried, sources_with_hits, errors))
+
         if not candidates:
             status = FactCheckStatus.API_ERROR if errors else FactCheckStatus.NOT_FOUND
             self.last_author_intersection = None
@@ -1647,6 +1680,65 @@ class FactChecker:
         # not part of the JSONL schema so existing consumers keep working.
         result.confidence_score = numeric_conf  # type: ignore[attr-defined]
         return result
+
+    @staticmethod
+    def _arxiv_id_from_entry(entry: dict[str, Any]) -> str | None:
+        """Extract a bare arXiv ID from an entry's eprint/url/howpublished fields.
+
+        Recognizes both modern (``2602.01031``) and legacy (``cs/0001001``) IDs,
+        from an explicit ``eprint`` (with an arXiv ``archivePrefix``/``journal``)
+        or from an ``arxiv.org/abs/<id>`` URL / ``arXiv:<id>`` string.
+        """
+        eprint = (entry.get("eprint") or "").strip()
+        archive = (entry.get("archiveprefix") or entry.get("archivePrefix") or "").strip().lower()
+        if eprint and (archive == "arxiv" or re.match(r"^\d{4}\.\d{4,5}(v\d+)?$", eprint)):
+            return re.sub(r"v\d+$", "", eprint)
+
+        for field_name in ("url", "howpublished", "journal", "note"):
+            value = entry.get(field_name) or ""
+            m = re.search(r"arxiv\.org/abs/([^\s,}{]+)", value, flags=re.IGNORECASE)
+            if not m:
+                m = re.search(r"arxiv:\s*([0-9]{4}\.[0-9]{4,5}(?:v\d+)?)", value, flags=re.IGNORECASE)
+            if m:
+                return re.sub(r"v\d+$", "", m.group(1).strip())
+        return None
+
+    def _query_arxiv_by_id(
+        self,
+        entry: dict[str, Any],
+        sources_queried: list[str],
+        sources_with_hits: list[str],
+        errors: list[str],
+    ) -> list[tuple[float, PublishedRecord, str]]:
+        """Look the entry up on arXiv by its ID and return it as a scored candidate.
+
+        This rescues valid arXiv-only preprints that title/author search misses
+        because Crossref/DBLP/Semantic Scholar have not indexed them yet, which
+        otherwise produced false HALLUCINATED/NOT_FOUND verdicts.
+        """
+        if self.arxiv is None:
+            return []
+        arxiv_id = self._arxiv_id_from_entry(entry)
+        if not arxiv_id:
+            return []
+
+        sources_queried.append("arxiv")
+        try:
+            xml = self.arxiv.fetch_atom(arxiv_id)
+        except Exception as e:
+            errors.append(f"arXiv: {e}")
+            return []
+        if not xml:
+            return []
+        rec = arxiv_atom_to_record(xml)
+        if rec is None:
+            return []
+
+        sources_with_hits.append("arxiv")
+        title_norm = normalize_title_for_match(entry.get("title", ""))
+        authors_ref = authors_last_names(entry.get("author", ""), limit=3)
+        score = self._score_candidate(title_norm, authors_ref, rec)
+        return [(score, rec, "arxiv")]
 
     def _query_all_sources(
         self,
@@ -2107,7 +2199,7 @@ class UnifiedFactChecker:
         self.skip_categories = set(skip_categories or [])
 
         # Initialize verifiers
-        academic_checker = FactChecker(crossref, dblp, s2, config, self.logger)
+        academic_checker = FactChecker(crossref, dblp, s2, config, self.logger, arxiv=ArxivClient(http))
         self.verifiers: dict[EntryCategory, BaseVerifier] = {
             EntryCategory.ACADEMIC: AcademicVerifier(academic_checker),
             EntryCategory.WEB_REFERENCE: WebVerifier(http, web_config or WebVerifierConfig(), self.logger),
