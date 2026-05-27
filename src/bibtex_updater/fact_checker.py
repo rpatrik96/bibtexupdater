@@ -190,6 +190,7 @@ class FactCheckStatus(Enum):
     PARTIAL_MATCH = "partial_match"
     HALLUCINATED = "hallucinated"
     API_ERROR = "api_error"
+    ARXIV_ID_MISMATCH = "arxiv_id_mismatch"  # Entry's cited arXiv ID resolves to a different paper
 
     # Pre-API validation statuses
     FUTURE_DATE = "future_date"  # Year is in the future
@@ -261,6 +262,13 @@ class FactCheckerConfig:
     max_candidates_per_source: int = 10
     check_years: bool = True
     check_dois: bool = True
+    # Verify the entry's own arXiv ID points to the entry's paper (catches
+    # misattributed identifiers that title/author search silently VERIFIES).
+    check_arxiv_consistency: bool = True
+    # Below this normalized title score (0-1), the entry's arXiv ID is treated
+    # as pointing to a *different* paper. Deliberately low so only clear
+    # different-paper cases trip it, not minor preprint/published title edits.
+    arxiv_consistency_min_title: float = 0.50
     # CheckIfExist additions (Item 1 + 2): explicit cascading + top-K retrieval
     cascade_mode: bool = False
     top_k: int = DEFAULT_TOP_K
@@ -1553,6 +1561,15 @@ class FactChecker:
                     errors=[f"DOI does not resolve: {entry.get('doi', '')}"],
                 )
 
+        # Pre-search consistency: the entry's own arXiv ID must point to *this*
+        # paper. A wrong ID otherwise survives because title/author search
+        # VERIFIES the entry against the real paper from Crossref/DBLP/S2,
+        # silently leaving the misattributed identifier in place.
+        if self.config.check_arxiv_consistency:
+            arxiv_status = self._check_arxiv_id_consistency(entry)
+            if arxiv_status is not None:
+                return arxiv_status
+
         query = f"{title_norm} {first_author}".strip()
         # Item 1: explicit cascade vs. legacy parallel search.
         if self.config.cascade_mode:
@@ -1702,6 +1719,68 @@ class FactChecker:
             if m:
                 return re.sub(r"v\d+$", "", m.group(1).strip())
         return None
+
+    def _check_arxiv_id_consistency(self, entry: dict[str, Any]) -> FactCheckResult | None:
+        """Flag entries whose cited arXiv ID resolves to a *different* paper.
+
+        Title/author search happily VERIFIES a misattributed entry against the
+        real paper returned by Crossref/DBLP/S2, so a wrong arXiv ID (a
+        copy-paste or lookup error) survives unnoticed. Here we fetch the
+        entry's own arXiv ID and require its title to match the entry; a clear
+        mismatch is a misattributed identifier, not a valid preprint, and is
+        reported as :class:`FactCheckStatus.ARXIV_ID_MISMATCH`.
+
+        Returns ``None`` when there is nothing to check (no arXiv client, no
+        arXiv ID, lookup failed, or the titles are consistent) so the normal
+        verification flow proceeds.
+        """
+        if self.arxiv is None:
+            return None
+        arxiv_id = self._arxiv_id_from_entry(entry)
+        if not arxiv_id:
+            return None
+
+        try:
+            xml = self.arxiv.fetch_atom(arxiv_id)
+        except Exception:
+            return None
+        if not xml:
+            return None
+        rec = arxiv_atom_to_record(xml)
+        if rec is None or not rec.title:
+            return None
+
+        entry_title = normalize_title_for_match(entry.get("title", ""))
+        if not entry_title:
+            return None
+        arxiv_title = normalize_title_for_match(rec.title)
+        title_score = token_sort_ratio(entry_title, arxiv_title) / 100.0
+        if title_score >= self.config.arxiv_consistency_min_title:
+            return None
+
+        self.logger.warning(
+            "arXiv ID %s for entry %r points to a different paper: entry title "
+            "%r vs arXiv title %r (title score %.2f)",
+            arxiv_id,
+            entry.get("ID", "?"),
+            entry.get("title", ""),
+            rec.title,
+            title_score,
+        )
+        return FactCheckResult(
+            entry_key=entry.get("ID", "unknown"),
+            entry_type=entry.get("ENTRYTYPE", "misc").lower(),
+            status=FactCheckStatus.ARXIV_ID_MISMATCH,
+            overall_confidence=0.0,
+            field_comparisons={},
+            best_match=rec,
+            api_sources_queried=["arxiv"],
+            api_sources_with_hits=["arxiv"],
+            errors=[
+                f"arXiv ID {arxiv_id} resolves to {rec.title!r}, which does not "
+                f"match entry title {entry.get('title', '')!r}"
+            ],
+        )
 
     def _query_arxiv_by_id(
         self,

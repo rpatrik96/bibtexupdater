@@ -222,6 +222,47 @@ class TestDblpHitToRecord:
         assert rec is not None
         assert rec.url == "https://example.com/paper"
 
+    def test_dblp_disambiguation_suffix_stripped_from_surname(self):
+        """Regression: DBLP appends a 4-digit homonym suffix ("Yu Sun 0020",
+        "Chuan Guo 0001"). It must be dropped so the family name is the real
+        surname, not the number -- otherwise the author comparison scores a
+        false author_mismatch against the correct bib entry.
+        """
+        hit = {
+            "info": {
+                "title": "On Calibration of Modern Neural Networks",
+                "authors": {"author": ["Chuan Guo 0001", "Geoff Pleiss", "Yu Sun 0020", "Kilian Q. Weinberger"]},
+                "venue": "Journal of Testing",
+                "year": "2017",
+                "doi": "10.1234/dblp.calib",
+                "type": "Conference and Workshop Papers",
+            }
+        }
+        rec = dblp_hit_to_record(hit)
+        assert rec is not None
+        families = [a["family"] for a in rec.authors]
+        assert families == ["Guo", "Pleiss", "Sun", "Weinberger"]
+        # The disambiguation digits move into the given name, not the surname.
+        assert rec.authors[0] == {"given": "Chuan", "family": "Guo"}
+        assert rec.authors[2] == {"given": "Yu", "family": "Sun"}
+
+    def test_corr_venue_rejected_as_preprint(self):
+        """Regression (F4): DBLP labels arXiv papers with venue "CoRR". Such a
+        hit must be rejected (return None) so resolution falls through to the
+        real published venue instead of accepting the preprint as published.
+        """
+        hit = {
+            "info": {
+                "title": "Some Preprint Indexed Under CoRR",
+                "authors": {"author": ["Jane Doe"]},
+                "venue": "CoRR",
+                "year": "2024",
+                "doi": "10.48550/arXiv.2401.00001",
+                "type": "Journal Articles",
+            }
+        }
+        assert dblp_hit_to_record(hit) is None
+
 
 class TestS2DataToRecord:
     """Tests for s2_data_to_record function."""

@@ -271,6 +271,59 @@ class TestResolverMixinMethods:
         )
         assert resolver._credible_journal_article(journal_record)
 
+    def test_verify_arxiv_match_rejects_title_mismatch(self, resolver):
+        """Regression (onebench/agrawal): Stage 1/1b trust ``detection.arxiv_id``
+        and assign confidence 1.0. If the cited arXiv ID is wrong, the record it
+        maps to is an unrelated paper; _verify_arxiv_match must reject it so the
+        cascade falls through to title-based resolution instead of silently
+        rewriting the entry into that other paper.
+        """
+        entry = {
+            "title": "ONEBench to Test Them All: Sample-Level Benchmarking Over Open-Ended Capabilities",
+            "author": "Ghosh, Adhiraj and Dziadzio, Sebastian and Prabhu, Ameya",
+        }
+        # The record the wrong arXiv ID (2412.06745) actually resolves to.
+        wrong_paper = PublishedRecord(
+            doi="10.1000/robotron",
+            title="RoboTron-Drive: All-in-One Large Multimodal Model for Autonomous Driving",
+            journal="Some Journal",
+            year=2024,
+            authors=[{"given": "Zhijian", "family": "Huang"}, {"given": "Chengjian", "family": "Feng"}],
+            type="journal-article",
+        )
+        title_norm = normalize_title_for_match(entry["title"])
+        assert resolver._verify_arxiv_match(wrong_paper, entry, title_norm) is None
+
+    def test_verify_arxiv_match_accepts_title_match(self, resolver):
+        """A record whose title/author match the entry passes the gate unchanged."""
+        entry = {
+            "title": "ONEBench to Test Them All: Sample-Level Benchmarking Over Open-Ended Capabilities",
+            "author": "Ghosh, Adhiraj and Dziadzio, Sebastian and Prabhu, Ameya",
+        }
+        right_paper = PublishedRecord(
+            doi="10.18653/v1/2025.acl-long.1560",
+            title="ONEBench to Test Them All: Sample-Level Benchmarking Over Open-Ended Capabilities",
+            journal="ACL",
+            year=2025,
+            authors=[
+                {"given": "Adhiraj", "family": "Ghosh"},
+                {"given": "Sebastian", "family": "Dziadzio"},
+                {"given": "Ameya", "family": "Prabhu"},
+            ],
+            type="proceedings-article",
+        )
+        title_norm = normalize_title_for_match(entry["title"])
+        assert resolver._verify_arxiv_match(right_paper, entry, title_norm) is right_paper
+
+    def test_verify_arxiv_match_passthrough_without_title(self, resolver):
+        """With no entry title to verify against, the direct ID lookup is trusted."""
+        rec = PublishedRecord(doi="10.1/x", title="Whatever Paper", year=2024, authors=[])
+        assert resolver._verify_arxiv_match(rec, {"title": ""}, "") is rec
+
+    def test_verify_arxiv_match_none_stays_none(self, resolver):
+        """A miss (None) is propagated unchanged."""
+        assert resolver._verify_arxiv_match(None, {"title": "anything"}, "anything") is None
+
     def test_authors_to_bibtex_string_formats_correctly(self, resolver):
         """_authors_to_bibtex_string should format authors correctly."""
         record = PublishedRecord(
