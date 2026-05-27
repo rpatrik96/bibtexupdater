@@ -29,8 +29,10 @@ from bibtex_updater.fact_checker import (
     SemanticScholarClient,
 )
 from bibtex_updater.matching import get_canonical_venue
+from bibtex_updater.updater import Resolver
 from bibtex_updater.utils import (
     PublishedRecord,
+    authors_last_names,
     extract_arxiv_id_from_text,
     last_name_from_person,
 )
@@ -142,3 +144,63 @@ class TestVenueCollapsing:
 
     def test_exact_science_still_canonicalizes(self):
         assert get_canonical_venue("Science") == "science"
+
+    def test_acronym_with_short_suffix_still_canonicalizes(self):
+        # A single-token acronym with a short trailing word is the *same* venue
+        # (unlike a generic-word sibling journal) and must still canonicalize --
+        # restricting exact-match to generic journal words must not regress this.
+        assert get_canonical_venue("NeurIPS Track") == "neurips"
+        assert get_canonical_venue("ICML Conf") == "icml"
+
+    def test_generic_journal_siblings_not_collapsed(self):
+        # Sibling journals sharing a generic-word prefix must NOT collapse.
+        assert get_canonical_venue("Nature Methods") != "nature"
+        assert get_canonical_venue("Science Advances") != "science"
+        assert get_canonical_venue("PNAS Nexus") != "pnas"
+
+
+# ------------- 4. Symmetric surnames in the resolver match score -------------
+
+
+class TestResolverSurnameSymmetry:
+    """The resolver's _compute_match_score must normalize the record-side family
+    names the same way as the entry side (authors_last_names). Otherwise a
+    particle surname stored comma-first in the .bib (`van den Oord, Aaron`)
+    yields entry key `oord` but record key `van den oord`, Jaccard 0, and the
+    arXiv-keyed stages / _verify_arxiv_match wrongly reject a correct record.
+    """
+
+    @pytest.fixture
+    def resolver(self):
+        http = MagicMock()
+        http._request.return_value = MagicMock(status_code=404, json=lambda: {})
+        return Resolver(http=http, logger=logging.getLogger("test_resolver_sym"), scholarly_client=None)
+
+    def test_particle_surname_match_score_symmetric(self, resolver):
+        from bibtex_updater.utils import normalize_title_for_match
+
+        title = "WaveNet: A Generative Model for Raw Audio"
+        authors_ref = authors_last_names("van den Oord, Aaron")
+        rec = PublishedRecord(
+            doi="10.0/x",
+            title=title,
+            authors=[{"given": "Aaron", "family": "van den Oord"}],
+            year=2016,
+            type="journal-article",
+        )
+        score = resolver._compute_match_score(normalize_title_for_match(title), rec, authors_ref)
+        assert score >= resolver.MATCH_THRESHOLD, score
+
+    def test_verify_arxiv_match_accepts_particle_author(self, resolver):
+        from bibtex_updater.utils import normalize_title_for_match
+
+        title = "WaveNet: A Generative Model for Raw Audio"
+        entry = {"title": title, "author": "van den Oord, Aaron"}
+        rec = PublishedRecord(
+            doi="10.0/x",
+            title=title,
+            authors=[{"given": "Aaron", "family": "van den Oord"}],
+            year=2016,
+            type="journal-article",
+        )
+        assert resolver._verify_arxiv_match(rec, entry, normalize_title_for_match(title)) is rec

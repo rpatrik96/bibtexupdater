@@ -136,62 +136,15 @@ def split_authors_bibtex(author_field: str) -> list[str]:
     return parts
 
 
-#: Lowercase nobiliary / patronymic particles that precede the distinctive
-#: surname token (e.g. "van den Oord", "von Mises", "de la Cruz"). These are
-#: stripped when deriving a comparable surname key so that the same author
-#: matches whether the entry stores "Given particle Family" or
-#: "particle Family, Given" -- the two forms otherwise produced an asymmetric
-#: key ("oord" vs "van den oord") and a spurious author mismatch.
-SURNAME_PARTICLES = frozenset(
-    {
-        "von",
-        "vom",
-        "zu",
-        "zum",
-        "zur",
-        "van",
-        "der",
-        "den",
-        "ter",
-        "ten",
-        "te",
-        "op",
-        "de",
-        "del",
-        "della",
-        "di",
-        "da",
-        "dal",
-        "dos",
-        "das",
-        "du",
-        "do",
-        "la",
-        "le",
-        "el",
-        "al",
-        "lo",
-        "li",
-        "af",
-        "av",
-        "bin",
-        "ibn",
-        "abu",
-        "mc",
-        "mac",
-        "saint",
-        "st",
-    }
-)
-
-
 def last_name_from_person(name: str) -> str:
     """Extract a comparable surname key from a person name.
 
-    Handles both 'Family, Given' and 'Given Family' formats, and strips leading
-    nobiliary particles so that particle-prefixed surnames compare equal across
-    citation styles. Falls back to the unstripped form if stripping would leave
-    nothing.
+    Handles both 'Family, Given' and 'Given Family' formats, reducing a
+    multi-token family (including nobiliary particles like "van den") to its
+    final, most distinctive token. This keeps the key symmetric regardless of
+    citation style -- both "van den Oord, Aaron" and "Aaron van den Oord"
+    reduce to "oord" -- as long as callers run the entry side and the API-record
+    side through this same function.
     """
     name = latex_to_plain(name)
     if "," in name:
@@ -203,11 +156,8 @@ def last_name_from_person(name: str) -> str:
     last = re.sub(r"[^a-z0-9\s-]", "", last).strip()
 
     tokens = last.split()
-    if len(tokens) > 1:
-        stripped = tokens
-        while len(stripped) > 1 and stripped[0] in SURNAME_PARTICLES:
-            stripped = stripped[1:]
-        last = " ".join(stripped)
+    if tokens:
+        last = tokens[-1]
     return last
 
 
@@ -290,21 +240,26 @@ def extract_arxiv_id_from_text(text: str) -> str | None:
     """
     if not text:
         return None
-    m = ARXIV_HOST_RE.search(text)
-    if m:
-        raw = m.group("id")
+
+    def _normalize(raw: str) -> str | None:
+        # Drop a .pdf suffix and version, re-extract the canonical ID, and keep
+        # it only if the month is real. Returns None for non-arXiv numbers.
         if raw.lower().endswith(".pdf"):
             raw = raw[:-4]
-        # Normalize through the ID regex so legacy URLs (.../abs/hep-th/9901001)
-        # are not truncated and version suffixes are dropped consistently.
         idm = ARXIV_ID_RE.search(raw)
-        candidate = idm.group("id") if idm else raw
-        candidate = re.sub(r"v\d+$", "", candidate)
-        if is_valid_arxiv_id(candidate):
+        candidate = re.sub(r"v\d+$", "", idm.group("id") if idm else raw)
+        return candidate if is_valid_arxiv_id(candidate) else None
+
+    # Prefer the ID from an explicit arxiv.org URL over a coincidental number
+    # elsewhere in the text; legacy URLs (.../abs/hep-th/9901001) keep their slash.
+    m = ARXIV_HOST_RE.search(text)
+    if m:
+        candidate = _normalize(m.group("id"))
+        if candidate:
             return candidate
     for match in ARXIV_ID_RE.finditer(text):
-        candidate = re.sub(r"v\d+$", "", match.group("id"))
-        if is_valid_arxiv_id(candidate):
+        candidate = _normalize(match.group("id"))
+        if candidate:
             return candidate
     return None
 

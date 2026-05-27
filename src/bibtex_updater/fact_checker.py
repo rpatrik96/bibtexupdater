@@ -1419,6 +1419,22 @@ class FactChecker:
         # Per-source records from the most recent check (used by the rich
         # VerificationResult builder).
         self.last_source_records: dict[str, PublishedRecord | None] = {}
+        # Memoize fetched+parsed arXiv records by ID: the consistency pre-check
+        # and the by-ID candidate query both look up the entry's arXiv ID in one
+        # verification pass, so this avoids a duplicate network fetch + parse.
+        self._arxiv_record_cache: dict[str, PublishedRecord | None] = {}
+
+    def _arxiv_record(self, arxiv_id: str) -> PublishedRecord | None:
+        """Fetch + parse the arXiv record for an ID, memoized per checker."""
+        if arxiv_id in self._arxiv_record_cache:
+            return self._arxiv_record_cache[arxiv_id]
+        rec: PublishedRecord | None = None
+        if self.arxiv is not None:
+            xml = self.arxiv.fetch_atom(arxiv_id)
+            if xml:
+                rec = arxiv_atom_to_record(xml)
+        self._arxiv_record_cache[arxiv_id] = rec
+        return rec
 
     def _validate_year(self, entry: dict[str, Any]) -> FactCheckStatus | None:
         """Pre-API year validation. Returns a status if year is invalid, None if OK."""
@@ -1750,12 +1766,9 @@ class FactChecker:
             return None
 
         try:
-            xml = self.arxiv.fetch_atom(arxiv_id)
+            rec = self._arxiv_record(arxiv_id)
         except Exception:
             return None
-        if not xml:
-            return None
-        rec = arxiv_atom_to_record(xml)
         if rec is None or not rec.title:
             return None
 
@@ -1812,13 +1825,10 @@ class FactChecker:
 
         sources_queried.append("arxiv")
         try:
-            xml = self.arxiv.fetch_atom(arxiv_id)
+            rec = self._arxiv_record(arxiv_id)
         except Exception as e:
             errors.append(f"arXiv: {e}")
             return []
-        if not xml:
-            return []
-        rec = arxiv_atom_to_record(xml)
         if rec is None:
             return []
 
