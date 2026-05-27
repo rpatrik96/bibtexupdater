@@ -1685,11 +1685,13 @@ class Resolver:
 
         # Stage 1: Direct lookup (arXiv -> S2 -> Crossref)
         result, candidate_doi = self._stage1_direct_lookup(detection)
+        result = self._verify_arxiv_match(result, entry, title_norm)
         if result:
             return result
 
         # Stage 1b: OpenAlex lookup (preprint-to-published version tracking)
         result = self._stage1b_openalex(detection, candidate_doi)
+        result = self._verify_arxiv_match(result, entry, title_norm)
         if result:
             return result
 
@@ -1728,6 +1730,40 @@ class Resolver:
         if result:
             return result
 
+        return None
+
+    def _verify_arxiv_match(
+        self, result: PublishedRecord | None, entry: dict[str, Any], title_norm: str
+    ) -> PublishedRecord | None:
+        """Reject an arXiv-ID-keyed record whose title/author do not match the entry.
+
+        Stages 1 and 1b resolve purely from ``detection.arxiv_id`` and assign
+        ``confidence = 1.0`` to whatever that ID maps to. If the entry's cited
+        arXiv ID is wrong, those stages would silently rewrite the entry into an
+        unrelated paper. Gate them on the same combined title/author match score
+        the search-based stages (1c, 3-5) already require, so a misattributed
+        identifier falls through to title-based resolution instead of corrupting
+        the entry.
+
+        Returns ``result`` unchanged when it is ``None`` or when the entry has no
+        title to verify against (we then trust the direct ID lookup as before).
+        """
+        if result is None:
+            return None
+        if not title_norm:
+            return result
+        authors_ref = authors_last_names(entry.get("author", ""))
+        score = self._compute_match_score(title_norm, result, authors_ref)
+        if score >= self.MATCH_THRESHOLD:
+            return result
+        self.logger.warning(
+            "Rejecting %s: arXiv-keyed record title %r does not match entry %r (score %.2f < %.2f)",
+            result.method,
+            result.title,
+            entry.get("title", ""),
+            score,
+            self.MATCH_THRESHOLD,
+        )
         return None
 
     def _stage1_direct_lookup(self, detection: PreprintDetection) -> tuple[PublishedRecord | None, str | None]:

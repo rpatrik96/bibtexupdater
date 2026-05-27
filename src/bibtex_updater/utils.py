@@ -1222,6 +1222,12 @@ def dblp_hit_to_record(hit: dict[str, Any]) -> PublishedRecord | None:
         if not full:
             continue
         parts = full.split()
+        # DBLP appends a 4-digit disambiguation suffix to homonymous author
+        # names ("Yu Sun 0020", "Chuan Guo 0001"). Drop it so the surname is the
+        # real family name rather than the number, which would otherwise score a
+        # false author mismatch against the bib entry.
+        if len(parts) >= 2 and re.fullmatch(r"\d{4}", parts[-1]):
+            parts = parts[:-1]
         if len(parts) >= 2:
             authors.append({"given": " ".join(parts[:-1]), "family": parts[-1]})
         else:
