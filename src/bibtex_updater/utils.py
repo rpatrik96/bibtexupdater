@@ -45,7 +45,7 @@ ARXIV_ID_RE = re.compile(
     re.IGNORECASE | re.VERBOSE,
 )
 
-ARXIV_HOST_RE = re.compile(r"https?://(?:www\.)?arxiv\.org/(?:abs|pdf)/(?P<id>[^?/]+)", re.IGNORECASE)
+ARXIV_HOST_RE = re.compile(r"https?://(?:www\.)?arxiv\.org/(?:abs|pdf)/(?P<id>[^\s?#]+)", re.IGNORECASE)
 
 PREPRINT_HOSTS = ("arxiv", "biorxiv", "medrxiv")
 
@@ -137,9 +137,14 @@ def split_authors_bibtex(author_field: str) -> list[str]:
 
 
 def last_name_from_person(name: str) -> str:
-    """Extract last name from a person name.
+    """Extract a comparable surname key from a person name.
 
-    Handles both 'Family, Given' and 'Given Family' formats.
+    Handles both 'Family, Given' and 'Given Family' formats, reducing a
+    multi-token family (including nobiliary particles like "van den") to its
+    final, most distinctive token. This keeps the key symmetric regardless of
+    citation style -- both "van den Oord, Aaron" and "Aaron van den Oord"
+    reduce to "oord" -- as long as callers run the entry side and the API-record
+    side through this same function.
     """
     name = latex_to_plain(name)
     if "," in name:
@@ -148,7 +153,11 @@ def last_name_from_person(name: str) -> str:
         toks = name.split()
         last = toks[-1].strip() if toks else ""
     last = strip_diacritics(last).lower()
-    last = re.sub(r"[^a-z0-9\s-]", "", last)
+    last = re.sub(r"[^a-z0-9\s-]", "", last).strip()
+
+    tokens = last.split()
+    if tokens:
+        last = tokens[-1]
     return last
 
 
@@ -202,16 +211,56 @@ def doi_url(doi: str) -> str:
     return f"https://doi.org/{doi}"
 
 
+_ARXIV_NEW_ID_RE = re.compile(r"^(\d{2})(\d{2})\.\d{4,5}(v\d+)?$")
+
+
+def is_valid_arxiv_id(arxiv_id: str | None) -> bool:
+    """Validate a bare arXiv identifier.
+
+    Modern IDs are ``YYMM.NNNNN`` where ``MM`` is a real month (01-12); a
+    number with an impossible month (e.g. a DOI fragment like ``5678.9012``)
+    is not a valid arXiv ID. Legacy IDs (``hep-th/9901001``) are accepted
+    structurally. Returns False for None/empty.
+    """
+    if not arxiv_id:
+        return False
+    m = _ARXIV_NEW_ID_RE.match(arxiv_id.strip())
+    if m:
+        month = int(m.group(2))
+        return 1 <= month <= 12
+    # Legacy scheme handled by ARXIV_ID_RE old-style alternative; accept as-is.
+    return True
+
+
 def extract_arxiv_id_from_text(text: str) -> str | None:
-    """Extract arXiv ID from a text string (URL, eprint field, note, etc.)."""
+    """Extract arXiv ID from a text string (URL, eprint field, note, etc.).
+
+    Modern IDs with an impossible month are rejected so that DOI fragments or
+    arbitrary ``NNNN.NNNNN`` numbers are not mistaken for arXiv identifiers.
+    """
     if not text:
         return None
+
+    def _normalize(raw: str) -> str | None:
+        # Drop a .pdf suffix and version, re-extract the canonical ID, and keep
+        # it only if the month is real. Returns None for non-arXiv numbers.
+        if raw.lower().endswith(".pdf"):
+            raw = raw[:-4]
+        idm = ARXIV_ID_RE.search(raw)
+        candidate = re.sub(r"v\d+$", "", idm.group("id") if idm else raw)
+        return candidate if is_valid_arxiv_id(candidate) else None
+
+    # Prefer the ID from an explicit arxiv.org URL over a coincidental number
+    # elsewhere in the text; legacy URLs (.../abs/hep-th/9901001) keep their slash.
     m = ARXIV_HOST_RE.search(text)
     if m:
-        return m.group("id")
-    m = ARXIV_ID_RE.search(text)
-    if m:
-        return m.group("id")
+        candidate = _normalize(m.group("id"))
+        if candidate:
+            return candidate
+    for match in ARXIV_ID_RE.finditer(text):
+        candidate = _normalize(match.group("id"))
+        if candidate:
+            return candidate
     return None
 
 
@@ -1128,6 +1177,12 @@ def dblp_hit_to_record(hit: dict[str, Any]) -> PublishedRecord | None:
         if not full:
             continue
         parts = full.split()
+        # DBLP appends a 4-digit disambiguation suffix to homonymous author
+        # names ("Yu Sun 0020", "Chuan Guo 0001"). Drop it so the surname is the
+        # real family name rather than the number, which would otherwise score a
+        # false author mismatch against the bib entry.
+        if len(parts) >= 2 and re.fullmatch(r"\d{4}", parts[-1]):
+            parts = parts[:-1]
         if len(parts) >= 2:
             authors.append({"given": " ".join(parts[:-1]), "family": parts[-1]})
         else:

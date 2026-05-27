@@ -338,6 +338,12 @@ EXPANDED_VENUE_ALIASES: dict[str, set[str]] = {
 }
 
 
+#: Canonical venues whose name is a common English word that is also a prefix of
+#: distinct sibling journals (Nature Physics, Science Robotics). For these,
+#: substring matching is unsafe, so they only match on exact equality.
+GENERIC_SINGLE_WORD_VENUES: frozenset[str] = frozenset({"nature", "science", "pnas"})
+
+
 def _normalize_venue_for_matching(venue: str) -> str:
     """Normalize venue string for matching.
 
@@ -383,11 +389,22 @@ def get_canonical_venue(venue: str, aliases: dict[str, set[str]] | None = None) 
         for name in all_names:
             if len(name) <= 3:
                 continue
+            if name == venue_norm:
+                return canonical
+            # Generic single-word *journal* names ("nature"/"science") are
+            # prefixes of distinct sibling journals ("Nature Physics", "Science
+            # Robotics"), so substring matching would wrongly collapse them and
+            # mask a genuine venue mismatch -- require an exact match for those.
+            # Single-token acronyms ("iclr", "neurips") are NOT generic words and
+            # still substring-match so a track/poster suffix ("ICLR (Poster)")
+            # canonicalizes to the same venue.
+            if canonical in GENERIC_SINGLE_WORD_VENUES and " " not in name:
+                continue
             # Require substantial overlap for substring matching
             shorter, longer = sorted([name, venue_norm], key=len)
             if len(shorter) / len(longer) < 0.4:
                 continue  # Too different in length for substring match
-            if name == venue_norm or name in venue_norm or venue_norm in name:
+            if name in venue_norm or venue_norm in name:
                 return canonical
 
     return None

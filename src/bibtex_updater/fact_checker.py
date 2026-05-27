@@ -78,8 +78,10 @@ from bibtex_updater.utils import (
     crossref_message_to_record,
     dblp_hit_to_record,
     first_author_surname,
+    is_valid_arxiv_id,
     # Matching
     jaccard_similarity,
+    last_name_from_person,
     # Text normalization
     normalize_title_for_match,
     s2_data_to_record,
@@ -190,6 +192,7 @@ class FactCheckStatus(Enum):
     PARTIAL_MATCH = "partial_match"
     HALLUCINATED = "hallucinated"
     API_ERROR = "api_error"
+    ARXIV_ID_MISMATCH = "arxiv_id_mismatch"  # Entry's cited arXiv ID resolves to a different paper
 
     # Pre-API validation statuses
     FUTURE_DATE = "future_date"  # Year is in the future
@@ -261,6 +264,13 @@ class FactCheckerConfig:
     max_candidates_per_source: int = 10
     check_years: bool = True
     check_dois: bool = True
+    # Verify the entry's own arXiv ID points to the entry's paper (catches
+    # misattributed identifiers that title/author search silently VERIFIES).
+    check_arxiv_consistency: bool = True
+    # Below this normalized title score (0-1), the entry's arXiv ID is treated
+    # as pointing to a *different* paper. Deliberately low so only clear
+    # different-paper cases trip it, not minor preprint/published title edits.
+    arxiv_consistency_min_title: float = 0.50
     # CheckIfExist additions (Item 1 + 2): explicit cascading + top-K retrieval
     cascade_mode: bool = False
     top_k: int = DEFAULT_TOP_K
@@ -1409,6 +1419,22 @@ class FactChecker:
         # Per-source records from the most recent check (used by the rich
         # VerificationResult builder).
         self.last_source_records: dict[str, PublishedRecord | None] = {}
+        # Memoize fetched+parsed arXiv records by ID: the consistency pre-check
+        # and the by-ID candidate query both look up the entry's arXiv ID in one
+        # verification pass, so this avoids a duplicate network fetch + parse.
+        self._arxiv_record_cache: dict[str, PublishedRecord | None] = {}
+
+    def _arxiv_record(self, arxiv_id: str) -> PublishedRecord | None:
+        """Fetch + parse the arXiv record for an ID, memoized per checker."""
+        if arxiv_id in self._arxiv_record_cache:
+            return self._arxiv_record_cache[arxiv_id]
+        rec: PublishedRecord | None = None
+        if self.arxiv is not None:
+            xml = self.arxiv.fetch_atom(arxiv_id)
+            if xml:
+                rec = arxiv_atom_to_record(xml)
+        self._arxiv_record_cache[arxiv_id] = rec
+        return rec
 
     def _validate_year(self, entry: dict[str, Any]) -> FactCheckStatus | None:
         """Pre-API year validation. Returns a status if year is invalid, None if OK."""
@@ -1553,6 +1579,15 @@ class FactChecker:
                     errors=[f"DOI does not resolve: {entry.get('doi', '')}"],
                 )
 
+        # Pre-search consistency: the entry's own arXiv ID must point to *this*
+        # paper. A wrong ID otherwise survives because title/author search
+        # VERIFIES the entry against the real paper from Crossref/DBLP/S2,
+        # silently leaving the misattributed identifier in place.
+        if self.config.check_arxiv_consistency:
+            arxiv_status = self._check_arxiv_id_consistency(entry)
+            if arxiv_status is not None:
+                return arxiv_status
+
         query = f"{title_norm} {first_author}".strip()
         # Item 1: explicit cascade vs. legacy parallel search.
         if self.config.cascade_mode:
@@ -1692,7 +1727,12 @@ class FactChecker:
         eprint = (entry.get("eprint") or "").strip()
         archive = (entry.get("archiveprefix") or entry.get("archivePrefix") or "").strip().lower()
         if eprint and (archive == "arxiv" or re.match(r"^\d{4}\.\d{4,5}(v\d+)?$", eprint)):
-            return re.sub(r"v\d+$", "", eprint)
+            bare = re.sub(r"v\d+$", "", eprint)
+            # A legacy-scheme eprint (e.g. "math.GT/0309136") is structurally
+            # valid; a modern "YYMM.NNNNN" must have a real month.
+            if is_valid_arxiv_id(bare):
+                return bare
+            return None
 
         for field_name in ("url", "howpublished", "journal", "note"):
             value = entry.get(field_name) or ""
@@ -1700,8 +1740,69 @@ class FactChecker:
             if not m:
                 m = re.search(r"arxiv:\s*([0-9]{4}\.[0-9]{4,5}(?:v\d+)?)", value, flags=re.IGNORECASE)
             if m:
-                return re.sub(r"v\d+$", "", m.group(1).strip())
+                bare = re.sub(r"v\d+$", "", m.group(1).strip())
+                if is_valid_arxiv_id(bare):
+                    return bare
         return None
+
+    def _check_arxiv_id_consistency(self, entry: dict[str, Any]) -> FactCheckResult | None:
+        """Flag entries whose cited arXiv ID resolves to a *different* paper.
+
+        Title/author search happily VERIFIES a misattributed entry against the
+        real paper returned by Crossref/DBLP/S2, so a wrong arXiv ID (a
+        copy-paste or lookup error) survives unnoticed. Here we fetch the
+        entry's own arXiv ID and require its title to match the entry; a clear
+        mismatch is a misattributed identifier, not a valid preprint, and is
+        reported as :class:`FactCheckStatus.ARXIV_ID_MISMATCH`.
+
+        Returns ``None`` when there is nothing to check (no arXiv client, no
+        arXiv ID, lookup failed, or the titles are consistent) so the normal
+        verification flow proceeds.
+        """
+        if self.arxiv is None:
+            return None
+        arxiv_id = self._arxiv_id_from_entry(entry)
+        if not arxiv_id:
+            return None
+
+        try:
+            rec = self._arxiv_record(arxiv_id)
+        except Exception:
+            return None
+        if rec is None or not rec.title:
+            return None
+
+        entry_title = normalize_title_for_match(entry.get("title", ""))
+        if not entry_title:
+            return None
+        arxiv_title = normalize_title_for_match(rec.title)
+        title_score = token_sort_ratio(entry_title, arxiv_title) / 100.0
+        if title_score >= self.config.arxiv_consistency_min_title:
+            return None
+
+        self.logger.warning(
+            "arXiv ID %s for entry %r points to a different paper: entry title "
+            "%r vs arXiv title %r (title score %.2f)",
+            arxiv_id,
+            entry.get("ID", "?"),
+            entry.get("title", ""),
+            rec.title,
+            title_score,
+        )
+        return FactCheckResult(
+            entry_key=entry.get("ID", "unknown"),
+            entry_type=entry.get("ENTRYTYPE", "misc").lower(),
+            status=FactCheckStatus.ARXIV_ID_MISMATCH,
+            overall_confidence=0.0,
+            field_comparisons={},
+            best_match=rec,
+            api_sources_queried=["arxiv"],
+            api_sources_with_hits=["arxiv"],
+            errors=[
+                f"arXiv ID {arxiv_id} resolves to {rec.title!r}, which does not "
+                f"match entry title {entry.get('title', '')!r}"
+            ],
+        )
 
     def _query_arxiv_by_id(
         self,
@@ -1724,13 +1825,10 @@ class FactChecker:
 
         sources_queried.append("arxiv")
         try:
-            xml = self.arxiv.fetch_atom(arxiv_id)
+            rec = self._arxiv_record(arxiv_id)
         except Exception as e:
             errors.append(f"arXiv: {e}")
             return []
-        if not xml:
-            return []
-        rec = arxiv_atom_to_record(xml)
         if rec is None:
             return []
 
@@ -1943,7 +2041,8 @@ class FactChecker:
         title_b = normalize_title_for_match(rec.title or "")
         title_score = token_sort_ratio(title_norm, title_b) / 100.0
 
-        authors_b = [strip_diacritics(a.get("family", "")).lower() for a in rec.authors][:3]
+        authors_b = [last_name_from_person(a.get("family", "")) for a in rec.authors][:3]
+        authors_b = [a for a in authors_b if a]
         author_score = jaccard_similarity(authors_ref, authors_b)
 
         return 0.7 * title_score + 0.3 * author_score
@@ -2063,7 +2162,8 @@ class FactChecker:
         # Author (P2.3: Ordered author comparison)
         entry_authors = entry.get("author", "")
         entry_names = authors_last_names(entry_authors, limit=10)
-        api_names = [strip_diacritics(a.get("family", "")).lower() for a in record.authors]
+        api_names = [last_name_from_person(a.get("family", "")) for a in record.authors]
+        api_names = [n for n in api_names if n]
         # Use combined score (Jaccard + sequence similarity)
         author_score = combined_author_score(entry_names, api_names, jaccard_weight=0.5, sequence_weight=0.5)
         api_authors_str = " and ".join(f"{a.get('given', '')} {a.get('family', '')}".strip() for a in record.authors)

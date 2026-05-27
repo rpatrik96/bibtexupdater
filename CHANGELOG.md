@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.2] - 2026-05-27
+
+### Fixed
+- **Misattributed arXiv IDs silently survived (and could rewrite an entry into an unrelated paper)**: an entry's cited arXiv ID was trusted without checking that the ID's *actual* paper matches the entry, so a wrong ID (copy-paste / lookup error) survived because title/author search VERIFIED the entry against the real paper from Crossref/DBLP/S2 — and the resolver's arXiv-ID-keyed stages would rewrite the entry into the unrelated paper at `confidence = 1.0` (real cases: `onebench2024`'s correct `2412.07689` "ONEBench…" replaced by `2412.06745` "RoboTron-Drive…"). `bibtex-check` now runs a pre-search `_check_arxiv_id_consistency()` that fetches the entry's own arXiv ID and reports `FactCheckStatus.ARXIV_ID_MISMATCH` when the fetched title diverges (gated by `FactCheckerConfig.check_arxiv_consistency`, default on, with `arxiv_consistency_min_title=0.50`). `bibtex-update`'s `Resolver._verify_arxiv_match()` gates Stage 1 / 1b on `MATCH_THRESHOLD` like the search-based stages, so a wrong cited ID falls through to title-based resolution instead of corrupting the entry.
+- **DBLP homonym disambiguation suffix produced false `author_mismatch`**: DBLP appends a 4-digit suffix to homonymous author names (`"Yu Sun 0020"`, `"Chuan Guo 0001"`); `dblp_hit_to_record` took the number as the family name. The suffix is now stripped so the surname is the real family name (the digits move into the given name).
+- **Particle surnames produced false `AUTHOR_MISMATCH` / false `HALLUCINATED` and false resolver rejections**: author comparison was asymmetric. The BibTeX entry side reduced a name to its last token, while the API-record side used the raw multi-word `family` field verbatim (`"van den Oord"` → `van den oord`), so Jaccard against the entry's `oord` was `0` and a correctly-cited paper by an author with a nobiliary particle (von, van der, de la, dos, …) was flagged as an author mismatch — depressing the score enough to risk a false `HALLUCINATED` in `bibtex-check`, and (combined with the new arXiv-match gate, below) falsely *rejecting* a correctly-resolved record in `bibtex-update`. `last_name_from_person` now reduces any family — including particles — to its final, most distinctive token, and every comparison site runs **both** the entry side and the API-record side through it: `FactChecker._compare_all_fields` / `_score_candidate`, and the resolver's five match-score sites via a new `_record_surnames` helper. Both citation styles now produce the same key symmetrically.
+- **`extract_arxiv_id_from_text` mistook numbers that merely look like a modern arXiv ID**: any `NNNN.NNNNN` substring matched, so a DOI fragment (`10.1234/5678.9012` → `5678.9012`) or an arbitrary number was treated as an arXiv identifier, driving false preprint detection in `bibtex-update` and bogus arXiv lookups in `bibtex-check` / Zotero sync. A new `is_valid_arxiv_id` rejects modern IDs whose `YYMM` month is not `01–12`, and extraction now scans all candidates (`finditer`) returning the first *valid* one. `FactChecker._arxiv_id_from_entry` applies the same month check to `eprint`.
+- **Legacy / `.pdf` arXiv URLs were truncated**: `ARXIV_HOST_RE` stopped at the first `/`, so `arxiv.org/abs/hep-th/9901001` yielded `hep-th` and `arxiv.org/pdf/2602.01031v2.pdf` leaked the `v2.pdf` suffix. The host pattern now captures the full path segment, and extraction strips a trailing `.pdf` and `vN` version and re-normalizes through `ARXIV_ID_RE`, so legacy category IDs survive intact and modern IDs are returned bare.
+- **Generic single-word venue aliases collapsed distinct sibling journals**: `get_canonical_venue("Nature Physics")` substring-matched the alias `"nature"` and returned canonical `"nature"`, conflating *Nature* with *Nature Physics* / *Science* with *Science Robotics* / *PNAS* with *PNAS Nexus* and masking a genuine `VENUE_MISMATCH`. Only the generic single-word journal names (`nature`, `science`, `pnas`) now require an exact match; acronym venues keep substring matching, so a track/suffix form (`"NeurIPS Track"` → `neurips`, `"ICML 2021"` → `icml`) and multi-word siblings (`"Nature Communications"` → `nature_comm`) still canonicalize correctly.
+
+### Internal
+- De-duplicated the arXiv-record lookup: `_check_arxiv_id_consistency` and `_query_arxiv_by_id` now share a memoized `FactChecker._arxiv_record(id)` instead of fetching + parsing the same arXiv Atom feed twice per entry. Factored the record-surname extraction (`updater._record_surnames`) and the arXiv-ID normalization (`extract_arxiv_id_from_text._normalize`) out of duplicated call sites.
+
+### Tests
+- +22 tests in `tests/test_subtle_failures.py` (particle-surname symmetry on both the fact-checker and resolver paths, impossible-month arXiv-ID rejection, legacy/`.pdf` URL extraction, generic-journal vs acronym venue matching); plus arXiv-ID↔title consistency, resolver `_verify_arxiv_match`, and DBLP-suffix/`CoRR`-venue regression tests. Full suite: 785 passed, 1 skipped (zero regressions).
+
 ## [0.9.1] - 2026-05-26
 
 ### Added
@@ -299,7 +315,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Comprehensive test suite with pytest fixtures
 - MIT License
 
-[Unreleased]: https://github.com/rpatrik96/bibtexupdater/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/rpatrik96/bibtexupdater/compare/v0.9.2...HEAD
+[0.9.2]: https://github.com/rpatrik96/bibtexupdater/compare/v0.9.1...v0.9.2
+[0.9.1]: https://github.com/rpatrik96/bibtexupdater/compare/v0.9.0...v0.9.1
+[0.9.0]: https://github.com/rpatrik96/bibtexupdater/compare/v0.7.0...v0.9.0
 [0.7.0]: https://github.com/rpatrik96/bibtexupdater/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/rpatrik96/bibtexupdater/compare/v0.6.0...v0.6.1
 [0.5.1]: https://github.com/rpatrik96/bibtexupdater/compare/v0.5.0...v0.5.1

@@ -57,6 +57,108 @@ ARXIV_ERROR_ATOM = """<?xml version="1.0" encoding="UTF-8"?>
 </feed>
 """
 
+# The real ONEBench paper (arXiv:2412.07689).
+ONEBENCH_ATOM = """<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom" xmlns:arxiv="http://arxiv.org/schemas/atom">
+  <entry>
+    <id>http://arxiv.org/abs/2412.07689v1</id>
+    <published>2024-12-10T18:00:00Z</published>
+    <title>ONEBench to Test Them All: Sample-Level Benchmarking Over Open-Ended Capabilities</title>
+    <summary>We propose ONEBench...</summary>
+    <author><name>Adhiraj Ghosh</name></author>
+    <author><name>Sebastian Dziadzio</name></author>
+    <author><name>Ameya Prabhu</name></author>
+    <author><name>Vishaal Udandarao</name></author>
+    <author><name>Samuel Albanie</name></author>
+    <author><name>Matthias Bethge</name></author>
+    <arxiv:primary_category term="cs.LG"/>
+  </entry>
+</feed>
+"""
+
+# The *unrelated* paper that the wrong arXiv:2412.06745 actually points to.
+ROBOTRON_ATOM = """<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom" xmlns:arxiv="http://arxiv.org/schemas/atom">
+  <entry>
+    <id>http://arxiv.org/abs/2412.06745v1</id>
+    <published>2024-12-09T18:00:00Z</published>
+    <title>RoboTron-Drive: All-in-One Large Multimodal Model for Autonomous Driving</title>
+    <summary>We present RoboTron-Drive...</summary>
+    <author><name>Zhijian Huang</name></author>
+    <author><name>Chengjian Feng</name></author>
+    <author><name>Feng Yan</name></author>
+    <arxiv:primary_category term="cs.CV"/>
+  </entry>
+</feed>
+"""
+
+
+def _onebench_entry(arxiv_url: str) -> dict[str, str]:
+    """ONEBench bib entry parameterized by the arXiv URL it cites."""
+    return {
+        "ID": "onebench2024",
+        "ENTRYTYPE": "inproceedings",
+        "title": "ONEBench to Test Them All: Sample-Level Benchmarking Over Open-Ended Capabilities",
+        "author": (
+            "Ghosh, Adhiraj and Dziadzio, Sebastian and Prabhu, Ameya and "
+            "Udandarao, Vishaal and Albanie, Samuel and Bethge, Matthias"
+        ),
+        "url": arxiv_url,
+        "year": "2024",
+    }
+
+
+class TestArxivIdConsistency:
+    """Regression: an entry whose cited arXiv ID resolves to a *different* paper
+    must be flagged ARXIV_ID_MISMATCH, not silently VERIFIED against the real
+    paper found by title/author search. This is the onebench2024 failure where
+    the correct arXiv:2412.07689 was replaced with the unrelated 2412.06745.
+    """
+
+    def test_wrong_arxiv_id_flagged_mismatch(self, dead_sources, logger):
+        crossref, dblp, s2 = dead_sources
+        arxiv = _StubArxiv({"2412.06745": ROBOTRON_ATOM})
+        checker = FactChecker(crossref, dblp, s2, FactCheckerConfig(), logger, arxiv=arxiv)
+
+        result = checker.check_entry(_onebench_entry("https://arxiv.org/abs/2412.06745"))
+
+        assert result.status == FactCheckStatus.ARXIV_ID_MISMATCH
+        assert "2412.06745" in arxiv.requested
+        assert result.best_match is not None
+        assert "RoboTron" in result.best_match.title
+        assert result.errors and "2412.06745" in result.errors[0]
+
+    def test_correct_arxiv_id_not_flagged(self, dead_sources, logger):
+        """The correct ID resolves to ONEBench, so the entry verifies instead."""
+        crossref, dblp, s2 = dead_sources
+        arxiv = _StubArxiv({"2412.07689": ONEBENCH_ATOM})
+        checker = FactChecker(crossref, dblp, s2, FactCheckerConfig(), logger, arxiv=arxiv)
+
+        result = checker.check_entry(_onebench_entry("https://arxiv.org/abs/2412.07689"))
+
+        assert result.status != FactCheckStatus.ARXIV_ID_MISMATCH
+        assert result.status == FactCheckStatus.VERIFIED
+
+    def test_mismatch_check_disabled_by_config(self, dead_sources, logger):
+        """With the guard disabled, the wrong ID is not flagged (opt-out works)."""
+        crossref, dblp, s2 = dead_sources
+        arxiv = _StubArxiv({"2412.06745": ROBOTRON_ATOM})
+        config = FactCheckerConfig(check_arxiv_consistency=False)
+        checker = FactChecker(crossref, dblp, s2, config, logger, arxiv=arxiv)
+
+        result = checker.check_entry(_onebench_entry("https://arxiv.org/abs/2412.06745"))
+
+        assert result.status != FactCheckStatus.ARXIV_ID_MISMATCH
+
+    def test_no_arxiv_client_skips_consistency_check(self, dead_sources, logger):
+        """Without an arXiv client the guard is a no-op (no false mismatch)."""
+        crossref, dblp, s2 = dead_sources
+        checker = FactChecker(crossref, dblp, s2, FactCheckerConfig(), logger)
+
+        result = checker.check_entry(_onebench_entry("https://arxiv.org/abs/2412.06745"))
+
+        assert result.status != FactCheckStatus.ARXIV_ID_MISMATCH
+
 
 class _StubArxiv:
     """ArxivClient stand-in returning canned Atom XML, no network."""
