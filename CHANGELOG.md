@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.2] - 2026-05-27
+
+### Fixed
+- **Particle surnames produced false `AUTHOR_MISMATCH` (and depressed match scores → false `HALLUCINATED`)**: author comparison was asymmetric. The BibTeX entry side reduced a name to its last whitespace token (`"Aaron van den Oord"` → `oord`), while the API-record side used the raw `family` field verbatim (`"van den Oord"` → `van den oord`). Jaccard over `{oord}` vs `{van den oord}` is `0`, so a correctly-cited paper by an author with a nobiliary/patronymic particle (von, van der, de la, dos, …) was flagged as an author mismatch, and the lowered score could tip a real paper into `HALLUCINATED`. `last_name_from_person` now strips leading particles (new `SURNAME_PARTICLES` set) to derive a stable surname key, and `FactChecker._compare_all_fields` / `_score_candidate` route API `family` names through the same function, so both sides compare symmetrically regardless of citation style. The reduction is guarded so a surname that is *only* a particle token (`"Le"`, `"De"`) is never emptied.
+- **`extract_arxiv_id_from_text` mistook numbers that merely look like a modern arXiv ID**: any `NNNN.NNNNN` substring matched, so a DOI fragment (`10.1234/5678.9012` → `5678.9012`) or an arbitrary number was treated as an arXiv identifier, driving false preprint detection in `bibtex-update` and bogus arXiv lookups in `bibtex-check` / Zotero sync. A new `is_valid_arxiv_id` rejects modern IDs whose `YYMM` month is not `01–12`, and extraction now scans all candidates (`finditer`) returning the first *valid* one. `FactChecker._arxiv_id_from_entry` applies the same month check to `eprint`.
+- **Legacy / `.pdf` arXiv URLs were truncated**: `ARXIV_HOST_RE` stopped at the first `/`, so `arxiv.org/abs/hep-th/9901001` yielded `hep-th` and `arxiv.org/pdf/2602.01031v2.pdf` leaked the `v2.pdf` suffix. The host pattern now captures the full path segment, and extraction strips a trailing `.pdf` and `vN` version and re-normalizes through `ARXIV_ID_RE`, so legacy category IDs survive intact and modern IDs are returned bare.
+- **Generic single-word venue aliases collapsed distinct sibling journals**: `get_canonical_venue("Nature Physics")` substring-matched the alias `"nature"` and returned canonical `"nature"`, conflating *Nature* with *Nature Physics* / *Science* with *Science Robotics* and masking a genuine `VENUE_MISMATCH`. Single-token aliases now require an exact match; substring matching is reserved for multi-word aliases. Multi-word siblings (`"Nature Communications"` → `nature_comm`) and acronym venues with stripped years (`"ICML 2021"` → `icml`) are unaffected.
+
+### Tests
+- +18 tests in `tests/test_subtle_failures.py` covering particle-surname symmetry, impossible-month arXiv-ID rejection, legacy/`.pdf` URL extraction, and single-token venue exact-matching. Full suite: 771 passed, 1 skipped (zero regressions).
+
 ## [0.9.1] - 2026-05-26
 
 ### Added
@@ -299,7 +310,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Comprehensive test suite with pytest fixtures
 - MIT License
 
-[Unreleased]: https://github.com/rpatrik96/bibtexupdater/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/rpatrik96/bibtexupdater/compare/v0.9.2...HEAD
+[0.9.2]: https://github.com/rpatrik96/bibtexupdater/compare/v0.9.1...v0.9.2
+[0.9.1]: https://github.com/rpatrik96/bibtexupdater/compare/v0.9.0...v0.9.1
+[0.9.0]: https://github.com/rpatrik96/bibtexupdater/compare/v0.7.0...v0.9.0
 [0.7.0]: https://github.com/rpatrik96/bibtexupdater/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/rpatrik96/bibtexupdater/compare/v0.6.0...v0.6.1
 [0.5.1]: https://github.com/rpatrik96/bibtexupdater/compare/v0.5.0...v0.5.1

@@ -78,8 +78,10 @@ from bibtex_updater.utils import (
     crossref_message_to_record,
     dblp_hit_to_record,
     first_author_surname,
+    is_valid_arxiv_id,
     # Matching
     jaccard_similarity,
+    last_name_from_person,
     # Text normalization
     normalize_title_for_match,
     s2_data_to_record,
@@ -1692,7 +1694,12 @@ class FactChecker:
         eprint = (entry.get("eprint") or "").strip()
         archive = (entry.get("archiveprefix") or entry.get("archivePrefix") or "").strip().lower()
         if eprint and (archive == "arxiv" or re.match(r"^\d{4}\.\d{4,5}(v\d+)?$", eprint)):
-            return re.sub(r"v\d+$", "", eprint)
+            bare = re.sub(r"v\d+$", "", eprint)
+            # A legacy-scheme eprint (e.g. "math.GT/0309136") is structurally
+            # valid; a modern "YYMM.NNNNN" must have a real month.
+            if is_valid_arxiv_id(bare):
+                return bare
+            return None
 
         for field_name in ("url", "howpublished", "journal", "note"):
             value = entry.get(field_name) or ""
@@ -1700,7 +1707,9 @@ class FactChecker:
             if not m:
                 m = re.search(r"arxiv:\s*([0-9]{4}\.[0-9]{4,5}(?:v\d+)?)", value, flags=re.IGNORECASE)
             if m:
-                return re.sub(r"v\d+$", "", m.group(1).strip())
+                bare = re.sub(r"v\d+$", "", m.group(1).strip())
+                if is_valid_arxiv_id(bare):
+                    return bare
         return None
 
     def _query_arxiv_by_id(
@@ -1943,7 +1952,8 @@ class FactChecker:
         title_b = normalize_title_for_match(rec.title or "")
         title_score = token_sort_ratio(title_norm, title_b) / 100.0
 
-        authors_b = [strip_diacritics(a.get("family", "")).lower() for a in rec.authors][:3]
+        authors_b = [last_name_from_person(a.get("family", "")) for a in rec.authors][:3]
+        authors_b = [a for a in authors_b if a]
         author_score = jaccard_similarity(authors_ref, authors_b)
 
         return 0.7 * title_score + 0.3 * author_score
@@ -2063,7 +2073,8 @@ class FactChecker:
         # Author (P2.3: Ordered author comparison)
         entry_authors = entry.get("author", "")
         entry_names = authors_last_names(entry_authors, limit=10)
-        api_names = [strip_diacritics(a.get("family", "")).lower() for a in record.authors]
+        api_names = [last_name_from_person(a.get("family", "")) for a in record.authors]
+        api_names = [n for n in api_names if n]
         # Use combined score (Jaccard + sequence similarity)
         author_score = combined_author_score(entry_names, api_names, jaccard_weight=0.5, sequence_weight=0.5)
         api_authors_str = " and ".join(f"{a.get('given', '')} {a.get('family', '')}".strip() for a in record.authors)

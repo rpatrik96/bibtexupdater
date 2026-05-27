@@ -45,7 +45,7 @@ ARXIV_ID_RE = re.compile(
     re.IGNORECASE | re.VERBOSE,
 )
 
-ARXIV_HOST_RE = re.compile(r"https?://(?:www\.)?arxiv\.org/(?:abs|pdf)/(?P<id>[^?/]+)", re.IGNORECASE)
+ARXIV_HOST_RE = re.compile(r"https?://(?:www\.)?arxiv\.org/(?:abs|pdf)/(?P<id>[^\s?#]+)", re.IGNORECASE)
 
 PREPRINT_HOSTS = ("arxiv", "biorxiv", "medrxiv")
 
@@ -136,10 +136,62 @@ def split_authors_bibtex(author_field: str) -> list[str]:
     return parts
 
 
-def last_name_from_person(name: str) -> str:
-    """Extract last name from a person name.
+#: Lowercase nobiliary / patronymic particles that precede the distinctive
+#: surname token (e.g. "van den Oord", "von Mises", "de la Cruz"). These are
+#: stripped when deriving a comparable surname key so that the same author
+#: matches whether the entry stores "Given particle Family" or
+#: "particle Family, Given" -- the two forms otherwise produced an asymmetric
+#: key ("oord" vs "van den oord") and a spurious author mismatch.
+SURNAME_PARTICLES = frozenset(
+    {
+        "von",
+        "vom",
+        "zu",
+        "zum",
+        "zur",
+        "van",
+        "der",
+        "den",
+        "ter",
+        "ten",
+        "te",
+        "op",
+        "de",
+        "del",
+        "della",
+        "di",
+        "da",
+        "dal",
+        "dos",
+        "das",
+        "du",
+        "do",
+        "la",
+        "le",
+        "el",
+        "al",
+        "lo",
+        "li",
+        "af",
+        "av",
+        "bin",
+        "ibn",
+        "abu",
+        "mc",
+        "mac",
+        "saint",
+        "st",
+    }
+)
 
-    Handles both 'Family, Given' and 'Given Family' formats.
+
+def last_name_from_person(name: str) -> str:
+    """Extract a comparable surname key from a person name.
+
+    Handles both 'Family, Given' and 'Given Family' formats, and strips leading
+    nobiliary particles so that particle-prefixed surnames compare equal across
+    citation styles. Falls back to the unstripped form if stripping would leave
+    nothing.
     """
     name = latex_to_plain(name)
     if "," in name:
@@ -148,7 +200,14 @@ def last_name_from_person(name: str) -> str:
         toks = name.split()
         last = toks[-1].strip() if toks else ""
     last = strip_diacritics(last).lower()
-    last = re.sub(r"[^a-z0-9\s-]", "", last)
+    last = re.sub(r"[^a-z0-9\s-]", "", last).strip()
+
+    tokens = last.split()
+    if len(tokens) > 1:
+        stripped = tokens
+        while len(stripped) > 1 and stripped[0] in SURNAME_PARTICLES:
+            stripped = stripped[1:]
+        last = " ".join(stripped)
     return last
 
 
@@ -202,16 +261,51 @@ def doi_url(doi: str) -> str:
     return f"https://doi.org/{doi}"
 
 
+_ARXIV_NEW_ID_RE = re.compile(r"^(\d{2})(\d{2})\.\d{4,5}(v\d+)?$")
+
+
+def is_valid_arxiv_id(arxiv_id: str | None) -> bool:
+    """Validate a bare arXiv identifier.
+
+    Modern IDs are ``YYMM.NNNNN`` where ``MM`` is a real month (01-12); a
+    number with an impossible month (e.g. a DOI fragment like ``5678.9012``)
+    is not a valid arXiv ID. Legacy IDs (``hep-th/9901001``) are accepted
+    structurally. Returns False for None/empty.
+    """
+    if not arxiv_id:
+        return False
+    m = _ARXIV_NEW_ID_RE.match(arxiv_id.strip())
+    if m:
+        month = int(m.group(2))
+        return 1 <= month <= 12
+    # Legacy scheme handled by ARXIV_ID_RE old-style alternative; accept as-is.
+    return True
+
+
 def extract_arxiv_id_from_text(text: str) -> str | None:
-    """Extract arXiv ID from a text string (URL, eprint field, note, etc.)."""
+    """Extract arXiv ID from a text string (URL, eprint field, note, etc.).
+
+    Modern IDs with an impossible month are rejected so that DOI fragments or
+    arbitrary ``NNNN.NNNNN`` numbers are not mistaken for arXiv identifiers.
+    """
     if not text:
         return None
     m = ARXIV_HOST_RE.search(text)
     if m:
-        return m.group("id")
-    m = ARXIV_ID_RE.search(text)
-    if m:
-        return m.group("id")
+        raw = m.group("id")
+        if raw.lower().endswith(".pdf"):
+            raw = raw[:-4]
+        # Normalize through the ID regex so legacy URLs (.../abs/hep-th/9901001)
+        # are not truncated and version suffixes are dropped consistently.
+        idm = ARXIV_ID_RE.search(raw)
+        candidate = idm.group("id") if idm else raw
+        candidate = re.sub(r"v\d+$", "", candidate)
+        if is_valid_arxiv_id(candidate):
+            return candidate
+    for match in ARXIV_ID_RE.finditer(text):
+        candidate = re.sub(r"v\d+$", "", match.group("id"))
+        if is_valid_arxiv_id(candidate):
+            return candidate
     return None
 
 

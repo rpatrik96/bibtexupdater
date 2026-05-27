@@ -383,11 +383,19 @@ def get_canonical_venue(venue: str, aliases: dict[str, set[str]] | None = None) 
         for name in all_names:
             if len(name) <= 3:
                 continue
+            if name == venue_norm:
+                return canonical
+            # Single-token aliases (generic words like "nature"/"science" and
+            # acronyms) must match exactly: substring matching would collapse
+            # distinct sibling journals ("Nature Physics" -> "Nature") and mask a
+            # genuine venue mismatch. Only multi-word aliases use substring logic.
+            if " " not in name:
+                continue
             # Require substantial overlap for substring matching
             shorter, longer = sorted([name, venue_norm], key=len)
             if len(shorter) / len(longer) < 0.4:
                 continue  # Too different in length for substring match
-            if name == venue_norm or name in venue_norm or venue_norm in name:
+            if name in venue_norm or venue_norm in name:
                 return canonical
 
     return None
