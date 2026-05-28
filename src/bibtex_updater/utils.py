@@ -150,12 +150,16 @@ def last_name_from_person(name: str) -> str:
     if "," in name:
         last = name.split(",", 1)[0].strip()
     else:
-        toks = name.split()
-        last = toks[-1].strip() if toks else ""
+        last = name.strip()
     last = strip_diacritics(last).lower()
     last = re.sub(r"[^a-z0-9\s-]", "", last).strip()
 
     tokens = last.split()
+    # Drop a trailing 4-digit DBLP homonym-disambiguation suffix ("Sun 0020",
+    # "Li 0001") so the key is the real surname rather than the number. Guarded
+    # by len > 1 so a name that is only digits is never emptied.
+    while len(tokens) > 1 and re.fullmatch(r"\d{4}", tokens[-1]):
+        tokens.pop()
     if tokens:
         last = tokens[-1]
     return last
@@ -1091,6 +1095,28 @@ class PublishedRecord:
     type: str | None = None
     method: str | None = None  # how found
     confidence: float = 0.0
+
+    def surname_keys(self, limit: int = 3) -> list[str]:
+        """Canonical surname comparison keys derived from ``self.authors``.
+
+        Single source of truth for turning a record author into a surname key:
+        each ``family`` field is reduced via ``last_name_from_person`` (the same
+        function the BibTeX-entry side uses through ``authors_last_names``), so
+        the entry and record sides are provably symmetric. Mirrors
+        ``authors_last_names`` exactly -- truncate to ``limit`` first, then drop
+        empties -- so neither side can drift from the other.
+        """
+        keys = [last_name_from_person(a.get("family", "") or "") for a in self.authors][:limit]
+        return [k for k in keys if k]
+
+    @property
+    def canonical_venue(self) -> str | None:
+        """Canonical venue id for ``self.journal`` (or None if unrecognized)."""
+        # Lazy import: matching.py imports from utils, so a module-level import
+        # here would be a cycle.
+        from bibtex_updater.matching import get_canonical_venue
+
+        return get_canonical_venue(self.journal or "")
 
 
 # ------------- API Response Converters -------------

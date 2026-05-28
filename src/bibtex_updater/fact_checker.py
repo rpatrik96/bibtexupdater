@@ -81,7 +81,6 @@ from bibtex_updater.utils import (
     is_valid_arxiv_id,
     # Matching
     jaccard_similarity,
-    last_name_from_person,
     # Text normalization
     normalize_title_for_match,
     s2_data_to_record,
@@ -1179,7 +1178,7 @@ class WorkingPaperVerifier(BaseVerifier):
         title_score = token_sort_ratio(title_entry, title_rec) / 100.0
 
         authors_entry = authors_last_names(entry.get("author", ""), limit=3)
-        authors_rec = [strip_diacritics(a.get("family", "")).lower() for a in rec.authors[:3]]
+        authors_rec = rec.surname_keys(limit=3)
         author_score = jaccard_similarity(authors_entry, authors_rec)
 
         return 0.7 * title_score + 0.3 * author_score
@@ -2041,8 +2040,7 @@ class FactChecker:
         title_b = normalize_title_for_match(rec.title or "")
         title_score = token_sort_ratio(title_norm, title_b) / 100.0
 
-        authors_b = [last_name_from_person(a.get("family", "")) for a in rec.authors][:3]
-        authors_b = [a for a in authors_b if a]
+        authors_b = rec.surname_keys(limit=3)
         author_score = jaccard_similarity(authors_ref, authors_b)
 
         return 0.7 * title_score + 0.3 * author_score
@@ -2162,8 +2160,9 @@ class FactChecker:
         # Author (P2.3: Ordered author comparison)
         entry_authors = entry.get("author", "")
         entry_names = authors_last_names(entry_authors, limit=10)
-        api_names = [last_name_from_person(a.get("family", "")) for a in record.authors]
-        api_names = [n for n in api_names if n]
+        # Route the API side through the same canonical surname reduction as the
+        # entry side. The API side was previously unsliced; keep that.
+        api_names = record.surname_keys(limit=10_000)
         # Use combined score (Jaccard + sequence similarity)
         author_score = combined_author_score(entry_names, api_names, jaccard_weight=0.5, sequence_weight=0.5)
         api_authors_str = " and ".join(f"{a.get('given', '')} {a.get('family', '')}".strip() for a in record.authors)
