@@ -206,6 +206,7 @@ class FactCheckStatus(Enum):
     HALLUCINATED = "hallucinated"
     API_ERROR = "api_error"
     ARXIV_ID_MISMATCH = "arxiv_id_mismatch"  # Entry's cited arXiv ID resolves to a different paper
+    DOI_MISMATCH = "doi_mismatch"  # Entry's cited DOI resolves to a different paper
 
     # Pre-API validation statuses
     FUTURE_DATE = "future_date"  # Year is in the future
@@ -348,6 +349,16 @@ class FactCheckerConfig:
     # as pointing to a *different* paper. Deliberately low so only clear
     # different-paper cases trip it, not minor preprint/published title edits.
     arxiv_consistency_min_title: float = 0.50
+    # Verify the entry's own DOI points to the entry's paper. Today _validate_doi
+    # only checks the DOI *resolves* (doi.org HEAD); it never checks the DOI
+    # points to the CITED paper. A copy-paste DOI that resolves to a different
+    # work otherwise survives because title/author search VERIFIES the entry
+    # against its real record.
+    check_doi_consistency: bool = True
+    # Below this normalized title score (0-1), the DOI's Crossref record is
+    # treated as a *different* paper. Deliberately low (mirrors arXiv) so only
+    # clear different-paper cases trip it.
+    doi_consistency_min_title: float = 0.50
     # CheckIfExist additions (Item 1 + 2): explicit cascading + top-K retrieval.
     # Default on: the cascade (CrossRef -> OpenAlex -> S2) short-circuits on a
     # high-confidence match, so the slow keyless-S2 / specialist sources stay
@@ -1314,6 +1325,28 @@ class CrossrefClient:
         except Exception:
             return []
 
+    def get_by_doi(self, doi: str) -> dict[str, Any] | None:
+        """Fetch the Crossref ``message`` record a DOI resolves to.
+
+        Uses the Crossref REST ``/works/{doi}`` endpoint for reliable metadata
+        (unlike a doi.org HEAD, which only tells you the DOI resolves). Returns
+        ``None`` on any non-200 / parse failure / network error so callers can
+        treat "cannot determine" as no evidence (FPR-safe), never a flag.
+        """
+        from urllib.parse import quote
+
+        doi = normalize_doi_for_resolution(doi) or (doi or "").strip()
+        if not doi:
+            return None
+        url = f"{CROSSREF_API}/{quote(doi, safe='')}"
+        try:
+            resp = self.http._request("GET", url, accept="application/json", service="crossref")
+            if resp.status_code != 200:
+                return None
+            return resp.json().get("message", {}) or None
+        except Exception:
+            return None
+
 
 class DBLPClient:
     """DBLP API client for computer science publications."""
@@ -1762,6 +1795,14 @@ class FactChecker:
             if arxiv_status is not None:
                 return arxiv_status
 
+        # Pre-search consistency: the entry's own DOI must point to *this* paper.
+        # A copy-paste DOI that resolves to a different work otherwise survives
+        # because title/author search VERIFIES the entry against its real record.
+        if self.config.check_doi_consistency:
+            doi_consistency_status = self._check_doi_consistency(entry)
+            if doi_consistency_status is not None:
+                return doi_consistency_status
+
         query = f"{title_norm} {first_author}".strip()
         # Item 1: explicit cascade vs. legacy parallel search.
         if self.config.cascade_mode:
@@ -1981,6 +2022,73 @@ class FactChecker:
             api_sources_with_hits=["arxiv"],
             errors=[
                 f"arXiv ID {arxiv_id} resolves to {rec.title!r}, which does not "
+                f"match entry title {entry.get('title', '')!r}"
+            ],
+        )
+
+    def _check_doi_consistency(self, entry: dict[str, Any]) -> FactCheckResult | None:
+        """Flag entries whose cited DOI resolves to a *different* paper.
+
+        ``_validate_doi`` only checks that the DOI *resolves* (doi.org HEAD); it
+        never checks that the DOI points to the CITED paper. Title/author search
+        then happily VERIFIES a misattributed entry against its real record, so a
+        copy-paste DOI (e.g. "IBRNet" carrying the DOI of a 3D-detection paper)
+        survives unnoticed. Here we fetch the DOI's Crossref record and require
+        its title to match the entry; a clear mismatch is reported as
+        :class:`FactCheckStatus.DOI_MISMATCH`.
+
+        FPR-safe: returns ``None`` (no flag) when there is nothing to check (no
+        DOI, feature off) OR the determination is uncertain (Crossref fetch
+        failed / non-200 / no record / no title -- e.g. IEEE bot-block or a DOI
+        Crossref doesn't index). Only a SUCCESSFULLY fetched record whose title
+        CLEARLY differs (score below ``doi_consistency_min_title``) trips it.
+        """
+        if not self.config.check_doi_consistency:
+            return None
+        raw_doi = entry.get("doi", "")
+        if not raw_doi:
+            return None
+
+        entry_title = normalize_title_for_match(entry.get("title", ""))
+        if not entry_title:
+            return None
+
+        try:
+            msg = self.crossref.get_by_doi(raw_doi)
+        except Exception:
+            return None
+        # Cannot determine -> do NOT flag (keeps FPR low).
+        if msg is None:
+            return None
+        rec = crossref_message_to_record(msg)
+        if rec is None or not rec.title:
+            return None
+
+        doi_title = normalize_title_for_match(rec.title)
+        title_score = token_sort_ratio(entry_title, doi_title) / 100.0
+        if title_score >= self.config.doi_consistency_min_title:
+            return None
+
+        self.logger.warning(
+            "DOI %s for entry %r points to a different paper: entry title "
+            "%r vs DOI title %r (title score %.2f)",
+            raw_doi,
+            entry.get("ID", "?"),
+            entry.get("title", ""),
+            rec.title,
+            title_score,
+        )
+        return FactCheckResult(
+            entry_key=entry.get("ID", "unknown"),
+            entry_type=entry.get("ENTRYTYPE", "misc").lower(),
+            status=FactCheckStatus.DOI_MISMATCH,
+            overall_confidence=0.0,
+            field_comparisons={},
+            best_match=rec,
+            api_sources_queried=["crossref"],
+            api_sources_with_hits=["crossref"],
+            errors=[
+                f"DOI {raw_doi} resolves to {rec.title!r}, which does not "
                 f"match entry title {entry.get('title', '')!r}"
             ],
         )
@@ -2878,6 +2986,7 @@ class FactCheckProcessor:
             "invalid_year",
             "doi_not_found",
             "arxiv_id_mismatch",
+            "doi_mismatch",
             "preprint_only",
         ]
 

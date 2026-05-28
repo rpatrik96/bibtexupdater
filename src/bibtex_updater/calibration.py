@@ -44,6 +44,9 @@ STATUS_BASE_CONFIDENCE = {
     "future_date": 0.95,
     "invalid_year": 0.95,
     "doi_not_found": 0.85,
+    # A DOI that resolves to a clearly different paper is strong positive
+    # evidence of a misattributed identifier (copy-paste / lookup error).
+    "doi_mismatch": 0.85,
     "preprint_only": 0.90,
     "published_version_exists": 0.85,
     "url_verified": 0.90,
@@ -96,6 +99,9 @@ def compute_confidence_from_scores(
         "future_date",
         "invalid_year",
         "doi_not_found",
+        # Pre-search positive-evidence check: the verdict comes from the DOI's
+        # own Crossref record, not from a scored title-search candidate.
+        "doi_mismatch",
         "api_error",
         "skipped",
     }
