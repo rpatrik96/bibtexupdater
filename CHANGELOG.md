@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-05-28
+
+### Changed
+- **Comparison surnames now have a single source of truth (`PublishedRecord.surname_keys`)**: the recurring "subtle wrong verdict" bugs all shared one root cause — *comparison asymmetry*, where the BibTeX-entry side and the API-record side reduced the same surname through *different* normalization (e.g. entry `"Aaron van den Oord"` → `oord` vs. record `family` kept raw as `van den oord` → Jaccard `0` → false `AUTHOR_MISMATCH` / `HALLUCINATED`). The fix had been a helper called at ~7 separate sites, which is exactly how it drifted. `PublishedRecord` now exposes `surname_keys(limit)` — the one place that turns a record author into a comparison key, routing each `family` through the same `last_name_from_person` the entry side uses via `authors_last_names`. All seven comparison sites (5 in `updater.py`, 2 in `fact_checker.py`, plus `FieldFiller._find_best_crossref_match` and `WorkingPaperVerifier._score` which were still keying the record side *raw*) now consume it, so the two sides are symmetric by construction and cannot drift again. The now-redundant module-level `_record_surnames` helper was removed. No thresholds, weights, or verdict logic changed.
+
+### Added
+- **`PublishedRecord.canonical_venue`**: a single record-side accessor for the canonical venue (wrapping `get_canonical_venue`), mirroring `surname_keys` for the venue dimension.
+
+### Fixed
+- **DBLP homonym-disambiguation suffix is now stripped at the surname-key level too**: a record family carrying a `NNNN` homonym suffix (`"Yu Sun 0020"`, `"Chuan Guo 0001"`) reduced to the *number* (`0020`) as its comparison key, falsely mismatching the same author. `last_name_from_person` now drops a trailing 4-digit token before reducing to the final surname token (guarded so an all-digits name is never emptied). This is defense-in-depth alongside the existing strip in `dblp_hit_to_record`, so the key is robust even when a suffix reaches the comparison layer from any source.
+
+### Tests
+- **+54 tests across two new self-checking oracles** that would have caught the asymmetry class before it shipped, instead of after:
+  - `tests/test_record_roundtrip.py` — a record turned into an entry (via the production `Updater.update_entry` path) must verify against *itself* with zero field mismatches and clear the resolver `MATCH_THRESHOLD`; covers particle surnames, multi-word particles, diacritics, conference venues, and many-author records.
+  - `tests/test_metamorphic_symmetry.py` — states each past bug as an *invariance*: a true match's verdict must survive citation-style transforms (`"Given Family"` ↔ `"Family, Given"`, diacritics, DBLP suffix, particle placement), `combined_author_score` must be symmetric, and `canonical_venue` must not collapse sibling journals.
+- Full suite: 839 passed, 1 skipped (was 785 + 54 new; zero regressions).
+
 ## [0.9.2] - 2026-05-27
 
 ### Fixed
@@ -315,7 +332,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Comprehensive test suite with pytest fixtures
 - MIT License
 
-[Unreleased]: https://github.com/rpatrik96/bibtexupdater/compare/v0.9.2...HEAD
+[Unreleased]: https://github.com/rpatrik96/bibtexupdater/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/rpatrik96/bibtexupdater/compare/v0.9.2...v0.10.0
 [0.9.2]: https://github.com/rpatrik96/bibtexupdater/compare/v0.9.1...v0.9.2
 [0.9.1]: https://github.com/rpatrik96/bibtexupdater/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/rpatrik96/bibtexupdater/compare/v0.7.0...v0.9.0

@@ -538,7 +538,7 @@ class FieldFiller:
             title_b = normalize_title_for_match(rec.title or "")
             title_score = token_sort_ratio(title_a, title_b)
 
-            authors_b = [a.get("family", "").lower() for a in rec.authors[:3]]
+            authors_b = rec.surname_keys(limit=3)
             auth_score = jaccard_similarity(authors_a, authors_b)
 
             combined = 0.7 * (title_score / 100.0) + 0.3 * auth_score
@@ -801,17 +801,6 @@ class Detector:
             )
 
         return PreprintDetection(False)
-
-
-def _record_surnames(authors: list[dict[str, Any]], limit: int = 3) -> list[str]:
-    """Comparable surname keys for a record's authors.
-
-    Routes the API-record ``family`` names through the same ``last_name_from_person``
-    reduction the entry side uses (via ``authors_last_names``), so author Jaccard
-    comparison is symmetric for particle surnames ("van den Oord" -> "oord" on
-    both sides) instead of scoring a spurious mismatch.
-    """
-    return [n for n in (last_name_from_person(a.get("family") or "") for a in authors) if n][:limit]
 
 
 def _s2_record_is_still_preprint(msg: dict[str, Any], doi: str | None) -> bool:
@@ -2007,7 +1996,7 @@ class Resolver:
         """
         tb = normalize_title_for_match(rec.title or "")
         title_score = token_sort_ratio(title_norm, tb)  # 0..100
-        blns = _record_surnames(rec.authors)
+        blns = rec.surname_keys(limit=3)
         auth_score = jaccard_similarity(authors_ref[:3], blns)
         return 0.7 * (title_score / 100.0) + 0.3 * auth_score
 
@@ -2692,7 +2681,7 @@ class AsyncResolver:
                         continue
                     tb = normalize_title_for_match(rec.title or "")
                     title_score = token_sort_ratio(title_norm, tb)
-                    blns = _record_surnames(rec.authors)
+                    blns = rec.surname_keys(limit=3)
                     auth_score = jaccard_similarity(authors[:3], blns)
                     combined = 0.7 * (title_score / 100.0) + 0.3 * auth_score
                     if combined >= self.MATCH_THRESHOLD and self._credible_journal_article(rec):
@@ -2731,7 +2720,7 @@ class AsyncResolver:
                     )
                     tb = normalize_title_for_match(rec.title or "")
                     title_score = token_sort_ratio(title_norm, tb)
-                    blns = _record_surnames(rec.authors)
+                    blns = rec.surname_keys(limit=3)
                     auth_score = jaccard_similarity(authors[:3], blns)
                     combined = 0.7 * (title_score / 100.0) + 0.3 * auth_score
                     if combined >= self.MATCH_THRESHOLD and self._credible_journal_article(rec):
@@ -2753,7 +2742,7 @@ class AsyncResolver:
                         continue
                     tb = normalize_title_for_match(rec.title or "")
                     title_score = token_sort_ratio(title_norm, tb)
-                    blns = _record_surnames(rec.authors)
+                    blns = rec.surname_keys(limit=3)
                     auth_score = jaccard_similarity(authors[:3], blns)
                     combined = 0.7 * (title_score / 100.0) + 0.3 * auth_score
                     if combined >= self.MATCH_THRESHOLD and self._credible_journal_article(rec):
@@ -2869,7 +2858,7 @@ class AsyncResolver:
                     authors_ref = authors_last_names(entry.get("author", ""))
                     tb = normalize_title_for_match(rec.title or "")
                     title_score = token_sort_ratio(title_norm, tb)
-                    blns = _record_surnames(rec.authors)
+                    blns = rec.surname_keys(limit=3)
                     auth_score = jaccard_similarity(authors_ref[:3], blns)
                     combined = 0.7 * (title_score / 100.0) + 0.3 * auth_score
                     if combined >= self.MATCH_THRESHOLD and self._credible_journal_article(rec):
