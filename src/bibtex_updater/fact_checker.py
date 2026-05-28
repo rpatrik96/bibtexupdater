@@ -6,8 +6,10 @@ This tool validates that bibliographic entries in BibTeX files:
 2. Have matching metadata (title, authors, year, venue)
 
 It outputs detailed reports categorizing mismatches:
-- VERIFIED: Entry matches an external record
+- VERIFIED: Every claimed field positively confirmed against an external record
 - NOT_FOUND: No matching record found in any database
+- UNCONFIRMED: Record found and nothing contradicted, but a claimed field could
+  not be positively confirmed (e.g. preprint-only venue, incomplete authors)
 - HALLUCINATED: Very low match score, likely fabricated
 - TITLE_MISMATCH: Title differs significantly
 - AUTHOR_MISMATCH: Author list differs
@@ -44,6 +46,7 @@ from rapidfuzz.fuzz import token_sort_ratio
 from bibtex_updater.calibration import calibrate_result
 from bibtex_updater.matching import (
     EXPANDED_VENUE_ALIASES,
+    MatchOutcome,
     get_canonical_venue,
     is_near_miss_title,
     is_preprint_or_series_venue,
@@ -188,6 +191,13 @@ class FactCheckStatus(Enum):
     # Academic verification statuses
     VERIFIED = "verified"
     NOT_FOUND = "not_found"
+    # A matching record was found and nothing contradicts the entry, but at
+    # least one claimed field could not be POSITIVELY CONFIRMED (e.g. only a
+    # preprint record was found so the claimed published venue is unconfirmable,
+    # or the cited author list is a consistent-but-incomplete subset). This is a
+    # "could not fully confirm / needs review" verdict -- abstention, NOT a
+    # problem and NOT a verification.
+    UNCONFIRMED = "unconfirmed"
     TITLE_MISMATCH = "title_mismatch"
     AUTHOR_MISMATCH = "author_mismatch"
     YEAR_MISMATCH = "year_mismatch"
@@ -231,6 +241,10 @@ class FactCheckStatus(Enum):
 ABSTAINED_STATUS_VALUES = frozenset(
     {
         FactCheckStatus.NOT_FOUND.value,
+        # A record was found but a claimed field could not be positively
+        # confirmed (preprint-only venue, incomplete author list). "Could not
+        # fully confirm" is abstention, not a problem.
+        FactCheckStatus.UNCONFIRMED.value,
         FactCheckStatus.BOOK_NOT_FOUND.value,
         FactCheckStatus.WORKING_PAPER_NOT_FOUND.value,
         FactCheckStatus.URL_NOT_FOUND.value,
@@ -245,7 +259,14 @@ def _is_abstained_status(status: FactCheckStatus) -> bool:
 
 @dataclass
 class FieldComparison:
-    """Result of comparing a single field between entry and API record."""
+    """Result of comparing a single field between entry and API record.
+
+    ``matches`` is the legacy two-valued flag (kept for reporting/JSONL and
+    backward compatibility): True only for a positive confirmation (MATCH).
+    ``outcome`` carries the three-valued verdict so the status gate can tell a
+    real MISMATCH apart from a NON_COMPARABLE / PARTIAL ("could not confirm").
+    When ``outcome`` is None it defaults to MATCH if ``matches`` else MISMATCH.
+    """
 
     field_name: str
     entry_value: str | None
@@ -253,6 +274,33 @@ class FieldComparison:
     similarity_score: float
     matches: bool
     note: str | None = None
+    outcome: MatchOutcome | None = None
+
+    @property
+    def resolved_outcome(self) -> MatchOutcome:
+        """Three-valued verdict, defaulting from ``matches`` when unset."""
+        if self.outcome is not None:
+            return self.outcome
+        return MatchOutcome.MATCH if self.matches else MatchOutcome.MISMATCH
+
+    @property
+    def is_confirmed(self) -> bool:
+        """True only for a positive confirmation (MATCH)."""
+        return self.resolved_outcome is MatchOutcome.MATCH
+
+    @property
+    def is_mismatch(self) -> bool:
+        """True only for a real contradiction (MISMATCH)."""
+        return self.resolved_outcome is MatchOutcome.MISMATCH
+
+    @property
+    def is_non_confirming(self) -> bool:
+        """True when the field is neither confirmed nor a mismatch.
+
+        i.e. NON_COMPARABLE or PARTIAL: a record was found and nothing is
+        contradicted, but the claimed field could not be positively confirmed.
+        """
+        return self.resolved_outcome in (MatchOutcome.NON_COMPARABLE, MatchOutcome.PARTIAL)
 
 
 @dataclass
@@ -1419,31 +1467,53 @@ def _find_canonical_venue(norm_venue: str) -> str | None:
     return None
 
 
-def venues_match(venue_a: str, venue_b: str, threshold: float = 0.70) -> tuple[bool, float]:
-    """Check if two venue names match, considering aliases. Returns (matches, score).
+@dataclass(frozen=True)
+class VenueMatchResult:
+    """Trichotomy result of :func:`venues_match`.
 
-    P2.5: Now uses EXPANDED_VENUE_ALIASES from matching.py for better venue coverage.
-
-    FIX E-venue: venue comparison is non-refuting in two symmetric cases, so it
-    never produces a false mismatch for a correctly cited paper:
-
-    - EMPTY on EITHER side -> non-comparable. (Previously empty *entry* matched
-      but empty *API* hard-failed; arXiv-indexed records routinely have a blank
-      venue.)
-    - PREPRINT / publisher-series on either side (arXiv/CoRR, bioRxiv, PMLR,
-      JMLR W&CP) -> non-comparable. A preprint venue says nothing about the
-      published venue the entry cites.
-
-    A genuine mismatch (both sides populated, both canonicalize to two DIFFERENT
-    real venues) is still reported.
+    ``outcome`` is one of MATCH / MISMATCH / NON_COMPARABLE. NON_COMPARABLE means
+    the claimed published venue cannot be *confirmed* (blank on a side, or the
+    matched record is only a preprint/series) -- it is NOT a match.
     """
-    # Empty on either side: nothing to compare -> neutral match.
-    if not venue_a or not venue_b:
-        return (True, 1.0)
 
-    # Preprint / non-specific series on either side: non-comparable -> neutral.
+    outcome: MatchOutcome
+    score: float
+
+    @property
+    def is_confirmed(self) -> bool:
+        return self.outcome is MatchOutcome.MATCH
+
+    @property
+    def is_mismatch(self) -> bool:
+        return self.outcome is MatchOutcome.MISMATCH
+
+
+def venues_match(venue_a: str, venue_b: str, threshold: float = 0.70) -> VenueMatchResult:
+    """Compare two venue names (alias-aware) into a three-valued outcome.
+
+    P2.5: Uses EXPANDED_VENUE_ALIASES from matching.py for venue coverage.
+
+    The comparison is three-valued so a blank/preprint record can no longer
+    masquerade as positive confirmation:
+
+    - NON_COMPARABLE when either side is empty, OR when the matched record's
+      venue is a preprint/publisher-series (arXiv/CoRR, bioRxiv, PMLR, JMLR
+      W&CP). A preprint record cannot *confirm* the published venue the entry
+      claims -- it says nothing about it -- so it must not read as a match.
+    - MATCH when both sides are populated real venues that canonicalize equal
+      (or fuzzy >= threshold).
+    - MISMATCH when both sides are populated real venues that differ.
+
+    Returns a :class:`VenueMatchResult`.
+    """
+    # Empty on either side: nothing to confirm -> non-comparable.
+    if not venue_a or not venue_b:
+        return VenueMatchResult(MatchOutcome.NON_COMPARABLE, 1.0)
+
+    # Preprint / non-specific series on either side: the published venue the
+    # entry cites cannot be confirmed from a preprint record -> non-comparable.
     if is_preprint_or_series_venue(venue_a) or is_preprint_or_series_venue(venue_b):
-        return (True, 1.0)
+        return VenueMatchResult(MatchOutcome.NON_COMPARABLE, 1.0)
 
     norm_a = normalize_venue(venue_a)
     norm_b = normalize_venue(venue_b)
@@ -1453,12 +1523,14 @@ def venues_match(venue_a: str, venue_b: str, threshold: float = 0.70) -> tuple[b
     canonical_b = get_canonical_venue(norm_b, EXPANDED_VENUE_ALIASES)
     if canonical_a and canonical_b:
         if canonical_a == canonical_b:
-            return (True, 0.95)
-        return (False, 0.0)  # Known different venues
+            return VenueMatchResult(MatchOutcome.MATCH, 0.95)
+        return VenueMatchResult(MatchOutcome.MISMATCH, 0.0)  # Known different venues
 
     # Fall back to fuzzy matching
     score = token_sort_ratio(normalize_title_for_match(norm_a), normalize_title_for_match(norm_b)) / 100.0
-    return (score >= threshold, score)
+    if score >= threshold:
+        return VenueMatchResult(MatchOutcome.MATCH, score)
+    return VenueMatchResult(MatchOutcome.MISMATCH, score)
 
 
 def _doi_resolves(client: httpx.Client, doi: str) -> bool | None:
@@ -1754,8 +1826,15 @@ class FactChecker:
         field_comparisons = self._compare_all_fields(entry, best_match)
         status = self._determine_status(best_score, field_comparisons, sources_with_hits)
 
-        # Post-match: check preprint status
-        if status in (FactCheckStatus.VERIFIED, FactCheckStatus.VENUE_MISMATCH):
+        # Post-match: check preprint status. UNCONFIRMED is included because a
+        # venue we could not confirm is exactly the case where an independent
+        # preprint-only signal (arXiv-only, no DOI/venue) upgrades the verdict to
+        # the positive-evidence PREPRINT_ONLY.
+        if status in (
+            FactCheckStatus.VERIFIED,
+            FactCheckStatus.VENUE_MISMATCH,
+            FactCheckStatus.UNCONFIRMED,
+        ):
             preprint_status = self._check_preprint_status(entry, best_match)
             if preprint_status is not None:
                 status = preprint_status
@@ -2321,16 +2400,36 @@ class FactChecker:
         entry_authors = entry.get("author", "")
         entry_names = authors_last_names(entry_authors, limit=10_000)
         api_names = record.surname_keys(limit=10_000)
-        author_matches, author_score = symmetric_author_match(
-            entry_names, api_names, threshold=cfg.author_threshold
-        )
+        author_result = symmetric_author_match(entry_names, api_names, threshold=cfg.author_threshold)
         api_authors_str = " and ".join(f"{a.get('given', '')} {a.get('family', '')}".strip() for a in record.authors)
+        # Mirror the venue "no claim" rule: if the entry lists no authors there is
+        # nothing to confirm (vacuously MATCH). A PARTIAL (consistent-but-
+        # incomplete) confirmation is NOT a full confirmation and routes to
+        # UNCONFIRMED; a NON_COMPARABLE result with authors on the entry side but
+        # none in the record also could-not-confirm.
+        if not entry_names:
+            author_outcome = MatchOutcome.MATCH
+            author_confirmed = True
+            author_note = "No authors claimed"
+        else:
+            author_outcome = author_result.outcome
+            author_confirmed = author_result.is_confirmed
+            if author_result.outcome is MatchOutcome.PARTIAL:
+                author_note = "Authors consistent but incomplete"
+            elif author_result.outcome is MatchOutcome.NON_COMPARABLE:
+                author_note = "Authors could not be confirmed (no author data in record)"
+            else:
+                author_note = None
         comparisons["author"] = FieldComparison(
             "author",
             entry_authors,
             api_authors_str,
-            author_score,
-            author_matches,
+            author_result.score,
+            # ``matches`` is positive-confirmation only: a PARTIAL/NON_COMPARABLE
+            # author check is not a full confirmation, so it is not "matched".
+            author_confirmed,
+            note=author_note,
+            outcome=author_outcome,
         )
 
         # Year
@@ -2353,16 +2452,38 @@ class FactChecker:
             f"Tolerance: ±{cfg.year_tolerance}",
         )
 
-        # Venue (alias-aware matching)
+        # Venue (alias-aware matching, three-valued).
         entry_venue = entry.get("journal") or entry.get("booktitle") or ""
         api_venue = record.journal or ""
-        venue_matches, venue_score = venues_match(entry_venue, api_venue, cfg.venue_threshold)
+        venue_result = venues_match(entry_venue, api_venue, cfg.venue_threshold)
+        # Positive-confirmation gate distinguishes "no claim" from "claim we
+        # could not confirm":
+        #  - The entry makes NO venue claim (preprint @misc/@article with no
+        #    journal/booktitle) -> there is nothing to confirm, so the field is
+        #    vacuously confirmed (MATCH) and must not block VERIFIED.
+        #  - The entry CLAIMS a published venue but the matched record is blank
+        #    or preprint-only -> the claim cannot be confirmed -> NON_COMPARABLE,
+        #    which routes the verdict to UNCONFIRMED (could not verify).
+        if not entry_venue:
+            venue_outcome = MatchOutcome.MATCH
+            venue_confirmed = True
+            venue_note = "No venue claimed"
+        else:
+            venue_outcome = venue_result.outcome
+            venue_confirmed = venue_result.is_confirmed
+            venue_note = (
+                "Claimed venue could not be confirmed (preprint/blank record)"
+                if venue_result.outcome is MatchOutcome.NON_COMPARABLE
+                else None
+            )
         comparisons["venue"] = FieldComparison(
             "venue",
             entry_venue,
             api_venue,
-            venue_score,
-            venue_matches,
+            venue_result.score,
+            venue_confirmed,
+            note=venue_note,
+            outcome=venue_outcome,
         )
 
         return comparisons
@@ -2373,9 +2494,22 @@ class FactChecker:
         comparisons: dict[str, FieldComparison],
         sources_with_hits: list[str],
     ) -> FactCheckStatus:
-        """Determine final status from score and comparisons.
+        """Determine final status from score and field comparisons.
 
-        P2.6: Venue mismatch is prioritized when title+author match.
+        VERIFIED means POSITIVE CONFIRMATION of every claimed field, not merely
+        "nothing was contradicted". Each field comparison is three-valued
+        (MATCH / MISMATCH / NON_COMPARABLE|PARTIAL), and the gate routes them:
+
+        - Any MISMATCH (two different real venues, a swapped/wrong author, a
+          different title/year) is positive evidence of a problem -> the usual
+          PROBLEMATIC statuses (VENUE_MISMATCH / AUTHOR_MISMATCH / ... /
+          PARTIAL_MATCH).
+        - No MISMATCH but some field is NON_COMPARABLE or PARTIAL (preprint-only
+          venue, incomplete author list) -> UNCONFIRMED: a record was found and
+          nothing conflicts, but a claimed field could not be positively
+          confirmed. This is abstention ("could not fully confirm / needs
+          review"), distinct from both VERIFIED and PROBLEMATIC.
+        - Every field CONFIRMED -> VERIFIED.
 
         Fix B (abstention): a weak best candidate means the title search returned
         an *unrelated* paper -- the tool simply could not find the real one. That
@@ -2395,35 +2529,43 @@ class FactChecker:
         title_cmp = comparisons.get("title")
         author_cmp = comparisons.get("author")
         title_score = title_cmp.similarity_score if title_cmp else 0.0
-        title_ok = bool(title_cmp and title_cmp.matches)
-        author_ok = bool(author_cmp and author_cmp.matches)
-        wrong_paper_signature = title_score < 0.30 and not title_ok and not author_ok
+        title_confirmed = bool(title_cmp and title_cmp.is_confirmed)
+        author_confirmed = bool(author_cmp and author_cmp.is_confirmed)
+        wrong_paper_signature = title_score < 0.30 and not title_confirmed and not author_confirmed
 
         if best_score < self.config.abstention_below or wrong_paper_signature:
             return FactCheckStatus.NOT_FOUND
 
-        mismatches = [name for name, c in comparisons.items() if not c.matches]
+        # Positive evidence of a problem: a field that is a real MISMATCH (both
+        # sides populated and conflicting). These take priority over abstention.
+        mismatches = [name for name, c in comparisons.items() if c.is_mismatch]
 
-        if not mismatches:
-            return FactCheckStatus.VERIFIED
-
-        # P2.6: Prioritize venue mismatch when title+author match
-        if "venue" in mismatches:
-            title_ok = comparisons.get("title") and comparisons["title"].matches
-            author_ok = comparisons.get("author") and comparisons["author"].matches
-            if title_ok and author_ok:
+        if mismatches:
+            # P2.6: Prioritize venue mismatch when title+author are confirmed.
+            if "venue" in mismatches and title_confirmed and author_confirmed:
                 return FactCheckStatus.VENUE_MISMATCH
 
-        if len(mismatches) == 1:
-            mismatch_map = {
-                "title": FactCheckStatus.TITLE_MISMATCH,
-                "author": FactCheckStatus.AUTHOR_MISMATCH,
-                "year": FactCheckStatus.YEAR_MISMATCH,
-                "venue": FactCheckStatus.VENUE_MISMATCH,
-            }
-            return mismatch_map.get(mismatches[0], FactCheckStatus.PARTIAL_MATCH)
+            if len(mismatches) == 1:
+                mismatch_map = {
+                    "title": FactCheckStatus.TITLE_MISMATCH,
+                    "author": FactCheckStatus.AUTHOR_MISMATCH,
+                    "year": FactCheckStatus.YEAR_MISMATCH,
+                    "venue": FactCheckStatus.VENUE_MISMATCH,
+                }
+                return mismatch_map.get(mismatches[0], FactCheckStatus.PARTIAL_MATCH)
 
-        return FactCheckStatus.PARTIAL_MATCH
+            return FactCheckStatus.PARTIAL_MATCH
+
+        # No mismatch, but require POSITIVE confirmation of every claimed field.
+        # A NON_COMPARABLE venue (preprint/blank record) or a PARTIAL author
+        # confirmation (consistent-but-incomplete) is not a full confirmation:
+        # the claim could not be verified, so abstain with UNCONFIRMED rather
+        # than reporting VERIFIED.
+        non_confirming = [name for name, c in comparisons.items() if c.is_non_confirming]
+        if non_confirming:
+            return FactCheckStatus.UNCONFIRMED
+
+        return FactCheckStatus.VERIFIED
 
 
 class AcademicVerifier(BaseVerifier):
@@ -2727,6 +2869,10 @@ class FactCheckProcessor:
             "author_mismatch",
             "year_mismatch",
             "venue_mismatch",
+            # Multiple confirmed mismatches -> positive evidence of a problem.
+            # (Previously omitted, so PARTIAL_MATCH entries fell through all three
+            # buckets and the bucket counts under-summed.)
+            "partial_match",
             "url_content_mismatch",
             "future_date",
             "invalid_year",

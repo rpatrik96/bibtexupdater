@@ -30,6 +30,10 @@ __all__ = [
 STATUS_BASE_CONFIDENCE = {
     "verified": 0.85,
     "not_found": 0.70,
+    # Abstention: a record was found but a claimed field could not be positively
+    # confirmed (preprint-only venue, incomplete authors). Treated like not_found
+    # (could-not-verify), not a confident verdict.
+    "unconfirmed": 0.65,
     "hallucinated": 0.90,
     "title_mismatch": 0.80,
     "author_mismatch": 0.75,

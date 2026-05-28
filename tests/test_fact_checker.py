@@ -18,6 +18,7 @@ from bibtex_updater.fact_checker import (
     FieldComparison,
     SemanticScholarClient,
 )
+from bibtex_updater.matching import MatchOutcome
 from bibtex_updater.utils import PublishedRecord
 
 # ------------- Fixtures -------------
@@ -239,18 +240,49 @@ class TestFactCheckerFieldComparison:
         comparisons = fact_checker._compare_all_fields(entry, record)
         assert comparisons["year"].matches is False
 
-    def test_compare_missing_venue_allowed(self, fact_checker):
-        entry = {"title": "Test", "author": "Author"}  # No journal
+    def test_compare_no_venue_claim_is_vacuously_confirmed(self, fact_checker):
+        """Entry makes NO venue claim -> nothing to confirm -> vacuous MATCH.
+
+        A preprint @misc/@article with no journal/booktitle must not be blocked
+        from VERIFIED just because it omits a venue: there is no claim to verify.
+        """
+        from bibtex_updater.matching import MatchOutcome
+
+        entry = {"title": "Test", "author": "Author"}  # No journal/booktitle
         record = PublishedRecord(doi="", title="Test", journal="Some Journal")
         comparisons = fact_checker._compare_all_fields(entry, record)
-        assert comparisons["venue"].matches is True
+        venue = comparisons["venue"]
+        assert venue.outcome is MatchOutcome.MATCH
+        assert venue.matches is True
 
-    def test_compare_author_subset_not_asymmetric_mismatch(self, fact_checker):
-        """FIX C: entry lists first 3 authors, API record has 8 -> author matches.
+    def test_compare_claimed_venue_vs_preprint_record_is_non_comparable(self, fact_checker):
+        """Entry CLAIMS a published venue but the record is preprint-only ->
+        NON_COMPARABLE: not a mismatch, but not a positive confirmation either."""
+        from bibtex_updater.matching import MatchOutcome
 
-        The legacy asymmetric comparison (entry-first-3 vs full-8) scored ~0.375,
-        below author_threshold 0.80, falsely flagging a correctly cited paper.
+        entry = {"title": "Test", "author": "Smith, John", "booktitle": "NeurIPS"}
+        record = PublishedRecord(
+            doi="",
+            title="Test",
+            authors=[{"given": "John", "family": "Smith"}],
+            journal="arXiv preprint arXiv:2010.11929",
+        )
+        comparisons = fact_checker._compare_all_fields(entry, record)
+        venue = comparisons["venue"]
+        assert venue.outcome is MatchOutcome.NON_COMPARABLE
+        assert venue.is_mismatch is False
+        assert venue.matches is False  # cannot confirm the claimed published venue
+
+    def test_compare_author_subset_without_sentinel_is_partial(self, fact_checker):
+        """FIX C / positive-confirmation: entry lists first 3 of 8 authors with no
+        elision sentinel -> consistent but INCOMPLETE -> PARTIAL, not a full match.
+
+        The legacy asymmetric comparison scored ~0.375 (false mismatch); the prior
+        softening folded this into a full match. A silent leading subset is now a
+        PARTIAL confirmation: not a mismatch, but not a positive confirmation either.
         """
+        from bibtex_updater.matching import MatchOutcome
+
         entry = {
             "title": "An Image Is Worth 16x16 Words",
             "author": "Dosovitskiy, Alexey and Beyer, Lucas and Kolesnikov, Alexander",
@@ -270,7 +302,10 @@ class TestFactCheckerFieldComparison:
             ],
         )
         comparisons = fact_checker._compare_all_fields(entry, record)
-        assert comparisons["author"].matches is True
+        author = comparisons["author"]
+        assert author.outcome is MatchOutcome.PARTIAL
+        assert author.is_mismatch is False
+        assert author.matches is False  # incomplete is NOT a full confirmation
 
     def test_compare_author_and_others_matches(self, fact_checker):
         """FIX C: 'and others' must not introduce a phantom mismatch author."""
@@ -377,6 +412,66 @@ class TestFactCheckerStatusDetermination:
         }
         status = fact_checker._determine_status(0.70, comparisons, ["crossref"])
         assert status == FactCheckStatus.PARTIAL_MATCH
+
+
+class TestPositiveConfirmationGate:
+    """VERIFIED requires positive confirmation of EVERY claimed field.
+
+    A field that is neither a confirmed MATCH nor a real MISMATCH
+    (NON_COMPARABLE venue / PARTIAL author) must route to UNCONFIRMED -- a
+    could-not-verify abstention -- not VERIFIED and not a *_MISMATCH.
+    """
+
+    def _confirmed(self, name):
+        return FieldComparison(name, "x", "x", 1.0, True, outcome=MatchOutcome.MATCH)
+
+    def test_non_comparable_venue_routes_to_unconfirmed(self, fact_checker):
+        comparisons = {
+            "title": self._confirmed("title"),
+            "author": self._confirmed("author"),
+            "year": self._confirmed("year"),
+            "venue": FieldComparison("venue", "NeurIPS", "", 1.0, False, outcome=MatchOutcome.NON_COMPARABLE),
+        }
+        status = fact_checker._determine_status(0.95, comparisons, ["crossref"])
+        assert status == FactCheckStatus.UNCONFIRMED
+
+    def test_partial_author_routes_to_unconfirmed(self, fact_checker):
+        comparisons = {
+            "title": self._confirmed("title"),
+            "author": FieldComparison("author", "a,b", "a,b,c,d", 1.0, False, outcome=MatchOutcome.PARTIAL),
+            "year": self._confirmed("year"),
+            "venue": self._confirmed("venue"),
+        }
+        status = fact_checker._determine_status(0.95, comparisons, ["crossref"])
+        assert status == FactCheckStatus.UNCONFIRMED
+
+    def test_all_confirmed_is_verified(self, fact_checker):
+        comparisons = {
+            "title": self._confirmed("title"),
+            "author": self._confirmed("author"),
+            "year": self._confirmed("year"),
+            "venue": self._confirmed("venue"),
+        }
+        status = fact_checker._determine_status(0.95, comparisons, ["crossref"])
+        assert status == FactCheckStatus.VERIFIED
+
+    def test_real_venue_mismatch_beats_unconfirmed(self, fact_checker):
+        """A real MISMATCH is positive evidence -> PROBLEMATIC, taking priority
+        over a co-occurring non-confirming field."""
+        comparisons = {
+            "title": self._confirmed("title"),
+            "author": self._confirmed("author"),
+            "year": self._confirmed("year"),
+            "venue": FieldComparison("venue", "NeurIPS", "ICML", 0.0, False, outcome=MatchOutcome.MISMATCH),
+        }
+        status = fact_checker._determine_status(0.95, comparisons, ["crossref"])
+        assert status == FactCheckStatus.VENUE_MISMATCH
+
+    def test_unconfirmed_is_an_abstention_not_a_problem(self):
+        """UNCONFIRMED belongs in the could-not-verify (abstained) bucket."""
+        from bibtex_updater.fact_checker import _is_abstained_status
+
+        assert _is_abstained_status(FactCheckStatus.UNCONFIRMED) is True
 
 
 class TestDetectionRatePreservation:
@@ -577,6 +672,30 @@ class TestFactCheckProcessor:
         assert summary["problematic_count"] == 1
         assert summary["abstained_count"] == 1
         assert summary["verified_count"] == 1
+
+    def test_summary_buckets_partition_unconfirmed_and_partial(self, processor, sample_published_record):
+        """The three buckets must partition all entries: UNCONFIRMED -> could-not-
+        verify (abstained); PARTIAL_MATCH -> problematic; VERIFIED -> verified."""
+
+        def _r(key, status):
+            return FactCheckResult(key, "article", status, 0.7, {}, None, ["crossref"], ["crossref"], [])
+
+        results = [
+            _r("v", FactCheckStatus.VERIFIED),
+            _r("u", FactCheckStatus.UNCONFIRMED),
+            _r("p", FactCheckStatus.PARTIAL_MATCH),
+            _r("n", FactCheckStatus.NOT_FOUND),
+        ]
+        summary = processor.generate_summary(results)
+        assert summary["verified_count"] == 1
+        # could-not-verify = unconfirmed + not_found
+        assert summary["abstained_count"] == 2
+        # problematic = partial_match (now included so buckets fully partition)
+        assert summary["problematic_count"] == 1
+        # All four entries are accounted for across the three buckets.
+        assert (
+            summary["verified_count"] + summary["abstained_count"] + summary["problematic_count"] == summary["total"]
+        )
 
     def test_generate_json_report(self, processor, sample_published_record):
         results = [
@@ -1149,62 +1268,72 @@ class TestArxivDoiVersionStripping:
 
 
 class TestVenueMatching:
-    """Tests for venue matching with aliases."""
+    """Tests for venue matching with aliases (now three-valued)."""
 
     def test_exact_match(self):
         from bibtex_updater.fact_checker import venues_match
+        from bibtex_updater.matching import MatchOutcome
 
-        matches, score = venues_match("NeurIPS", "NeurIPS")
-        assert matches is True
+        result = venues_match("NeurIPS", "NeurIPS")
+        assert result.outcome is MatchOutcome.MATCH
+        assert result.is_confirmed is True
 
     def test_alias_match_neurips(self):
         from bibtex_updater.fact_checker import venues_match
+        from bibtex_updater.matching import MatchOutcome
 
-        matches, score = venues_match("NeurIPS", "Advances in Neural Information Processing Systems")
-        assert matches is True
-        assert score >= 0.90
+        result = venues_match("NeurIPS", "Advances in Neural Information Processing Systems")
+        assert result.outcome is MatchOutcome.MATCH
+        assert result.score >= 0.90
 
     def test_alias_match_nips_neurips(self):
         from bibtex_updater.fact_checker import venues_match
+        from bibtex_updater.matching import MatchOutcome
 
-        matches, score = venues_match("NIPS", "NeurIPS")
-        assert matches is True
+        assert venues_match("NIPS", "NeurIPS").outcome is MatchOutcome.MATCH
 
     def test_alias_match_icml(self):
         from bibtex_updater.fact_checker import venues_match
+        from bibtex_updater.matching import MatchOutcome
 
-        matches, score = venues_match("ICML", "International Conference on Machine Learning")
-        assert matches is True
+        assert venues_match("ICML", "International Conference on Machine Learning").outcome is MatchOutcome.MATCH
 
     def test_different_venues(self):
         from bibtex_updater.fact_checker import venues_match
+        from bibtex_updater.matching import MatchOutcome
 
-        matches, score = venues_match("NeurIPS", "ICML")
-        assert matches is False
+        result = venues_match("NeurIPS", "ICML")
+        assert result.outcome is MatchOutcome.MISMATCH
+        assert result.is_mismatch is True
 
     def test_empty_entry_venue(self):
         from bibtex_updater.fact_checker import venues_match
+        from bibtex_updater.matching import MatchOutcome
 
-        matches, score = venues_match("", "NeurIPS")
-        assert matches is True  # No claim = no mismatch
+        # No claim on one side -> non-comparable (NOT a positive confirmation).
+        result = venues_match("", "NeurIPS")
+        assert result.outcome is MatchOutcome.NON_COMPARABLE
+        assert result.is_confirmed is False
 
     def test_proceedings_prefix_stripped(self):
         from bibtex_updater.fact_checker import venues_match
+        from bibtex_updater.matching import MatchOutcome
 
-        matches, score = venues_match(
+        result = venues_match(
             "Proceedings of NeurIPS 2023",
             "Advances in Neural Information Processing Systems",
         )
-        assert matches is True
+        assert result.outcome is MatchOutcome.MATCH
 
     def test_wrong_venue_detected(self):
         from bibtex_updater.fact_checker import venues_match
+        from bibtex_updater.matching import MatchOutcome
 
-        matches, score = venues_match(
+        result = venues_match(
             "IEEE Conference on Computer Vision and Pattern Recognition",
             "IEEE International Conference on Computer Vision",
         )
-        assert matches is False
+        assert result.outcome is MatchOutcome.MISMATCH
 
     def test_venue_in_fact_checker(self, fact_checker):
         """Venue mismatch detected in field comparison."""
@@ -1228,62 +1357,76 @@ class TestVenueMatching:
 
 
 class TestVenueSymmetryAndPreprint:
-    """FIX E-venue: symmetric empty handling + preprint/series non-comparability."""
+    """FIX E-venue: symmetric empty handling + preprint/series non-comparability.
 
-    def test_empty_api_venue_is_neutral_not_mismatch(self):
-        """Empty API venue (arXiv-indexed record) must NOT hard-fail."""
+    Non-comparable cases are now distinguished from positive confirmation: a
+    blank or preprint-only record cannot CONFIRM the claimed published venue, so
+    it returns NON_COMPARABLE (not MATCH and not MISMATCH).
+    """
+
+    def test_empty_api_venue_is_non_comparable_not_mismatch(self):
+        """Empty API venue (arXiv-indexed record) must NOT hard-fail as mismatch."""
         from bibtex_updater.fact_checker import venues_match
+        from bibtex_updater.matching import MatchOutcome
 
-        matches, score = venues_match("NeurIPS", "")
-        assert matches is True
-        assert score == 1.0
+        result = venues_match("NeurIPS", "")
+        assert result.outcome is MatchOutcome.NON_COMPARABLE
+        assert result.is_mismatch is False
+        assert result.is_confirmed is False
 
-    def test_empty_entry_venue_is_neutral(self):
+    def test_empty_entry_venue_is_non_comparable(self):
         from bibtex_updater.fact_checker import venues_match
+        from bibtex_updater.matching import MatchOutcome
 
-        matches, _ = venues_match("", "NeurIPS")
-        assert matches is True
+        assert venues_match("", "NeurIPS").outcome is MatchOutcome.NON_COMPARABLE
 
     def test_arxiv_api_venue_is_non_comparable(self):
-        """A published-conference entry vs an arXiv API venue is not a mismatch."""
+        """A published-conference entry vs an arXiv API venue is non-comparable."""
         from bibtex_updater.fact_checker import venues_match
+        from bibtex_updater.matching import MatchOutcome
 
-        matches, score = venues_match("NeurIPS", "arXiv preprint arXiv:2010.11929")
-        assert matches is True
-        assert score == 1.0
+        result = venues_match("NeurIPS", "arXiv preprint arXiv:2010.11929")
+        assert result.outcome is MatchOutcome.NON_COMPARABLE
+        assert result.is_confirmed is False
 
     def test_corr_api_venue_is_non_comparable(self):
         from bibtex_updater.fact_checker import venues_match
+        from bibtex_updater.matching import MatchOutcome
 
-        matches, _ = venues_match("ICML", "CoRR")
-        assert matches is True
+        assert venues_match("ICML", "CoRR").outcome is MatchOutcome.NON_COMPARABLE
 
     def test_pmlr_series_is_non_comparable(self):
         """PMLR is an umbrella series, not a specific venue."""
         from bibtex_updater.fact_checker import venues_match
+        from bibtex_updater.matching import MatchOutcome
 
-        matches, _ = venues_match("ICML", "Proceedings of Machine Learning Research")
-        assert matches is True
+        assert venues_match("ICML", "Proceedings of Machine Learning Research").outcome is MatchOutcome.NON_COMPARABLE
 
     def test_genuinely_different_venues_still_mismatch(self):
         """Two populated, distinct real venues must still be detectable."""
         from bibtex_updater.fact_checker import venues_match
+        from bibtex_updater.matching import MatchOutcome
 
-        matches, _ = venues_match("NeurIPS", "ICML")
-        assert matches is False
+        assert venues_match("NeurIPS", "ICML").outcome is MatchOutcome.MISMATCH
 
     def test_neurips_full_name_aliases(self):
         from bibtex_updater.fact_checker import venues_match
+        from bibtex_updater.matching import MatchOutcome
 
         for full in (
             "Conference on Neural Information Processing Systems",
             "Annual Conference on Neural Information Processing Systems",
         ):
-            matches, _ = venues_match("NeurIPS", full)
-            assert matches is True, full
+            assert venues_match("NeurIPS", full).outcome is MatchOutcome.MATCH, full
 
-    def test_empty_api_venue_in_field_comparison_no_mismatch(self, fact_checker):
-        """An arXiv-indexed record with blank venue should not produce venue_mismatch."""
+    def test_empty_api_venue_in_field_comparison_not_mismatch(self, fact_checker):
+        """An arXiv-indexed record with blank venue must NOT produce venue_mismatch.
+
+        It is non-comparable: not a confirmed match (so ``matches`` is False), but
+        also not a mismatch -- the verdict routes to UNCONFIRMED, not VENUE_MISMATCH.
+        """
+        from bibtex_updater.matching import MatchOutcome
+
         entry = {
             "ID": "test",
             "ENTRYTYPE": "inproceedings",
@@ -1300,7 +1443,10 @@ class TestVenueSymmetryAndPreprint:
             year=2017,
         )
         comparisons = fact_checker._compare_all_fields(entry, record)
-        assert comparisons["venue"].matches is True
+        venue = comparisons["venue"]
+        assert venue.outcome is MatchOutcome.NON_COMPARABLE
+        assert venue.is_mismatch is False
+        assert venue.matches is False  # non-comparable is NOT a positive confirmation
 
 
 class TestNormalizeVenue:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from bibtex_updater.matching import (
     EXPANDED_VENUE_ALIASES,
+    MatchOutcome,
     author_sequence_similarity,
     combined_author_score,
     get_canonical_venue,
@@ -217,65 +218,82 @@ class TestCombinedAuthorScore:
 
 
 class TestSymmetricAuthorMatch:
-    """FIX C: entry vs API author comparison must be symmetric."""
+    """FIX C + positive-confirmation: entry vs API author comparison is symmetric
+    AND three-valued. Containment proves "consistent with", not "complete"."""
 
-    def test_entry_subset_of_api_matches(self):
-        """Entry lists first 3 of 8 real authors -> match (was a false mismatch).
+    def test_entry_subset_without_sentinel_is_partial(self):
+        """Entry lists first 3 of 8 real authors, NO sentinel -> PARTIAL.
 
-        The legacy asymmetric scoring (entry-first-3 vs full-8) scored ~0.375.
+        Consistent but incomplete: not a mismatch (was a legacy false mismatch),
+        but also not a full positive confirmation (the prior softening over-claimed
+        this as a full match).
         """
         entry = ["smith", "doe", "jones"]
         api = ["smith", "doe", "jones", "brown", "wang", "lee", "kim", "patel"]
-        matches, score = symmetric_author_match(entry, api)
-        assert matches is True
-        assert score == 1.0
+        result = symmetric_author_match(entry, api)
+        assert result.outcome is MatchOutcome.PARTIAL
+        assert result.is_confirmed is False
+        assert result.is_mismatch is False
 
-    def test_first_three_vs_first_three_matches(self):
+    def test_exact_match_is_confirmed(self):
         names = ["smith", "doe", "jones"]
-        matches, score = symmetric_author_match(names, names)
-        assert matches is True
-        assert score == 1.0
+        result = symmetric_author_match(names, names)
+        assert result.outcome is MatchOutcome.MATCH
+        assert result.is_confirmed is True
+        assert result.score == 1.0
 
-    def test_and_others_sentinel_stripped(self):
-        """'and others' -> 'others' must not count as a phantom mismatch author."""
+    def test_and_others_sentinel_leading_prefix_is_confirmed(self):
+        """'and others' marks a deliberate leading truncation -> CONFIRMED match."""
         entry = ["smith", "doe", "others"]
         api = ["smith", "doe", "jones", "brown"]
-        matches, _ = symmetric_author_match(entry, api)
-        assert matches is True
+        result = symmetric_author_match(entry, api)
+        assert result.outcome is MatchOutcome.MATCH
+        assert result.is_confirmed is True
 
-    def test_et_al_sentinel_stripped(self):
+    def test_et_al_sentinel_leading_prefix_is_confirmed(self):
         entry = ["smith", "et al"]
         api = ["smith", "doe", "jones"]
-        matches, _ = symmetric_author_match(entry, api)
-        assert matches is True
+        result = symmetric_author_match(entry, api)
+        assert result.outcome is MatchOutcome.MATCH
+        assert result.is_confirmed is True
 
-    def test_different_first_author_fails(self):
-        """A genuinely swapped/wrong lead author must still fail."""
+    def test_different_first_author_mismatches(self):
+        """A genuinely swapped/wrong lead author must still be a MISMATCH."""
         entry = ["wrong", "doe", "jones"]
         api = ["smith", "doe", "jones"]
-        matches, score = symmetric_author_match(entry, api)
-        assert matches is False
-        assert score == 0.0
+        result = symmetric_author_match(entry, api)
+        assert result.outcome is MatchOutcome.MISMATCH
+        assert result.score == 0.0
 
-    def test_empty_side_is_neutral(self):
-        """No usable names on a side -> cannot refute -> neutral match."""
-        assert symmetric_author_match([], ["smith"])[0] is True
-        assert symmetric_author_match(["smith"], [])[0] is True
-        assert symmetric_author_match(["others"], ["smith", "doe"])[0] is True
+    def test_empty_side_is_non_comparable(self):
+        """No usable names on a side -> cannot confirm or refute -> non-comparable."""
+        assert symmetric_author_match([], ["smith"]).outcome is MatchOutcome.NON_COMPARABLE
+        assert symmetric_author_match(["smith"], []).outcome is MatchOutcome.NON_COMPARABLE
+        # Only-sentinel side strips to empty -> non-comparable.
+        assert symmetric_author_match(["others"], ["smith", "doe"]).outcome is MatchOutcome.NON_COMPARABLE
 
-    def test_completely_different_lists_fail(self):
+    def test_completely_different_lists_mismatch(self):
         entry = ["alpha", "beta", "gamma"]
         api = ["delta", "epsilon", "zeta"]
-        matches, _ = symmetric_author_match(entry, api)
-        assert matches is False
+        result = symmetric_author_match(entry, api)
+        assert result.outcome is MatchOutcome.MISMATCH
+
+    def test_dropped_interior_author_with_sentinel_is_partial(self):
+        """A sentinel only confirms a LEADING truncation; dropping an interior
+        author (non-prefix subsequence) is still PARTIAL even with 'and others'."""
+        entry = ["smith", "jones", "others"]  # drops interior "doe"
+        api = ["smith", "doe", "jones", "brown"]
+        result = symmetric_author_match(entry, api)
+        assert result.outcome is MatchOutcome.PARTIAL
+        assert result.is_confirmed is False
 
     def test_same_lead_partial_overlap_scores_symmetrically(self):
         """Same first author, partially divergent tails -> symmetric slice scoring."""
         entry = ["smith", "doe", "x"]
         api = ["smith", "doe", "y", "z", "w"]
-        matches, _ = symmetric_author_match(entry, api)
+        result = symmetric_author_match(entry, api)
         # smith,doe,x vs smith,doe,y (sliced to 3) -> not a subsequence, scored.
-        assert isinstance(matches, bool)
+        assert result.outcome in (MatchOutcome.MATCH, MatchOutcome.MISMATCH)
 
 
 # ------------- FIX E-venue: Preprint / series venue Tests -------------

@@ -11,6 +11,8 @@ These functions are standalone and can be used by fact_checker.py or other modul
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
+from enum import Enum
 
 from rapidfuzz.distance import Levenshtein
 
@@ -22,11 +24,51 @@ __all__ = [
     "word_level_diff",
     "author_sequence_similarity",
     "combined_author_score",
+    "MatchOutcome",
+    "AuthorMatchResult",
     "symmetric_author_match",
     "EXPANDED_VENUE_ALIASES",
     "get_canonical_venue",
     "is_preprint_or_series_venue",
 ]
+
+
+class MatchOutcome(Enum):
+    """Three-valued result of a field comparison.
+
+    The verifier distinguishes positive confirmation from mere absence of
+    contradiction. A field is only allowed to contribute to a VERIFIED verdict
+    when it is CONFIRMED (MATCH); a real contradiction is a MISMATCH; and
+    "I had nothing comparable / could not positively confirm" is NON_COMPARABLE
+    (no data either side) or PARTIAL (consistent-but-incomplete confirmation).
+    """
+
+    MATCH = "match"  # both sides populated and positively agree
+    MISMATCH = "mismatch"  # both sides populated real values that conflict
+    NON_COMPARABLE = "non_comparable"  # empty/blank, or a preprint/series record
+    PARTIAL = "partial"  # consistent but incomplete (e.g. dropped authors)
+
+
+@dataclass(frozen=True)
+class AuthorMatchResult:
+    """Trichotomy result of :func:`symmetric_author_match`.
+
+    ``outcome`` carries the three-valued verdict; ``score`` is the legacy
+    0-1 similarity for confidence/reporting. ``is_confirmed`` is true only for
+    a full positive confirmation (exact match or a leading subset explicitly
+    elided with an "and others"/"et al" sentinel).
+    """
+
+    outcome: MatchOutcome
+    score: float
+
+    @property
+    def is_confirmed(self) -> bool:
+        return self.outcome is MatchOutcome.MATCH
+
+    @property
+    def is_mismatch(self) -> bool:
+        return self.outcome is MatchOutcome.MISMATCH
 
 
 # ------------- P2.2: Near-Miss Title Detection -------------
@@ -182,6 +224,11 @@ def combined_author_score(
 _AUTHOR_SENTINELS: frozenset[str] = frozenset({"others", "et al", "etal", "al"})
 
 
+def _has_author_sentinel(names: list[str]) -> bool:
+    """True if a surname list contains an elision sentinel ("others"/"et al")."""
+    return any(n and n.lower() in _AUTHOR_SENTINELS for n in names)
+
+
 def _strip_author_sentinels(names: list[str]) -> list[str]:
     """Drop "others"/"et al" sentinels from a surname list."""
     return [n for n in names if n and n.lower() not in _AUTHOR_SENTINELS]
@@ -195,55 +242,84 @@ def _is_ordered_subsequence(short: list[str], long: list[str]) -> bool:
     return all(name in it for name in short)
 
 
+def _is_leading_prefix(short: list[str], long: list[str]) -> bool:
+    """True if ``short`` is a contiguous *leading* prefix of ``long``."""
+    return len(short) <= len(long) and short == long[: len(short)]
+
+
 def symmetric_author_match(
     entry_names: list[str],
     api_names: list[str],
     threshold: float = 0.80,
     prefix_n: int = 5,
-) -> tuple[bool, float]:
-    """Compare entry vs API author surnames on a *symmetric* basis.
+) -> AuthorMatchResult:
+    """Compare entry vs API author surnames on a *symmetric* basis (trichotomy).
 
-    The legacy comparison sliced the entry side to a small limit but left the
-    API side effectively unbounded, so a correctly cited paper that lists fewer
-    authors (or elides them with "and others") scored far below threshold purely
-    from the length asymmetry. This restores symmetry:
+    Containment proves the cited authors are *consistent with* the real list, not
+    that the citation is *complete*. We therefore distinguish a full positive
+    confirmation from a consistent-but-incomplete one:
 
-    1. Strip "others"/"et al" sentinels from both sides.
-    2. First-author surname is a HARD signal: a genuinely different first author
-       fails immediately (so a swapped/wrong lead author is still caught).
-    3. ORDERED-CONTAINMENT: if one side's (sentinel-stripped) surnames are an
-       in-order subsequence of the other -- i.e. the citation lists a leading
-       subset of the real author list -- treat it as a match.
-    4. Otherwise score on a symmetric slice: both sides truncated to the same
-       ``min(len, prefix_n)`` length, combining unordered (Jaccard) and ordered
-       (LCS) similarity.
+    1. Strip "others"/"et al" sentinels from both sides (but remember whether a
+       sentinel was present -- it signals a deliberate elision).
+    2. NON_COMPARABLE: either side has no usable surnames -- nothing to confirm
+       or refute.
+    3. MISMATCH: first-author surnames differ (a swapped/wrong lead author).
+    4. MATCH (CONFIRMED): the sentinel-stripped surname lists are EQUAL, OR one
+       side is a *leading prefix* of the other AND the shorter side carried an
+       explicit elision sentinel ("and others"/"et al"). The author claim is then
+       positively confirmed (exactly, or as an explicitly-truncated head).
+    5. PARTIAL: the shorter side is an in-order subsequence (or leading prefix)
+       of the longer WITHOUT a sentinel -- authors are consistent but the claim
+       silently drops interior/trailing authors, so it is not a full confirmation.
+    6. Otherwise score a symmetric slice (Jaccard + LCS): >= threshold is a MATCH,
+       below is a MISMATCH (real conflict beyond the shared lead author).
 
-    Returns ``(matches, score)``.
+    Returns an :class:`AuthorMatchResult` carrying the trichotomy and a 0-1 score.
     """
+    a_has_sentinel = _has_author_sentinel(entry_names)
+    b_has_sentinel = _has_author_sentinel(api_names)
     a = _strip_author_sentinels(entry_names)
     b = _strip_author_sentinels(api_names)
 
-    # If either side has no usable names, treat as non-comparable (neutral pass):
-    # the author field can't refute a match it has no data for.
+    # If either side has no usable names, there is nothing to confirm or refute.
     if not a or not b:
-        return (True, 1.0)
+        return AuthorMatchResult(MatchOutcome.NON_COMPARABLE, 1.0)
 
     # Hard first-author signal: an outright different lead author is a real
-    # mismatch. Both sides are already canonicalized surname keys, so compare by
-    # equality.
+    # mismatch. Both sides are already canonicalized surname keys.
     if a[0] != b[0]:
-        return (False, 0.0)
+        return AuthorMatchResult(MatchOutcome.MISMATCH, 0.0)
 
-    # Ordered-containment: one side's surnames are an in-order subsequence of the
-    # other. This is the common "citation lists first k of n authors" case.
+    # Exact (sentinel-stripped) equality: full positive confirmation.
+    if a == b:
+        return AuthorMatchResult(MatchOutcome.MATCH, 1.0)
+
+    # Leading-prefix containment: one side is a contiguous head of the other.
+    # An explicit elision sentinel on the SHORTER side means the citation
+    # deliberately truncated a leading run ("first k authors, and others") --
+    # that is a confirmation, not a silent drop.
+    if _is_leading_prefix(a, b):  # entry is a head of the (longer) api list
+        if a_has_sentinel:
+            return AuthorMatchResult(MatchOutcome.MATCH, 1.0)
+        return AuthorMatchResult(MatchOutcome.PARTIAL, 1.0)
+    if _is_leading_prefix(b, a):  # api is a head of the (longer) entry list
+        if b_has_sentinel:
+            return AuthorMatchResult(MatchOutcome.MATCH, 1.0)
+        return AuthorMatchResult(MatchOutcome.PARTIAL, 1.0)
+
+    # In-order subsequence (but not a contiguous leading prefix): interior or
+    # trailing authors are dropped. Consistent, never a full confirmation, even
+    # with a sentinel -- the elision is not a simple leading truncation.
     if _is_ordered_subsequence(a, b) or _is_ordered_subsequence(b, a):
-        return (True, 1.0)
+        return AuthorMatchResult(MatchOutcome.PARTIAL, 1.0)
 
     # Symmetric slice + combined (Jaccard + LCS) score.
     n = min(len(a), len(b), prefix_n)
     a_slice, b_slice = a[:n], b[:n]
     score = combined_author_score(a_slice, b_slice, jaccard_weight=0.5, sequence_weight=0.5)
-    return (score >= threshold, score)
+    if score >= threshold:
+        return AuthorMatchResult(MatchOutcome.MATCH, score)
+    return AuthorMatchResult(MatchOutcome.MISMATCH, score)
 
 
 # ------------- P2.5: Expanded Venue Aliases -------------
