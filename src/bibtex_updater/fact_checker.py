@@ -76,6 +76,7 @@ from bibtex_updater.utils import (
     arxiv_atom_to_record,
     authors_last_names,
     crossref_message_to_record,
+    dblp_hit_to_candidate_record,
     dblp_hit_to_record,
     first_author_surname,
     is_valid_arxiv_id,
@@ -1197,9 +1198,36 @@ class CrossrefClient:
     def __init__(self, http: HttpClient):
         self.http = http
 
-    def search(self, query: str, rows: int = 10) -> list[dict[str, Any]]:
-        """Search Crossref for bibliographic records."""
-        params = {"query.bibliographic": query, "rows": rows}
+    def search(
+        self,
+        query: str,
+        rows: int = 10,
+        title: str | None = None,
+        author: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Search Crossref for bibliographic records.
+
+        Args:
+            query: Free-text bibliographic query (``"<title> <author>"`` blob).
+                Used as the ``query.bibliographic`` fallback.
+            rows: Max records to retrieve.
+            title: Raw (un-normalized, author-free) title. When provided, the
+                client uses Crossref's *fielded* ``query.title`` instead of the
+                generic ``query.bibliographic`` blob, which keeps DOI-less
+                ML-conference titles ranked correctly rather than letting the
+                appended surname pull in unrelated records.
+            author: First-author surname, sent as ``query.author`` to tighten
+                the fielded result set. Only used when ``title`` is supplied.
+
+        Returns:
+            List of Crossref message items, never None. Empty on any error.
+        """
+        if title and title.strip():
+            params: dict[str, Any] = {"query.title": title.strip(), "rows": rows}
+            if author and author.strip():
+                params["query.author"] = author.strip()
+        else:
+            params = {"query.bibliographic": query, "rows": rows}
         try:
             resp = self.http._request("GET", CROSSREF_API, params=params, accept="application/json", service="crossref")
             if resp.status_code != 200:
@@ -1949,24 +1977,36 @@ class FactChecker:
         sources_with_hits: list[str],
         errors: list[str],
     ) -> list[tuple[float, PublishedRecord, str]]:
-        """Cascading source order: CrossRef -> OpenAlex -> Semantic Scholar.
+        """Cascading source order: CrossRef -> OpenAlex -> DBLP -> Semantic Scholar.
 
         Item 1 (CheckIfExist Algorithm 1, Abbonato 2026). Each step retrieves
         ``config.top_k`` candidates and re-ranks them by Levenshtein title
         similarity (Item 2). The cascade short-circuits as soon as a source
         returns a candidate at or above ``cascade_high_confidence``.
 
+        Retrieval (this fix): Crossref and OpenAlex are queried with *fielded
+        title* searches (``query.title`` / ``filter=title.search:``) using the
+        raw, author-free title rather than the normalized ``"title + surname"``
+        blob. The blob fed to the free-text BM25 endpoints returned unrelated
+        papers for DOI-less ML-conference titles (ICML/ICLR/NeurIPS), causing
+        ~61% of valid references to be falsely flagged. DBLP -- which
+        authoritatively indexes those venues -- is added as a cascade step
+        after OpenAlex.
+
         Order rationale (throughput): the fast, broad sources come first so the
         slow specialist is only reached on hard entries. OpenAlex runs on the
-        polite pool (~100 req/min) and aggregates Crossref + others; a keyless
-        Semantic Scholar is throttled to ~10 req/min, so querying it last keeps
-        it off the hot path for the easy majority of entries.
+        polite pool (~100 req/min) and aggregates Crossref + others; DBLP
+        (~30 req/min) is the CS-conference authority; a keyless Semantic Scholar
+        is throttled to ~10 req/min, so querying it last keeps it off the hot
+        path for the easy majority of entries.
 
         Returns:
             List of ``(score, record, source_name)`` tuples, possibly from
             multiple sources if intermediate matches were below threshold.
         """
-        title_norm = normalize_title_for_match(entry.get("title", ""))
+        raw_title = entry.get("title", "") or ""
+        title_norm = normalize_title_for_match(raw_title)
+        first_author = first_author_surname(entry)
         authors_ref = authors_last_names(entry.get("author", ""), limit=3)
         top_k = max(1, min(int(self.config.top_k), MAX_TOP_K))
 
@@ -1983,10 +2023,10 @@ class FactChecker:
                     best_local = score
             return best_local
 
-        # ----- Step 1: CrossRef -----
+        # ----- Step 1: CrossRef (fielded query.title + query.author) -----
         sources_queried.append("crossref")
         try:
-            cr_items = self.crossref.search(query, rows=top_k)
+            cr_items = self.crossref.search(query, rows=top_k, title=raw_title, author=first_author)
         except Exception as exc:
             cr_items = []
             errors.append(f"Crossref: {exc}")
@@ -2018,7 +2058,8 @@ class FactChecker:
         if self.openalex is not None:
             sources_queried.append("openalex")
             try:
-                oa_items = self.openalex.search(query, limit=top_k)
+                # Fielded filter=title.search:<raw title>, free-text fallback.
+                oa_items = self.openalex.search(query, limit=top_k, title=raw_title)
             except Exception as exc:
                 oa_items = []
                 errors.append(f"OpenAlex: {exc}")
@@ -2033,10 +2074,37 @@ class FactChecker:
             if max(best_cr, best_oa) >= self.config.cascade_high_confidence:
                 return all_candidates
 
-        # ----- Step 3: Semantic Scholar (preprint coverage; slowest w/o key) -----
+        # ----- Step 3: DBLP (authoritative ICML/ICLR/NeurIPS index) -----
+        # DBLP's q= is a token-AND matcher (not BM25 relevance), so the raw
+        # title + surname locates the exact paper. Uses the permissive
+        # dblp_hit_to_candidate_record so DOI-less / CoRR conference hits are
+        # kept as scorable candidates (the strict resolver converter drops them).
+        best_dblp = 0.0
+        if self.dblp is not None:
+            sources_queried.append("dblp")
+            dblp_query = f"{raw_title} {first_author}".strip()
+            try:
+                dblp_hits = self.dblp.search(dblp_query, max_hits=top_k)
+            except Exception as exc:
+                dblp_hits = []
+                errors.append(f"DBLP: {exc}")
+            dblp_records: list[PublishedRecord] = []
+            for hit in dblp_hits or []:
+                rec = dblp_hit_to_candidate_record(hit)
+                if rec:
+                    dblp_records.append(rec)
+            if dblp_records:
+                sources_with_hits.append("dblp")
+            best_dblp = _ingest("dblp", dblp_records)
+            if max(best_cr, best_oa, best_dblp) >= self.config.cascade_high_confidence:
+                return all_candidates
+
+        # ----- Step 4: Semantic Scholar (preprint coverage; slowest w/o key) -----
         sources_queried.append("semanticscholar")
         try:
-            s2_data = self.s2.search(query, limit=top_k)
+            # Title-led query keeps S2 relevance focused on the paper title.
+            s2_query = f"{raw_title} {first_author}".strip() or query
+            s2_data = self.s2.search(s2_query, limit=top_k)
         except Exception as exc:
             s2_data = []
             errors.append(f"Semantic Scholar: {exc}")

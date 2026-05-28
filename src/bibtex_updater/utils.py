@@ -1260,6 +1260,93 @@ def dblp_hit_to_record(hit: dict[str, Any]) -> PublishedRecord | None:
     )
 
 
+def dblp_hit_to_candidate_record(hit: dict[str, Any]) -> PublishedRecord | None:
+    """Permissive DBLP hit -> ``PublishedRecord`` for cascade candidate search.
+
+    Unlike :func:`dblp_hit_to_record` (which is preprint-strict for
+    publication-*resolution*: it drops hits lacking a DOI/``ee`` URL, lacking a
+    venue/year, or labelled with an arXiv/CoRR venue), this converter is built
+    for the fact-checker *cascade*, which only needs candidates to *score*
+    against. DBLP authoritatively indexes ICML/ICLR/NeurIPS papers that are
+    frequently DOI-less, so we keep any hit with a clear title + authors and we
+    retain the arXiv/CoRR copy rather than discarding it outright.
+
+    Args:
+        hit: A DBLP search ``hit`` dict (``{"info": {...}}``).
+
+    Returns:
+        ``PublishedRecord`` or ``None`` if the hit lacks a usable title or any
+        author.
+    """
+    if not hit:
+        return None
+    info = hit.get("info", {}) or {}
+    title = info.get("title") or ""
+    title = re.sub(r"<[^>]*>", "", title).strip()  # strip HTML tags
+    if not title:
+        return None
+
+    # Parse authors (same logic as dblp_hit_to_record, including the 4-digit
+    # homonym-disambiguation-suffix stripping).
+    authors_field = info.get("authors", {}).get("author")
+    authors_list: list[str] = []
+    if isinstance(authors_field, list):
+        for a in authors_field:
+            if isinstance(a, dict):
+                authors_list.append(a.get("text") or a.get("name") or "")
+            elif isinstance(a, str):
+                authors_list.append(a)
+    elif isinstance(authors_field, dict):
+        authors_list.append(authors_field.get("text") or authors_field.get("name") or "")
+
+    authors: list[dict[str, str]] = []
+    for full in authors_list:
+        full = full.strip()
+        if not full:
+            continue
+        parts = full.split()
+        if len(parts) >= 2 and re.fullmatch(r"\d{4}", parts[-1]):
+            parts = parts[:-1]
+        if len(parts) >= 2:
+            authors.append({"given": " ".join(parts[:-1]), "family": parts[-1]})
+        else:
+            authors.append({"given": "", "family": parts[0]})
+
+    if not authors:
+        return None
+
+    venue = info.get("journal") or info.get("venue")
+    year = None
+    try:
+        year = int(info.get("year")) if info.get("year") else None
+    except Exception:
+        pass
+
+    doi = doi_normalize(info.get("doi"))
+    ee = info.get("ee")
+    venue_lower = safe_lower(venue) if venue else ""
+    typ = safe_lower(info.get("type"))
+    is_conference = (
+        "conference" in typ
+        or "proceedings" in typ
+        or re.search(r"proceedings|conference|workshop|symposium", venue_lower)
+    )
+    record_type = "proceedings-article" if is_conference else "journal-article"
+
+    return PublishedRecord(
+        doi=doi or "",
+        url=ee,
+        title=title or None,
+        authors=authors,
+        journal=venue,
+        year=year,
+        volume=info.get("volume"),
+        number=info.get("number"),
+        pages=info.get("pages"),
+        type=record_type,
+    )
+
+
 def s2_data_to_record(data: dict[str, Any]) -> PublishedRecord | None:
     """Convert Semantic Scholar data to a PublishedRecord."""
     doi = doi_normalize(data.get("doi") or (data.get("externalIds") or {}).get("DOI"))

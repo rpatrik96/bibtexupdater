@@ -194,9 +194,9 @@ class TestQueryCascade:
         }
         sources_queried = []
         fc._query_cascade(entry, "Deep Learning Smith", sources_queried, [], [])
-        # New order puts the fast, broad aggregator (OpenAlex) before the slow
-        # keyless-S2 specialist.
-        assert sources_queried == ["crossref", "openalex", "semanticscholar"]
+        # New order puts the fast, broad aggregator (OpenAlex) and the
+        # CS-conference authority (DBLP) before the slow keyless-S2 specialist.
+        assert sources_queried == ["crossref", "openalex", "dblp", "semanticscholar"]
 
     def test_top_k_capped_at_max(self):
         fc, _ = self._build(config_override={"top_k": MAX_TOP_K + 100})
@@ -534,3 +534,146 @@ def test_openalex_client_search_returns_empty_on_http_error():
     # environment), and the client should gracefully return [].
     out = client.search("nonexistent_query_xyz_12345_zzz")
     assert out == [] or isinstance(out, list)
+
+
+# ===========================================================================
+# Fielded title search (FIX A): OpenAlex filter=title.search, Crossref query.title
+# ===========================================================================
+
+
+def _ok(results):
+    """A MagicMock 200 response whose .json() yields {"results": results}."""
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.json.return_value = {"results": list(results)}
+    return resp
+
+
+class TestOpenAlexFieldedTitleSearch:
+    """FIX A.1: OpenAlex must issue a fielded ``filter=title.search:<title>``
+    using the RAW title (no appended author) and only fall back to free-text
+    ``?search=`` when the fielded query returns zero results.
+    """
+
+    def test_fielded_filter_used_when_title_given(self):
+        http = MagicMock()
+        http._request.return_value = _ok([{"title": "Context-Aware Sparse Deep Coordination Graphs"}])
+        client = OpenAlexClient(http=http)
+
+        out = client.search(
+            "context aware sparse deep coordination graphs wang",
+            title="Context-Aware Sparse Deep Coordination Graphs",
+        )
+        assert out and out[0]["title"].startswith("Context-Aware")
+        # Exactly one request, and it must be the fielded filter (NOT ?search=).
+        assert http._request.call_count == 1
+        params = http._request.call_args.kwargs["params"]
+        assert params["filter"] == "title.search:Context-Aware Sparse Deep Coordination Graphs"
+        assert "search" not in params  # author-free, no free-text blob
+
+    def test_falls_back_to_free_text_when_fielded_empty(self):
+        http = MagicMock()
+        # First call (fielded) -> empty; second call (free-text) -> a result.
+        http._request.side_effect = [_ok([]), _ok([{"title": "Fallback Hit"}])]
+        client = OpenAlexClient(http=http)
+
+        out = client.search("some title surname", title="Some Title")
+        assert out and out[0]["title"] == "Fallback Hit"
+        assert http._request.call_count == 2
+        # Second (fallback) call uses the free-text ?search= blob.
+        fallback_params = http._request.call_args_list[1].kwargs["params"]
+        assert fallback_params["search"] == "some title surname"
+        assert "filter" not in fallback_params
+
+    def test_no_fallback_when_fielded_has_results(self):
+        http = MagicMock()
+        http._request.return_value = _ok([{"title": "X"}])
+        client = OpenAlexClient(http=http)
+        client.search("x surname", title="X")
+        assert http._request.call_count == 1  # fielded hit -> no free-text call
+
+    def test_free_text_only_when_no_title(self):
+        http = MagicMock()
+        http._request.return_value = _ok([{"title": "Y"}])
+        client = OpenAlexClient(http=http)
+        client.search("y surname")
+        params = http._request.call_args.kwargs["params"]
+        assert params["search"] == "y surname"
+        assert "filter" not in params
+
+
+class TestCrossrefFieldedTitleSearch:
+    """FIX A.2: Crossref must use fielded ``query.title`` (+ ``query.author``)
+    with the raw title instead of the generic ``query.bibliographic`` blob.
+    """
+
+    def _client(self):
+        from bibtex_updater.fact_checker import CrossrefClient
+
+        http = MagicMock()
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {"message": {"items": [{"title": ["Hit"]}]}}
+        http._request.return_value = resp
+        return CrossrefClient(http), http
+
+    def test_uses_query_title_and_author(self):
+        client, http = self._client()
+        client.search("deep learning smith", title="Deep Learning", author="Smith")
+        params = http._request.call_args.kwargs["params"]
+        assert params["query.title"] == "Deep Learning"
+        assert params["query.author"] == "Smith"
+        assert "query.bibliographic" not in params
+
+    def test_falls_back_to_bibliographic_without_title(self):
+        client, http = self._client()
+        client.search("deep learning smith")
+        params = http._request.call_args.kwargs["params"]
+        assert params["query.bibliographic"] == "deep learning smith"
+        assert "query.title" not in params
+
+
+class TestCascadePassesRawTitle(TestQueryCascade):
+    """FIX A.3: the cascade must forward the RAW title (not the normalized
+    title+surname blob) into the fielded Crossref/OpenAlex searches, and must
+    query DBLP after OpenAlex via the permissive candidate converter.
+    """
+
+    def test_raw_title_forwarded_to_crossref_and_openalex(self):
+        fc, oa = self._build(cr_items=[], s2_items=[], oa_items=[])
+        fc.openalex = oa
+        # DBLP returns a clean conference hit with no DOI (the exact case the
+        # permissive converter must keep).
+        dblp_hit = {
+            "info": {
+                "title": "Context-Aware Sparse Deep Coordination Graphs",
+                "authors": {"author": ["Tonghan Wang", "Liang Zeng"]},
+                "venue": "ICLR",
+                "year": "2022",
+                "type": "Conference and Workshop Papers",
+            }
+        }
+        fc.dblp = MagicMock()
+        fc.dblp.search.return_value = [dblp_hit]
+
+        entry = {
+            "ID": "x",
+            "ENTRYTYPE": "inproceedings",
+            "title": "Context-Aware Sparse Deep Coordination Graphs",
+            "author": "Wang, Tonghan and Zeng, Liang",
+            "year": "2022",
+        }
+        sources_queried: list = []
+        cands = fc._query_cascade(entry, "context aware sparse deep coordination graphs wang", sources_queried, [], [])
+
+        # Crossref received the raw title, not the normalized blob.
+        cr_kwargs = fc.crossref.search.call_args.kwargs
+        assert cr_kwargs["title"] == "Context-Aware Sparse Deep Coordination Graphs"
+        # OpenAlex received the raw title too.
+        oa_kwargs = oa.search.call_args.kwargs
+        assert oa_kwargs["title"] == "Context-Aware Sparse Deep Coordination Graphs"
+        # DBLP is in the cascade after OpenAlex and its DOI-less hit survived.
+        # The exact-title hit scores >= cascade_high_confidence, so the cascade
+        # short-circuits at DBLP and never reaches Semantic Scholar.
+        assert sources_queried == ["crossref", "openalex", "dblp"]
+        assert any(src == "dblp" for _, _, src in cands)

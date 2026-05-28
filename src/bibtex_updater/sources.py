@@ -89,28 +89,61 @@ class OpenAlexClient:
         self.mailto = mailto
         self.timeout = timeout
 
-    def search(self, query: str, limit: int = DEFAULT_TOP_K) -> list[dict[str, Any]]:
+    def search(
+        self,
+        query: str,
+        limit: int = DEFAULT_TOP_K,
+        title: str | None = None,
+    ) -> list[dict[str, Any]]:
         """Search OpenAlex works.
 
         Args:
             query: Free-text search string (typically ``"<title> <author>"``).
+                Used for the ``?search=`` fallback path.
             limit: Max records to retrieve (capped at ``MAX_TOP_K``).
+            title: Raw (un-normalized, author-free) title. When provided, the
+                client first issues a *fielded* ``filter=title.search:<title>``
+                query, which matches the exact paper at rank #1 far more often
+                than the BM25 ``?search=`` relevance endpoint -- the latter
+                returns unrelated papers for DOI-less ML-conference titles.
+                The free-text ``?search=`` path is used only as a fallback when
+                the fielded query yields zero results.
 
         Returns:
             List of OpenAlex work dicts, never None. Empty on any error.
         """
+        per_page = max(1, min(int(limit), MAX_TOP_K))
+
+        # ----- Fielded title.search path (preferred) -----
+        if title and title.strip():
+            fielded_params = {
+                "filter": f"title.search:{title.strip()}",
+                "per-page": per_page,
+                "mailto": self.mailto,
+            }
+            fielded = self._fetch(fielded_params)
+            if fielded:
+                return fielded
+            # Zero fielded results -> fall through to free-text below.
+
+        # ----- Free-text ?search= path (fallback / legacy) -----
         if not query:
             return []
-        per_page = max(1, min(int(limit), MAX_TOP_K))
         params = {
             "search": query,
             "per-page": per_page,
             "mailto": self.mailto,
         }
-        url = f"{OPENALEX_API}/works"
+        return self._fetch(params)
 
-        # Prefer the shared HttpClient if available -- it carries rate limiting,
-        # caching, and the polite User-Agent. Fall back to bare httpx otherwise.
+    def _fetch(self, params: dict[str, Any]) -> list[dict[str, Any]]:
+        """Issue a single OpenAlex /works request and return the result list.
+
+        Preserves the shared-HttpClient-vs-bare-httpx routing (rate limiting,
+        caching, polite User-Agent on the shared path; hermetic fallback
+        otherwise). Returns ``[]`` on any non-200 status or exception.
+        """
+        url = f"{OPENALEX_API}/works"
         try:
             if self.http is not None and hasattr(self.http, "_request"):
                 resp = self.http._request(

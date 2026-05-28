@@ -315,10 +315,11 @@ class TestFactCheckerCheckEntry:
         assert "No title" in result.errors[0]
 
     def test_entry_not_found(self, fact_checker, sample_entry):
-        # All API clients return empty results by default
+        # All API clients return empty results by default. The cascade now
+        # queries four sources: crossref -> openalex -> dblp -> semanticscholar.
         result = fact_checker.check_entry(sample_entry)
         assert result.status == FactCheckStatus.NOT_FOUND
-        assert len(result.api_sources_queried) == 3
+        assert result.api_sources_queried == ["crossref", "openalex", "dblp", "semanticscholar"]
 
 
 # ------------- FactCheckProcessor Tests -------------

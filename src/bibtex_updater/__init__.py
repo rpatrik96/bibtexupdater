@@ -88,6 +88,7 @@ from bibtex_updater.utils import (
     authors_last_names,
     # API converters
     crossref_message_to_record,
+    dblp_hit_to_candidate_record,
     dblp_hit_to_record,
     # DOI/arXiv utilities
     doi_normalize,
@@ -180,6 +181,7 @@ __all__ = [
     "extract_acl_anthology_id",
     # API converters
     "crossref_message_to_record",
+    "dblp_hit_to_candidate_record",
     "dblp_hit_to_record",
     "europepmc_result_to_record",
     "openalex_work_to_record",
