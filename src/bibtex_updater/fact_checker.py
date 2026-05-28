@@ -224,6 +224,25 @@ class FactCheckStatus(Enum):
     SKIPPED = "skipped"  # Entry type not verifiable
 
 
+# Fix B: statuses that mean "could not verify" (abstention) rather than
+# "positive evidence of a problem". These are NOT hallucinations -- the tool
+# simply failed to locate a matching record. Kept module-level so the JSONL
+# writer and the summary buckets stay in sync.
+ABSTAINED_STATUS_VALUES = frozenset(
+    {
+        FactCheckStatus.NOT_FOUND.value,
+        FactCheckStatus.BOOK_NOT_FOUND.value,
+        FactCheckStatus.WORKING_PAPER_NOT_FOUND.value,
+        FactCheckStatus.URL_NOT_FOUND.value,
+    }
+)
+
+
+def _is_abstained_status(status: FactCheckStatus) -> bool:
+    """True when ``status`` is an abstention (could-not-verify), not a problem."""
+    return status.value in ABSTAINED_STATUS_VALUES
+
+
 @dataclass
 class FieldComparison:
     """Result of comparing a single field between entry and API record."""
@@ -264,6 +283,13 @@ class FactCheckerConfig:
     year_tolerance: int = 1
     venue_threshold: float = 0.70
     hallucination_max_score: float = 0.50
+    # Fix B (abstention): when the best title-search candidate scores below this,
+    # the tool could not find the real paper -- it has *no* positive evidence of
+    # fabrication. Such cases ABSTAIN (NOT_FOUND) instead of asserting
+    # HALLUCINATED. Reserve HALLUCINATED for positive-evidence signals
+    # (fabricated DOI, future/invalid year, arXiv-ID misattribution, chimeric
+    # title) that fire *before* the score gate.
+    abstention_below: float = 0.50
     max_candidates_per_source: int = 10
     check_years: bool = True
     check_dois: bool = True
@@ -2350,9 +2376,31 @@ class FactChecker:
         """Determine final status from score and comparisons.
 
         P2.6: Venue mismatch is prioritized when title+author match.
+
+        Fix B (abstention): a weak best candidate means the title search returned
+        an *unrelated* paper -- the tool simply could not find the real one. That
+        is "I couldn't verify this", NOT "this is fabricated", so we ABSTAIN with
+        NOT_FOUND rather than asserting HALLUCINATED. This sits AFTER the
+        positive-evidence checks in ``check_entry`` (``_validate_year``,
+        ``_validate_doi``, ``_check_arxiv_id_consistency``, ``_detect_chimeric_title``),
+        each of which ``return``s before ``_determine_status`` is ever reached --
+        so abstention can never suppress a true HALLUCINATED verdict backed by
+        positive evidence.
         """
-        if best_score < self.config.hallucination_max_score:
-            return FactCheckStatus.HALLUCINATED
+        # Wrong-paper signature: the best match is too weak to trust. Either the
+        # blended score is below the abstention threshold, or the title itself is
+        # essentially unrelated (very low title score) AND neither title nor
+        # author corroborate the entry. In both cases there is no positive
+        # evidence of fabrication, only a failed lookup -> abstain.
+        title_cmp = comparisons.get("title")
+        author_cmp = comparisons.get("author")
+        title_score = title_cmp.similarity_score if title_cmp else 0.0
+        title_ok = bool(title_cmp and title_cmp.matches)
+        author_ok = bool(author_cmp and author_cmp.matches)
+        wrong_paper_signature = title_score < 0.30 and not title_ok and not author_ok
+
+        if best_score < self.config.abstention_below or wrong_paper_signature:
+            return FactCheckStatus.NOT_FOUND
 
         mismatches = [name for name, c in comparisons.items() if not c.matches]
 
@@ -2607,6 +2655,10 @@ class FactCheckProcessor:
                                 "key": result.entry_key,
                                 "category": result.category.value if result.category else None,
                                 "status": result.status.value,
+                                # Fix B: distinct flag so abstentions ("could not
+                                # verify") are unambiguously identifiable and never
+                                # read as confirmed hallucinations downstream.
+                                "abstained": _is_abstained_status(result.status),
                                 "confidence": result.overall_confidence,
                                 # Additive: 0-100 numeric confidence (Item 4).
                                 "confidence_score": float(getattr(result, "confidence_score", 0.0)),
@@ -2661,27 +2713,32 @@ class FactCheckProcessor:
                 if not c.matches:
                     field_mismatches[name] = field_mismatches.get(name, 0) + 1
 
-        # Include new problematic statuses
+        # Three buckets (Fix B). ABSTAINED ("could not verify") is reported
+        # separately from PROBLEMATIC ("positive evidence of a problem"): a
+        # not-found / uncertain entry is the tool failing to locate a record, NOT
+        # evidence of fabrication, so it must never read as a confirmed
+        # hallucination.
+        abstained_statuses = sorted(ABSTAINED_STATUS_VALUES)
+        # Positive-evidence problems only. (not_found / *_not_found moved to the
+        # abstained bucket above.)
         problematic_statuses = [
-            "not_found",
             "hallucinated",
             "title_mismatch",
             "author_mismatch",
             "year_mismatch",
             "venue_mismatch",
-            "url_not_found",
             "url_content_mismatch",
-            "book_not_found",
-            "working_paper_not_found",
             "future_date",
             "invalid_year",
             "doi_not_found",
+            "arxiv_id_mismatch",
             "preprint_only",
         ]
 
         # Calculate verified rate including new verified statuses
         verified_statuses = ["verified", "url_verified", "url_accessible", "book_verified", "working_paper_verified"]
         verified_count = sum(counts.get(s, 0) for s in verified_statuses)
+        abstained_count = sum(counts.get(s, 0) for s in abstained_statuses)
 
         return {
             "total": len(results),
@@ -2689,6 +2746,10 @@ class FactCheckProcessor:
             "by_category": category_counts,
             "field_mismatch_counts": field_mismatches,
             "verified_rate": verified_count / len(results) if results else 0,
+            "verified_count": verified_count,
+            # Distinct "could not verify" bucket -- abstentions, not hallucinations.
+            "could_not_verify_rate": abstained_count / len(results) if results else 0,
+            "abstained_count": abstained_count,
             "problematic_count": sum(counts.get(s, 0) for s in problematic_statuses),
         }
 
@@ -2764,6 +2825,8 @@ class FactCheckProcessor:
                         "key": r.entry_key,
                         "category": r.category.value if r.category else None,
                         "status": r.status.value,
+                        # Fix B: distinct abstention flag (see process_entries).
+                        "abstained": _is_abstained_status(r.status),
                         "confidence": r.overall_confidence,
                         # Additive: 0-100 numeric confidence (Item 4).
                         "confidence_score": float(getattr(r, "confidence_score", 0.0)),
@@ -3111,9 +3174,39 @@ def main() -> int:
         if count > 0:
             logger.info("  %s: %d", status.upper(), count)
 
+    # Three clearly distinct buckets (Fix B): VERIFIED, COULD NOT VERIFY
+    # (abstained -- no matching record found, NOT evidence of fabrication), and
+    # PROBLEMATIC (positive evidence of a problem). "Could not verify" must never
+    # be lumped in with either "verified" or "hallucinated".
+    total = summary["total"]
+    verified_n = summary.get("verified_count", 0)
+    abstained_n = summary.get("abstained_count", 0)
+    problematic_n = summary.get("problematic_count", 0)
+    logger.info("Results by bucket:")
+    logger.info(
+        "  (1) VERIFIED:            %d  (%.1f%%)",
+        verified_n,
+        summary["verified_rate"] * 100,
+    )
+    logger.info(
+        "  (2) COULD NOT VERIFY:    %d  (%.1f%%)  -- no matching record found; not evidence of fabrication",
+        abstained_n,
+        summary["could_not_verify_rate"] * 100,
+    )
+    logger.info(
+        "  (3) PROBLEMATIC:         %d  (%.1f%%)  -- positive evidence of a problem",
+        problematic_n,
+        (problematic_n / total * 100) if total else 0.0,
+    )
     logger.info("Verified rate: %.1f%%", summary["verified_rate"] * 100)
-    if summary["problematic_count"] > 0:
-        logger.warning("Problematic entries: %d", summary["problematic_count"])
+    logger.info("Could-not-verify rate: %.1f%%", summary["could_not_verify_rate"] * 100)
+    if problematic_n > 0:
+        logger.warning("Problematic entries (positive evidence): %d", problematic_n)
+    if abstained_n > 0:
+        logger.info(
+            "Could-not-verify entries (abstained, no matching record found): %d",
+            abstained_n,
+        )
 
     # Item 4: numeric confidence summary in the text report.
     numeric_scores = [float(getattr(r, "confidence_score", 0.0)) for r in results]
@@ -3139,9 +3232,17 @@ def main() -> int:
 
     # Exit code
     if args.strict:
-        problem_count = summary["status_counts"].get("not_found", 0) + summary["status_counts"].get("hallucinated", 0)
+        # Fix B: only POSITIVE-evidence problems gate the exit code. Abstentions
+        # (could-not-verify) are reported on their own line and do NOT count as
+        # confirmed hallucinations, so they no longer fail strict mode.
+        problem_count = summary["problematic_count"]
+        if abstained_n > 0:
+            logger.info(
+                "Strict mode: %d could-not-verify entries (abstained; not counted as failures)",
+                abstained_n,
+            )
         if problem_count > 0:
-            logger.warning("Strict mode: %d NOT_FOUND or HALLUCINATED entries found", problem_count)
+            logger.warning("Strict mode: %d PROBLEMATIC entries (positive evidence of a problem)", problem_count)
             return 4
 
     return 0

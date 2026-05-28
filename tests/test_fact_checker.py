@@ -318,10 +318,25 @@ class TestFactCheckerStatusDetermination:
         status = fact_checker._determine_status(0.95, comparisons, ["crossref"])
         assert status == FactCheckStatus.VERIFIED
 
-    def test_hallucinated_low_score(self, fact_checker):
+    def test_low_score_abstains_not_hallucinated(self, fact_checker):
+        # Fix B: a weak best match means the title search returned an unrelated
+        # paper -- the tool could not verify, which is NOT positive evidence of
+        # fabrication. It must ABSTAIN (NOT_FOUND), not assert HALLUCINATED.
         comparisons = {"title": FieldComparison("title", "A", "B", 0.3, False)}
         status = fact_checker._determine_status(0.35, comparisons, [])
-        assert status == FactCheckStatus.HALLUCINATED
+        assert status == FactCheckStatus.NOT_FOUND
+
+    def test_wrong_paper_signature_abstains(self, fact_checker):
+        # Above the abstention score threshold, but the title is essentially
+        # unrelated and neither title nor author corroborate -> still abstain.
+        comparisons = {
+            "title": FieldComparison("title", "A", "Z", 0.10, False),
+            "author": FieldComparison("author", "X", "Q", 0.0, False),
+            "year": FieldComparison("year", "2021", "2021", 1.0, True),
+            "venue": FieldComparison("venue", "J", "J", 1.0, True),
+        }
+        status = fact_checker._determine_status(0.55, comparisons, ["crossref"])
+        assert status == FactCheckStatus.NOT_FOUND
 
     def test_title_mismatch_only(self, fact_checker):
         comparisons = {
@@ -364,6 +379,98 @@ class TestFactCheckerStatusDetermination:
         assert status == FactCheckStatus.PARTIAL_MATCH
 
 
+class TestDetectionRatePreservation:
+    """Fix B guard: positive-evidence hallucination signals must STILL yield
+    HALLUCINATED. These signals fire *before* ``_determine_status`` (in
+    ``check_entry``), so the new abstention rule cannot suppress them.
+    """
+
+    def test_future_date_still_flagged(self, fact_checker):
+        # _validate_year runs before any title search / score gate.
+        entry = {
+            "ID": "future",
+            "ENTRYTYPE": "article",
+            "title": "Some Real Title",
+            "author": "Smith, John",
+            "year": "2099",
+        }
+        result = fact_checker.check_entry(entry)
+        assert result.status == FactCheckStatus.FUTURE_DATE
+        assert result.status != FactCheckStatus.NOT_FOUND
+
+    def test_invalid_year_still_flagged(self, fact_checker):
+        entry = {
+            "ID": "badyear",
+            "ENTRYTYPE": "article",
+            "title": "Some Real Title",
+            "author": "Smith, John",
+            "year": "1500",
+        }
+        result = fact_checker.check_entry(entry)
+        assert result.status == FactCheckStatus.INVALID_YEAR
+        assert result.status != FactCheckStatus.NOT_FOUND
+
+    def test_fabricated_doi_still_flagged(self, fact_checker):
+        # Pre-validated DOI map marks the DOI invalid (404/410). _validate_doi
+        # returns DOI_NOT_FOUND before the title search runs.
+        entry = {
+            "ID": "fakedoi",
+            "ENTRYTYPE": "article",
+            "title": "Some Real Title",
+            "author": "Smith, John",
+            "year": "2020",
+            "doi": "10.9999/totally.made.up",
+        }
+        result = fact_checker.check_entry(entry, pre_validated_dois={"fakedoi": False})
+        assert result.status == FactCheckStatus.DOI_NOT_FOUND
+        assert result.status != FactCheckStatus.NOT_FOUND
+
+    def test_chimeric_title_still_flagged(self, fact_checker, monkeypatch):
+        # Chimeric detection fires on positive cross-source evidence BEFORE the
+        # candidate sort and score gate. Force the cascade to return two records
+        # from two sources whose titles each contribute distinct token sets that
+        # the entry title borrows from.
+        entry = {
+            "ID": "chimera",
+            "ENTRYTYPE": "article",
+            # Borrows "attention transformers sequence modeling" from one paper
+            # and "graph convolutional molecular property prediction" from
+            # another (>= 4 shared tokens per source, so the chimeric detector
+            # fires -- which is the point of this DR-preservation guard).
+            "title": "Attention Transformers Sequence Modeling Graph Convolutional Molecular Property Prediction",
+            "author": "Smith, John",
+            "year": "2020",
+        }
+        rec_a = PublishedRecord(
+            doi="10.1/a",
+            title="Attention Transformers Sequence Modeling Translation",
+            authors=[{"given": "John", "family": "Smith"}],
+            journal="JMLR",
+            year=2020,
+        )
+        rec_b = PublishedRecord(
+            doi="10.1/b",
+            title="Graph Convolutional Molecular Property Prediction Networks",
+            authors=[{"given": "Jane", "family": "Doe"}],
+            journal="NeurIPS",
+            year=2020,
+        )
+
+        def fake_cascade(entry, query, sq, sh, errors):
+            sq.extend(["crossref", "dblp"])
+            sh.extend(["crossref", "dblp"])
+            return [
+                (fact_checker._score_candidate(query, ["smith"], rec_a), rec_a, "crossref"),
+                (fact_checker._score_candidate(query, ["smith"], rec_b), rec_b, "dblp"),
+            ]
+
+        monkeypatch.setattr(fact_checker, "_query_cascade", fake_cascade)
+        monkeypatch.setattr(fact_checker, "_query_arxiv_by_id", lambda *a, **k: [])
+        result = fact_checker.check_entry(entry)
+        assert result.status == FactCheckStatus.HALLUCINATED
+        assert result.status != FactCheckStatus.NOT_FOUND
+
+
 class TestFactCheckerCheckEntry:
     """Tests for FactChecker.check_entry method."""
 
@@ -379,6 +486,36 @@ class TestFactCheckerCheckEntry:
         result = fact_checker.check_entry(sample_entry)
         assert result.status == FactCheckStatus.NOT_FOUND
         assert result.api_sources_queried == ["crossref", "openalex", "dblp", "semanticscholar"]
+
+    def test_weak_unrelated_match_abstains(self, fact_checker, monkeypatch):
+        # Fix B: the search returns an UNRELATED paper (low best_score). This is
+        # a failed lookup, not positive evidence of fabrication -> NOT_FOUND,
+        # never HALLUCINATED.
+        entry = {
+            "ID": "weak",
+            "ENTRYTYPE": "article",
+            "title": "A Very Specific Real Paper Title That Was Not Indexed",
+            "author": "Smith, John",
+            "year": "2020",
+        }
+        unrelated = PublishedRecord(
+            doi="10.1/unrelated",
+            title="Completely Different Topic About Quantum Chromodynamics",
+            authors=[{"given": "Zed", "family": "Other"}],
+            journal="Physics Today",
+            year=2019,
+        )
+
+        def fake_cascade(entry, query, sq, sh, errors):
+            sq.append("crossref")
+            sh.append("crossref")
+            return [(fact_checker._score_candidate(query, ["smith"], unrelated), unrelated, "crossref")]
+
+        monkeypatch.setattr(fact_checker, "_query_cascade", fake_cascade)
+        monkeypatch.setattr(fact_checker, "_query_arxiv_by_id", lambda *a, **k: [])
+        result = fact_checker.check_entry(entry)
+        assert result.status == FactCheckStatus.NOT_FOUND
+        assert result.status != FactCheckStatus.HALLUCINATED
 
 
 # ------------- FactCheckProcessor Tests -------------
@@ -434,7 +571,12 @@ class TestFactCheckProcessor:
         assert summary["status_counts"]["verified"] == 1
         assert summary["status_counts"]["not_found"] == 1
         assert summary["status_counts"]["hallucinated"] == 1
-        assert summary["problematic_count"] == 2
+        # Fix B: not_found is now an ABSTENTION ("could not verify"), reported
+        # separately from PROBLEMATIC (positive evidence). Only the hallucinated
+        # entry is problematic; the not_found entry is abstained.
+        assert summary["problematic_count"] == 1
+        assert summary["abstained_count"] == 1
+        assert summary["verified_count"] == 1
 
     def test_generate_json_report(self, processor, sample_published_record):
         results = [
