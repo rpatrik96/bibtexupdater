@@ -22,8 +22,10 @@ __all__ = [
     "word_level_diff",
     "author_sequence_similarity",
     "combined_author_score",
+    "symmetric_author_match",
     "EXPANDED_VENUE_ALIASES",
     "get_canonical_venue",
+    "is_preprint_or_series_venue",
 ]
 
 
@@ -173,6 +175,77 @@ def combined_author_score(
     return jaccard_weight * jaccard_score + sequence_weight * sequence_score
 
 
+#: Sentinel surnames that BibTeX/citation tooling inserts for elided author
+#: lists ("and others" -> "others"; "et al."). They are not real authors and
+#: must be stripped before any author-set comparison, otherwise a correctly
+#: cited paper that uses "and others" is punished for a phantom mismatch.
+_AUTHOR_SENTINELS: frozenset[str] = frozenset({"others", "et al", "etal", "al"})
+
+
+def _strip_author_sentinels(names: list[str]) -> list[str]:
+    """Drop "others"/"et al" sentinels from a surname list."""
+    return [n for n in names if n and n.lower() not in _AUTHOR_SENTINELS]
+
+
+def _is_ordered_subsequence(short: list[str], long: list[str]) -> bool:
+    """True if ``short`` appears in ``long`` in order (not necessarily contiguous)."""
+    if not short:
+        return True
+    it = iter(long)
+    return all(name in it for name in short)
+
+
+def symmetric_author_match(
+    entry_names: list[str],
+    api_names: list[str],
+    threshold: float = 0.80,
+    prefix_n: int = 5,
+) -> tuple[bool, float]:
+    """Compare entry vs API author surnames on a *symmetric* basis.
+
+    The legacy comparison sliced the entry side to a small limit but left the
+    API side effectively unbounded, so a correctly cited paper that lists fewer
+    authors (or elides them with "and others") scored far below threshold purely
+    from the length asymmetry. This restores symmetry:
+
+    1. Strip "others"/"et al" sentinels from both sides.
+    2. First-author surname is a HARD signal: a genuinely different first author
+       fails immediately (so a swapped/wrong lead author is still caught).
+    3. ORDERED-CONTAINMENT: if one side's (sentinel-stripped) surnames are an
+       in-order subsequence of the other -- i.e. the citation lists a leading
+       subset of the real author list -- treat it as a match.
+    4. Otherwise score on a symmetric slice: both sides truncated to the same
+       ``min(len, prefix_n)`` length, combining unordered (Jaccard) and ordered
+       (LCS) similarity.
+
+    Returns ``(matches, score)``.
+    """
+    a = _strip_author_sentinels(entry_names)
+    b = _strip_author_sentinels(api_names)
+
+    # If either side has no usable names, treat as non-comparable (neutral pass):
+    # the author field can't refute a match it has no data for.
+    if not a or not b:
+        return (True, 1.0)
+
+    # Hard first-author signal: an outright different lead author is a real
+    # mismatch. Both sides are already canonicalized surname keys, so compare by
+    # equality.
+    if a[0] != b[0]:
+        return (False, 0.0)
+
+    # Ordered-containment: one side's surnames are an in-order subsequence of the
+    # other. This is the common "citation lists first k of n authors" case.
+    if _is_ordered_subsequence(a, b) or _is_ordered_subsequence(b, a):
+        return (True, 1.0)
+
+    # Symmetric slice + combined (Jaccard + LCS) score.
+    n = min(len(a), len(b), prefix_n)
+    a_slice, b_slice = a[:n], b[:n]
+    score = combined_author_score(a_slice, b_slice, jaccard_weight=0.5, sequence_weight=0.5)
+    return (score >= threshold, score)
+
+
 # ------------- P2.5: Expanded Venue Aliases -------------
 
 EXPANDED_VENUE_ALIASES: dict[str, set[str]] = {
@@ -181,12 +254,18 @@ EXPANDED_VENUE_ALIASES: dict[str, set[str]] = {
         "nips",
         "advances in neural information processing systems",
         "neural information processing systems",
+        "conference on neural information processing systems",
+        "annual conference on neural information processing systems",
     },
     "icml": {
         "international conference on machine learning",
         "proceedings of the international conference on machine learning",
+        "proceedings of the th international conference on machine learning",
     },
-    "iclr": {"international conference on learning representations"},
+    "iclr": {
+        "international conference on learning representations",
+        "proceedings of the international conference on learning representations",
+    },
     "aaai": {
         "association for the advancement of artificial intelligence",
         "proceedings of the aaai conference on artificial intelligence",
@@ -408,3 +487,49 @@ def get_canonical_venue(venue: str, aliases: dict[str, set[str]] | None = None) 
                 return canonical
 
     return None
+
+
+#: Substrings that mark a venue as a preprint server or a publisher *series*
+#: rather than a specific published venue. An arXiv-indexed record often carries
+#: a blank or preprint venue while the entry cites the real conference, so a
+#: preprint venue on EITHER side must never produce a hard mismatch. "PMLR" /
+#: "proceedings of machine learning research" is the umbrella series for many
+#: distinct conferences (ICML, AISTATS, CoRL, ...), so it cannot pin a single
+#: venue and is likewise treated as non-comparable.
+#: Preprint-server markers, matched as substrings of the lowercased raw venue.
+_PREPRINT_SERVER_MARKERS: tuple[str, ...] = (
+    "arxiv",
+    "biorxiv",
+    "medrxiv",
+    "chemrxiv",
+    "preprint",
+    "corr",  # arXiv's "Computing Research Repository" DBLP label
+)
+
+#: Publisher-*series* markers (matched against the lowercased raw venue). These
+#: name an umbrella series that spans many distinct conferences, so they cannot
+#: pin a single venue. Matched on the RAW venue (not the prefix-stripped form)
+#: so "Proceedings of Machine Learning Research" (PMLR) is caught while the
+#: distinct journal "Journal of Machine Learning Research" (JMLR) is NOT.
+_SERIES_MARKERS: tuple[str, ...] = (
+    "proceedings of machine learning research",
+    "pmlr",
+    "jmlr workshop and conference proceedings",
+    "w&cp",
+)
+
+
+def is_preprint_or_series_venue(venue: str) -> bool:
+    """True if ``venue`` names a preprint server or non-specific publisher series.
+
+    Such venues (arXiv/CoRR, bioRxiv, "Proceedings of Machine Learning Research",
+    PMLR/JMLR W&CP) cannot pin a single published venue, so a venue comparison
+    against them is *non-comparable* rather than a mismatch. The distinct journal
+    "Journal of Machine Learning Research" (JMLR) is deliberately NOT matched.
+    """
+    if not venue:
+        return False
+    raw = venue.lower().strip()
+    if not raw:
+        return False
+    return any(m in raw for m in _PREPRINT_SERVER_MARKERS) or any(m in raw for m in _SERIES_MARKERS)

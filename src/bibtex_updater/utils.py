@@ -210,6 +210,31 @@ def doi_normalize(doi: str | None) -> str | None:
     return d.lower()
 
 
+#: arXiv DataCite DOI prefix. arXiv mints versioned DOIs
+#: (``10.48550/arXiv.2010.11929v1``), but only the *unversioned* DOI
+#: (``10.48550/arXiv.2010.11929``) resolves via doi.org -- the versioned form
+#: 404s. Stripping the version suffix is therefore safe ONLY for this prefix;
+#: other DOIs may legitimately end in a letter+digit token.
+_ARXIV_DOI_PREFIX = "10.48550/arxiv."
+
+
+def normalize_doi_for_resolution(doi: str | None) -> str | None:
+    """Normalize a DOI for resolution against doi.org.
+
+    Builds on ``doi_normalize`` (strips URL prefix, lowercases). Additionally,
+    for arXiv DataCite DOIs (prefix ``10.48550/arXiv.``) strips a trailing
+    version suffix (``v1``, ``v2``, ...): the versioned DOI 404s at doi.org but
+    the unversioned one resolves (302). The version strip is scoped to the arXiv
+    prefix so non-arXiv DOIs that legitimately end in ``vN`` are left untouched.
+    """
+    normalized = doi_normalize(doi)
+    if not normalized:
+        return normalized
+    if normalized.startswith(_ARXIV_DOI_PREFIX):
+        normalized = re.sub(r"v\d+$", "", normalized)
+    return normalized
+
+
 def doi_url(doi: str) -> str:
     """Convert a DOI to a URL."""
     return f"https://doi.org/{doi}"

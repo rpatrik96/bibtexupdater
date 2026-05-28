@@ -227,6 +227,43 @@ class TestDoiNormalize:
         assert result is None
 
 
+class TestNormalizeDoiForResolution:
+    """FIX D: arXiv DataCite DOIs must be version-stripped, others left intact."""
+
+    def test_strips_arxiv_version(self):
+        from bibtex_updater import normalize_doi_for_resolution
+
+        assert normalize_doi_for_resolution("10.48550/arXiv.2010.11929v1") == "10.48550/arxiv.2010.11929"
+
+    def test_strips_arxiv_version_multidigit(self):
+        from bibtex_updater import normalize_doi_for_resolution
+
+        assert normalize_doi_for_resolution("10.48550/arXiv.2010.11929v12") == "10.48550/arxiv.2010.11929"
+
+    def test_unversioned_arxiv_unchanged(self):
+        from bibtex_updater import normalize_doi_for_resolution
+
+        assert normalize_doi_for_resolution("10.48550/arXiv.2010.11929") == "10.48550/arxiv.2010.11929"
+
+    def test_non_arxiv_version_like_suffix_preserved(self):
+        from bibtex_updater import normalize_doi_for_resolution
+
+        # Non-arXiv DOI legitimately ending in letter+digit -> must NOT strip.
+        assert normalize_doi_for_resolution("10.1234/journal.v2") == "10.1234/journal.v2"
+
+    def test_strips_url_prefix(self):
+        from bibtex_updater import normalize_doi_for_resolution
+
+        result = normalize_doi_for_resolution("https://doi.org/10.48550/arXiv.2010.11929v3")
+        assert result == "10.48550/arxiv.2010.11929"
+
+    def test_none_and_empty(self):
+        from bibtex_updater import normalize_doi_for_resolution
+
+        assert normalize_doi_for_resolution(None) is None
+        assert normalize_doi_for_resolution("") is None
+
+
 class TestDoiUrl:
     """Tests for doi_url function."""
 

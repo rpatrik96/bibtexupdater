@@ -245,6 +245,65 @@ class TestFactCheckerFieldComparison:
         comparisons = fact_checker._compare_all_fields(entry, record)
         assert comparisons["venue"].matches is True
 
+    def test_compare_author_subset_not_asymmetric_mismatch(self, fact_checker):
+        """FIX C: entry lists first 3 authors, API record has 8 -> author matches.
+
+        The legacy asymmetric comparison (entry-first-3 vs full-8) scored ~0.375,
+        below author_threshold 0.80, falsely flagging a correctly cited paper.
+        """
+        entry = {
+            "title": "An Image Is Worth 16x16 Words",
+            "author": "Dosovitskiy, Alexey and Beyer, Lucas and Kolesnikov, Alexander",
+        }
+        record = PublishedRecord(
+            doi="10.48550/arXiv.2010.11929",
+            title="An Image Is Worth 16x16 Words",
+            authors=[
+                {"given": "Alexey", "family": "Dosovitskiy"},
+                {"given": "Lucas", "family": "Beyer"},
+                {"given": "Alexander", "family": "Kolesnikov"},
+                {"given": "Dirk", "family": "Weissenborn"},
+                {"given": "Xiaohua", "family": "Zhai"},
+                {"given": "Thomas", "family": "Unterthiner"},
+                {"given": "Mostafa", "family": "Dehghani"},
+                {"given": "Matthias", "family": "Minderer"},
+            ],
+        )
+        comparisons = fact_checker._compare_all_fields(entry, record)
+        assert comparisons["author"].matches is True
+
+    def test_compare_author_and_others_matches(self, fact_checker):
+        """FIX C: 'and others' must not introduce a phantom mismatch author."""
+        entry = {
+            "title": "Test",
+            "author": "Smith, John and Doe, Jane and others",
+        }
+        record = PublishedRecord(
+            doi="",
+            title="Test",
+            authors=[
+                {"given": "John", "family": "Smith"},
+                {"given": "Jane", "family": "Doe"},
+                {"given": "Alan", "family": "Turing"},
+            ],
+        )
+        comparisons = fact_checker._compare_all_fields(entry, record)
+        assert comparisons["author"].matches is True
+
+    def test_compare_different_first_author_still_fails(self, fact_checker):
+        """FIX C: a genuinely wrong lead author must still be flagged."""
+        entry = {"title": "Test", "author": "Wrong, Person and Doe, Jane"}
+        record = PublishedRecord(
+            doi="",
+            title="Test",
+            authors=[
+                {"given": "John", "family": "Smith"},
+                {"given": "Jane", "family": "Doe"},
+            ],
+        )
+        comparisons = fact_checker._compare_all_fields(entry, record)
+        assert comparisons["author"].matches is False
+
 
 class TestFactCheckerStatusDetermination:
     """Tests for FactChecker status determination."""
@@ -867,6 +926,83 @@ class TestDOIValidation:
         assert result.status != FactCheckStatus.DOI_NOT_FOUND
 
 
+# ------------- FIX D: arXiv DOI version-suffix Tests -------------
+
+
+class TestArxivDoiVersionStripping:
+    """FIX D: versioned arXiv DOIs must be version-stripped before resolution."""
+
+    def test_versioned_arxiv_doi_stripped_and_resolves(self, fact_checker):
+        """The versioned arXiv DOI 404s, but the version-stripped one resolves (302).
+
+        We must NOT flag it as DOI_NOT_FOUND.
+        """
+        client = fact_checker.crossref.http.client
+
+        def fake_head(url, headers=None):
+            # The stripped (unversioned) DOI is what should be requested.
+            assert "v1" not in url
+            assert url == "https://doi.org/10.48550/arxiv.2010.11929"
+            return MagicMock(status_code=302)
+
+        client.head.side_effect = fake_head
+        result = fact_checker._validate_doi({"doi": "10.48550/arXiv.2010.11929v1"})
+        assert result is None
+
+    def test_non_arxiv_doi_version_like_suffix_not_stripped(self, fact_checker):
+        """A non-arXiv DOI ending in letter+digit must NOT be version-stripped."""
+        client = fact_checker.crossref.http.client
+        seen = {}
+
+        def fake_head(url, headers=None):
+            seen["url"] = url
+            return MagicMock(status_code=200)
+
+        client.head.side_effect = fake_head
+        fact_checker._validate_doi({"doi": "10.1234/journal.v2"})
+        # The trailing 'v2' must survive (non-arXiv prefix).
+        assert seen["url"] == "https://doi.org/10.1234/journal.v2"
+
+    def test_head_hostile_host_retries_with_get(self, fact_checker):
+        """A 404 to HEAD that resolves on GET must NOT be DOI_NOT_FOUND."""
+        client = fact_checker.crossref.http.client
+        client.head.return_value = MagicMock(status_code=404)
+        client.get.return_value = MagicMock(status_code=206)  # ranged GET success
+        result = fact_checker._validate_doi({"doi": "10.1234/headhostile"})
+        assert result is None
+        client.get.assert_called_once()
+
+    def test_genuinely_missing_doi_still_flagged(self, fact_checker):
+        """404 on both HEAD and GET -> genuinely missing DOI."""
+        client = fact_checker.crossref.http.client
+        client.head.return_value = MagicMock(status_code=404)
+        client.get.return_value = MagicMock(status_code=410)
+        result = fact_checker._validate_doi({"doi": "10.1234/gone"})
+        assert result == FactCheckStatus.DOI_NOT_FOUND
+
+    def test_publisher_block_not_flagged(self, fact_checker):
+        """418/403/429 are publisher blocks, not invalid DOIs."""
+        client = fact_checker.crossref.http.client
+        client.head.return_value = MagicMock(status_code=418)
+        result = fact_checker._validate_doi({"doi": "10.1109/ieee.block"})
+        assert result is None
+
+    def test_batch_validate_strips_arxiv_version(self, processor):
+        """_batch_validate_dois must also version-strip arXiv DOIs."""
+        client = processor.checker.crossref.http.client
+        requested = []
+
+        def fake_head(url, headers=None):
+            requested.append(url)
+            return MagicMock(status_code=302)
+
+        client.head.side_effect = fake_head
+        entries = [{"ID": "vit", "doi": "10.48550/arXiv.2010.11929v1"}]
+        results = processor._batch_validate_dois(entries)
+        assert results["vit"] is True
+        assert requested == ["https://doi.org/10.48550/arxiv.2010.11929"]
+
+
 # ------------- Venue Matching Tests -------------
 
 
@@ -947,6 +1083,82 @@ class TestVenueMatching:
         )
         comparisons = fact_checker._compare_all_fields(entry, record)
         assert comparisons["venue"].matches is False
+
+
+class TestVenueSymmetryAndPreprint:
+    """FIX E-venue: symmetric empty handling + preprint/series non-comparability."""
+
+    def test_empty_api_venue_is_neutral_not_mismatch(self):
+        """Empty API venue (arXiv-indexed record) must NOT hard-fail."""
+        from bibtex_updater.fact_checker import venues_match
+
+        matches, score = venues_match("NeurIPS", "")
+        assert matches is True
+        assert score == 1.0
+
+    def test_empty_entry_venue_is_neutral(self):
+        from bibtex_updater.fact_checker import venues_match
+
+        matches, _ = venues_match("", "NeurIPS")
+        assert matches is True
+
+    def test_arxiv_api_venue_is_non_comparable(self):
+        """A published-conference entry vs an arXiv API venue is not a mismatch."""
+        from bibtex_updater.fact_checker import venues_match
+
+        matches, score = venues_match("NeurIPS", "arXiv preprint arXiv:2010.11929")
+        assert matches is True
+        assert score == 1.0
+
+    def test_corr_api_venue_is_non_comparable(self):
+        from bibtex_updater.fact_checker import venues_match
+
+        matches, _ = venues_match("ICML", "CoRR")
+        assert matches is True
+
+    def test_pmlr_series_is_non_comparable(self):
+        """PMLR is an umbrella series, not a specific venue."""
+        from bibtex_updater.fact_checker import venues_match
+
+        matches, _ = venues_match("ICML", "Proceedings of Machine Learning Research")
+        assert matches is True
+
+    def test_genuinely_different_venues_still_mismatch(self):
+        """Two populated, distinct real venues must still be detectable."""
+        from bibtex_updater.fact_checker import venues_match
+
+        matches, _ = venues_match("NeurIPS", "ICML")
+        assert matches is False
+
+    def test_neurips_full_name_aliases(self):
+        from bibtex_updater.fact_checker import venues_match
+
+        for full in (
+            "Conference on Neural Information Processing Systems",
+            "Annual Conference on Neural Information Processing Systems",
+        ):
+            matches, _ = venues_match("NeurIPS", full)
+            assert matches is True, full
+
+    def test_empty_api_venue_in_field_comparison_no_mismatch(self, fact_checker):
+        """An arXiv-indexed record with blank venue should not produce venue_mismatch."""
+        entry = {
+            "ID": "test",
+            "ENTRYTYPE": "inproceedings",
+            "title": "Attention Is All You Need",
+            "author": "Vaswani, Ashish",
+            "booktitle": "NeurIPS",
+            "year": "2017",
+        }
+        record = PublishedRecord(
+            doi="10.48550/arXiv.1706.03762",
+            title="Attention Is All You Need",
+            authors=[{"given": "Ashish", "family": "Vaswani"}],
+            journal="",  # arXiv-indexed: blank venue
+            year=2017,
+        )
+        comparisons = fact_checker._compare_all_fields(entry, record)
+        assert comparisons["venue"].matches is True
 
 
 class TestNormalizeVenue:

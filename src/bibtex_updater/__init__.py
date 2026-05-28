@@ -102,6 +102,7 @@ from bibtex_updater.utils import (
     last_name_from_person,
     # Text normalization
     latex_to_plain,
+    normalize_doi_for_resolution,
     normalize_title_for_match,
     openalex_work_to_record,
     s2_data_to_record,
@@ -162,6 +163,7 @@ __all__ = [
     "SqliteCache",
     # Text normalization
     "latex_to_plain",
+    "normalize_doi_for_resolution",
     "normalize_title_for_match",
     "safe_lower",
     "strip_diacritics",

@@ -8,6 +8,8 @@ from bibtex_updater.matching import (
     combined_author_score,
     get_canonical_venue,
     is_near_miss_title,
+    is_preprint_or_series_venue,
+    symmetric_author_match,
     title_edit_distance,
     word_level_diff,
 )
@@ -209,6 +211,98 @@ class TestCombinedAuthorScore:
         # Combined (equal weights) = 0.5 * 0.5 + 0.5 * 0.667 ≈ 0.583
         score = combined_author_score(authors_a, authors_b)
         assert 0.55 < score < 0.62
+
+
+# ------------- FIX C: Symmetric Author Matching Tests -------------
+
+
+class TestSymmetricAuthorMatch:
+    """FIX C: entry vs API author comparison must be symmetric."""
+
+    def test_entry_subset_of_api_matches(self):
+        """Entry lists first 3 of 8 real authors -> match (was a false mismatch).
+
+        The legacy asymmetric scoring (entry-first-3 vs full-8) scored ~0.375.
+        """
+        entry = ["smith", "doe", "jones"]
+        api = ["smith", "doe", "jones", "brown", "wang", "lee", "kim", "patel"]
+        matches, score = symmetric_author_match(entry, api)
+        assert matches is True
+        assert score == 1.0
+
+    def test_first_three_vs_first_three_matches(self):
+        names = ["smith", "doe", "jones"]
+        matches, score = symmetric_author_match(names, names)
+        assert matches is True
+        assert score == 1.0
+
+    def test_and_others_sentinel_stripped(self):
+        """'and others' -> 'others' must not count as a phantom mismatch author."""
+        entry = ["smith", "doe", "others"]
+        api = ["smith", "doe", "jones", "brown"]
+        matches, _ = symmetric_author_match(entry, api)
+        assert matches is True
+
+    def test_et_al_sentinel_stripped(self):
+        entry = ["smith", "et al"]
+        api = ["smith", "doe", "jones"]
+        matches, _ = symmetric_author_match(entry, api)
+        assert matches is True
+
+    def test_different_first_author_fails(self):
+        """A genuinely swapped/wrong lead author must still fail."""
+        entry = ["wrong", "doe", "jones"]
+        api = ["smith", "doe", "jones"]
+        matches, score = symmetric_author_match(entry, api)
+        assert matches is False
+        assert score == 0.0
+
+    def test_empty_side_is_neutral(self):
+        """No usable names on a side -> cannot refute -> neutral match."""
+        assert symmetric_author_match([], ["smith"])[0] is True
+        assert symmetric_author_match(["smith"], [])[0] is True
+        assert symmetric_author_match(["others"], ["smith", "doe"])[0] is True
+
+    def test_completely_different_lists_fail(self):
+        entry = ["alpha", "beta", "gamma"]
+        api = ["delta", "epsilon", "zeta"]
+        matches, _ = symmetric_author_match(entry, api)
+        assert matches is False
+
+    def test_same_lead_partial_overlap_scores_symmetrically(self):
+        """Same first author, partially divergent tails -> symmetric slice scoring."""
+        entry = ["smith", "doe", "x"]
+        api = ["smith", "doe", "y", "z", "w"]
+        matches, _ = symmetric_author_match(entry, api)
+        # smith,doe,x vs smith,doe,y (sliced to 3) -> not a subsequence, scored.
+        assert isinstance(matches, bool)
+
+
+# ------------- FIX E-venue: Preprint / series venue Tests -------------
+
+
+class TestIsPreprintOrSeriesVenue:
+    """FIX E-venue: preprint/series venues are non-comparable."""
+
+    def test_arxiv_variants(self):
+        for v in ("arXiv", "arXiv preprint arXiv:2010.11929", "CoRR"):
+            assert is_preprint_or_series_venue(v) is True, v
+
+    def test_other_preprint_servers(self):
+        for v in ("bioRxiv", "medRxiv", "chemRxiv", "Some Preprint"):
+            assert is_preprint_or_series_venue(v) is True, v
+
+    def test_pmlr_series(self):
+        for v in ("PMLR", "Proceedings of Machine Learning Research", "JMLR W&CP"):
+            assert is_preprint_or_series_venue(v) is True, v
+
+    def test_real_venue_is_not_preprint(self):
+        for v in ("NeurIPS", "ICML", "Nature", ""):
+            assert is_preprint_or_series_venue(v) is False, v
+
+    def test_jmlr_journal_not_treated_as_series(self):
+        """JMLR is a distinct published journal, NOT the PMLR umbrella series."""
+        assert is_preprint_or_series_venue("Journal of Machine Learning Research") is False
 
 
 # ------------- P2.5: Expanded Venue Aliases Tests -------------

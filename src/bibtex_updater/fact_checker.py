@@ -44,9 +44,10 @@ from rapidfuzz.fuzz import token_sort_ratio
 from bibtex_updater.calibration import calibrate_result
 from bibtex_updater.matching import (
     EXPANDED_VENUE_ALIASES,
-    combined_author_score,
     get_canonical_venue,
     is_near_miss_title,
+    is_preprint_or_series_venue,
+    symmetric_author_match,
     title_edit_distance,
 )
 from bibtex_updater.sources import (
@@ -82,6 +83,8 @@ from bibtex_updater.utils import (
     is_valid_arxiv_id,
     # Matching
     jaccard_similarity,
+    # DOI normalization (arXiv-version-aware)
+    normalize_doi_for_resolution,
     # Text normalization
     normalize_title_for_match,
     s2_data_to_record,
@@ -1394,9 +1397,27 @@ def venues_match(venue_a: str, venue_b: str, threshold: float = 0.70) -> tuple[b
     """Check if two venue names match, considering aliases. Returns (matches, score).
 
     P2.5: Now uses EXPANDED_VENUE_ALIASES from matching.py for better venue coverage.
+
+    FIX E-venue: venue comparison is non-refuting in two symmetric cases, so it
+    never produces a false mismatch for a correctly cited paper:
+
+    - EMPTY on EITHER side -> non-comparable. (Previously empty *entry* matched
+      but empty *API* hard-failed; arXiv-indexed records routinely have a blank
+      venue.)
+    - PREPRINT / publisher-series on either side (arXiv/CoRR, bioRxiv, PMLR,
+      JMLR W&CP) -> non-comparable. A preprint venue says nothing about the
+      published venue the entry cites.
+
+    A genuine mismatch (both sides populated, both canonicalize to two DIFFERENT
+    real venues) is still reported.
     """
+    # Empty on either side: nothing to compare -> neutral match.
     if not venue_a or not venue_b:
-        return (True, 1.0) if not venue_a else (False, 0.0)
+        return (True, 1.0)
+
+    # Preprint / non-specific series on either side: non-comparable -> neutral.
+    if is_preprint_or_series_venue(venue_a) or is_preprint_or_series_venue(venue_b):
+        return (True, 1.0)
 
     norm_a = normalize_venue(venue_a)
     norm_b = normalize_venue(venue_b)
@@ -1412,6 +1433,38 @@ def venues_match(venue_a: str, venue_b: str, threshold: float = 0.70) -> tuple[b
     # Fall back to fuzzy matching
     score = token_sort_ratio(normalize_title_for_match(norm_a), normalize_title_for_match(norm_b)) / 100.0
     return (score >= threshold, score)
+
+
+def _doi_resolves(client: httpx.Client, doi: str) -> bool | None:
+    """Probe whether a DOI resolves at doi.org.
+
+    Returns:
+        False  -- the DOI definitively does not exist (404/410, confirmed by a
+                  GET retry to rule out HEAD-hostile hosts).
+        True   -- it resolves (2xx/3xx) or is blocked by a publisher (418/403/
+                  429): a block is not evidence of an invalid DOI.
+        None   -- network error; the caller should treat this as non-evidence
+                  (do not penalize).
+    """
+    url = doi if doi.startswith("http") else f"https://doi.org/{doi}"
+    headers = {"User-Agent": "BibtexFactChecker/1.0"}
+    try:
+        resp = client.head(url, headers=headers)
+    except Exception:
+        return None  # Network errors are not DOI validation failures.
+    # Only 404/410 indicate a DOI that truly doesn't exist. Other 4xx (418
+    # bot-detection, 403 access control, 429 rate limit) are publisher-side
+    # blocks, not evidence of an invalid DOI.
+    if resp.status_code not in (404, 410):
+        return True
+    # Some hosts are HEAD-hostile (return 404/410 to HEAD but resolve to GET).
+    # Retry once with a tiny ranged GET before concluding the DOI is missing.
+    try:
+        retry = client.get(url, headers={**headers, "Range": "bytes=0-0"})
+    except Exception:
+        return None
+    # Definitively missing only if the GET also returns 404/410.
+    return retry.status_code not in (404, 410)
 
 
 # ------------- Fact Checker Core -------------
@@ -1498,26 +1551,18 @@ class FactChecker:
         if pre_validated is not None and entry_id in pre_validated:
             return None if pre_validated[entry_id] else FactCheckStatus.DOI_NOT_FOUND
 
-        doi = entry.get("doi", "")
-        if not doi:
+        raw_doi = entry.get("doi", "")
+        if not raw_doi:
             return None
-        doi = doi.strip()
-        if doi.startswith("http"):
-            doi = doi.replace("https://doi.org/", "").replace("http://doi.org/", "")
+        # Normalize: strip URL prefix/lowercase, and for arXiv DataCite DOIs drop
+        # a trailing version suffix (the versioned DOI 404s at doi.org but the
+        # unversioned one resolves). Fall back to the raw string if normalization
+        # yields nothing.
+        doi = normalize_doi_for_resolution(raw_doi) or raw_doi.strip()
 
-        # Reuse the shared httpx.Client to avoid per-entry TCP/TLS overhead
-        try:
-            resp = self.crossref.http.client.head(
-                f"https://doi.org/{doi}",
-                headers={"User-Agent": "BibtexFactChecker/1.0"},
-            )
-            # Only 404/410 indicate a DOI that truly doesn't exist.
-            # Other 4xx (418 bot-detection, 403 access control, 429 rate limit)
-            # are publisher-side blocks, not evidence of an invalid DOI.
-            if resp.status_code in (404, 410):
-                return FactCheckStatus.DOI_NOT_FOUND
-        except Exception:
-            pass  # Network errors are not DOI validation failures
+        # Reuse the shared httpx.Client to avoid per-entry TCP/TLS overhead.
+        if _doi_resolves(self.crossref.http.client, doi) is False:
+            return FactCheckStatus.DOI_NOT_FOUND
         return None
 
     def _check_preprint_status(self, entry: dict[str, Any], best_match: PublishedRecord) -> FactCheckStatus | None:
@@ -2240,21 +2285,26 @@ class FactChecker:
             f"Edit distance: {edit_dist}" if near_miss else None,
         )
 
-        # Author (P2.3: Ordered author comparison)
+        # Author (symmetric comparison; see FIX C / symmetric_author_match).
+        # Both sides go through the same canonical surname reduction
+        # (last_name_from_person) with a generous limit, then the matcher slices
+        # both sides symmetrically and applies ordered-containment. The legacy
+        # code sliced the entry side to 10 but left the API side at 10_000, so a
+        # correctly cited paper that lists fewer authors (or "and others") scored
+        # below threshold purely from the length asymmetry.
         entry_authors = entry.get("author", "")
-        entry_names = authors_last_names(entry_authors, limit=10)
-        # Route the API side through the same canonical surname reduction as the
-        # entry side. The API side was previously unsliced; keep that.
+        entry_names = authors_last_names(entry_authors, limit=10_000)
         api_names = record.surname_keys(limit=10_000)
-        # Use combined score (Jaccard + sequence similarity)
-        author_score = combined_author_score(entry_names, api_names, jaccard_weight=0.5, sequence_weight=0.5)
+        author_matches, author_score = symmetric_author_match(
+            entry_names, api_names, threshold=cfg.author_threshold
+        )
         api_authors_str = " and ".join(f"{a.get('given', '')} {a.get('family', '')}".strip() for a in record.authors)
         comparisons["author"] = FieldComparison(
             "author",
             entry_authors,
             api_authors_str,
             author_score,
-            author_score >= cfg.author_threshold,
+            author_matches,
         )
 
         # Year
@@ -2466,21 +2516,13 @@ class FactCheckProcessor:
             return {}
 
         def _check_doi(entry_id: str, doi: str, client: httpx.Client) -> tuple[str, bool]:
-            """Check a single DOI via HEAD request."""
-            try:
-                # Normalize DOI URL
-                if doi.startswith("http"):
-                    url = doi
-                else:
-                    url = f"https://doi.org/{doi}"
-
-                resp = client.head(url, headers={"User-Agent": "BibtexFactChecker/1.0"})
-                # Only 404/410 mean the DOI doesn't exist.
-                # 418/403/429 are publisher bot-detection, not invalid DOIs.
-                return (entry_id, resp.status_code not in (404, 410))
-            except Exception:
-                # Assume valid on error (don't penalize network issues)
-                return (entry_id, True)
+            """Check a single DOI via HEAD (with a GET fallback)."""
+            # Normalize: strip URL prefix/lowercase, and for arXiv DataCite DOIs
+            # drop a trailing version suffix (the versioned DOI 404s at doi.org
+            # but the unversioned one resolves).
+            normalized = normalize_doi_for_resolution(doi) or doi.strip()
+            # None (network error) -> assume valid (don't penalize network issues).
+            return (entry_id, _doi_resolves(client, normalized) is not False)
 
         results: dict[str, bool] = {}
         # Reuse shared httpx.Client if available (avoids TCP/TLS overhead)
