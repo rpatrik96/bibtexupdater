@@ -270,8 +270,12 @@ class FactCheckerConfig:
     # as pointing to a *different* paper. Deliberately low so only clear
     # different-paper cases trip it, not minor preprint/published title edits.
     arxiv_consistency_min_title: float = 0.50
-    # CheckIfExist additions (Item 1 + 2): explicit cascading + top-K retrieval
-    cascade_mode: bool = False
+    # CheckIfExist additions (Item 1 + 2): explicit cascading + top-K retrieval.
+    # Default on: the cascade (CrossRef -> OpenAlex -> S2) short-circuits on a
+    # high-confidence match, so the slow keyless-S2 / specialist sources stay
+    # off the hot path for easy entries. Set False to fall back to the legacy
+    # parallel CrossRef+DBLP+S2 fan-out (queries every source on every entry).
+    cascade_mode: bool = True
     top_k: int = DEFAULT_TOP_K
     cascade_low_confidence: float = CASCADE_LOW_CONFIDENCE
     cascade_high_confidence: float = CASCADE_HIGH_CONFIDENCE
@@ -1945,12 +1949,18 @@ class FactChecker:
         sources_with_hits: list[str],
         errors: list[str],
     ) -> list[tuple[float, PublishedRecord, str]]:
-        """Cascading source order: CrossRef -> Semantic Scholar -> OpenAlex.
+        """Cascading source order: CrossRef -> OpenAlex -> Semantic Scholar.
 
         Item 1 (CheckIfExist Algorithm 1, Abbonato 2026). Each step retrieves
         ``config.top_k`` candidates and re-ranks them by Levenshtein title
         similarity (Item 2). The cascade short-circuits as soon as a source
         returns a candidate at or above ``cascade_high_confidence``.
+
+        Order rationale (throughput): the fast, broad sources come first so the
+        slow specialist is only reached on hard entries. OpenAlex runs on the
+        polite pool (~100 req/min) and aggregates Crossref + others; a keyless
+        Semantic Scholar is throttled to ~10 req/min, so querying it last keeps
+        it off the hot path for the easy majority of entries.
 
         Returns:
             List of ``(score, record, source_name)`` tuples, possibly from
@@ -1991,7 +2001,39 @@ class FactChecker:
         if best_cr >= self.config.cascade_high_confidence:
             return all_candidates
 
-        # ----- Step 2: Semantic Scholar (preprint coverage) -----
+        # ----- Step 2: OpenAlex (high-rate aggregator, broad coverage) -----
+        best_oa = 0.0
+        if self.openalex is None:
+            # Lazily build a default OpenAlex client, reusing the shared HTTP
+            # client reachable through the Crossref client. Without a shared
+            # client we skip OpenAlex rather than fabricate a bare, unthrottled
+            # connection -- this keeps tests hermetic and avoids impolite
+            # off-pool traffic.
+            shared_http = getattr(self.crossref, "http", None)
+            if shared_http is not None:
+                self.openalex = OpenAlexClient(
+                    http=shared_http,
+                    mailto=self.config.openalex_mailto,
+                )
+        if self.openalex is not None:
+            sources_queried.append("openalex")
+            try:
+                oa_items = self.openalex.search(query, limit=top_k)
+            except Exception as exc:
+                oa_items = []
+                errors.append(f"OpenAlex: {exc}")
+            oa_records: list[PublishedRecord] = []
+            for item in oa_items or []:
+                rec = openalex_work_to_candidate_record(item)
+                if rec:
+                    oa_records.append(rec)
+            if oa_records:
+                sources_with_hits.append("openalex")
+            best_oa = _ingest("openalex", oa_records)
+            if max(best_cr, best_oa) >= self.config.cascade_high_confidence:
+                return all_candidates
+
+        # ----- Step 3: Semantic Scholar (preprint coverage; slowest w/o key) -----
         sources_queried.append("semanticscholar")
         try:
             s2_data = self.s2.search(query, limit=top_k)
@@ -2005,34 +2047,7 @@ class FactChecker:
                 s2_records.append(rec)
         if s2_records:
             sources_with_hits.append("semanticscholar")
-        best_s2 = _ingest("semanticscholar", s2_records)
-        best_so_far = max(best_cr, best_s2)
-        if best_so_far >= self.config.cascade_high_confidence:
-            return all_candidates
-
-        # ----- Step 3: OpenAlex (aggregator catch-all) -----
-        if self.openalex is None:
-            # Lazily build a default OpenAlex client; reuses the shared HTTP
-            # client when one is reachable through the Crossref client.
-            shared_http = getattr(self.crossref, "http", None)
-            self.openalex = OpenAlexClient(
-                http=shared_http,
-                mailto=self.config.openalex_mailto,
-            )
-        sources_queried.append("openalex")
-        try:
-            oa_items = self.openalex.search(query, limit=top_k)
-        except Exception as exc:
-            oa_items = []
-            errors.append(f"OpenAlex: {exc}")
-        oa_records: list[PublishedRecord] = []
-        for item in oa_items or []:
-            rec = openalex_work_to_candidate_record(item)
-            if rec:
-                oa_records.append(rec)
-        if oa_records:
-            sources_with_hits.append("openalex")
-        _ingest("openalex", oa_records)
+        _ingest("semanticscholar", s2_records)
         return all_candidates
 
     def _score_candidate(self, title_norm: str, authors_ref: list[str], rec: PublishedRecord) -> float:
@@ -2797,9 +2812,13 @@ Examples:
     # CheckIfExist additions
     cascade_opts = p.add_argument_group("cascading source order (CheckIfExist)")
     cascade_opts.add_argument(
-        "--cascade",
+        "--no-cascade",
         action="store_true",
-        help="Use explicit CrossRef -> Semantic Scholar -> OpenAlex cascade (Item 1).",
+        help=(
+            "Disable the default CrossRef -> OpenAlex -> Semantic Scholar cascade "
+            "and use the legacy parallel CrossRef+DBLP+S2 fan-out (queries every "
+            "source on every entry; slower under rate limits)."
+        ),
     )
     cascade_opts.add_argument(
         "--top-k",
@@ -2908,7 +2927,7 @@ def main() -> int:
         venue_threshold=args.venue_threshold,
         check_dois=not args.no_check_dois,
         check_years=not args.no_check_years,
-        cascade_mode=bool(args.cascade),
+        cascade_mode=not args.no_cascade,
         top_k=top_k,
         openalex_mailto=args.openalex_mailto,
     )

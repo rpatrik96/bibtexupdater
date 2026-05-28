@@ -1,7 +1,7 @@
 """Tests for the CheckIfExist cascade extensions to bibtex-check.
 
 Covers items 1-6 of the CheckIfExist (Abbonato 2026) port:
-1. Cascading source order (CrossRef -> Semantic Scholar -> OpenAlex)
+1. Cascading source order (CrossRef -> OpenAlex -> Semantic Scholar)
 2. Top-K candidate retrieval before fuzzy match
 3. Cross-source author intersection
 4. Numeric confidence (0-100) with explicit penalties / multi-source bonus
@@ -113,7 +113,7 @@ class TestSelectTopKByTitleSimilarity:
 
 
 class TestQueryCascade:
-    """Verify the cascade order CrossRef -> S2 -> OpenAlex."""
+    """Verify the cascade order CrossRef -> OpenAlex -> S2."""
 
     def _build(self, cr_items=(), s2_items=(), oa_items=(), config_override=None, openalex=None):
         crossref = MagicMock()
@@ -182,7 +182,7 @@ class TestQueryCascade:
         assert "crossref" in sources_queried
         assert "semanticscholar" in sources_queried
 
-    def test_falls_through_to_openalex_when_cr_and_s2_empty(self):
+    def test_falls_through_all_sources_when_empty(self):
         fc, oa = self._build(cr_items=[], s2_items=[], oa_items=[])
         fc.openalex = oa
         entry = {
@@ -194,7 +194,9 @@ class TestQueryCascade:
         }
         sources_queried = []
         fc._query_cascade(entry, "Deep Learning Smith", sources_queried, [], [])
-        assert sources_queried == ["crossref", "semanticscholar", "openalex"]
+        # New order puts the fast, broad aggregator (OpenAlex) before the slow
+        # keyless-S2 specialist.
+        assert sources_queried == ["crossref", "openalex", "semanticscholar"]
 
     def test_top_k_capped_at_max(self):
         fc, _ = self._build(config_override={"top_k": MAX_TOP_K + 100})
