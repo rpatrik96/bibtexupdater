@@ -1214,8 +1214,9 @@ class HttpClient:
                     headers={"X-From-Cache": "1"},
                 )
         backoff = 1.0
+        attempts = 6
         limiter = self._get_limiter_for_service(service)
-        for _ in range(6):
+        for attempt in range(attempts):
             limiter.wait()
             try:
                 headers = {"Accept": accept} if accept else {}
@@ -1234,8 +1235,12 @@ class HttpClient:
                         pass
                 return resp
             except httpx.HTTPError:
-                time.sleep(backoff)
-                backoff = min(backoff * 2, 16.0)
+                # Don't sleep after the final attempt -- we're about to give up, so
+                # the backoff would just be a wasted stall (up to 16s) on a dead or
+                # rate-limited source.
+                if attempt < attempts - 1:
+                    time.sleep(backoff)
+                    backoff = min(backoff * 2, 16.0)
         raise RuntimeError(f"Network failure after retries for {url}")
 
 
