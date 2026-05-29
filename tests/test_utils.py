@@ -53,6 +53,16 @@ class TestStripDiacritics:
         result = strip_diacritics("Ångström")
         assert "A" in result and "ngstr" in result
 
+    def test_strip_diacritics_eszett_folds_to_ss(self):
+        # ß has no NFKD decomposition; fold it so "Reiß" matches "Reiss".
+        assert strip_diacritics("Reiß").lower() == "reiss"
+        assert strip_diacritics("Reiß").lower() == strip_diacritics("Reiss").lower()
+
+    def test_strip_diacritics_nondecomposing_letters(self):
+        # ø/ł/æ/đ etc. lack combining marks but should still fold to ASCII.
+        assert strip_diacritics("Søndergaard").lower() == "sondergaard"
+        assert strip_diacritics("Łukasz").lower() == "lukasz"
+
 
 class TestLatexToPlain:
     """Tests for latex_to_plain function."""
@@ -151,6 +161,16 @@ class TestLastNameFromPerson:
     def test_last_name_with_suffix(self):
         result = last_name_from_person("Smith, John Jr.")
         assert "smith" in result.lower()
+
+    def test_last_name_trailing_initials_skipped(self):
+        # "Mallikarjun B. R." (surname first, then initials) -> "mallikarjun",
+        # not the naive last token "r".
+        assert last_name_from_person("Mallikarjun B. R.") == "mallikarjun"
+
+    def test_last_name_keeps_real_surname_after_initial(self):
+        # A middle initial must not cause the real trailing surname to be dropped.
+        assert last_name_from_person("John M. Smith") == "smith"
+        assert last_name_from_person("van den Oord, Aaron") == "oord"
 
 
 class TestAuthorsLastNames:

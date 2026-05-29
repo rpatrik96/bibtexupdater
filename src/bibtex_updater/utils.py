@@ -90,9 +90,25 @@ def safe_lower(x: str | None) -> str:
     return (x or "").lower().strip()
 
 
+# Letters with no NFKD decomposition (no combining mark) that should still fold
+# to an ASCII base so the SAME name matches across sources, e.g. "Reiß" -> "reiss".
+# This only equates variant spellings of one name; it never merges distinct names.
+_NONDECOMPOSING_FOLD = str.maketrans(
+    {
+        "ß": "ss", "ẞ": "ss", "ø": "o", "Ø": "O", "đ": "d", "Đ": "D",
+        "ł": "l", "Ł": "L", "æ": "ae", "Æ": "AE", "œ": "oe", "Œ": "OE",
+        "ð": "d", "Ð": "D", "þ": "th", "Þ": "TH", "ı": "i", "ŧ": "t",
+    }
+)
+
+
 def strip_diacritics(text: str) -> str:
-    """Remove diacritics from text (e.g., 'café' -> 'cafe')."""
-    nfkd = unicodedata.normalize("NFKD", text)
+    """Remove diacritics from text (e.g., 'café' -> 'cafe').
+
+    Also folds letters that lack an NFKD decomposition (ß, ø, ł, æ, ...) to an
+    ASCII base, so variant spellings of the same name produce the same key.
+    """
+    nfkd = unicodedata.normalize("NFKD", text.translate(_NONDECOMPOSING_FOLD))
     return "".join([c for c in nfkd if not unicodedata.combining(c)])
 
 
@@ -155,10 +171,12 @@ def last_name_from_person(name: str) -> str:
     last = re.sub(r"[^a-z0-9\s-]", "", last).strip()
 
     tokens = last.split()
-    # Drop a trailing 4-digit DBLP homonym-disambiguation suffix ("Sun 0020",
-    # "Li 0001") so the key is the real surname rather than the number. Guarded
-    # by len > 1 so a name that is only digits is never emptied.
-    while len(tokens) > 1 and re.fullmatch(r"\d{4}", tokens[-1]):
+    # Drop trailing junk tokens so the key is the real surname:
+    #   - 4-digit DBLP homonym suffixes ("Sun 0020", "Li 0001")
+    #   - trailing single-letter initials ("Mallikarjun B. R." -> "mallikarjun",
+    #     where naive last-token would give "r")
+    # Guarded by len > 1 so a name that is only an initial/number is never emptied.
+    while len(tokens) > 1 and (re.fullmatch(r"\d{4}", tokens[-1]) or len(tokens[-1]) == 1):
         tokens.pop()
     if tokens:
         last = tokens[-1]
