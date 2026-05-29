@@ -2107,14 +2107,27 @@ class TestGivenNameSubstitutionRouting:
         assert comps["author"].is_mismatch is False
         assert fact_checker._determine_status(0.95, comps, ["crossref"]) == FactCheckStatus.VERIFIED
 
-    def test_unstructured_record_does_not_escalate(self, fact_checker):
+    def test_unstructured_but_order_reliable_record_escalates(self, fact_checker):
+        # Loosened gate (d67418): a DBLP-style record (order-reliable, synthesized
+        # names) now drives escalation -- the substitution surfaces via this source.
         entry = {
             "title": self.TITLE,
             "author": "Durmus Acar and Yujing Zhao and Rafael Navarro and Matthew Mattina",
             "year": "2021",
         }
         comps = fact_checker._compare_all_fields(entry, self._record(structured=False))
-        assert comps["author"].is_mismatch is False  # audit gated off -> surname-level MATCH
+        assert comps["author"].is_mismatch is True
+        assert fact_checker._determine_status(0.95, comps, ["dblp"]) == FactCheckStatus.GIVEN_NAME_SUBSTITUTION
+
+    def test_not_order_reliable_record_does_not_escalate(self, fact_checker):
+        # Semantic Scholar (not order_reliable) stays excluded -> surname-level MATCH.
+        entry = {
+            "title": self.TITLE,
+            "author": "Durmus Acar and Yujing Zhao and Rafael Navarro and Matthew Mattina",
+            "year": "2021",
+        }
+        comps = fact_checker._compare_all_fields(entry, self._record(structured=False, order_reliable=False))
+        assert comps["author"].is_mismatch is False
 
 
 class TestDoiOrgRejection:

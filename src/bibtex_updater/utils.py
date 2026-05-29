@@ -324,6 +324,7 @@ class GivenNameVariety:
     EXACT = "given_exact"
     DIACRITIC_HYPHEN = "given_diacritic_hyphen_variant"
     INITIAL_COMPATIBLE = "given_initial_form"
+    ABBREVIATION = "given_abbreviation_variant"
     MIDDLE_NAME = "given_middle_name_delta"
     TRANSLITERATION = "given_transliteration_variant"
     NICKNAME = "given_nickname_variant"
@@ -339,6 +340,7 @@ GIVEN_VARIETY_CLASS: dict[str, str] = {
     GivenNameVariety.EXACT: "confirmed",
     GivenNameVariety.DIACRITIC_HYPHEN: "confirmed",
     GivenNameVariety.INITIAL_COMPATIBLE: "confirmed",
+    GivenNameVariety.ABBREVIATION: "confirmed",
     GivenNameVariety.MIDDLE_NAME: "confirmed",
     GivenNameVariety.TRANSLITERATION: "soften",
     GivenNameVariety.NICKNAME: "soften",
@@ -427,6 +429,13 @@ def classify_given_pair(given_entry: str, given_record: str) -> str:
         # Same first given token, differing middle/extra tokens -> middle-name
         # presence/absence (benign): "Diederik P." vs "Diederik".
         return GivenNameVariety.MIDDLE_NAME
+    # Abbreviation/diminutive: one full first token is a leading character prefix
+    # of the other ("Tim" of "Timothy", "Chris" of "Christopher", "Dan" of
+    # "Daniel") -- a shortened form, not a different person. Genuine substitutions
+    # (Yue/Yujing, Ramon/Rafael) are NOT prefixes of each other, so they still
+    # escalate. Both sides require >= 2 chars (bare initials are Tier 2 already).
+    if len(te[0]) >= 2 and len(tr[0]) >= 2 and (te[0].startswith(tr[0]) or tr[0].startswith(te[0])):
+        return GivenNameVariety.ABBREVIATION
     if _nickname_equiv(te[0], tr[0]):
         return GivenNameVariety.NICKNAME
     if Levenshtein.distance(te[0], tr[0]) <= _GIVEN_SOFTEN_MAX_EDIT:
@@ -440,19 +449,20 @@ def given_name_position_audit(entry_author_field: str, record: "PublishedRecord"
     worst_class is one of "escalate" / "soften" / "confirmed" / "skip" and findings
     is a per-position list of ``{position, variety, entry_given, record_given}``.
 
-    Gated on ``order_reliable`` AND ``structured_names`` so it never runs on
-    synthesized/flat-name sources (where given names and the family split are a
-    guess). A position is audited only when its surname is already positionally
-    confirmed AND that surname is UNIQUE on both sides. The uniqueness guard is
-    essential: when a surname repeats (two co-authors named "Liu") OR the record
-    returns authors in a non-publication order (some sources alphabetize), a raw
-    positional pairing can compare two DIFFERENT same-surname authors (Wanwei vs
-    Xinwang Liu) and read a benign reordering as a substitution. Requiring a
-    unique surname means a same-position surname match identifies the SAME author.
+    Gated on ``order_reliable`` (Crossref/OpenAlex/DBLP/OpenReview). Note it does
+    NOT require ``structured_names``: a leaked hallucinated author is far worse
+    than a spurious flag, and a genuine substitution (e.g. d67418 'Yue'->'Yujing'
+    Zhao) often surfaces only via a DBLP/OpenAlex record whose given/family split
+    is synthesized. Several guards keep the synthesized split from causing false
+    positives: (1) a position is audited only where its surname is already
+    positionally confirmed AND (2) that surname is UNIQUE on both sides -- so a
+    repeated surname (two co-authors named "Liu") or a non-publication record
+    order (some sources alphabetize) can never cross-pair two different
+    same-surname authors; and (3) the given-name cascade folds initials,
+    diacritics, hyphenation and middle names before any escalation, so only a
+    full-vs-full incompatible leading given token escalates.
     """
-    if not getattr(record, "order_reliable", False):
-        return "skip", []
-    if not getattr(record, "structured_names", False) or not record.authors:
+    if not getattr(record, "order_reliable", False) or not record.authors:
         return "skip", []
 
     entry_names = split_authors_bibtex(entry_author_field)

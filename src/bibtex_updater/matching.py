@@ -314,20 +314,18 @@ def symmetric_author_match(
     if _is_ordered_subsequence(a, b) or _is_ordered_subsequence(b, a):
         return AuthorMatchResult(MatchOutcome.PARTIAL, 1.0)
 
-    # Author ORDER mismatch. Having reached here, the lists share the lead author
-    # and are neither equal, a leading prefix, nor an in-order subsequence -- the
-    # shared authors appear in a DIFFERENT relative order. When the matched record
-    # comes from an order-preserving source (Crossref/OpenAlex/DBLP/OpenReview all
-    # return authors in publication order), and the two lists overlap
-    # substantially, that reordering is a real swapped-authors defect in the
-    # citation, not a retrieval artifact -> MISMATCH. Sources that synthesize
-    # names without a reliable order (Semantic Scholar) pass order_reliable=False
-    # and fall through to the order-agnostic score below.
-    if order_reliable:
-        common = set(a) & set(b)
-        overlap = len(common) / max(1, min(len(a), len(b)))
-        if overlap >= 0.6:
-            return AuthorMatchResult(MatchOutcome.MISMATCH, 0.0)
+    # Author ORDER mismatch: the lists share the lead author and contain the
+    # EXACT SAME author multiset but in a DIFFERENT order (a genuine reordering).
+    # Against an order-preserving source (Crossref/OpenAlex/DBLP/OpenReview) that
+    # is a real swapped-authors defect -> MISMATCH. Require full multiset equality
+    # (``sorted(a) == sorted(b)``) rather than mere overlap: a single differing
+    # author -- a record-side typo ('Ren' vs 'Rent') or a completeness difference
+    # -- is NOT a reordering and must fall through to the order-agnostic score
+    # below instead of being misread as a swap (this was a false-positive source
+    # on valid references whose matched record had one mangled/extra author).
+    # Semantic Scholar (order_reliable=False) is excluded.
+    if order_reliable and sorted(a) == sorted(b):
+        return AuthorMatchResult(MatchOutcome.MISMATCH, 0.0)
 
     # Symmetric slice + combined (Jaccard + LCS) score.
     n = min(len(a), len(b), prefix_n)

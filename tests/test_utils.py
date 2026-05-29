@@ -523,6 +523,15 @@ class TestClassifyGivenPair:
         assert self._class("Jun-Yan", "Junyan") == "confirmed"  # hyphen fold
         assert self._class("Yue", "Yue") == "confirmed"  # exact
 
+    def test_abbreviation_prefix_is_confirmed(self):
+        # Diminutives/abbreviations where one full token is a prefix of the other.
+        assert self._class("Tim", "Timothy A.") == "confirmed"
+        assert self._class("Chris", "Christopher") == "confirmed"
+        assert self._class("Dan", "Daniel") == "confirmed"
+        # Genuine substitutions are NOT prefixes -> still escalate.
+        assert self._class("Yujing", "Yue") == "escalate"
+        assert self._class("Rafael", "Ramon") == "escalate"
+
     def test_low_confidence_softens(self):
         assert self._class("Bill", "William") == "soften"  # nickname
         assert self._class("Sergey", "Serguei") == "soften"  # close romanization
@@ -559,13 +568,18 @@ class TestGivenNamePositionAudit:
         assert worst == "escalate"
         assert any(f["variety"] == "given_name_substitution" for f in findings)
 
-    def test_no_escalation_on_unstructured_record(self):
+    def test_escalates_on_unstructured_but_order_reliable_record(self):
+        # Loosened gate: a DBLP/OpenAlex record (order-reliable but synthesized
+        # names) DOES drive escalation -- this is the d67418 path, where the
+        # substitution surfaces only via a non-structured source.
         from bibtex_updater.utils import given_name_position_audit
 
-        worst, _ = given_name_position_audit(self.ENTRY, self._rec(self.REAL, structured=False))
-        assert worst == "skip"
+        worst, findings = given_name_position_audit(self.ENTRY, self._rec(self.REAL, structured=False))
+        assert worst == "escalate"
+        assert any(f["variety"] == "given_name_substitution" for f in findings)
 
     def test_no_escalation_when_not_order_reliable(self):
+        # Semantic Scholar (not order_reliable) is still excluded.
         from bibtex_updater.utils import given_name_position_audit
 
         worst, _ = given_name_position_audit(self.ENTRY, self._rec(self.REAL, order_reliable=False))

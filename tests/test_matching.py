@@ -350,6 +350,22 @@ class TestAuthorOrderSensitivity:
         r = symmetric_author_match(["alpha", "beta", "gamma"], ["alpha", "delta", "epsilon"], order_reliable=True)
         assert r.outcome is MatchOutcome.MISMATCH
 
+    def test_single_differing_author_is_not_an_order_mismatch(self):
+        # Regression (e1694f2a0b29): a valid entry whose order-reliable record has
+        # ONE mangled author (a record-side typo 'Ren' -> 'Rent') is NOT a
+        # reordering -- multisets differ -- so the order rule must not fire; the
+        # matching head verifies it via the score path.
+        entry = ["wang", "yang", "feng", "sun", "guo", "zhang", "ren"]
+        api = ["wang", "yang", "feng", "sun", "guo", "zhang", "rent"]  # last author typo'd
+        r = symmetric_author_match(entry, api, order_reliable=True)
+        assert r.outcome is not MatchOutcome.MISMATCH
+
+    def test_genuine_permutation_still_flags(self):
+        # A true reordering (identical author multiset, different order) still flags.
+        entry = ["caccia", "lin", "rodriguez", "ostapenko"]
+        api = ["caccia", "rodriguez", "ostapenko", "lin"]
+        assert symmetric_author_match(entry, api, order_reliable=True).outcome is MatchOutcome.MISMATCH
+
 
 # ------------- FIX E-venue: Preprint / series venue Tests -------------
 
