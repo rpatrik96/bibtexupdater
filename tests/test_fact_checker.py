@@ -2058,6 +2058,42 @@ class TestDifferentEditionAbstains:
         assert status == FactCheckStatus.AUTHOR_MISMATCH
 
 
+class TestDoiOrgRejection:
+    """doi.org's own rejection of a DOI: 404/410, or a 400 returned with no
+    redirect (a malformed / unregistered DOI like a fabricated '10.77771/...').
+    A 400 AFTER a redirect is a downstream publisher quirk, not doi.org's verdict.
+    """
+
+    def _resp(self, status, redirected=False):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(status_code=status, history=([object()] if redirected else []))
+
+    def test_404_and_410_are_rejected(self):
+        from bibtex_updater.fact_checker import _doiorg_rejects_doi
+
+        assert _doiorg_rejects_doi(self._resp(404)) is True
+        assert _doiorg_rejects_doi(self._resp(410)) is True
+
+    def test_doiorg_direct_400_is_rejected(self):
+        # Fabricated/malformed DOI: doi.org returns 400 directly (no redirect).
+        from bibtex_updater.fact_checker import _doiorg_rejects_doi
+
+        assert _doiorg_rejects_doi(self._resp(400, redirected=False)) is True
+
+    def test_post_redirect_400_is_not_rejected(self):
+        # A 400 after doi.org's 302 is a publisher quirk, not an invalid DOI.
+        from bibtex_updater.fact_checker import _doiorg_rejects_doi
+
+        assert _doiorg_rejects_doi(self._resp(400, redirected=True)) is False
+
+    def test_redirect_and_blocks_resolve(self):
+        from bibtex_updater.fact_checker import _doiorg_rejects_doi
+
+        for code in (200, 302, 403, 418, 429):
+            assert _doiorg_rejects_doi(self._resp(code, redirected=True)) is False, code
+
+
 class TestResolveWhatCanBeResolved:
     """General principle: do not stop (short-circuit the cascade) while a claimed
     field is still unconfirmed and a remaining source could confirm it; and among

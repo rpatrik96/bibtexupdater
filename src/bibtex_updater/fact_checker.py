@@ -1616,12 +1616,34 @@ def _doi_is_preprint(doi: str | None) -> bool:
     return doi.lower().startswith(("10.48550/arxiv", "10.1101"))
 
 
+def _doiorg_rejects_doi(resp: httpx.Response) -> bool:
+    """True when doi.org ITSELF rejects the DOI as nonexistent or malformed.
+
+    - 404/410: a well-formed DOI that does not exist.
+    - 400 returned with NO redirect (``resp.history`` empty): the doi.org
+      resolver could not parse/route the DOI -- a malformed string or an
+      unregistered prefix (e.g. a fabricated ``10.77771/...``). Real DOIs get a
+      302 redirect from doi.org first, so a 400 AFTER a redirect is a downstream
+      publisher quirk, not doi.org's verdict, and is NOT treated as a rejection.
+
+    Other 4xx (418 bot-detection, 403 access control, 429 rate limit), typically
+    seen post-redirect from a publisher, are blocks -- not evidence of an invalid
+    DOI -- and return False here.
+    """
+    if resp.status_code in (404, 410):
+        return True
+    if resp.status_code == 400 and not resp.history:
+        return True
+    return False
+
+
 def _doi_resolves(client: httpx.Client, doi: str) -> bool | None:
     """Probe whether a DOI resolves at doi.org.
 
     Returns:
-        False  -- the DOI definitively does not exist (404/410, confirmed by a
-                  GET retry to rule out HEAD-hostile hosts).
+        False  -- the DOI definitively does not exist / is malformed (doi.org
+                  itself rejects it; see ``_doiorg_rejects_doi``), confirmed by a
+                  GET retry to rule out HEAD-hostile hosts.
         True   -- it resolves (2xx/3xx) or is blocked by a publisher (418/403/
                   429): a block is not evidence of an invalid DOI.
         None   -- network error; the caller should treat this as non-evidence
@@ -1633,19 +1655,15 @@ def _doi_resolves(client: httpx.Client, doi: str) -> bool | None:
         resp = client.head(url, headers=headers)
     except Exception:
         return None  # Network errors are not DOI validation failures.
-    # Only 404/410 indicate a DOI that truly doesn't exist. Other 4xx (418
-    # bot-detection, 403 access control, 429 rate limit) are publisher-side
-    # blocks, not evidence of an invalid DOI.
-    if resp.status_code not in (404, 410):
+    if not _doiorg_rejects_doi(resp):
         return True
-    # Some hosts are HEAD-hostile (return 404/410 to HEAD but resolve to GET).
-    # Retry once with a tiny ranged GET before concluding the DOI is missing.
+    # Some hosts are HEAD-hostile (reject HEAD but resolve to GET). Retry once
+    # with a tiny ranged GET before concluding the DOI is missing/malformed.
     try:
         retry = client.get(url, headers={**headers, "Range": "bytes=0-0"})
     except Exception:
         return None
-    # Definitively missing only if the GET also returns 404/410.
-    return retry.status_code not in (404, 410)
+    return not _doiorg_rejects_doi(retry)
 
 
 # ------------- Fact Checker Core -------------
