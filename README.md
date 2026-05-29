@@ -210,17 +210,24 @@ For `filter_bibliography.py` only (no dependencies required):
 
 ![Reference fact-checker](assets/fact-checker.gif)
 
-- **Multi-source validation**: Crossref, DBLP, Semantic Scholar, OpenAlex
+**v1.0.0** cut false positives on valid references from **61% → 9%** and brought hallucinations leaking through as "verified" to **0%**, with honest three-way verdicts (validated on HALLMARK dev_public):
+
+![bibtex-check v1.0.0 accuracy](assets/accuracy_v1_0_0.png)
+
+- **Multi-source validation**: Crossref, OpenAlex, DBLP, OpenReview, Semantic Scholar
 - **Detailed mismatch detection**: Title, author, year, venue comparisons
-- **Hallucination detection**: Identifies likely fabricated references
+- **Integrity checks**: DOI- and arXiv-ID-target consistency, ID-anchored author fabrication, chimeric-title detection
+- **Hallucination detection**: Reserves `hallucinated` for positive evidence (fabricated DOI, future/invalid year, ID misattribution); abstains (`not_found`) on weak matches
 - **Structured reports**: JSON and JSONL output formats
 - **CI/CD integration**: Strict mode with exit codes for automation
 
 #### Cascading verification
 
-Inspired by [Abbonato 2026 (CheckIfExist)](https://arxiv.org/abs/2602.15871), verification orders sources CrossRef → OpenAlex → DBLP → Semantic Scholar and short-circuits as soon as one source produces a high-confidence match. Combined with top-K candidate retrieval and cross-source author intersection, it catches `swapped_authors` / chimeric citations that single-source verification misses.
+Inspired by [Abbonato 2026 (CheckIfExist)](https://arxiv.org/abs/2602.15871), verification runs a single cascade — CrossRef → OpenAlex → DBLP → OpenReview → Semantic Scholar — that short-circuits as soon as one source produces a high-confidence match (`≥0.95`). Each step retrieves top-K candidates and re-ranks them by title similarity; combined with cross-source author intersection, this catches swapped-author / chimeric citations that single-source verification misses.
 
-The order is throughput-aware: CrossRef and OpenAlex (polite pool, ~100 req/min) come first, so the slow keyless Semantic Scholar fallback (~10 req/min) is only reached on hard entries. Set a Semantic Scholar API key (`--s2-api-key` or `S2_API_KEY`) to lift S2 from ~10 to ~60 req/min.
+The order is throughput-aware: CrossRef and OpenAlex (polite pool, ~100 req/min) come first, then DBLP and OpenReview (~30 req/min) as the CS-conference and ICLR/NeurIPS/TMLR authorities, so the slow keyless Semantic Scholar fallback (~10 req/min) is only reached on hard entries. Set a Semantic Scholar API key (`--s2-api-key` or `S2_API_KEY`) to lift S2 from ~10 to ~60 req/min.
+
+OpenReview owns the submission record for most ML conferences, so it positively confirms ICLR/NeurIPS/TMLR papers that the DOI- and CS-index sources above can only leave in the "could-not-verify" bucket. Retrieval uses *fielded* title search (CrossRef `query.title`, OpenAlex `title.search`) rather than a free-text title+author blob, which keeps DOI-less ML-conference titles ranked correctly.
 
 ```bash
 # Verification with top-3 candidates per source
@@ -242,7 +249,7 @@ A 0–100 numeric `confidence_score` (additive in the JSONL output) summarizes p
 
 #### Author handling
 
-All four sources return authors in as-published order, so an author-order difference is treated as a real citation error (e.g. a transposed or wrong lead author) and flagged — it is not an API artifact. Surname comparison uses each source's structured `family` field where available, so family-first/CJK names like "Chen Xing" ↔ "Xing Chen" are not falsely flagged; when the matched source lacks structured names (Semantic Scholar flat names, DBLP), a Crossref structured-name lookup is used to vet a potential author mismatch before reporting it.
+All sources return authors in as-published order, so an author-order difference is treated as a real citation error (e.g. a transposed or wrong lead author) and flagged — it is not an API artifact. Surname comparison uses each source's structured `family` field where available (Crossref, OpenAlex, OpenReview `~Given_Family` handles), so family-first/CJK names like "Chen Xing" ↔ "Xing Chen" are not falsely flagged; when the matched source lacks structured names (Semantic Scholar flat names, DBLP), a Crossref structured-name lookup is used to vet a potential author mismatch before reporting it.
 
 #### Non-generative-AI mode (`--non-generative`)
 
