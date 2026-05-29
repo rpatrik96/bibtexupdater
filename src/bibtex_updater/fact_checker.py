@@ -61,8 +61,10 @@ from bibtex_updater.sources import (
     MAX_TOP_K,
     AuthorIntersectionResult,
     OpenAlexClient,
+    OpenReviewClient,
     cross_source_author_intersection,
     openalex_work_to_candidate_record,
+    openreview_note_to_candidate_record,
     select_top_k_by_title_similarity,
 )
 from bibtex_updater.utils import (
@@ -1626,7 +1628,7 @@ def _doi_resolves(client: httpx.Client, doi: str) -> bool | None:
 class FactChecker:
     """Validates bibliographic entries against external APIs."""
 
-    API_SOURCES = ["crossref", "dblp", "semanticscholar", "openalex"]
+    API_SOURCES = ["crossref", "dblp", "semanticscholar", "openalex", "openreview"]
 
     def __init__(
         self,
@@ -1637,6 +1639,7 @@ class FactChecker:
         logger: logging.Logger,
         openalex: OpenAlexClient | None = None,
         arxiv: ArxivClient | None = None,
+        openreview: OpenReviewClient | None = None,
     ):
         self.crossref = crossref
         self.dblp = dblp
@@ -1649,6 +1652,10 @@ class FactChecker:
         # OpenAlex client is optional; tests can pass a fake. The cascade falls
         # back to creating a default client if not provided.
         self.openalex: OpenAlexClient | None = openalex
+        # OpenReview client is optional and lazily built from the shared HTTP
+        # client inside the cascade (mirroring OpenAlex). It is the authoritative
+        # source for ICLR/NeurIPS/TMLR submissions the other sources miss.
+        self.openreview: OpenReviewClient | None = openreview
         # Per-entry verification state (cross-source author intersection,
         # per-source records) is NOT stored on the shared instance: check_entry
         # runs concurrently across a ThreadPoolExecutor, so a sibling entry would
@@ -2372,7 +2379,7 @@ class FactChecker:
         sources_with_hits: list[str],
         errors: list[str],
     ) -> list[tuple[float, PublishedRecord, str]]:
-        """Cascading source order: CrossRef -> OpenAlex -> DBLP -> Semantic Scholar.
+        """Source order: CrossRef -> OpenAlex -> DBLP -> OpenReview -> Semantic Scholar.
 
         Item 1 (CheckIfExist Algorithm 1, Abbonato 2026). Each step retrieves
         ``config.top_k`` candidates and re-ranks them by Levenshtein title
@@ -2391,9 +2398,10 @@ class FactChecker:
         Order rationale (throughput): the fast, broad sources come first so the
         slow specialist is only reached on hard entries. OpenAlex runs on the
         polite pool (~100 req/min) and aggregates Crossref + others; DBLP
-        (~30 req/min) is the CS-conference authority; a keyless Semantic Scholar
-        is throttled to ~10 req/min, so querying it last keeps it off the hot
-        path for the easy majority of entries.
+        (~30 req/min) is the CS-conference authority; OpenReview (~30 req/min) is
+        the ICLR/NeurIPS/TMLR submission authority queried before the slow
+        keyless Semantic Scholar (~10 req/min), which is queried last to keep it
+        off the hot path for the easy majority of entries.
 
         Returns:
             List of ``(score, record, source_name)`` tuples, possibly from
@@ -2494,7 +2502,41 @@ class FactChecker:
             if max(best_cr, best_oa, best_dblp) >= self.config.cascade_high_confidence:
                 return all_candidates
 
-        # ----- Step 4: Semantic Scholar (preprint coverage; slowest w/o key) -----
+        # ----- Step 4: OpenReview (authoritative ICLR/NeurIPS/TMLR registry) -----
+        # OpenReview owns the submission record for most ML conferences, which the
+        # DOI/CS-index sources above frequently fail to *positively* confirm
+        # (these land in the "could-not-verify" bucket). It exposes ~Given_Family
+        # profile handles, yielding authoritative family names. Queried before the
+        # slow keyless Semantic Scholar so the ML-venue authority is consulted
+        # first. Lazily built from the shared HTTP client (reachable via Crossref),
+        # mirroring the OpenAlex step; skipped if no shared client is available so
+        # tests stay hermetic and no impolite off-pool traffic is created.
+        best_or = 0.0
+        if self.openreview is None:
+            shared_http = getattr(self.crossref, "http", None)
+            if shared_http is not None:
+                self.openreview = OpenReviewClient(http=shared_http)
+        if self.openreview is not None:
+            sources_queried.append("openreview")
+            try:
+                or_notes = self.openreview.search(
+                    query, limit=top_k, title=raw_title, first_author=first_author
+                )
+            except Exception as exc:
+                or_notes = []
+                errors.append(f"OpenReview: {exc}")
+            or_records: list[PublishedRecord] = []
+            for note in or_notes or []:
+                rec = openreview_note_to_candidate_record(note)
+                if rec:
+                    or_records.append(rec)
+            if or_records:
+                sources_with_hits.append("openreview")
+            best_or = _ingest("openreview", or_records)
+            if max(best_cr, best_oa, best_dblp, best_or) >= self.config.cascade_high_confidence:
+                return all_candidates
+
+        # ----- Step 5: Semantic Scholar (preprint coverage; slowest w/o key) -----
         sources_queried.append("semanticscholar")
         try:
             # Title-led query keeps S2 relevance focused on the paper title.
@@ -3480,6 +3522,7 @@ def main() -> int:
             "crossref": max(10, int(50 * rate_scale)),
             "semanticscholar": 60 if s2_api_key else max(5, int(10 * rate_scale)),
             "dblp": max(10, int(30 * rate_scale)),
+            "openreview": max(10, int(30 * rate_scale)),
             "openlibrary": max(10, int(30 * rate_scale)),
             "google_books": max(10, int(30 * rate_scale)),
         }

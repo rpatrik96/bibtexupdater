@@ -578,10 +578,18 @@ class TestFactCheckerCheckEntry:
 
     def test_entry_not_found(self, fact_checker, sample_entry):
         # All API clients return empty results by default. The cascade now
-        # queries four sources: crossref -> openalex -> dblp -> semanticscholar.
+        # queries five sources: crossref -> openalex -> dblp -> openreview ->
+        # semanticscholar (OpenAlex and OpenReview are lazily built from the
+        # shared crossref.http mock).
         result = fact_checker.check_entry(sample_entry)
         assert result.status == FactCheckStatus.NOT_FOUND
-        assert result.api_sources_queried == ["crossref", "openalex", "dblp", "semanticscholar"]
+        assert result.api_sources_queried == [
+            "crossref",
+            "openalex",
+            "dblp",
+            "openreview",
+            "semanticscholar",
+        ]
 
     def test_weak_unrelated_match_abstains(self, fact_checker, monkeypatch):
         # Fix B: the search returns an UNRELATED paper (low best_score). This is

@@ -194,9 +194,11 @@ class TestQueryCascade:
         }
         sources_queried = []
         fc._query_cascade(entry, "Deep Learning Smith", sources_queried, [], [])
-        # New order puts the fast, broad aggregator (OpenAlex) and the
-        # CS-conference authority (DBLP) before the slow keyless-S2 specialist.
-        assert sources_queried == ["crossref", "openalex", "dblp", "semanticscholar"]
+        # New order puts the fast, broad aggregator (OpenAlex), the CS-conference
+        # authority (DBLP), and the ML-venue authority (OpenReview) before the
+        # slow keyless-S2 specialist. OpenReview is lazily built from
+        # ``crossref.http`` (a MagicMock here), so it is reached.
+        assert sources_queried == ["crossref", "openalex", "dblp", "openreview", "semanticscholar"]
 
     def test_top_k_capped_at_max(self):
         fc, _ = self._build(config_override={"top_k": MAX_TOP_K + 100})

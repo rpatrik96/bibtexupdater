@@ -59,6 +59,11 @@ ACL_DOI_PREFIX = "10.18653/v1/"
 ACL_ANTHOLOGY_ID_RE = re.compile(r"https?://aclanthology\.org/([A-Z0-9][\w.-]+?)(?:\.pdf|\.bib)?/?$", re.IGNORECASE)
 OPENALEX_API = "https://api.openalex.org"
 EUROPEPMC_API = "https://www.ebi.ac.uk/europepmc/webservices/rest"
+# Legacy OpenReview API. The v2 host (api2.openreview.net) does NOT serve the
+# ``paperhash`` exact-match filter, but the legacy ``api.openreview.net/notes``
+# endpoint does -- and that is the authoritative title+first-author lookup the
+# cascade relies on. Public read is keyless.
+OPENREVIEW_API = "https://api.openreview.net"
 
 
 # ------------- Atomic File Replace -------------
@@ -601,6 +606,7 @@ class RateLimiterRegistry:
         "aclanthology": 30,  # ACL Anthology: 30/min (conservative)
         "openalex": 100,  # OpenAlex: polite pool (~10 req/sec max)
         "europepmc": 20,  # Europe PMC: conservative rate limit
+        "openreview": 30,  # OpenReview: 30/min (conservative; keyless public read)
     }
 
     def __init__(self, limits: dict[str, int] | None = None) -> None:
@@ -1917,6 +1923,7 @@ class AsyncRateLimiterRegistry:
         "aclanthology": 30,  # ACL Anthology: 30/min (conservative)
         "openalex": 100,  # OpenAlex: polite pool (~10 req/sec max)
         "europepmc": 20,  # Europe PMC: conservative rate limit
+        "openreview": 30,  # OpenReview: 30/min (conservative; keyless public read)
     }
 
     def __init__(self, limits: dict[str, int] | None = None) -> None:

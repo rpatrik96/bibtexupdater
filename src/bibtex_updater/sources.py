@@ -29,7 +29,9 @@ from rapidfuzz.fuzz import token_sort_ratio
 
 from bibtex_updater.utils import (
     OPENALEX_API,
+    OPENREVIEW_API,
     PublishedRecord,
+    last_name_from_person,
     normalize_title_for_match,
     strip_diacritics,
 )
@@ -37,6 +39,9 @@ from bibtex_updater.utils import (
 __all__ = [
     "OpenAlexClient",
     "openalex_work_to_candidate_record",
+    "OpenReviewClient",
+    "openreview_note_to_candidate_record",
+    "build_openreview_paperhash",
     "select_top_k_by_title_similarity",
     "cross_source_author_intersection",
     "AuthorIntersectionResult",
@@ -219,6 +224,225 @@ def openalex_work_to_candidate_record(work: dict[str, Any]) -> PublishedRecord |
         journal=journal,
         year=year,
         type=work_type,
+    )
+
+
+# ------------- OpenReview client -------------
+
+
+#: OpenReview "tilde" profile-id pattern, e.g. ``~Diederik_P_Kingma1`` or
+#: ``~Aidan_N._Gomez1`` (a middle initial may carry a trailing period). The
+#: family name is the underscore token immediately before the trailing digits.
+_OPENREVIEW_TILDE_ID = re.compile(r"^~([A-Za-z][\w.]*?)(\d+)$")
+
+
+def _content_value(content: dict[str, Any], key: str) -> Any:
+    """Read an OpenReview note ``content`` field across API v1/v2 shapes.
+
+    API v2 wraps every field as ``{"value": <v>}``; API v1 stores the bare
+    value. This returns the inner value either way (or ``None`` if absent).
+    """
+    raw = content.get(key)
+    if isinstance(raw, dict) and "value" in raw:
+        return raw.get("value")
+    return raw
+
+
+def build_openreview_paperhash(title: str, first_author_last_name: str) -> str | None:
+    """Construct OpenReview's ``paperhash`` exact-match key for a paper.
+
+    OpenReview indexes every note under ``<firstauthor_lastname>|<title>`` where
+    the title is lowercased, stripped of all non-alphanumeric characters (colons,
+    hyphens, apostrophes are *removed*, not spaced -- "Few-Shot" -> "fewshot",
+    "BERT:" -> "bert"), whitespace-collapsed, and spaces become underscores. The
+    author prefix is the first author's last name, lowercased + diacritics-free.
+    Verified live against the Kingma/He/Vaswani/Devlin/Brown/Ho papers.
+
+    Returns ``None`` when either component is empty (an un-hashable entry).
+    """
+    last = strip_diacritics(first_author_last_name or "").lower().strip()
+    last = re.sub(r"[^a-z0-9]", "", last)
+    norm_title = strip_diacritics(title or "").lower()
+    norm_title = re.sub(r"[^a-z0-9\s]", "", norm_title)
+    norm_title = "_".join(norm_title.split())
+    if not last or not norm_title:
+        return None
+    return f"{last}|{norm_title}"
+
+
+class OpenReviewClient:
+    """Minimal OpenReview lookup client (legacy ``api.openreview.net``).
+
+    OpenReview is the authoritative submission registry for ICLR, NeurIPS, TMLR
+    and many other ML venues, which the rest of the cascade (CrossRef/OpenAlex/
+    DBLP/S2) frequently fails to *positively* confirm. The legacy ``/notes``
+    endpoint exposes a ``paperhash`` filter that does an exact title + first-author
+    match -- far more precise than the full-text ``term=``/``query=`` search,
+    which returns reviews and unrelated public articles. ``content.authors`` is a
+    flat name list, but ``content.authorids`` carries ``~Given_Family<N>`` profile
+    handles from which an authoritative family name is recoverable.
+
+    Mirrors :class:`OpenAlexClient`: optional shared ``http`` (rate limiting +
+    caching via ``service="openreview"``), bare ``httpx`` fallback for hermetic
+    use, and ``[]`` on any error / non-200.
+    """
+
+    def __init__(self, http: Any | None = None, timeout: float = 20.0) -> None:
+        self.http = http
+        self.timeout = timeout
+
+    def search(
+        self,
+        query: str,
+        limit: int = DEFAULT_TOP_K,
+        title: str | None = None,
+        first_author: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Look up OpenReview notes by exact ``paperhash`` (title + first author).
+
+        Args:
+            query: Free-text blob (unused by the paperhash path; accepted for a
+                signature symmetric with the other cascade clients).
+            limit: Max notes to retrieve (capped at ``MAX_TOP_K``).
+            title: Raw paper title. Required to build the ``paperhash``.
+            first_author: First author's *last* name (already reduced). Required
+                to build the ``paperhash``; without it no lookup is possible.
+
+        Returns:
+            List of OpenReview note dicts (never ``None``). Empty on any error,
+            on a missing title/author, or when nothing matches.
+        """
+        per_page = max(1, min(int(limit), MAX_TOP_K))
+        paperhash = build_openreview_paperhash(title or "", first_author or "")
+        if not paperhash:
+            return []
+        params = {"paperhash": paperhash, "limit": per_page}
+        return self._fetch(params)
+
+    def _fetch(self, params: dict[str, Any]) -> list[dict[str, Any]]:
+        """Issue a single OpenReview ``/notes`` request, return the note list.
+
+        Preserves shared-HttpClient-vs-bare-httpx routing (rate limiting + caching
+        on the shared path). Returns ``[]`` on any non-200 status or exception.
+        """
+        url = f"{OPENREVIEW_API}/notes"
+        try:
+            if self.http is not None and hasattr(self.http, "_request"):
+                resp = self.http._request(
+                    "GET",
+                    url,
+                    params=params,
+                    accept="application/json",
+                    service="openreview",
+                )
+                if resp.status_code != 200:
+                    return []
+                data = resp.json() or {}
+            else:
+                with httpx.Client(timeout=self.timeout) as client:
+                    resp = client.get(url, params=params)
+                    if resp.status_code != 200:
+                        return []
+                    data = resp.json() or {}
+        except Exception:
+            return []
+        notes = data.get("notes") or []
+        if not isinstance(notes, list):
+            return []
+        return notes
+
+
+def _family_from_tilde_id(authorid: str) -> str | None:
+    """Recover an authoritative family name from a ``~Given_Family<N>`` handle.
+
+    OpenReview profile ids encode the name as underscore-separated tokens with a
+    trailing disambiguation digit, e.g. ``~Diederik_P_Kingma1`` -> ``Kingma``,
+    ``~Aidan_N._Gomez1`` -> ``Gomez``. Non-tilde ids (raw emails, DBLP-search
+    URLs) yield ``None`` so the caller can fall back to the flat display name.
+    """
+    if not authorid or not authorid.startswith("~"):
+        return None
+    m = _OPENREVIEW_TILDE_ID.match(authorid)
+    if not m:
+        return None
+    tokens = [t for t in m.group(1).split("_") if t]
+    if not tokens:
+        return None
+    return tokens[-1]
+
+
+def openreview_note_to_candidate_record(note: dict[str, Any]) -> PublishedRecord | None:
+    """Convert an OpenReview note to a ``PublishedRecord`` for cascade scoring.
+
+    Authors come from the flat ``content.authors`` list; whenever the parallel
+    ``content.authorids`` entry is a ``~Given_Family<N>`` profile handle we lift
+    the AUTHORITATIVE family name out of it and set ``structured_names=True`` so
+    ``surname_keys`` trusts the family verbatim. If *any* author lacks a usable
+    tilde id we leave ``structured_names=False`` and the synthesized last-token
+    family is used (and the verdict logic stays conservative). The venue is taken
+    from ``content.venue`` (falling back to ``content.venueid``).
+
+    Returns ``None`` if the note has no usable title.
+    """
+    if not note:
+        return None
+    content = note.get("content") or {}
+    if not isinstance(content, dict):
+        return None
+
+    title = _content_value(content, "title")
+    if not title or not str(title).strip():
+        return None
+    title = re.sub(r"<[^>]*>", "", str(title)).strip()
+
+    raw_authors = _content_value(content, "authors") or []
+    raw_authorids = _content_value(content, "authorids") or []
+    if not isinstance(raw_authors, list):
+        raw_authors = []
+    if not isinstance(raw_authorids, list):
+        raw_authorids = []
+
+    authors: list[dict[str, str]] = []
+    all_structured = bool(raw_authors)
+    for idx, full_name in enumerate(raw_authors):
+        if not isinstance(full_name, str) or not full_name.strip():
+            continue
+        authorid = raw_authorids[idx] if idx < len(raw_authorids) else ""
+        family = _family_from_tilde_id(authorid if isinstance(authorid, str) else "")
+        if family:
+            parts = full_name.strip().split()
+            given = " ".join(parts[:-1]) if len(parts) > 1 else ""
+            authors.append({"given": given, "family": family})
+        else:
+            # No authoritative handle: synthesize a family via the same last-token
+            # heuristic the entry side uses, and mark the record unstructured.
+            all_structured = False
+            family = last_name_from_person(full_name)
+            parts = full_name.strip().split()
+            given = " ".join(parts[:-1]) if len(parts) > 1 else ""
+            authors.append({"given": given, "family": family})
+
+    if not authors:
+        all_structured = False
+
+    venue = _content_value(content, "venue") or _content_value(content, "venueid")
+
+    year = None
+    raw_year = _content_value(content, "year")
+    try:
+        if raw_year is not None:
+            year = int(str(raw_year)[:4])
+    except (ValueError, TypeError):
+        year = None
+
+    return PublishedRecord(
+        doi=None,
+        title=title,
+        authors=authors,
+        journal=venue,
+        year=year,
+        type="conference",
+        structured_names=all_structured,
     )
 
 
