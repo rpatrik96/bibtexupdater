@@ -220,6 +220,106 @@ class TestCrossrefGetByDoi:
         assert client.get_by_doi("10.0/x") is None
 
 
+class TestIdAnchoredAuthorMismatch:
+    """When an entry's own DOI/arXiv-ID resolves to the cited paper (title
+    matches) but the entry lists swapped/placeholder authors, that is positive
+    evidence of author fabrication -> AUTHOR_MISMATCH, not a silent VERIFIED or
+    abstention. Catches the residual slip-through where a hallucinated citation
+    carries a correct identifier but wrong authors. FPR-safe: only a genuine
+    author MISMATCH flags; correct authors verify and legitimate "and others"
+    truncations stay un-flagged.
+    """
+
+    def test_doi_title_match_wrong_authors_flagged(self, dead_sources, logger):
+        crossref, dblp, s2 = dead_sources
+        entry = _ibrnet_entry()
+        # DOI resolves to the SAME paper (title matches) but with different authors.
+        crossref.get_by_doi = MagicMock(
+            return_value=_crossref_message(
+                entry["title"],
+                entry["doi"],
+                authors=[{"given": "John", "family": "Doe"}, {"given": "Jane", "family": "Roe"}],
+            )
+        )
+        checker = FactChecker(crossref, dblp, s2, FactCheckerConfig(), logger)
+
+        result = checker.check_entry(entry)
+
+        assert result.status == FactCheckStatus.AUTHOR_MISMATCH
+        assert result.best_match is not None and "IBRNet" in result.best_match.title
+        crossref.get_by_doi.assert_called_once_with(entry["doi"])
+
+    def test_doi_title_and_authors_match_verifies(self, dead_sources, logger):
+        crossref, dblp, s2 = dead_sources
+        entry = _ibrnet_entry()
+        authors = [
+            {"given": "Qianqian", "family": "Wang"},
+            {"given": "Zhicheng", "family": "Wang"},
+            {"given": "Kyle", "family": "Genova"},
+        ]
+        matching = _crossref_message(entry["title"], entry["doi"], authors=authors)
+        matching["issued"] = {"date-parts": [[2021]]}
+        crossref.get_by_doi = MagicMock(return_value=matching)
+        crossref.search = MagicMock(return_value=[matching])
+        checker = FactChecker(crossref, dblp, s2, FactCheckerConfig(), logger)
+
+        result = checker.check_entry(entry)
+
+        assert result.status != FactCheckStatus.AUTHOR_MISMATCH
+        assert result.status == FactCheckStatus.VERIFIED
+
+    def test_doi_truncated_authors_with_sentinel_not_flagged(self, dead_sources, logger):
+        """A legitimate "...and others" citation against the full author list is
+        consistent-but-incomplete (never a MISMATCH) -> not flagged."""
+        crossref, dblp, s2 = dead_sources
+        entry = _ibrnet_entry()
+        entry["author"] = "Wang, Qianqian and others"
+        authors = [
+            {"given": "Qianqian", "family": "Wang"},
+            {"given": "Zhicheng", "family": "Wang"},
+            {"given": "Kyle", "family": "Genova"},
+        ]
+        matching = _crossref_message(entry["title"], entry["doi"], authors=authors)
+        matching["issued"] = {"date-parts": [[2021]]}
+        crossref.get_by_doi = MagicMock(return_value=matching)
+        crossref.search = MagicMock(return_value=[matching])
+        checker = FactChecker(crossref, dblp, s2, FactCheckerConfig(), logger)
+
+        result = checker.check_entry(entry)
+
+        assert result.status != FactCheckStatus.AUTHOR_MISMATCH
+
+    def test_arxiv_id_title_match_wrong_authors_flagged(self, dead_sources, logger):
+        from bibtex_updater.utils import PublishedRecord
+
+        crossref, dblp, s2 = dead_sources
+        entry = {
+            "ID": "node2018",
+            "ENTRYTYPE": "article",
+            "title": "Neural Ordinary Differential Equations",
+            "author": "Doe, John and Roe, Jane",
+            "eprint": "1806.07366",
+            "year": "2018",
+        }
+        checker = FactChecker(crossref, dblp, s2, FactCheckerConfig(), logger, arxiv=MagicMock())
+        # arXiv ID resolves to the real paper (title matches) but wrong authors.
+        checker._arxiv_record = MagicMock(
+            return_value=PublishedRecord(
+                doi=None,
+                title="Neural Ordinary Differential Equations",
+                authors=[
+                    {"given": "Ricky T. Q.", "family": "Chen"},
+                    {"given": "Yulia", "family": "Rubanova"},
+                ],
+                year=2018,
+            )
+        )
+
+        result = checker.check_entry(entry)
+
+        assert result.status == FactCheckStatus.AUTHOR_MISMATCH
+
+
 @pytest.fixture
 def logger():
     return logging.getLogger("test_doi_consistency")

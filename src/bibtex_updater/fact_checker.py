@@ -1967,6 +1967,68 @@ class FactChecker:
                     return bare
         return None
 
+    def _id_anchored_author_mismatch(
+        self,
+        entry: dict[str, Any],
+        rec: PublishedRecord,
+        source: str,
+        identifier: str,
+        id_kind: str,
+    ) -> FactCheckResult | None:
+        """Flag an ID-resolved record whose title matches but authors are wrong.
+
+        The caller has already confirmed that ``rec`` IS the cited paper (its
+        title matches the entry). This catches the residual case where a
+        hallucinated citation carries a *correct* DOI/arXiv-ID resolving to the
+        exact real paper, but lists SWAPPED or PLACEHOLDER authors.
+
+        Both author sides are reduced to canonical surname keys with the same
+        machinery used everywhere else -- the entry via ``authors_last_names``
+        and the resolved record via ``PublishedRecord.surname_keys`` (both route
+        each name through ``last_name_from_person``) -- then compared with
+        ``symmetric_author_match``.
+
+        FPR-safe gating: a flag fires ONLY on a genuine ``MISMATCH`` (different
+        lead author / transposition / placeholder authors). ``MATCH`` (correct
+        authors), ``PARTIAL`` (consistent-but-incomplete, e.g. "and others"),
+        and ``NON_COMPARABLE`` (missing authors on either side) all return
+        ``None`` so valid citations are never touched.
+        """
+        entry_names = authors_last_names(entry.get("author", ""), limit=10_000)
+        api_names = rec.surname_keys(limit=10_000)
+        # Nothing comparable on either side -> cannot refute (FPR-safe).
+        if not entry_names or not api_names:
+            return None
+        author_result = symmetric_author_match(entry_names, api_names, threshold=self.config.author_threshold)
+        if not author_result.is_mismatch:
+            return None
+
+        self.logger.warning(
+            "%s %s for entry %r resolves to the cited paper but with mismatched "
+            "authors: entry authors %r vs %s authors %r",
+            id_kind,
+            identifier,
+            entry.get("ID", "?"),
+            entry.get("author", ""),
+            source,
+            api_names,
+        )
+        return FactCheckResult(
+            entry_key=entry.get("ID", "unknown"),
+            entry_type=entry.get("ENTRYTYPE", "misc").lower(),
+            status=FactCheckStatus.AUTHOR_MISMATCH,
+            overall_confidence=0.0,
+            field_comparisons=self._compare_all_fields(entry, rec),
+            best_match=rec,
+            api_sources_queried=[source],
+            api_sources_with_hits=[source],
+            errors=[
+                f"{id_kind} {identifier} resolves to the cited paper "
+                f"{rec.title!r}, but the entry's authors do not match the "
+                f"record's authors ({api_names})"
+            ],
+        )
+
     def _check_arxiv_id_consistency(self, entry: dict[str, Any]) -> FactCheckResult | None:
         """Flag entries whose cited arXiv ID resolves to a *different* paper.
 
@@ -2000,7 +2062,13 @@ class FactChecker:
         arxiv_title = normalize_title_for_match(rec.title)
         title_score = token_sort_ratio(entry_title, arxiv_title) / 100.0
         if title_score >= self.config.arxiv_consistency_min_title:
-            return None
+            # Title confirms this IS the cited paper. The arXiv ID is the entry's
+            # OWN identifier, so a genuine author mismatch here is positive
+            # evidence of ID-anchored author fabrication (swapped/placeholder
+            # authors on an otherwise-correct preprint).
+            return self._id_anchored_author_mismatch(
+                entry, rec, source="arxiv", identifier=arxiv_id, id_kind="arXiv ID"
+            )
 
         self.logger.warning(
             "arXiv ID %s for entry %r points to a different paper: entry title "
@@ -2067,7 +2135,13 @@ class FactChecker:
         doi_title = normalize_title_for_match(rec.title)
         title_score = token_sort_ratio(entry_title, doi_title) / 100.0
         if title_score >= self.config.doi_consistency_min_title:
-            return None
+            # Title confirms this IS the cited paper. The DOI is the entry's OWN
+            # identifier, so a genuine author mismatch here is positive evidence
+            # of ID-anchored author fabrication (swapped/placeholder authors on
+            # an entry that otherwise carries the correct DOI).
+            return self._id_anchored_author_mismatch(
+                entry, rec, source="crossref", identifier=raw_doi, id_kind="DOI"
+            )
 
         self.logger.warning(
             "DOI %s for entry %r points to a different paper: entry title "
