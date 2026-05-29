@@ -236,6 +236,14 @@ A 0–100 numeric `confidence_score` (additive in the JSONL output) summarizes p
 - Penalties: title-mismatch `-20`, author-mismatch `-20`, journal-mismatch `-15`, fabricated-author `-10` each (capped at `-20`)
 - Asymmetric formula for the high-title-low-author chimeric case: `confidence = S_title − 0.5 × (100 − S_author)`
 
+#### Verdicts: verified vs. could-not-verify vs. problematic
+
+`VERIFIED` requires every claimed field to be *positively confirmed* against the matched record — not merely "not contradicted". When a record is found but a claimed field can't be confirmed (e.g. a published venue backed only by a preprint, or an incomplete author list), the entry is reported as **could-not-verify** (`UNCONFIRMED`/`NOT_FOUND`), distinct from a **problematic** flag (`*_mismatch`, `doi_mismatch`, chimeric, …) which is positive evidence of a defect. A "could-not-verify" is *not* a clean pass: it means the tool couldn't decide, and such entries warrant review.
+
+#### Author order (`--ignore-author-order`)
+
+All four sources return authors in as-published order, so an author-order difference usually indicates a real citation error and is flagged by default. Pass `--ignore-author-order` to treat an author list as confirmed when the author *set* matches regardless of order. This is opt-in because it also stops detecting `swapped_authors` hallucinations (same people, reordered). Surname comparison uses each source's structured `family` field where available (so family-first/CJK names like "Chen Xing" ↔ "Xing Chen" are not falsely flagged), falling back to a Crossref structured-name lookup when the matched source lacks one.
+
 #### Non-generative-AI mode (`--non-generative`)
 
 For venue-policy compliance ([ACL ARR](https://aclrollingreview.org/reviewerguidelines#q-can-i-use-generative-ai), [ICML 2026](https://icml.cc/Conferences/2026/LLM-Policy)) the `--non-generative` flag (or `BIBTEX_CHECK_NON_GENERATIVE=1` env var) refuses to load any LLM backend at runtime. Today the package has no LLM backends, so this is a forward-compat guard plus a startup banner:

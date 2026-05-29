@@ -278,6 +278,21 @@ class TestSymmetricAuthorMatch:
         result = symmetric_author_match(entry, api)
         assert result.outcome is MatchOutcome.MISMATCH
 
+    def test_ignore_order_flag_matches_reordered_set(self):
+        """Opt-in ignore_order: same author SET, different order -> MATCH; the
+        default (order matters) still MISMATCHes a different lead author."""
+        entry = ["ren", "yang", "engquist"]
+        api = ["engquist", "ren", "yang"]
+        assert symmetric_author_match(entry, api).outcome is MatchOutcome.MISMATCH
+        assert symmetric_author_match(entry, api, ignore_order=True).outcome is MatchOutcome.MATCH
+
+    def test_ignore_order_flag_still_mismatches_different_set(self):
+        """ignore_order ignores ORDER only; a different author SET still MISMATCHes
+        (so it never rescues a genuinely wrong/added/missing author)."""
+        entry = ["ren", "yang", "engquist"]
+        api = ["engquist", "ren", "smith"]  # smith replaces yang -> different people
+        assert symmetric_author_match(entry, api, ignore_order=True).outcome is MatchOutcome.MISMATCH
+
     def test_dropped_interior_author_with_sentinel_is_partial(self):
         """A sentinel only confirms a LEADING truncation; dropping an interior
         author (non-prefix subsequence) is still PARTIAL even with 'and others'."""

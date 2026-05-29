@@ -252,6 +252,7 @@ def symmetric_author_match(
     api_names: list[str],
     threshold: float = 0.80,
     prefix_n: int = 5,
+    ignore_order: bool = False,
 ) -> AuthorMatchResult:
     """Compare entry vs API author surnames on a *symmetric* basis (trichotomy).
 
@@ -284,6 +285,15 @@ def symmetric_author_match(
     # If either side has no usable names, there is nothing to confirm or refute.
     if not a or not b:
         return AuthorMatchResult(MatchOutcome.NON_COMPARABLE, 1.0)
+
+    # Opt-in (off by default): when the author SETS are identical, ignore order
+    # and confirm. Scholarly APIs reliably return as-published author order, so a
+    # differing order normally signals a real citation error and is flagged --
+    # hence this is NOT the default. With it on, only a *set* match confirms, so
+    # a genuinely different/added/missing author (different set) still MISMATCHes;
+    # this trades away swapped-same-authors detection, which is why it is opt-in.
+    if ignore_order and set(a) == set(b):
+        return AuthorMatchResult(MatchOutcome.MATCH, 1.0)
 
     # Hard first-author signal: an outright different lead author is a real
     # mismatch. Both sides are already canonicalized surname keys.

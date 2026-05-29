@@ -329,6 +329,12 @@ class FactCheckerConfig:
 
     title_threshold: float = 0.90
     author_threshold: float = 0.80
+    # Opt-in (default off): treat an author list as confirmed when the author
+    # SET matches, ignoring order. APIs return as-published order reliably, so a
+    # differing order usually signals a real citation error and is flagged by
+    # default; enable this only if author order is not a defect for your use case
+    # (note: it trades away detection of same-authors-reordered hallucinations).
+    ignore_author_order: bool = False
     year_tolerance: int = 1
     venue_threshold: float = 0.70
     hallucination_max_score: float = 0.50
@@ -2009,7 +2015,10 @@ class FactChecker:
         # Nothing comparable on either side -> cannot refute (FPR-safe).
         if not entry_names or not api_names:
             return None
-        author_result = symmetric_author_match(entry_names, api_names, threshold=self.config.author_threshold)
+        author_result = symmetric_author_match(
+            entry_names, api_names, threshold=self.config.author_threshold,
+            ignore_order=self.config.ignore_author_order,
+        )
         if not author_result.is_mismatch:
             return None
 
@@ -2265,7 +2274,10 @@ class FactChecker:
         if not api_names:
             return None
         entry_names = self._entry_surname_keys(entry, structured, limit=10_000)
-        author_result = symmetric_author_match(entry_names, api_names, threshold=self.config.author_threshold)
+        author_result = symmetric_author_match(
+            entry_names, api_names, threshold=self.config.author_threshold,
+            ignore_order=self.config.ignore_author_order,
+        )
         if not author_result.is_confirmed:
             # Still not a positive MATCH (genuine different/swapped/placeholder
             # authors, or only a partial confirmation) -> keep AUTHOR_MISMATCH.
@@ -2614,7 +2626,10 @@ class FactChecker:
         entry_authors = entry.get("author", "")
         entry_names = self._entry_surname_keys(entry, record, limit=10_000)
         api_names = record.surname_keys(limit=10_000)
-        author_result = symmetric_author_match(entry_names, api_names, threshold=cfg.author_threshold)
+        author_result = symmetric_author_match(
+            entry_names, api_names, threshold=cfg.author_threshold,
+            ignore_order=getattr(cfg, "ignore_author_order", False),
+        )
         api_authors_str = " and ".join(f"{a.get('given', '')} {a.get('family', '')}".strip() for a in record.authors)
         # Mirror the venue "no claim" rule: if the entry lists no authors there is
         # nothing to confirm (vacuously MATCH). A PARTIAL (consistent-but-
@@ -3286,6 +3301,16 @@ Examples:
         help="Disable year validation (future dates, implausible years)",
     )
     api_opts.add_argument(
+        "--ignore-author-order",
+        action="store_true",
+        help=(
+            "Treat an author list as confirmed when the author SET matches, "
+            "ignoring order. Off by default: APIs return as-published order, so "
+            "a differing order usually signals a real citation error. Enabling "
+            "this also stops detecting same-authors-reordered hallucinations."
+        ),
+    )
+    api_opts.add_argument(
         "--workers",
         type=int,
         default=8,
@@ -3452,6 +3477,7 @@ def main() -> int:
         venue_threshold=args.venue_threshold,
         check_dois=not args.no_check_dois,
         check_years=not args.no_check_years,
+        ignore_author_order=args.ignore_author_order,
         top_k=top_k,
         openalex_mailto=args.openalex_mailto,
     )
