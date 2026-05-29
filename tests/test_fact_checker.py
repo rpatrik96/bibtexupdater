@@ -1855,3 +1855,291 @@ class TestSemanticScholarGetPaper:
         result = client.get_paper("DOI:10.1234/test")
         assert result is not None
         assert result["title"] == "Test"
+
+
+class TestPreprintDoiVenue:
+    """A matched record that IS a preprint (arXiv/bioRxiv DOI) cannot confirm the
+    claimed *published* venue, even when its venue STRING is an unrecognized
+    repository name (e.g. 'UvA-DARE') that the string-based preprint heuristic
+    misses. Such a record routes venue to NON_COMPARABLE, never a MISMATCH.
+    """
+
+    def test_arxiv_doi_record_with_repository_venue_string_is_non_comparable(self, fact_checker):
+        # Regression: 'Adam' (entry: ICLR 2015) matched its arXiv-DOI preprint
+        # whose Crossref/OpenAlex 'journal' came back as the institutional repo
+        # 'UvA-DARE (University of Amsterdam)'. is_preprint_or_series_venue does
+        # NOT recognize that string, so the old code fell through to a venue
+        # MISMATCH against 'ICLR'. The arXiv DOI is the authoritative preprint
+        # signal -> NON_COMPARABLE.
+        entry = {
+            "title": "Adam: A Method for Stochastic Optimization",
+            "author": "Kingma, Diederik P. and Ba, Jimmy",
+            "booktitle": "International Conference on Learning Representations (ICLR)",
+            "year": "2015",
+        }
+        record = PublishedRecord(
+            doi="10.48550/arxiv.1412.6980",
+            title="Adam: A Method for Stochastic Optimization",
+            authors=[
+                {"given": "Diederik P.", "family": "Kingma"},
+                {"given": "Jimmy", "family": "Ba"},
+            ],
+            journal="UvA-DARE (University of Amsterdam)",
+            year=2014,
+            structured_names=True,
+        )
+        comparisons = fact_checker._compare_all_fields(entry, record)
+        venue = comparisons["venue"]
+        assert venue.outcome is MatchOutcome.NON_COMPARABLE
+        assert venue.is_mismatch is False
+        assert venue.matches is False
+
+    def test_biorxiv_doi_record_is_non_comparable(self, fact_checker):
+        entry = {"title": "T", "author": "Smith, John", "journal": "Nature", "year": "2021"}
+        record = PublishedRecord(
+            doi="10.1101/2021.01.01.123456",
+            title="T",
+            authors=[{"given": "John", "family": "Smith"}],
+            journal="Some Repository",
+            year=2021,
+            structured_names=True,
+        )
+        comparisons = fact_checker._compare_all_fields(entry, record)
+        assert comparisons["venue"].outcome is MatchOutcome.NON_COMPARABLE
+
+    def test_published_doi_record_with_different_venue_still_mismatches(self, fact_checker):
+        # Guard: a NON-preprint (real publisher) DOI with a genuinely different,
+        # populated venue must STILL be a venue MISMATCH. Year matches here so the
+        # different-edition rule does not apply.
+        entry = {"title": "T", "author": "Smith, John", "booktitle": "NeurIPS", "year": "2020"}
+        record = PublishedRecord(
+            doi="10.1145/3422622",
+            title="T",
+            authors=[{"given": "John", "family": "Smith"}],
+            journal="Communications of the ACM",
+            year=2020,
+            structured_names=True,
+        )
+        comparisons = fact_checker._compare_all_fields(entry, record)
+        assert comparisons["venue"].is_mismatch is True
+
+
+class TestYearNonComparable:
+    """An empty or unparseable year on either side cannot confirm OR refute the
+    claimed year -> NON_COMPARABLE (abstention), not a YEAR_MISMATCH.
+    """
+
+    def test_empty_record_year_is_non_comparable_not_mismatch(self, fact_checker):
+        # Regression: 'DDPM' matched a DBLP 'CoRR 2020' record carrying no year.
+        # The old code set year_matches=False -> read as a YEAR_MISMATCH.
+        entry = {
+            "title": "Denoising Diffusion Probabilistic Models",
+            "author": "Ho, Jonathan",
+            "booktitle": "Advances in Neural Information Processing Systems (NeurIPS)",
+            "year": "2020",
+        }
+        record = PublishedRecord(
+            doi="",
+            title="Denoising Diffusion Probabilistic Models",
+            authors=[{"given": "Jonathan", "family": "Ho"}],
+            journal="CoRR 2020",
+            year=None,
+        )
+        comparisons = fact_checker._compare_all_fields(entry, record)
+        year = comparisons["year"]
+        assert year.outcome is MatchOutcome.NON_COMPARABLE
+        assert year.is_mismatch is False
+
+    def test_no_entry_year_claim_is_vacuous_match(self, fact_checker):
+        entry = {"title": "T", "author": "A"}  # no year claimed
+        record = PublishedRecord(doi="", title="T", year=2020)
+        comparisons = fact_checker._compare_all_fields(entry, record)
+        assert comparisons["year"].outcome is MatchOutcome.MATCH
+        assert comparisons["year"].matches is True
+
+    def test_small_year_error_same_venue_still_mismatches(self, fact_checker):
+        # Guard: a genuine small year error (both years present, beyond tolerance,
+        # gap below the different-edition threshold) on an otherwise-matching
+        # record must STILL flag YEAR_MISMATCH.
+        entry = {"title": "T", "author": "A", "year": "2010", "journal": "Nature"}
+        record = PublishedRecord(doi="10.1/x", title="T", journal="Nature", year=2013)
+        comparisons = fact_checker._compare_all_fields(entry, record)
+        assert comparisons["year"].is_mismatch is True
+
+
+class TestDifferentEditionAbstains:
+    """A matched record with the SAME title but published in a substantially
+    different year, whose claimed venue is NOT positively confirmed, is almost
+    certainly a different edition/reprint of the same work (or a same-title
+    decoy) -- it can neither confirm nor refute the entry. Abstain (UNCONFIRMED),
+    do not flag a *_MISMATCH.
+    """
+
+    def test_identical_title_large_year_gap_blank_venue_abstains(self, fact_checker):
+        # Regression: 'Attention Is All You Need' (entry: NeurIPS 2017) matched a
+        # 2025 same-title item with a blank venue -> old code: YEAR_MISMATCH.
+        entry = {
+            "title": "Attention Is All You Need",
+            "author": "Vaswani, Ashish",
+            "booktitle": "Advances in Neural Information Processing Systems (NeurIPS)",
+            "year": "2017",
+        }
+        record = PublishedRecord(
+            doi="10.65215/2q58a426",
+            title="Attention Is All You Need",
+            authors=[{"given": "Ashish", "family": "Vaswani"}],
+            journal="",
+            year=2025,
+            structured_names=True,
+        )
+        comparisons = fact_checker._compare_all_fields(entry, record)
+        assert comparisons["year"].is_mismatch is False
+        status = fact_checker._determine_status(0.95, comparisons, ["crossref"])
+        assert status == FactCheckStatus.UNCONFIRMED
+
+    def test_reprint_in_different_venue_abstains_not_partial_match(self, fact_checker):
+        # Regression: 'GAN' (entry: NeurIPS 2014) matched the CACM 2020 reprint of
+        # the same work (title 'Nets'->'networks' near-miss, venue CACM, year 2020)
+        # -> old code: PARTIAL_MATCH. Same work, different edition -> abstain.
+        entry = {
+            "title": "Generative Adversarial Nets",
+            "author": "Goodfellow, Ian",
+            "booktitle": "Advances in Neural Information Processing Systems (NeurIPS)",
+            "year": "2014",
+        }
+        record = PublishedRecord(
+            doi="10.1145/3422622",
+            title="Generative adversarial networks",
+            authors=[{"given": "Ian", "family": "Goodfellow"}],
+            journal="Communications of the ACM",
+            year=2020,
+            structured_names=True,
+        )
+        comparisons = fact_checker._compare_all_fields(entry, record)
+        status = fact_checker._determine_status(0.90, comparisons, ["crossref"])
+        assert status == FactCheckStatus.UNCONFIRMED
+
+    def test_same_venue_large_year_gap_still_flags(self, fact_checker):
+        # Guard: when the venue DOES positively match, a large year gap is NOT a
+        # different-edition signature -> it remains a YEAR_MISMATCH (the entry's
+        # year claim is genuinely contradicted in the same venue).
+        entry = {"title": "T", "author": "Smith, John", "journal": "Nature", "year": "2008"}
+        record = PublishedRecord(
+            doi="10.1/x",
+            title="T",
+            authors=[{"given": "John", "family": "Smith"}],
+            journal="Nature",
+            year=2020,
+            structured_names=True,
+        )
+        comparisons = fact_checker._compare_all_fields(entry, record)
+        status = fact_checker._determine_status(0.95, comparisons, ["crossref"])
+        assert status == FactCheckStatus.YEAR_MISMATCH
+
+    def test_wrong_author_still_flags_despite_year_gap(self, fact_checker):
+        # Guard: the different-edition rule only neutralizes year/venue/near-miss
+        # title -- a genuinely wrong lead author is still positive evidence.
+        entry = {
+            "title": "Attention Is All You Need",
+            "author": "Imposter, Alice",
+            "booktitle": "NeurIPS",
+            "year": "2017",
+        }
+        record = PublishedRecord(
+            doi="10.65215/2q58a426",
+            title="Attention Is All You Need",
+            authors=[{"given": "Ashish", "family": "Vaswani"}],
+            journal="",
+            year=2025,
+            structured_names=True,
+        )
+        comparisons = fact_checker._compare_all_fields(entry, record)
+        status = fact_checker._determine_status(0.95, comparisons, ["crossref"])
+        assert status == FactCheckStatus.AUTHOR_MISMATCH
+
+
+class TestResolveWhatCanBeResolved:
+    """General principle: do not stop (short-circuit the cascade) while a claimed
+    field is still unconfirmed and a remaining source could confirm it; and among
+    equally-good title/author matches, prefer the candidate that confirms the
+    MOST claimed fields. A DOI-less conference paper (Attention/NeurIPS) matches a
+    preprint perfectly on title+author but the preprint cannot confirm the venue;
+    the proceedings record from DBLP/OpenReview can, so the cascade must reach it
+    and selection must prefer it -> VERIFIED, not could-not-verify.
+    """
+
+    def _entry(self):
+        return {
+            "title": "Attention Is All You Need",
+            "author": "Vaswani, Ashish",
+            "booktitle": "Advances in Neural Information Processing Systems (NeurIPS)",
+            "year": "2017",
+        }
+
+    def _preprint(self):
+        return PublishedRecord(
+            doi="10.48550/arxiv.1706.03762",
+            title="Attention Is All You Need",
+            authors=[{"given": "Ashish", "family": "Vaswani"}],
+            journal="arXiv (Cornell University)",
+            year=2017,
+            structured_names=True,
+        )
+
+    def _proceedings(self):
+        return PublishedRecord(
+            doi="",
+            title="Attention Is All You Need",
+            authors=[{"given": "Ashish", "family": "Vaswani"}],
+            journal="NeurIPS",
+            year=2017,
+            structured_names=True,
+        )
+
+    def test_preprint_alone_is_not_full_confirmation(self, fact_checker):
+        cands = [(1.0, self._preprint(), "crossref")]
+        assert fact_checker._has_full_confirmation(self._entry(), cands) is False
+
+    def test_proceedings_record_yields_full_confirmation(self, fact_checker):
+        cands = [(1.0, self._preprint(), "crossref"), (0.99, self._proceedings(), "dblp")]
+        assert fact_checker._has_full_confirmation(self._entry(), cands) is True
+
+    def test_selection_prefers_venue_confirming_record_over_preprint(self, fact_checker):
+        cands = [(1.0, self._preprint(), "crossref"), (0.99, self._proceedings(), "dblp")]
+        score, rec, src = fact_checker._select_best_candidate(self._entry(), cands)
+        assert src == "dblp"
+        comps = fact_checker._compare_all_fields(self._entry(), rec)
+        status = fact_checker._determine_status(score, comps, ["crossref", "dblp"])
+        assert status == FactCheckStatus.VERIFIED
+
+    def test_fake_venue_never_full_confirmation(self, fact_checker):
+        # Leak guard: a hallucinated published-venue claim whose only real record
+        # is a preprint never reaches full confirmation -> the cascade's early
+        # stop can never mint a VERIFIED for it.
+        entry = {"title": "Real Title", "author": "Real, Author", "booktitle": "NeurIPS", "year": "2020"}
+        preprint = PublishedRecord(
+            doi="10.48550/arxiv.2003.00001",
+            title="Real Title",
+            authors=[{"given": "Author", "family": "Real"}],
+            journal="arXiv (Cornell University)",
+            year=2020,
+            structured_names=True,
+        )
+        assert fact_checker._has_full_confirmation(entry, [(1.0, preprint, "crossref")]) is False
+
+    def test_selection_does_not_promote_low_score_paper(self, fact_checker):
+        # A clearly different (low title+author) record must NOT be promoted over
+        # the genuine top match just because it shares a field.
+        entry = self._entry()
+        good = self._proceedings()
+        unrelated = PublishedRecord(
+            doi="10.1/x",
+            title="A Completely Different Paper About Something Else",
+            authors=[{"given": "Ashish", "family": "Vaswani"}],
+            journal="NeurIPS",
+            year=2017,
+            structured_names=True,
+        )
+        cands = [(0.99, good, "dblp"), (0.40, unrelated, "s2")]
+        _score, rec, _src = fact_checker._select_best_candidate(entry, cands)
+        assert rec is good

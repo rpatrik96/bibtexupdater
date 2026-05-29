@@ -434,6 +434,14 @@ def openreview_note_to_candidate_record(note: dict[str, Any]) -> PublishedRecord
             year = int(str(raw_year)[:4])
     except (ValueError, TypeError):
         year = None
+    # OpenReview rarely sets an explicit ``year`` field, but its venue strings
+    # almost always embed one ("ICLR 2024", "NeurIPS 2023 Conference"). Recover it
+    # so the record can positively confirm the entry's claimed year instead of
+    # leaving it unconfirmable -- resolve what can be resolved.
+    if year is None and venue:
+        m = re.search(r"\b(19|20)\d{2}\b", str(venue))
+        if m:
+            year = int(m.group(0))
 
     return PublishedRecord(
         doi=None,

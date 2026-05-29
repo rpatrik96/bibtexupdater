@@ -1590,6 +1590,31 @@ def venues_match(venue_a: str, venue_b: str, threshold: float = 0.70) -> VenueMa
     return VenueMatchResult(MatchOutcome.MISMATCH, score)
 
 
+#: A record whose title matches the entry but whose publication year is at least
+#: this many years away, AND whose claimed venue cannot be positively confirmed,
+#: is treated as a DIFFERENT edition/reprint of the same work (or a same-title
+#: decoy from free-text retrieval) rather than positive evidence the entry is
+#: wrong. Its venue/year fields abstain (NON_COMPARABLE) instead of flagging a
+#: mismatch. Small year slips (typos) stay below this gap and still surface as a
+#: YEAR_MISMATCH; a genuinely matching venue or a wrong author is never masked.
+_EDITION_YEAR_GAP = 4
+
+
+def _doi_is_preprint(doi: str | None) -> bool:
+    """True when ``doi`` is a preprint DOI: arXiv (``10.48550/arXiv...``) or
+    bioRxiv/medRxiv (``10.1101...``).
+
+    The matched record's identifier is the authoritative preprint signal -- more
+    reliable than the venue STRING, which APIs sometimes fill with an institutional
+    repository name (e.g. 'UvA-DARE (University of Amsterdam)' for an arXiv DataCite
+    DOI) that the venue-string heuristic does not recognize. A preprint record
+    cannot confirm a claimed *published* venue.
+    """
+    if not doi:
+        return False
+    return doi.lower().startswith(("10.48550/arxiv", "10.1101"))
+
+
 def _doi_resolves(client: httpx.Client, doi: str) -> bool | None:
     """Probe whether a DOI resolves at doi.org.
 
@@ -1892,9 +1917,14 @@ class FactChecker:
                 source_records={},
             )
 
-        # Sort candidates by score descending
+        # Sort candidates by score descending (used below for per-source author
+        # intersection, which takes the top record per source).
         candidates.sort(key=lambda x: x[0], reverse=True)
-        best_score, best_match, _source = candidates[0]
+        # Pick the best match preferring fuller positive confirmation: among the
+        # candidates that tie at the top of the title+author score, choose the one
+        # that confirms the most claimed fields, so a proceedings record that
+        # confirms the venue wins over a tied preprint that cannot.
+        best_score, best_match, _source = self._select_best_candidate(entry, candidates)
 
         # Item 3: cross-source author intersection -- pick the best record from
         # each source and intersect their author lists. Carried on the returned
@@ -2435,12 +2465,11 @@ class FactChecker:
                 cr_records.append(rec)
         if cr_records:
             sources_with_hits.append("crossref")
-        best_cr = _ingest("crossref", cr_records)
-        if best_cr >= self.config.cascade_high_confidence:
+        _ingest("crossref", cr_records)
+        if self._has_full_confirmation(entry, all_candidates):
             return all_candidates
 
         # ----- Step 2: OpenAlex (high-rate aggregator, broad coverage) -----
-        best_oa = 0.0
         if self.openalex is None:
             # Lazily build a default OpenAlex client, reusing the shared HTTP
             # client reachable through the Crossref client. Without a shared
@@ -2468,8 +2497,8 @@ class FactChecker:
                     oa_records.append(rec)
             if oa_records:
                 sources_with_hits.append("openalex")
-            best_oa = _ingest("openalex", oa_records)
-            if max(best_cr, best_oa) >= self.config.cascade_high_confidence:
+            _ingest("openalex", oa_records)
+            if self._has_full_confirmation(entry, all_candidates):
                 return all_candidates
 
         # ----- Step 3: DBLP (authoritative ICML/ICLR/NeurIPS index) -----
@@ -2477,7 +2506,6 @@ class FactChecker:
         # title + surname locates the exact paper. Uses the permissive
         # dblp_hit_to_candidate_record so DOI-less / CoRR conference hits are
         # kept as scorable candidates (the strict resolver converter drops them).
-        best_dblp = 0.0
         if self.dblp is not None:
             sources_queried.append("dblp")
             dblp_query = f"{raw_title} {first_author}".strip()
@@ -2493,8 +2521,8 @@ class FactChecker:
                     dblp_records.append(rec)
             if dblp_records:
                 sources_with_hits.append("dblp")
-            best_dblp = _ingest("dblp", dblp_records)
-            if max(best_cr, best_oa, best_dblp) >= self.config.cascade_high_confidence:
+            _ingest("dblp", dblp_records)
+            if self._has_full_confirmation(entry, all_candidates):
                 return all_candidates
 
         # ----- Step 4: OpenReview (authoritative ICLR/NeurIPS/TMLR registry) -----
@@ -2506,7 +2534,6 @@ class FactChecker:
         # first. Lazily built from the shared HTTP client (reachable via Crossref),
         # mirroring the OpenAlex step; skipped if no shared client is available so
         # tests stay hermetic and no impolite off-pool traffic is created.
-        best_or = 0.0
         if self.openreview is None:
             shared_http = getattr(self.crossref, "http", None)
             if shared_http is not None:
@@ -2525,8 +2552,8 @@ class FactChecker:
                     or_records.append(rec)
             if or_records:
                 sources_with_hits.append("openreview")
-            best_or = _ingest("openreview", or_records)
-            if max(best_cr, best_oa, best_dblp, best_or) >= self.config.cascade_high_confidence:
+            _ingest("openreview", or_records)
+            if self._has_full_confirmation(entry, all_candidates):
                 return all_candidates
 
         # ----- Step 5: Semantic Scholar (preprint coverage; slowest w/o key) -----
@@ -2557,6 +2584,65 @@ class FactChecker:
         author_score = jaccard_similarity(authors_ref, authors_b)
 
         return 0.7 * title_score + 0.3 * author_score
+
+    def _has_full_confirmation(
+        self, entry: dict[str, Any], all_candidates: list[tuple[float, PublishedRecord, str]]
+    ) -> bool:
+        """True when some high-confidence candidate positively confirms EVERY
+        claimed field (title, author, year, venue) -- i.e. it would verdict
+        VERIFIED.
+
+        This is the cascade stop condition. The general principle: do not stop
+        while a claimed field is still unconfirmed and a remaining source could
+        resolve it. A DOI-less conference paper matches its arXiv preprint
+        perfectly on title+author, but the preprint cannot confirm the claimed
+        published venue -> not a full confirmation -> the cascade keeps going to
+        DBLP/OpenReview (which carry the proceedings venue) instead of returning a
+        could-not-verify the preprint forced. If no source ever fully confirms,
+        the cascade exhausts its sources and returns normally.
+        """
+        threshold = self.config.cascade_high_confidence
+        for score, rec, _src in all_candidates:
+            if score < threshold:
+                continue
+            comparisons = self._compare_all_fields(entry, rec)
+            if all(c.is_confirmed for c in comparisons.values()):
+                return True
+        return False
+
+    #: Title+author score window: candidates within this margin of the top score
+    #: are treated as equally-good title/author matches, and the tie is broken in
+    #: favour of the one that positively confirms the most claimed fields. Wide
+    #: enough to span a preprint vs its published-proceedings twin (identical
+    #: title+author), narrow enough not to promote an unrelated lower-ranked paper.
+    _SELECTION_SCORE_BAND = 0.05
+
+    def _select_best_candidate(
+        self, entry: dict[str, Any], candidates: list[tuple[float, PublishedRecord, str]]
+    ) -> tuple[float, PublishedRecord, str]:
+        """Pick the best candidate, preferring fuller positive confirmation.
+
+        Primary signal stays the title+author score; among the candidates that
+        tie at the top of that score (within ``_SELECTION_SCORE_BAND``), choose
+        the one that confirms the MOST claimed fields (and fewest mismatches), so
+        a published record that also confirms the venue/year is chosen over a
+        preprint that cannot. This is the selection half of "resolve what can be
+        resolved": reaching the proceedings record is useless unless it is then
+        actually selected over the tied preprint.
+        """
+        ordered = sorted(candidates, key=lambda x: x[0], reverse=True)
+        top = ordered[0][0]
+        band = [c for c in ordered if c[0] >= top - self._SELECTION_SCORE_BAND]
+        if len(band) == 1:
+            return band[0]
+
+        def confirmation_key(cand: tuple[float, PublishedRecord, str]) -> tuple[int, int, float]:
+            comparisons = self._compare_all_fields(entry, cand[1])
+            confirmed = sum(1 for c in comparisons.values() if c.is_confirmed)
+            mismatches = sum(1 for c in comparisons.values() if c.is_mismatch)
+            return (confirmed, -mismatches, cand[0])
+
+        return max(band, key=confirmation_key)
 
     def _detect_chimeric_title(
         self, entry: dict[str, Any], candidates: list[tuple[float, PublishedRecord, str]]
@@ -2730,44 +2816,75 @@ class FactChecker:
             outcome=author_outcome,
         )
 
-        # Year
+        # Year (three-valued, mirroring venue/author). An empty or unparseable
+        # year on either side cannot confirm OR refute the claim -> NON_COMPARABLE,
+        # not a mismatch (the old two-valued flag read a blank record year as a
+        # YEAR_MISMATCH). An entry that claims no year has nothing to confirm
+        # (vacuous MATCH). Only two populated, parseable years beyond tolerance are
+        # a real MISMATCH. ``year_diff`` is kept for the different-edition guard.
         entry_year = entry.get("year", "")
         api_year = str(record.year) if record.year else ""
-        try:
-            if entry_year and api_year:
-                diff = abs(int(entry_year) - int(api_year))
-                year_matches = diff <= cfg.year_tolerance
-            else:
-                year_matches = False
-        except ValueError:
-            year_matches = False
+        year_diff: int | None = None
+        if not entry_year:
+            year_outcome = MatchOutcome.MATCH
+            year_score = 1.0
+            year_note = "No year claimed"
+        elif not api_year:
+            year_outcome = MatchOutcome.NON_COMPARABLE
+            year_score = 1.0
+            year_note = "Year could not be confirmed (no year in record)"
+        else:
+            try:
+                year_diff = abs(int(entry_year) - int(api_year))
+                year_outcome = MatchOutcome.MATCH if year_diff <= cfg.year_tolerance else MatchOutcome.MISMATCH
+                year_score = 1.0 if year_outcome is MatchOutcome.MATCH else 0.0
+                year_note = f"Tolerance: ±{cfg.year_tolerance}"
+            except ValueError:
+                year_outcome = MatchOutcome.NON_COMPARABLE
+                year_score = 1.0
+                year_note = "Year could not be compared (unparseable)"
         comparisons["year"] = FieldComparison(
             "year",
             entry_year,
             api_year,
-            1.0 if year_matches else 0.0,
-            year_matches,
-            f"Tolerance: ±{cfg.year_tolerance}",
+            year_score,
+            year_outcome is MatchOutcome.MATCH,
+            year_note,
+            outcome=year_outcome,
         )
 
         # Venue (alias-aware matching, three-valued).
         entry_venue = entry.get("journal") or entry.get("booktitle") or ""
         api_venue = record.journal or ""
-        venue_result = venues_match(entry_venue, api_venue, cfg.venue_threshold)
+        # A matched record that is itself a PREPRINT cannot confirm the published
+        # venue the entry claims. Detect the preprint from the authoritative
+        # identifier (arXiv/bioRxiv DOI) as well as the venue string, because APIs
+        # sometimes return a junk repository name for a preprint's venue (e.g.
+        # 'UvA-DARE (University of Amsterdam)' for an arXiv DataCite DOI) that the
+        # string heuristic alone does not catch -> a false venue MISMATCH.
+        record_is_preprint = _doi_is_preprint(record.doi) or is_preprint_or_series_venue(api_venue)
         # Positive-confirmation gate distinguishes "no claim" from "claim we
         # could not confirm":
         #  - The entry makes NO venue claim (preprint @misc/@article with no
         #    journal/booktitle) -> there is nothing to confirm, so the field is
         #    vacuously confirmed (MATCH) and must not block VERIFIED.
-        #  - The entry CLAIMS a published venue but the matched record is blank
-        #    or preprint-only -> the claim cannot be confirmed -> NON_COMPARABLE,
+        #  - The entry CLAIMS a published venue but the matched record is a
+        #    preprint or blank -> the claim cannot be confirmed -> NON_COMPARABLE,
         #    which routes the verdict to UNCONFIRMED (could not verify).
         if not entry_venue:
             venue_outcome = MatchOutcome.MATCH
+            venue_score = 1.0
             venue_confirmed = True
             venue_note = "No venue claimed"
+        elif record_is_preprint:
+            venue_outcome = MatchOutcome.NON_COMPARABLE
+            venue_score = 1.0
+            venue_confirmed = False
+            venue_note = "Claimed venue could not be confirmed (preprint record)"
         else:
+            venue_result = venues_match(entry_venue, api_venue, cfg.venue_threshold)
             venue_outcome = venue_result.outcome
+            venue_score = venue_result.score
             venue_confirmed = venue_result.is_confirmed
             venue_note = (
                 "Claimed venue could not be confirmed (preprint/blank record)"
@@ -2778,11 +2895,41 @@ class FactChecker:
             "venue",
             entry_venue,
             api_venue,
-            venue_result.score,
+            venue_score,
             venue_confirmed,
             note=venue_note,
             outcome=venue_outcome,
         )
+
+        # Different-edition / reprint guard. A record with essentially the SAME
+        # title (>= title_threshold) but published >= _EDITION_YEAR_GAP years away,
+        # whose claimed venue is NOT positively confirmed, is almost certainly a
+        # different edition/reprint of the same work -- or a same-title decoy from
+        # free-text retrieval. It can neither confirm nor refute the entry's
+        # published venue/year, so those fields abstain (NON_COMPARABLE) rather
+        # than reading as positive evidence of a problem. A genuinely matching
+        # venue keeps a year mismatch (a real contradiction in the same venue),
+        # and the author check is untouched -- so a wrong author still flags.
+        title_cmp = comparisons["title"]
+        venue_cmp = comparisons["venue"]
+        if (
+            title_cmp.similarity_score >= cfg.title_threshold
+            and year_diff is not None
+            and year_diff >= _EDITION_YEAR_GAP
+            and not venue_cmp.is_confirmed
+        ):
+            comparisons["year"].outcome = MatchOutcome.NON_COMPARABLE
+            comparisons["year"].matches = False
+            comparisons["year"].note = "Different edition/reprint (same title, different year/venue)"
+            comparisons["venue"].outcome = MatchOutcome.NON_COMPARABLE
+            comparisons["venue"].matches = False
+            # A high-fuzzy near-miss title on a different edition ('Nets' vs
+            # 'networks') is a stylistic variant of the same work, not a chimera
+            # -> it must not read as a TITLE_MISMATCH. Chimeric/welded titles are
+            # caught earlier by _detect_chimeric_title, before this point.
+            if not title_cmp.is_confirmed:
+                comparisons["title"].outcome = MatchOutcome.NON_COMPARABLE
+                comparisons["title"].matches = False
 
         return comparisons
 
@@ -3541,6 +3688,11 @@ def main() -> int:
     # Setup logging
     level = logging.DEBUG if args.verbose else logging.INFO
     logging.basicConfig(level=level, format="%(levelname)s: %(message)s")
+    # Quiet the noisy per-request HTTP client logs (one INFO line per API call)
+    # unless --verbose: they bury the tool's own progress and the final summary.
+    if not args.verbose:
+        for noisy in ("httpx", "httpcore", "urllib3"):
+            logging.getLogger(noisy).setLevel(logging.WARNING)
     logger = logging.getLogger("fact_checker")
 
     # Item 6: non-generative-AI mode (CLI flag wins; env var also honored).
@@ -3720,8 +3872,13 @@ def main() -> int:
             abstained_n,
         )
 
-    # Item 4: numeric confidence summary in the text report.
-    numeric_scores = [float(getattr(r, "confidence_score", 0.0)) for r in results]
+    # Item 4: numeric confidence summary in the text report. ``confidence_score``
+    # is the optional calibrated 0-100 score (populated in generative mode); when
+    # it is absent/zero, fall back to the always-populated ``overall_confidence``
+    # (0-1) scaled to 0-100 so the line reports the real confidence instead of 0.
+    numeric_scores = [
+        float(getattr(r, "confidence_score", 0.0)) or float(r.overall_confidence) * 100.0 for r in results
+    ]
     if numeric_scores:
         mean_score = sum(numeric_scores) / len(numeric_scores)
         min_score = min(numeric_scores)
