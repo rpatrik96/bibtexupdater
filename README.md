@@ -216,16 +216,18 @@ For `filter_bibliography.py` only (no dependencies required):
 - **Structured reports**: JSON and JSONL output formats
 - **CI/CD integration**: Strict mode with exit codes for automation
 
-#### Cascading verification (`--cascade`)
+#### Cascading verification
 
-Inspired by [Abbonato 2026 (CheckIfExist)](https://arxiv.org/abs/2602.15871), the cascade explicitly orders sources CrossRef → Semantic Scholar → OpenAlex and short-circuits as soon as one source produces a high-confidence match. Combined with top-K candidate retrieval and cross-source author intersection, it catches `swapped_authors` / chimeric citations that single-source verification misses.
+Inspired by [Abbonato 2026 (CheckIfExist)](https://arxiv.org/abs/2602.15871), verification orders sources CrossRef → OpenAlex → DBLP → Semantic Scholar and short-circuits as soon as one source produces a high-confidence match. Combined with top-K candidate retrieval and cross-source author intersection, it catches `swapped_authors` / chimeric citations that single-source verification misses.
+
+The order is throughput-aware: CrossRef and OpenAlex (polite pool, ~100 req/min) come first, so the slow keyless Semantic Scholar fallback (~10 req/min) is only reached on hard entries. Set a Semantic Scholar API key (`--s2-api-key` or `S2_API_KEY`) to lift S2 from ~10 to ~60 req/min.
 
 ```bash
-# Cascading verification with top-3 candidates per source
-bibtex-check references.bib --cascade --top-k 3 --jsonl out.jsonl
+# Verification with top-3 candidates per source
+bibtex-check references.bib --top-k 3 --jsonl out.jsonl
 
 # Polite OpenAlex pool (recommended)
-bibtex-check references.bib --cascade --openalex-mailto you@example.com
+bibtex-check references.bib --openalex-mailto you@example.com
 ```
 
 A 0–100 numeric `confidence_score` (additive in the JSONL output) summarizes per-field similarity with explicit penalty/bonus contributions:
@@ -233,6 +235,14 @@ A 0–100 numeric `confidence_score` (additive in the JSONL output) summarizes p
 - Multi-source bonus: `+10` when ≥2 sources confirm the same authors
 - Penalties: title-mismatch `-20`, author-mismatch `-20`, journal-mismatch `-15`, fabricated-author `-10` each (capped at `-20`)
 - Asymmetric formula for the high-title-low-author chimeric case: `confidence = S_title − 0.5 × (100 − S_author)`
+
+#### Verdicts: verified vs. could-not-verify vs. problematic
+
+`VERIFIED` requires every claimed field to be *positively confirmed* against the matched record — not merely "not contradicted". When a record is found but a claimed field can't be confirmed (e.g. a published venue backed only by a preprint, or an incomplete author list), the entry is reported as **could-not-verify** (`UNCONFIRMED`/`NOT_FOUND`), distinct from a **problematic** flag (`*_mismatch`, `doi_mismatch`, chimeric, …) which is positive evidence of a defect. A "could-not-verify" is *not* a clean pass: it means the tool couldn't decide, and such entries warrant review.
+
+#### Author handling
+
+All four sources return authors in as-published order, so an author-order difference is treated as a real citation error (e.g. a transposed or wrong lead author) and flagged — it is not an API artifact. Surname comparison uses each source's structured `family` field where available, so family-first/CJK names like "Chen Xing" ↔ "Xing Chen" are not falsely flagged; when the matched source lacks structured names (Semantic Scholar flat names, DBLP), a Crossref structured-name lookup is used to vet a potential author mismatch before reporting it.
 
 #### Non-generative-AI mode (`--non-generative`)
 

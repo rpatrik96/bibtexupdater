@@ -17,7 +17,9 @@ from bibtex_updater.fact_checker import (
     FactCheckStatus,
     FieldComparison,
     SemanticScholarClient,
+    build_verification_result,
 )
+from bibtex_updater.matching import MatchOutcome
 from bibtex_updater.utils import PublishedRecord
 
 # ------------- Fixtures -------------
@@ -239,11 +241,104 @@ class TestFactCheckerFieldComparison:
         comparisons = fact_checker._compare_all_fields(entry, record)
         assert comparisons["year"].matches is False
 
-    def test_compare_missing_venue_allowed(self, fact_checker):
-        entry = {"title": "Test", "author": "Author"}  # No journal
+    def test_compare_no_venue_claim_is_vacuously_confirmed(self, fact_checker):
+        """Entry makes NO venue claim -> nothing to confirm -> vacuous MATCH.
+
+        A preprint @misc/@article with no journal/booktitle must not be blocked
+        from VERIFIED just because it omits a venue: there is no claim to verify.
+        """
+        from bibtex_updater.matching import MatchOutcome
+
+        entry = {"title": "Test", "author": "Author"}  # No journal/booktitle
         record = PublishedRecord(doi="", title="Test", journal="Some Journal")
         comparisons = fact_checker._compare_all_fields(entry, record)
-        assert comparisons["venue"].matches is True
+        venue = comparisons["venue"]
+        assert venue.outcome is MatchOutcome.MATCH
+        assert venue.matches is True
+
+    def test_compare_claimed_venue_vs_preprint_record_is_non_comparable(self, fact_checker):
+        """Entry CLAIMS a published venue but the record is preprint-only ->
+        NON_COMPARABLE: not a mismatch, but not a positive confirmation either."""
+        from bibtex_updater.matching import MatchOutcome
+
+        entry = {"title": "Test", "author": "Smith, John", "booktitle": "NeurIPS"}
+        record = PublishedRecord(
+            doi="",
+            title="Test",
+            authors=[{"given": "John", "family": "Smith"}],
+            journal="arXiv preprint arXiv:2010.11929",
+        )
+        comparisons = fact_checker._compare_all_fields(entry, record)
+        venue = comparisons["venue"]
+        assert venue.outcome is MatchOutcome.NON_COMPARABLE
+        assert venue.is_mismatch is False
+        assert venue.matches is False  # cannot confirm the claimed published venue
+
+    def test_compare_author_subset_without_sentinel_is_partial(self, fact_checker):
+        """FIX C / positive-confirmation: entry lists first 3 of 8 authors with no
+        elision sentinel -> consistent but INCOMPLETE -> PARTIAL, not a full match.
+
+        The legacy asymmetric comparison scored ~0.375 (false mismatch); the prior
+        softening folded this into a full match. A silent leading subset is now a
+        PARTIAL confirmation: not a mismatch, but not a positive confirmation either.
+        """
+        from bibtex_updater.matching import MatchOutcome
+
+        entry = {
+            "title": "An Image Is Worth 16x16 Words",
+            "author": "Dosovitskiy, Alexey and Beyer, Lucas and Kolesnikov, Alexander",
+        }
+        record = PublishedRecord(
+            doi="10.48550/arXiv.2010.11929",
+            title="An Image Is Worth 16x16 Words",
+            authors=[
+                {"given": "Alexey", "family": "Dosovitskiy"},
+                {"given": "Lucas", "family": "Beyer"},
+                {"given": "Alexander", "family": "Kolesnikov"},
+                {"given": "Dirk", "family": "Weissenborn"},
+                {"given": "Xiaohua", "family": "Zhai"},
+                {"given": "Thomas", "family": "Unterthiner"},
+                {"given": "Mostafa", "family": "Dehghani"},
+                {"given": "Matthias", "family": "Minderer"},
+            ],
+        )
+        comparisons = fact_checker._compare_all_fields(entry, record)
+        author = comparisons["author"]
+        assert author.outcome is MatchOutcome.PARTIAL
+        assert author.is_mismatch is False
+        assert author.matches is False  # incomplete is NOT a full confirmation
+
+    def test_compare_author_and_others_matches(self, fact_checker):
+        """FIX C: 'and others' must not introduce a phantom mismatch author."""
+        entry = {
+            "title": "Test",
+            "author": "Smith, John and Doe, Jane and others",
+        }
+        record = PublishedRecord(
+            doi="",
+            title="Test",
+            authors=[
+                {"given": "John", "family": "Smith"},
+                {"given": "Jane", "family": "Doe"},
+                {"given": "Alan", "family": "Turing"},
+            ],
+        )
+        comparisons = fact_checker._compare_all_fields(entry, record)
+        assert comparisons["author"].matches is True
+
+    def test_compare_different_first_author_still_fails(self, fact_checker):
+        """FIX C: a genuinely wrong lead author must still be flagged."""
+        entry = {"title": "Test", "author": "Wrong, Person and Doe, Jane"}
+        record = PublishedRecord(
+            doi="",
+            title="Test",
+            authors=[
+                {"given": "John", "family": "Smith"},
+                {"given": "Jane", "family": "Doe"},
+            ],
+        )
+        comparisons = fact_checker._compare_all_fields(entry, record)
+        assert comparisons["author"].matches is False
 
 
 class TestFactCheckerStatusDetermination:
@@ -259,10 +354,25 @@ class TestFactCheckerStatusDetermination:
         status = fact_checker._determine_status(0.95, comparisons, ["crossref"])
         assert status == FactCheckStatus.VERIFIED
 
-    def test_hallucinated_low_score(self, fact_checker):
+    def test_low_score_abstains_not_hallucinated(self, fact_checker):
+        # Fix B: a weak best match means the title search returned an unrelated
+        # paper -- the tool could not verify, which is NOT positive evidence of
+        # fabrication. It must ABSTAIN (NOT_FOUND), not assert HALLUCINATED.
         comparisons = {"title": FieldComparison("title", "A", "B", 0.3, False)}
         status = fact_checker._determine_status(0.35, comparisons, [])
-        assert status == FactCheckStatus.HALLUCINATED
+        assert status == FactCheckStatus.NOT_FOUND
+
+    def test_wrong_paper_signature_abstains(self, fact_checker):
+        # Above the abstention score threshold, but the title is essentially
+        # unrelated and neither title nor author corroborate -> still abstain.
+        comparisons = {
+            "title": FieldComparison("title", "A", "Z", 0.10, False),
+            "author": FieldComparison("author", "X", "Q", 0.0, False),
+            "year": FieldComparison("year", "2021", "2021", 1.0, True),
+            "venue": FieldComparison("venue", "J", "J", 1.0, True),
+        }
+        status = fact_checker._determine_status(0.55, comparisons, ["crossref"])
+        assert status == FactCheckStatus.NOT_FOUND
 
     def test_title_mismatch_only(self, fact_checker):
         comparisons = {
@@ -305,6 +415,158 @@ class TestFactCheckerStatusDetermination:
         assert status == FactCheckStatus.PARTIAL_MATCH
 
 
+class TestPositiveConfirmationGate:
+    """VERIFIED requires positive confirmation of EVERY claimed field.
+
+    A field that is neither a confirmed MATCH nor a real MISMATCH
+    (NON_COMPARABLE venue / PARTIAL author) must route to UNCONFIRMED -- a
+    could-not-verify abstention -- not VERIFIED and not a *_MISMATCH.
+    """
+
+    def _confirmed(self, name):
+        return FieldComparison(name, "x", "x", 1.0, True, outcome=MatchOutcome.MATCH)
+
+    def test_non_comparable_venue_routes_to_unconfirmed(self, fact_checker):
+        comparisons = {
+            "title": self._confirmed("title"),
+            "author": self._confirmed("author"),
+            "year": self._confirmed("year"),
+            "venue": FieldComparison("venue", "NeurIPS", "", 1.0, False, outcome=MatchOutcome.NON_COMPARABLE),
+        }
+        status = fact_checker._determine_status(0.95, comparisons, ["crossref"])
+        assert status == FactCheckStatus.UNCONFIRMED
+
+    def test_partial_author_routes_to_unconfirmed(self, fact_checker):
+        comparisons = {
+            "title": self._confirmed("title"),
+            "author": FieldComparison("author", "a,b", "a,b,c,d", 1.0, False, outcome=MatchOutcome.PARTIAL),
+            "year": self._confirmed("year"),
+            "venue": self._confirmed("venue"),
+        }
+        status = fact_checker._determine_status(0.95, comparisons, ["crossref"])
+        assert status == FactCheckStatus.UNCONFIRMED
+
+    def test_all_confirmed_is_verified(self, fact_checker):
+        comparisons = {
+            "title": self._confirmed("title"),
+            "author": self._confirmed("author"),
+            "year": self._confirmed("year"),
+            "venue": self._confirmed("venue"),
+        }
+        status = fact_checker._determine_status(0.95, comparisons, ["crossref"])
+        assert status == FactCheckStatus.VERIFIED
+
+    def test_real_venue_mismatch_beats_unconfirmed(self, fact_checker):
+        """A real MISMATCH is positive evidence -> PROBLEMATIC, taking priority
+        over a co-occurring non-confirming field."""
+        comparisons = {
+            "title": self._confirmed("title"),
+            "author": self._confirmed("author"),
+            "year": self._confirmed("year"),
+            "venue": FieldComparison("venue", "NeurIPS", "ICML", 0.0, False, outcome=MatchOutcome.MISMATCH),
+        }
+        status = fact_checker._determine_status(0.95, comparisons, ["crossref"])
+        assert status == FactCheckStatus.VENUE_MISMATCH
+
+    def test_unconfirmed_is_an_abstention_not_a_problem(self):
+        """UNCONFIRMED belongs in the could-not-verify (abstained) bucket."""
+        from bibtex_updater.fact_checker import _is_abstained_status
+
+        assert _is_abstained_status(FactCheckStatus.UNCONFIRMED) is True
+
+
+class TestDetectionRatePreservation:
+    """Fix B guard: positive-evidence hallucination signals must STILL yield
+    HALLUCINATED. These signals fire *before* ``_determine_status`` (in
+    ``check_entry``), so the new abstention rule cannot suppress them.
+    """
+
+    def test_future_date_still_flagged(self, fact_checker):
+        # _validate_year runs before any title search / score gate.
+        entry = {
+            "ID": "future",
+            "ENTRYTYPE": "article",
+            "title": "Some Real Title",
+            "author": "Smith, John",
+            "year": "2099",
+        }
+        result = fact_checker.check_entry(entry)
+        assert result.status == FactCheckStatus.FUTURE_DATE
+        assert result.status != FactCheckStatus.NOT_FOUND
+
+    def test_invalid_year_still_flagged(self, fact_checker):
+        entry = {
+            "ID": "badyear",
+            "ENTRYTYPE": "article",
+            "title": "Some Real Title",
+            "author": "Smith, John",
+            "year": "1500",
+        }
+        result = fact_checker.check_entry(entry)
+        assert result.status == FactCheckStatus.INVALID_YEAR
+        assert result.status != FactCheckStatus.NOT_FOUND
+
+    def test_fabricated_doi_still_flagged(self, fact_checker):
+        # Pre-validated DOI map marks the DOI invalid (404/410). _validate_doi
+        # returns DOI_NOT_FOUND before the title search runs.
+        entry = {
+            "ID": "fakedoi",
+            "ENTRYTYPE": "article",
+            "title": "Some Real Title",
+            "author": "Smith, John",
+            "year": "2020",
+            "doi": "10.9999/totally.made.up",
+        }
+        result = fact_checker.check_entry(entry, pre_validated_dois={"fakedoi": False})
+        assert result.status == FactCheckStatus.DOI_NOT_FOUND
+        assert result.status != FactCheckStatus.NOT_FOUND
+
+    def test_chimeric_title_still_flagged(self, fact_checker, monkeypatch):
+        # Chimeric detection fires on positive cross-source evidence BEFORE the
+        # candidate sort and score gate. Force the cascade to return two records
+        # from two sources whose titles each contribute distinct token sets that
+        # the entry title borrows from.
+        entry = {
+            "ID": "chimera",
+            "ENTRYTYPE": "article",
+            # Borrows "attention transformers sequence modeling" from one paper
+            # and "graph convolutional molecular property prediction" from
+            # another (>= 4 shared tokens per source, so the chimeric detector
+            # fires -- which is the point of this DR-preservation guard).
+            "title": "Attention Transformers Sequence Modeling Graph Convolutional Molecular Property Prediction",
+            "author": "Smith, John",
+            "year": "2020",
+        }
+        rec_a = PublishedRecord(
+            doi="10.1/a",
+            title="Attention Transformers Sequence Modeling Translation",
+            authors=[{"given": "John", "family": "Smith"}],
+            journal="JMLR",
+            year=2020,
+        )
+        rec_b = PublishedRecord(
+            doi="10.1/b",
+            title="Graph Convolutional Molecular Property Prediction Networks",
+            authors=[{"given": "Jane", "family": "Doe"}],
+            journal="NeurIPS",
+            year=2020,
+        )
+
+        def fake_cascade(entry, query, sq, sh, errors):
+            sq.extend(["crossref", "dblp"])
+            sh.extend(["crossref", "dblp"])
+            return [
+                (fact_checker._score_candidate(query, ["smith"], rec_a), rec_a, "crossref"),
+                (fact_checker._score_candidate(query, ["smith"], rec_b), rec_b, "dblp"),
+            ]
+
+        monkeypatch.setattr(fact_checker, "_query_cascade", fake_cascade)
+        monkeypatch.setattr(fact_checker, "_query_arxiv_by_id", lambda *a, **k: [])
+        result = fact_checker.check_entry(entry)
+        assert result.status == FactCheckStatus.HALLUCINATED
+        assert result.status != FactCheckStatus.NOT_FOUND
+
+
 class TestFactCheckerCheckEntry:
     """Tests for FactChecker.check_entry method."""
 
@@ -315,10 +577,220 @@ class TestFactCheckerCheckEntry:
         assert "No title" in result.errors[0]
 
     def test_entry_not_found(self, fact_checker, sample_entry):
-        # All API clients return empty results by default
+        # All API clients return empty results by default. The cascade now
+        # queries five sources: crossref -> openalex -> dblp -> openreview ->
+        # semanticscholar (OpenAlex and OpenReview are lazily built from the
+        # shared crossref.http mock).
         result = fact_checker.check_entry(sample_entry)
         assert result.status == FactCheckStatus.NOT_FOUND
-        assert len(result.api_sources_queried) == 3
+        assert result.api_sources_queried == [
+            "crossref",
+            "openalex",
+            "dblp",
+            "openreview",
+            "semanticscholar",
+        ]
+
+    def test_weak_unrelated_match_abstains(self, fact_checker, monkeypatch):
+        # Fix B: the search returns an UNRELATED paper (low best_score). This is
+        # a failed lookup, not positive evidence of fabrication -> NOT_FOUND,
+        # never HALLUCINATED.
+        entry = {
+            "ID": "weak",
+            "ENTRYTYPE": "article",
+            "title": "A Very Specific Real Paper Title That Was Not Indexed",
+            "author": "Smith, John",
+            "year": "2020",
+        }
+        unrelated = PublishedRecord(
+            doi="10.1/unrelated",
+            title="Completely Different Topic About Quantum Chromodynamics",
+            authors=[{"given": "Zed", "family": "Other"}],
+            journal="Physics Today",
+            year=2019,
+        )
+
+        def fake_cascade(entry, query, sq, sh, errors):
+            sq.append("crossref")
+            sh.append("crossref")
+            return [(fact_checker._score_candidate(query, ["smith"], unrelated), unrelated, "crossref")]
+
+        monkeypatch.setattr(fact_checker, "_query_cascade", fake_cascade)
+        monkeypatch.setattr(fact_checker, "_query_arxiv_by_id", lambda *a, **k: [])
+        result = fact_checker.check_entry(entry)
+        assert result.status == FactCheckStatus.NOT_FOUND
+        assert result.status != FactCheckStatus.HALLUCINATED
+
+
+# ------------- Thread-safety of per-entry state -------------
+
+
+class TestCheckEntryThreadSafety:
+    """check_entry runs concurrently across a ThreadPoolExecutor (see
+    FactCheckProcessor.process_entries). Per-entry verification state (the
+    cross-source author intersection and the per-source records) must therefore
+    live on each FactCheckResult, NOT on the shared FactChecker instance, or
+    concurrent entries clobber each other and produce nondeterministic verdicts.
+    """
+
+    @staticmethod
+    def _matching_record(entry: dict) -> PublishedRecord:
+        """Build a record that matches an entry exactly (so it VERIFIES)."""
+        # surname -> {"given","family"} so the author intersection is non-trivial
+        # and entry-specific.
+        family = entry["author"].split(",")[0].strip()
+        return PublishedRecord(
+            doi=f"10.9999/{entry['ID']}",
+            title=entry["title"],
+            authors=[{"given": "A", "family": family}],
+            journal=entry["journal"],
+            year=int(entry["year"]),
+        )
+
+    def _install_per_entry_cascade(self, checker, monkeypatch, barrier=None):
+        """Stub the cascade so each entry resolves to its OWN matching record.
+
+        If ``barrier`` is given, every worker blocks on it inside the cascade so
+        all entries are guaranteed to be *interleaved* inside check_entry at the
+        same time -- the exact window where shared-instance state would race.
+        """
+
+        def fake_cascade(entry, query, sq, sh, errors):
+            sq.append("crossref")
+            sh.append("crossref")
+            rec = self._matching_record(entry)
+            if barrier is not None:
+                # Force all workers to sit inside check_entry simultaneously.
+                barrier.wait(timeout=10)
+            return [(0.99, rec, "crossref")]
+
+        monkeypatch.setattr(checker, "_query_cascade", fake_cascade)
+        monkeypatch.setattr(checker, "_query_arxiv_by_id", lambda *a, **k: [])
+
+    @staticmethod
+    def _entry(i: int) -> dict:
+        return {
+            "ID": f"entry{i}",
+            "ENTRYTYPE": "article",
+            "title": f"Unique Paper Title Number {i}",
+            "author": f"Surname{i}, Given",
+            "journal": f"Journal {i}",
+            "year": str(2000 + (i % 20)),
+        }
+
+    def test_no_per_entry_state_left_on_instance(self, fact_checker, monkeypatch):
+        """After check_entry, nothing entry-specific lives on the shared self."""
+        self._install_per_entry_cascade(fact_checker, monkeypatch)
+        result = fact_checker.check_entry(self._entry(1))
+        assert result.status == FactCheckStatus.VERIFIED
+        # The old racy attributes must be gone entirely.
+        assert not hasattr(fact_checker, "last_author_intersection")
+        assert not hasattr(fact_checker, "last_source_records")
+        # Per-entry state rides on the result instead.
+        assert result.source_records  # populated
+        assert "crossref" in result.source_records
+        assert result.author_intersection is not None
+
+    def test_result_carries_its_own_records(self, fact_checker, monkeypatch):
+        """Each result's source_records/intersection describe ITS entry."""
+        self._install_per_entry_cascade(fact_checker, monkeypatch)
+        r3 = fact_checker.check_entry(self._entry(3))
+        r7 = fact_checker.check_entry(self._entry(7))
+        # The per-source record for each result is the one matching its entry.
+        assert r3.source_records["crossref"].doi == "10.9999/entry3"
+        assert r7.source_records["crossref"].doi == "10.9999/entry7"
+        # A sequential second call must not have mutated the first result.
+        assert r3.source_records["crossref"].doi == "10.9999/entry3"
+
+    def test_concurrent_check_entry_no_cross_contamination(self, fact_checker, monkeypatch):
+        """Interleaved concurrent check_entry calls must not cross-contaminate
+        the per-entry records, the intersection, or the rich VerificationResult.
+        """
+        import concurrent.futures
+        import threading
+
+        n = 16
+        entries = [self._entry(i) for i in range(n)]
+        # Barrier forces all n workers to be *inside* check_entry simultaneously,
+        # maximizing the chance a shared-state bug would surface.
+        barrier = threading.Barrier(n)
+        self._install_per_entry_cascade(fact_checker, monkeypatch, barrier=barrier)
+
+        def run(entry):
+            res = fact_checker.check_entry(entry)
+            rich = build_verification_result(res)
+            return entry["ID"], res, rich
+
+        out: dict[str, tuple] = {}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=n) as ex:
+            for key, res, rich in ex.map(run, entries):
+                out[key] = (res, rich)
+
+        assert len(out) == n
+        for i in range(n):
+            key = f"entry{i}"
+            res, rich = out[key]
+            assert res.status == FactCheckStatus.VERIFIED, key
+            # Each result's source record matches its OWN entry (the bug would
+            # leave a sibling entry's record here).
+            assert res.source_records["crossref"].doi == f"10.9999/{key}", key
+            # The rich result, built from res alone (no self.last_*), is entry-
+            # specific: it reflects this entry's own matched metadata.
+            assert rich.bibtex_key == key
+            assert rich.matched_metadata is not None
+            assert rich.matched_metadata["doi"] == f"10.9999/{key}", key
+
+        # And the shared instance still holds no per-entry leftovers.
+        assert not hasattr(fact_checker, "last_author_intersection")
+        assert not hasattr(fact_checker, "last_source_records")
+
+    def test_arxiv_record_cache_is_thread_safe(self, fact_checker, monkeypatch):
+        """The cross-entry arXiv memo is guarded: concurrent lookups of distinct
+        IDs all populate the cache without losing entries, the fetch runs outside
+        the lock, and a given ID is fetched at most once.
+        """
+        import concurrent.futures
+        import threading
+
+        # Real ArxivClient is None on the fixture; install a fake that records
+        # how many times each ID is fetched (a cache miss == one fetch).
+        fetch_counts: dict[str, int] = {}
+        counts_lock = threading.Lock()
+
+        class _FakeArxiv:
+            def fetch_atom(self, arxiv_id: str) -> str:
+                with counts_lock:
+                    fetch_counts[arxiv_id] = fetch_counts.get(arxiv_id, 0) + 1
+                # Return a minimal value; parsing is monkeypatched below.
+                return f"<atom>{arxiv_id}</atom>"
+
+        fact_checker.arxiv = _FakeArxiv()
+        # Parse step: map the xml back to a per-id record (no real XML needed).
+        monkeypatch.setattr(
+            "bibtex_updater.fact_checker.arxiv_atom_to_record",
+            lambda xml: PublishedRecord(doi=None, title=xml, authors=[]),
+        )
+
+        ids = [f"2401.{i:05d}" for i in range(8)]
+        # Hammer each ID from several threads at once -> exercises the double-
+        # checked insert: at most one fetch per ID despite the concurrency.
+        tasks = ids * 6
+
+        def run(arxiv_id):
+            return arxiv_id, fact_checker._arxiv_record(arxiv_id)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=12) as ex:
+            results = list(ex.map(run, tasks))
+
+        # Every lookup returned the correct per-id record.
+        for arxiv_id, rec in results:
+            assert rec is not None
+            assert rec.title == f"<atom>{arxiv_id}</atom>"
+        # The cache holds exactly the distinct IDs, none lost to races.
+        assert set(fact_checker._arxiv_record_cache.keys()) == set(ids)
+        # Each distinct ID was fetched at most once despite 6x concurrent hits.
+        for arxiv_id in ids:
+            assert fetch_counts[arxiv_id] == 1, (arxiv_id, fetch_counts[arxiv_id])
 
 
 # ------------- FactCheckProcessor Tests -------------
@@ -374,7 +846,34 @@ class TestFactCheckProcessor:
         assert summary["status_counts"]["verified"] == 1
         assert summary["status_counts"]["not_found"] == 1
         assert summary["status_counts"]["hallucinated"] == 1
-        assert summary["problematic_count"] == 2
+        # Fix B: not_found is now an ABSTENTION ("could not verify"), reported
+        # separately from PROBLEMATIC (positive evidence). Only the hallucinated
+        # entry is problematic; the not_found entry is abstained.
+        assert summary["problematic_count"] == 1
+        assert summary["abstained_count"] == 1
+        assert summary["verified_count"] == 1
+
+    def test_summary_buckets_partition_unconfirmed_and_partial(self, processor, sample_published_record):
+        """The three buckets must partition all entries: UNCONFIRMED -> could-not-
+        verify (abstained); PARTIAL_MATCH -> problematic; VERIFIED -> verified."""
+
+        def _r(key, status):
+            return FactCheckResult(key, "article", status, 0.7, {}, None, ["crossref"], ["crossref"], [])
+
+        results = [
+            _r("v", FactCheckStatus.VERIFIED),
+            _r("u", FactCheckStatus.UNCONFIRMED),
+            _r("p", FactCheckStatus.PARTIAL_MATCH),
+            _r("n", FactCheckStatus.NOT_FOUND),
+        ]
+        summary = processor.generate_summary(results)
+        assert summary["verified_count"] == 1
+        # could-not-verify = unconfirmed + not_found
+        assert summary["abstained_count"] == 2
+        # problematic = partial_match (now included so buckets fully partition)
+        assert summary["problematic_count"] == 1
+        # All four entries are accounted for across the three buckets.
+        assert summary["verified_count"] + summary["abstained_count"] + summary["problematic_count"] == summary["total"]
 
     def test_generate_json_report(self, processor, sample_published_record):
         results = [
@@ -866,66 +1365,153 @@ class TestDOIValidation:
         assert result.status != FactCheckStatus.DOI_NOT_FOUND
 
 
+# ------------- FIX D: arXiv DOI version-suffix Tests -------------
+
+
+class TestArxivDoiVersionStripping:
+    """FIX D: versioned arXiv DOIs must be version-stripped before resolution."""
+
+    def test_versioned_arxiv_doi_stripped_and_resolves(self, fact_checker):
+        """The versioned arXiv DOI 404s, but the version-stripped one resolves (302).
+
+        We must NOT flag it as DOI_NOT_FOUND.
+        """
+        client = fact_checker.crossref.http.client
+
+        def fake_head(url, headers=None):
+            # The stripped (unversioned) DOI is what should be requested.
+            assert "v1" not in url
+            assert url == "https://doi.org/10.48550/arxiv.2010.11929"
+            return MagicMock(status_code=302)
+
+        client.head.side_effect = fake_head
+        result = fact_checker._validate_doi({"doi": "10.48550/arXiv.2010.11929v1"})
+        assert result is None
+
+    def test_non_arxiv_doi_version_like_suffix_not_stripped(self, fact_checker):
+        """A non-arXiv DOI ending in letter+digit must NOT be version-stripped."""
+        client = fact_checker.crossref.http.client
+        seen = {}
+
+        def fake_head(url, headers=None):
+            seen["url"] = url
+            return MagicMock(status_code=200)
+
+        client.head.side_effect = fake_head
+        fact_checker._validate_doi({"doi": "10.1234/journal.v2"})
+        # The trailing 'v2' must survive (non-arXiv prefix).
+        assert seen["url"] == "https://doi.org/10.1234/journal.v2"
+
+    def test_head_hostile_host_retries_with_get(self, fact_checker):
+        """A 404 to HEAD that resolves on GET must NOT be DOI_NOT_FOUND."""
+        client = fact_checker.crossref.http.client
+        client.head.return_value = MagicMock(status_code=404)
+        client.get.return_value = MagicMock(status_code=206)  # ranged GET success
+        result = fact_checker._validate_doi({"doi": "10.1234/headhostile"})
+        assert result is None
+        client.get.assert_called_once()
+
+    def test_genuinely_missing_doi_still_flagged(self, fact_checker):
+        """404 on both HEAD and GET -> genuinely missing DOI."""
+        client = fact_checker.crossref.http.client
+        client.head.return_value = MagicMock(status_code=404)
+        client.get.return_value = MagicMock(status_code=410)
+        result = fact_checker._validate_doi({"doi": "10.1234/gone"})
+        assert result == FactCheckStatus.DOI_NOT_FOUND
+
+    def test_publisher_block_not_flagged(self, fact_checker):
+        """418/403/429 are publisher blocks, not invalid DOIs."""
+        client = fact_checker.crossref.http.client
+        client.head.return_value = MagicMock(status_code=418)
+        result = fact_checker._validate_doi({"doi": "10.1109/ieee.block"})
+        assert result is None
+
+    def test_batch_validate_strips_arxiv_version(self, processor):
+        """_batch_validate_dois must also version-strip arXiv DOIs."""
+        client = processor.checker.crossref.http.client
+        requested = []
+
+        def fake_head(url, headers=None):
+            requested.append(url)
+            return MagicMock(status_code=302)
+
+        client.head.side_effect = fake_head
+        entries = [{"ID": "vit", "doi": "10.48550/arXiv.2010.11929v1"}]
+        results = processor._batch_validate_dois(entries)
+        assert results["vit"] is True
+        assert requested == ["https://doi.org/10.48550/arxiv.2010.11929"]
+
+
 # ------------- Venue Matching Tests -------------
 
 
 class TestVenueMatching:
-    """Tests for venue matching with aliases."""
+    """Tests for venue matching with aliases (now three-valued)."""
 
     def test_exact_match(self):
         from bibtex_updater.fact_checker import venues_match
+        from bibtex_updater.matching import MatchOutcome
 
-        matches, score = venues_match("NeurIPS", "NeurIPS")
-        assert matches is True
+        result = venues_match("NeurIPS", "NeurIPS")
+        assert result.outcome is MatchOutcome.MATCH
+        assert result.is_confirmed is True
 
     def test_alias_match_neurips(self):
         from bibtex_updater.fact_checker import venues_match
+        from bibtex_updater.matching import MatchOutcome
 
-        matches, score = venues_match("NeurIPS", "Advances in Neural Information Processing Systems")
-        assert matches is True
-        assert score >= 0.90
+        result = venues_match("NeurIPS", "Advances in Neural Information Processing Systems")
+        assert result.outcome is MatchOutcome.MATCH
+        assert result.score >= 0.90
 
     def test_alias_match_nips_neurips(self):
         from bibtex_updater.fact_checker import venues_match
+        from bibtex_updater.matching import MatchOutcome
 
-        matches, score = venues_match("NIPS", "NeurIPS")
-        assert matches is True
+        assert venues_match("NIPS", "NeurIPS").outcome is MatchOutcome.MATCH
 
     def test_alias_match_icml(self):
         from bibtex_updater.fact_checker import venues_match
+        from bibtex_updater.matching import MatchOutcome
 
-        matches, score = venues_match("ICML", "International Conference on Machine Learning")
-        assert matches is True
+        assert venues_match("ICML", "International Conference on Machine Learning").outcome is MatchOutcome.MATCH
 
     def test_different_venues(self):
         from bibtex_updater.fact_checker import venues_match
+        from bibtex_updater.matching import MatchOutcome
 
-        matches, score = venues_match("NeurIPS", "ICML")
-        assert matches is False
+        result = venues_match("NeurIPS", "ICML")
+        assert result.outcome is MatchOutcome.MISMATCH
+        assert result.is_mismatch is True
 
     def test_empty_entry_venue(self):
         from bibtex_updater.fact_checker import venues_match
+        from bibtex_updater.matching import MatchOutcome
 
-        matches, score = venues_match("", "NeurIPS")
-        assert matches is True  # No claim = no mismatch
+        # No claim on one side -> non-comparable (NOT a positive confirmation).
+        result = venues_match("", "NeurIPS")
+        assert result.outcome is MatchOutcome.NON_COMPARABLE
+        assert result.is_confirmed is False
 
     def test_proceedings_prefix_stripped(self):
         from bibtex_updater.fact_checker import venues_match
+        from bibtex_updater.matching import MatchOutcome
 
-        matches, score = venues_match(
+        result = venues_match(
             "Proceedings of NeurIPS 2023",
             "Advances in Neural Information Processing Systems",
         )
-        assert matches is True
+        assert result.outcome is MatchOutcome.MATCH
 
     def test_wrong_venue_detected(self):
         from bibtex_updater.fact_checker import venues_match
+        from bibtex_updater.matching import MatchOutcome
 
-        matches, score = venues_match(
+        result = venues_match(
             "IEEE Conference on Computer Vision and Pattern Recognition",
             "IEEE International Conference on Computer Vision",
         )
-        assert matches is False
+        assert result.outcome is MatchOutcome.MISMATCH
 
     def test_venue_in_fact_checker(self, fact_checker):
         """Venue mismatch detected in field comparison."""
@@ -946,6 +1532,99 @@ class TestVenueMatching:
         )
         comparisons = fact_checker._compare_all_fields(entry, record)
         assert comparisons["venue"].matches is False
+
+
+class TestVenueSymmetryAndPreprint:
+    """FIX E-venue: symmetric empty handling + preprint/series non-comparability.
+
+    Non-comparable cases are now distinguished from positive confirmation: a
+    blank or preprint-only record cannot CONFIRM the claimed published venue, so
+    it returns NON_COMPARABLE (not MATCH and not MISMATCH).
+    """
+
+    def test_empty_api_venue_is_non_comparable_not_mismatch(self):
+        """Empty API venue (arXiv-indexed record) must NOT hard-fail as mismatch."""
+        from bibtex_updater.fact_checker import venues_match
+        from bibtex_updater.matching import MatchOutcome
+
+        result = venues_match("NeurIPS", "")
+        assert result.outcome is MatchOutcome.NON_COMPARABLE
+        assert result.is_mismatch is False
+        assert result.is_confirmed is False
+
+    def test_empty_entry_venue_is_non_comparable(self):
+        from bibtex_updater.fact_checker import venues_match
+        from bibtex_updater.matching import MatchOutcome
+
+        assert venues_match("", "NeurIPS").outcome is MatchOutcome.NON_COMPARABLE
+
+    def test_arxiv_api_venue_is_non_comparable(self):
+        """A published-conference entry vs an arXiv API venue is non-comparable."""
+        from bibtex_updater.fact_checker import venues_match
+        from bibtex_updater.matching import MatchOutcome
+
+        result = venues_match("NeurIPS", "arXiv preprint arXiv:2010.11929")
+        assert result.outcome is MatchOutcome.NON_COMPARABLE
+        assert result.is_confirmed is False
+
+    def test_corr_api_venue_is_non_comparable(self):
+        from bibtex_updater.fact_checker import venues_match
+        from bibtex_updater.matching import MatchOutcome
+
+        assert venues_match("ICML", "CoRR").outcome is MatchOutcome.NON_COMPARABLE
+
+    def test_pmlr_series_is_non_comparable(self):
+        """PMLR is an umbrella series, not a specific venue."""
+        from bibtex_updater.fact_checker import venues_match
+        from bibtex_updater.matching import MatchOutcome
+
+        assert venues_match("ICML", "Proceedings of Machine Learning Research").outcome is MatchOutcome.NON_COMPARABLE
+
+    def test_genuinely_different_venues_still_mismatch(self):
+        """Two populated, distinct real venues must still be detectable."""
+        from bibtex_updater.fact_checker import venues_match
+        from bibtex_updater.matching import MatchOutcome
+
+        assert venues_match("NeurIPS", "ICML").outcome is MatchOutcome.MISMATCH
+
+    def test_neurips_full_name_aliases(self):
+        from bibtex_updater.fact_checker import venues_match
+        from bibtex_updater.matching import MatchOutcome
+
+        for full in (
+            "Conference on Neural Information Processing Systems",
+            "Annual Conference on Neural Information Processing Systems",
+        ):
+            assert venues_match("NeurIPS", full).outcome is MatchOutcome.MATCH, full
+
+    def test_empty_api_venue_in_field_comparison_not_mismatch(self, fact_checker):
+        """An arXiv-indexed record with blank venue must NOT produce venue_mismatch.
+
+        It is non-comparable: not a confirmed match (so ``matches`` is False), but
+        also not a mismatch -- the verdict routes to UNCONFIRMED, not VENUE_MISMATCH.
+        """
+        from bibtex_updater.matching import MatchOutcome
+
+        entry = {
+            "ID": "test",
+            "ENTRYTYPE": "inproceedings",
+            "title": "Attention Is All You Need",
+            "author": "Vaswani, Ashish",
+            "booktitle": "NeurIPS",
+            "year": "2017",
+        }
+        record = PublishedRecord(
+            doi="10.48550/arXiv.1706.03762",
+            title="Attention Is All You Need",
+            authors=[{"given": "Ashish", "family": "Vaswani"}],
+            journal="",  # arXiv-indexed: blank venue
+            year=2017,
+        )
+        comparisons = fact_checker._compare_all_fields(entry, record)
+        venue = comparisons["venue"]
+        assert venue.outcome is MatchOutcome.NON_COMPARABLE
+        assert venue.is_mismatch is False
+        assert venue.matches is False  # non-comparable is NOT a positive confirmation
 
 
 class TestNormalizeVenue:

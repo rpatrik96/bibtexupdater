@@ -10,6 +10,7 @@ from bibtex_updater.utils import (
     DiskCache,
     RateLimiter,
     crossref_message_to_record,
+    dblp_hit_to_candidate_record,
     dblp_hit_to_record,
     s2_data_to_record,
 )
@@ -262,6 +263,76 @@ class TestDblpHitToRecord:
             }
         }
         assert dblp_hit_to_record(hit) is None
+
+
+class TestDblpHitToCandidateRecord:
+    """FIX E-DBLP: the permissive cascade-candidate converter must keep clean
+    title+author hits that the strict resolver converter drops -- i.e. DOI-less
+    conference papers and arXiv/CoRR copies -- so DBLP can contribute scorable
+    candidates for ICML/ICLR/NeurIPS references.
+    """
+
+    def test_keeps_doi_less_conference_hit(self):
+        """The exact failure case: a DOI-less, ee-less ICLR paper. The strict
+        converter returns None here; the permissive one must keep it."""
+        hit = {
+            "info": {
+                "title": "Context-Aware Sparse Deep Coordination Graphs",
+                "authors": {"author": ["Tonghan Wang", "Liang Zeng"]},
+                "venue": "ICLR",
+                "year": "2022",
+                "type": "Conference and Workshop Papers",
+            }
+        }
+        assert dblp_hit_to_record(hit) is None  # strict drops it
+        rec = dblp_hit_to_candidate_record(hit)  # permissive keeps it
+        assert rec is not None
+        assert rec.title == "Context-Aware Sparse Deep Coordination Graphs"
+        assert rec.type == "proceedings-article"
+        assert [a["family"] for a in rec.authors] == ["Wang", "Zeng"]
+
+    def test_keeps_corr_arxiv_copy(self):
+        """CoRR/arXiv hits are rejected by the strict converter but retained as
+        candidates here (we don't discard the preprint copy outright)."""
+        hit = {
+            "info": {
+                "title": "Some Paper Indexed Under CoRR",
+                "authors": {"author": ["Jane Doe"]},
+                "venue": "CoRR",
+                "year": "2024",
+                "doi": "10.48550/arXiv.2401.00001",
+                "type": "Journal Articles",
+            }
+        }
+        assert dblp_hit_to_record(hit) is None
+        rec = dblp_hit_to_candidate_record(hit)
+        assert rec is not None
+        assert rec.title == "Some Paper Indexed Under CoRR"
+
+    def test_strips_homonym_suffix(self):
+        hit = {
+            "info": {
+                "title": "On Calibration of Modern Neural Networks",
+                "authors": {"author": ["Chuan Guo 0001", "Yu Sun 0020"]},
+                "venue": "ICML",
+                "year": "2017",
+                "type": "Conference and Workshop Papers",
+            }
+        }
+        rec = dblp_hit_to_candidate_record(hit)
+        assert rec is not None
+        assert [a["family"] for a in rec.authors] == ["Guo", "Sun"]
+
+    def test_rejects_missing_title(self):
+        hit = {"info": {"authors": {"author": ["Jane Doe"]}, "venue": "ICML", "year": "2020"}}
+        assert dblp_hit_to_candidate_record(hit) is None
+
+    def test_rejects_no_authors(self):
+        hit = {"info": {"title": "Authorless", "venue": "ICML", "year": "2020"}}
+        assert dblp_hit_to_candidate_record(hit) is None
+
+    def test_empty_hit(self):
+        assert dblp_hit_to_candidate_record({}) is None
 
 
 class TestS2DataToRecord:

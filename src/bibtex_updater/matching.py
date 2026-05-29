@@ -11,6 +11,8 @@ These functions are standalone and can be used by fact_checker.py or other modul
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
+from enum import Enum
 
 from rapidfuzz.distance import Levenshtein
 
@@ -22,9 +24,51 @@ __all__ = [
     "word_level_diff",
     "author_sequence_similarity",
     "combined_author_score",
+    "MatchOutcome",
+    "AuthorMatchResult",
+    "symmetric_author_match",
     "EXPANDED_VENUE_ALIASES",
     "get_canonical_venue",
+    "is_preprint_or_series_venue",
 ]
+
+
+class MatchOutcome(Enum):
+    """Three-valued result of a field comparison.
+
+    The verifier distinguishes positive confirmation from mere absence of
+    contradiction. A field is only allowed to contribute to a VERIFIED verdict
+    when it is CONFIRMED (MATCH); a real contradiction is a MISMATCH; and
+    "I had nothing comparable / could not positively confirm" is NON_COMPARABLE
+    (no data either side) or PARTIAL (consistent-but-incomplete confirmation).
+    """
+
+    MATCH = "match"  # both sides populated and positively agree
+    MISMATCH = "mismatch"  # both sides populated real values that conflict
+    NON_COMPARABLE = "non_comparable"  # empty/blank, or a preprint/series record
+    PARTIAL = "partial"  # consistent but incomplete (e.g. dropped authors)
+
+
+@dataclass(frozen=True)
+class AuthorMatchResult:
+    """Trichotomy result of :func:`symmetric_author_match`.
+
+    ``outcome`` carries the three-valued verdict; ``score`` is the legacy
+    0-1 similarity for confidence/reporting. ``is_confirmed`` is true only for
+    a full positive confirmation (exact match or a leading subset explicitly
+    elided with an "and others"/"et al" sentinel).
+    """
+
+    outcome: MatchOutcome
+    score: float
+
+    @property
+    def is_confirmed(self) -> bool:
+        return self.outcome is MatchOutcome.MATCH
+
+    @property
+    def is_mismatch(self) -> bool:
+        return self.outcome is MatchOutcome.MISMATCH
 
 
 # ------------- P2.2: Near-Miss Title Detection -------------
@@ -173,6 +217,111 @@ def combined_author_score(
     return jaccard_weight * jaccard_score + sequence_weight * sequence_score
 
 
+#: Sentinel surnames that BibTeX/citation tooling inserts for elided author
+#: lists ("and others" -> "others"; "et al."). They are not real authors and
+#: must be stripped before any author-set comparison, otherwise a correctly
+#: cited paper that uses "and others" is punished for a phantom mismatch.
+_AUTHOR_SENTINELS: frozenset[str] = frozenset({"others", "et al", "etal", "al"})
+
+
+def _has_author_sentinel(names: list[str]) -> bool:
+    """True if a surname list contains an elision sentinel ("others"/"et al")."""
+    return any(n and n.lower() in _AUTHOR_SENTINELS for n in names)
+
+
+def _strip_author_sentinels(names: list[str]) -> list[str]:
+    """Drop "others"/"et al" sentinels from a surname list."""
+    return [n for n in names if n and n.lower() not in _AUTHOR_SENTINELS]
+
+
+def _is_ordered_subsequence(short: list[str], long: list[str]) -> bool:
+    """True if ``short`` appears in ``long`` in order (not necessarily contiguous)."""
+    if not short:
+        return True
+    it = iter(long)
+    return all(name in it for name in short)
+
+
+def _is_leading_prefix(short: list[str], long: list[str]) -> bool:
+    """True if ``short`` is a contiguous *leading* prefix of ``long``."""
+    return len(short) <= len(long) and short == long[: len(short)]
+
+
+def symmetric_author_match(
+    entry_names: list[str],
+    api_names: list[str],
+    threshold: float = 0.80,
+    prefix_n: int = 5,
+) -> AuthorMatchResult:
+    """Compare entry vs API author surnames on a *symmetric* basis (trichotomy).
+
+    Containment proves the cited authors are *consistent with* the real list, not
+    that the citation is *complete*. We therefore distinguish a full positive
+    confirmation from a consistent-but-incomplete one:
+
+    1. Strip "others"/"et al" sentinels from both sides (but remember whether a
+       sentinel was present -- it signals a deliberate elision).
+    2. NON_COMPARABLE: either side has no usable surnames -- nothing to confirm
+       or refute.
+    3. MISMATCH: first-author surnames differ (a swapped/wrong lead author).
+    4. MATCH (CONFIRMED): the sentinel-stripped surname lists are EQUAL, OR one
+       side is a *leading prefix* of the other AND the shorter side carried an
+       explicit elision sentinel ("and others"/"et al"). The author claim is then
+       positively confirmed (exactly, or as an explicitly-truncated head).
+    5. PARTIAL: the shorter side is an in-order subsequence (or leading prefix)
+       of the longer WITHOUT a sentinel -- authors are consistent but the claim
+       silently drops interior/trailing authors, so it is not a full confirmation.
+    6. Otherwise score a symmetric slice (Jaccard + LCS): >= threshold is a MATCH,
+       below is a MISMATCH (real conflict beyond the shared lead author).
+
+    Returns an :class:`AuthorMatchResult` carrying the trichotomy and a 0-1 score.
+    """
+    a_has_sentinel = _has_author_sentinel(entry_names)
+    b_has_sentinel = _has_author_sentinel(api_names)
+    a = _strip_author_sentinels(entry_names)
+    b = _strip_author_sentinels(api_names)
+
+    # If either side has no usable names, there is nothing to confirm or refute.
+    if not a or not b:
+        return AuthorMatchResult(MatchOutcome.NON_COMPARABLE, 1.0)
+
+    # Hard first-author signal: an outright different lead author is a real
+    # mismatch. Both sides are already canonicalized surname keys.
+    if a[0] != b[0]:
+        return AuthorMatchResult(MatchOutcome.MISMATCH, 0.0)
+
+    # Exact (sentinel-stripped) equality: full positive confirmation.
+    if a == b:
+        return AuthorMatchResult(MatchOutcome.MATCH, 1.0)
+
+    # Leading-prefix containment: one side is a contiguous head of the other.
+    # An explicit elision sentinel on the SHORTER side means the citation
+    # deliberately truncated a leading run ("first k authors, and others") --
+    # that is a confirmation, not a silent drop.
+    if _is_leading_prefix(a, b):  # entry is a head of the (longer) api list
+        if a_has_sentinel:
+            return AuthorMatchResult(MatchOutcome.MATCH, 1.0)
+        return AuthorMatchResult(MatchOutcome.PARTIAL, 1.0)
+    if _is_leading_prefix(b, a):  # api is a head of the (longer) entry list
+        if b_has_sentinel:
+            return AuthorMatchResult(MatchOutcome.MATCH, 1.0)
+        return AuthorMatchResult(MatchOutcome.PARTIAL, 1.0)
+
+    # In-order subsequence (but not a contiguous leading prefix): interior or
+    # trailing authors are dropped. Consistent, never a full confirmation, even
+    # with a sentinel -- the elision is not a simple leading truncation.
+    if _is_ordered_subsequence(a, b) or _is_ordered_subsequence(b, a):
+        return AuthorMatchResult(MatchOutcome.PARTIAL, 1.0)
+
+    # Symmetric slice + combined (Jaccard + LCS) score.
+    n = min(len(a), len(b), prefix_n)
+    a_slice, b_slice = a[:n], b[:n]
+    score = combined_author_score(a_slice, b_slice, jaccard_weight=0.5, sequence_weight=0.5)
+    if score >= threshold:
+        return AuthorMatchResult(MatchOutcome.MATCH, score)
+    return AuthorMatchResult(MatchOutcome.MISMATCH, score)
+
+
 # ------------- P2.5: Expanded Venue Aliases -------------
 
 EXPANDED_VENUE_ALIASES: dict[str, set[str]] = {
@@ -181,42 +330,105 @@ EXPANDED_VENUE_ALIASES: dict[str, set[str]] = {
         "nips",
         "advances in neural information processing systems",
         "neural information processing systems",
+        "conference on neural information processing systems",
+        "annual conference on neural information processing systems",
+        # Numbered proceedings, e.g. "The 36th Conference on Neural ..." -- the
+        # ordinal/year is stripped during normalization, leaving these forms.
+        "th conference on neural information processing systems",
+        "th annual conference on neural information processing systems",
     },
     "icml": {
         "international conference on machine learning",
         "proceedings of the international conference on machine learning",
+        # "Proceedings of the Nth International Conference on Machine Learning":
+        # the ordinal year is removed by normalization, leaving "th ...".
+        "proceedings of the th international conference on machine learning",
+        "th international conference on machine learning",
     },
-    "iclr": {"international conference on learning representations"},
+    "iclr": {
+        "international conference on learning representations",
+        "proceedings of the international conference on learning representations",
+    },
     "aaai": {
         "association for the advancement of artificial intelligence",
+        "aaai conference on artificial intelligence",
         "proceedings of the aaai conference on artificial intelligence",
     },
     "cvpr": {
         "computer vision and pattern recognition",
         "ieee conference on computer vision and pattern recognition",
         "ieee/cvf conference on computer vision and pattern recognition",
+        "conference on computer vision and pattern recognition",
     },
     "iccv": {
         "international conference on computer vision",
         "ieee international conference on computer vision",
         "ieee/cvf international conference on computer vision",
     },
-    "eccv": {"european conference on computer vision"},
+    "eccv": {
+        "european conference on computer vision",
+    },
     "acl": {
         "association for computational linguistics",
         "annual meeting of the association for computational linguistics",
+        # Findings track of ACL -- a distinct track of the SAME venue.
+        "findings of acl",
+        "findings of the association for computational linguistics: acl",
     },
     "emnlp": {
         "empirical methods in natural language processing",
         "conference on empirical methods in natural language processing",
+        # Findings track of EMNLP. The exact-match pass resolves these before
+        # the substring fallback would otherwise collapse them into "acl".
+        "findings of emnlp",
+        "findings of the association for computational linguistics: emnlp",
     },
-    "naacl": {"north american chapter of the association for computational linguistics"},
-    "kdd": {"knowledge discovery and data mining"},
-    "ijcai": {"international joint conference on artificial intelligence"},
-    "uai": {"uncertainty in artificial intelligence"},
-    "aistats": {"artificial intelligence and statistics"},
-    "jmlr": {"journal of machine learning research"},
-    "tmlr": {"transactions on machine learning research"},
+    "naacl": {
+        "north american chapter of the association for computational linguistics",
+        "annual conference of the north american chapter of the association for computational linguistics",
+        "naacl-hlt",
+        "naacl hlt",
+        "findings of naacl",
+        "findings of the association for computational linguistics: naacl",
+    },
+    "kdd": {
+        "knowledge discovery and data mining",
+        "sigkdd",
+        "acm sigkdd",
+        "acm sigkdd conference on knowledge discovery and data mining",
+        "acm sigkdd international conference on knowledge discovery and data mining",
+    },
+    "ijcai": {
+        "international joint conference on artificial intelligence",
+    },
+    "uai": {
+        "uncertainty in artificial intelligence",
+        "conference on uncertainty in artificial intelligence",
+    },
+    "aistats": {
+        "artificial intelligence and statistics",
+        "international conference on artificial intelligence and statistics",
+    },
+    "colt": {
+        "conference on learning theory",
+        "annual conference on learning theory",
+        "annual conference on computational learning theory",
+    },
+    "interspeech": {
+        "conference of the international speech communication association",
+        "annual conference of the international speech communication association",
+    },
+    "icassp": {
+        "international conference on acoustics, speech and signal processing",
+        "ieee international conference on acoustics, speech and signal processing",
+        "ieee international conference on acoustics, speech, and signal processing",
+    },
+    "jmlr": {
+        "journal of machine learning research",
+    },
+    "tmlr": {
+        "transactions on machine learning research",
+    },
     # Systems/DB (new)
     "sigmod": {
         "acm sigmod",
@@ -251,10 +463,12 @@ EXPANDED_VENUE_ALIASES: dict[str, set[str]] = {
     },
     "www": {
         "the web conference",
+        "thewebconf",
         "world wide web",
         "international world wide web conference",
         "international conference on world wide web",
         "proceedings of the web conference",
+        "acm web conference",
     },
     "wsdm": {
         "web search and data mining",
@@ -298,6 +512,9 @@ EXPANDED_VENUE_ALIASES: dict[str, set[str]] = {
     "eacl": {
         "european chapter of the association for computational linguistics",
         "proceedings of the european chapter of the association for computational linguistics",
+        "conference of the european chapter of the association for computational linguistics",
+        "findings of eacl",
+        "findings of the association for computational linguistics: eacl",
     },
     "conll": {
         "conference on computational natural language learning",
@@ -384,13 +601,24 @@ def get_canonical_venue(venue: str, aliases: dict[str, set[str]] | None = None) 
     if not venue_norm:
         return None
 
+    # Pass 1: exact equality against every canonical key and alias, including
+    # short acronyms (len <= 3). This must run before any substring matching so
+    # that a bare acronym ("ACL", "KDD", "UAI") maps to its own canonical venue
+    # instead of substring-colliding with a *different* acronym that merely
+    # contains it ("acl" is a substring of "naacl"). Exact match is always safe.
+    for canonical, alias_set in aliases.items():
+        if venue_norm == canonical or venue_norm in alias_set:
+            return canonical
+
+    # Pass 2: substring matching for spelled-out / decorated forms. Skip names
+    # <= 3 chars here: short acronyms are substrings of longer venue names and of
+    # each other, so substring-matching them produces false collisions (handled
+    # exactly by Pass 1 above).
     for canonical, alias_set in aliases.items():
         all_names = alias_set | {canonical}
         for name in all_names:
             if len(name) <= 3:
                 continue
-            if name == venue_norm:
-                return canonical
             # Generic single-word *journal* names ("nature"/"science") are
             # prefixes of distinct sibling journals ("Nature Physics", "Science
             # Robotics"), so substring matching would wrongly collapse them and
@@ -408,3 +636,49 @@ def get_canonical_venue(venue: str, aliases: dict[str, set[str]] | None = None) 
                 return canonical
 
     return None
+
+
+#: Substrings that mark a venue as a preprint server or a publisher *series*
+#: rather than a specific published venue. An arXiv-indexed record often carries
+#: a blank or preprint venue while the entry cites the real conference, so a
+#: preprint venue on EITHER side must never produce a hard mismatch. "PMLR" /
+#: "proceedings of machine learning research" is the umbrella series for many
+#: distinct conferences (ICML, AISTATS, CoRL, ...), so it cannot pin a single
+#: venue and is likewise treated as non-comparable.
+#: Preprint-server markers, matched as substrings of the lowercased raw venue.
+_PREPRINT_SERVER_MARKERS: tuple[str, ...] = (
+    "arxiv",
+    "biorxiv",
+    "medrxiv",
+    "chemrxiv",
+    "preprint",
+    "corr",  # arXiv's "Computing Research Repository" DBLP label
+)
+
+#: Publisher-*series* markers (matched against the lowercased raw venue). These
+#: name an umbrella series that spans many distinct conferences, so they cannot
+#: pin a single venue. Matched on the RAW venue (not the prefix-stripped form)
+#: so "Proceedings of Machine Learning Research" (PMLR) is caught while the
+#: distinct journal "Journal of Machine Learning Research" (JMLR) is NOT.
+_SERIES_MARKERS: tuple[str, ...] = (
+    "proceedings of machine learning research",
+    "pmlr",
+    "jmlr workshop and conference proceedings",
+    "w&cp",
+)
+
+
+def is_preprint_or_series_venue(venue: str) -> bool:
+    """True if ``venue`` names a preprint server or non-specific publisher series.
+
+    Such venues (arXiv/CoRR, bioRxiv, "Proceedings of Machine Learning Research",
+    PMLR/JMLR W&CP) cannot pin a single published venue, so a venue comparison
+    against them is *non-comparable* rather than a mismatch. The distinct journal
+    "Journal of Machine Learning Research" (JMLR) is deliberately NOT matched.
+    """
+    if not venue:
+        return False
+    raw = venue.lower().strip()
+    if not raw:
+        return False
+    return any(m in raw for m in _PREPRINT_SERVER_MARKERS) or any(m in raw for m in _SERIES_MARKERS)

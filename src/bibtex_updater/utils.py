@@ -59,6 +59,11 @@ ACL_DOI_PREFIX = "10.18653/v1/"
 ACL_ANTHOLOGY_ID_RE = re.compile(r"https?://aclanthology\.org/([A-Z0-9][\w.-]+?)(?:\.pdf|\.bib)?/?$", re.IGNORECASE)
 OPENALEX_API = "https://api.openalex.org"
 EUROPEPMC_API = "https://www.ebi.ac.uk/europepmc/webservices/rest"
+# Legacy OpenReview API. The v2 host (api2.openreview.net) does NOT serve the
+# ``paperhash`` exact-match filter, but the legacy ``api.openreview.net/notes``
+# endpoint does -- and that is the authoritative title+first-author lookup the
+# cascade relies on. Public read is keyless.
+OPENREVIEW_API = "https://api.openreview.net"
 
 
 # ------------- Atomic File Replace -------------
@@ -90,9 +95,40 @@ def safe_lower(x: str | None) -> str:
     return (x or "").lower().strip()
 
 
+# Letters with no NFKD decomposition (no combining mark) that should still fold
+# to an ASCII base so the SAME name matches across sources, e.g. "Reiß" -> "reiss".
+# This only equates variant spellings of one name; it never merges distinct names.
+_NONDECOMPOSING_FOLD = str.maketrans(
+    {
+        "ß": "ss",
+        "ẞ": "ss",
+        "ø": "o",
+        "Ø": "O",
+        "đ": "d",
+        "Đ": "D",
+        "ł": "l",
+        "Ł": "L",
+        "æ": "ae",
+        "Æ": "AE",
+        "œ": "oe",
+        "Œ": "OE",
+        "ð": "d",
+        "Ð": "D",
+        "þ": "th",
+        "Þ": "TH",
+        "ı": "i",
+        "ŧ": "t",
+    }
+)
+
+
 def strip_diacritics(text: str) -> str:
-    """Remove diacritics from text (e.g., 'café' -> 'cafe')."""
-    nfkd = unicodedata.normalize("NFKD", text)
+    """Remove diacritics from text (e.g., 'café' -> 'cafe').
+
+    Also folds letters that lack an NFKD decomposition (ß, ø, ł, æ, ...) to an
+    ASCII base, so variant spellings of the same name produce the same key.
+    """
+    nfkd = unicodedata.normalize("NFKD", text.translate(_NONDECOMPOSING_FOLD))
     return "".join([c for c in nfkd if not unicodedata.combining(c)])
 
 
@@ -155,14 +191,52 @@ def last_name_from_person(name: str) -> str:
     last = re.sub(r"[^a-z0-9\s-]", "", last).strip()
 
     tokens = last.split()
-    # Drop a trailing 4-digit DBLP homonym-disambiguation suffix ("Sun 0020",
-    # "Li 0001") so the key is the real surname rather than the number. Guarded
-    # by len > 1 so a name that is only digits is never emptied.
-    while len(tokens) > 1 and re.fullmatch(r"\d{4}", tokens[-1]):
+    # Drop trailing junk tokens so the key is the real surname:
+    #   - 4-digit DBLP homonym suffixes ("Sun 0020", "Li 0001")
+    #   - trailing single-letter initials ("Mallikarjun B. R." -> "mallikarjun",
+    #     where naive last-token would give "r")
+    # Guarded by len > 1 so a name that is only an initial/number is never emptied.
+    while len(tokens) > 1 and (re.fullmatch(r"\d{4}", tokens[-1]) or len(tokens[-1]) == 1):
         tokens.pop()
     if tokens:
         last = tokens[-1]
     return last
+
+
+def _normalize_surname_key(family: str) -> str:
+    """Normalize an AUTHORITATIVE structured ``family`` field to a comparison key.
+
+    The key insight versus :func:`last_name_from_person` is the INPUT, not the
+    reduction. ``last_name_from_person`` takes a *flattened* "Given Family"
+    string and must guess which token is the surname by taking the LAST one --
+    that guess is wrong for family-first CJK names ("Chen Xing" -> "xing"). Here
+    the input is ALREADY just the family component the source split out, so we
+    never have to strip a given name. We apply the SAME character normalization
+    and the SAME trailing-token reduction the entry side uses (drop 4-digit DBLP
+    homonym suffixes and single-letter initials, then keep the last token), so a
+    multi-token Western family ("van den Oord") still reduces to "oord" -- which
+    is exactly what the entry side ``last_name_from_person`` produces for
+    "Aaron van den Oord". A single-token CJK family ("Chen") is a no-op and
+    stays "chen". This makes the authoritative side symmetric with the entry
+    side WITHOUT inheriting the family-first misparse.
+    """
+    family = latex_to_plain(family or "")
+    # A structured family may itself arrive comma-first ("Chen, ...") on rare
+    # malformed inputs; take the part before the comma defensively.
+    if "," in family:
+        family = family.split(",", 1)[0].strip()
+    key = strip_diacritics(family).lower()
+    key = re.sub(r"[^a-z0-9\s-]", "", key).strip()
+    tokens = key.split()
+    # Drop trailing junk (4-digit DBLP suffix / single-letter initial) then take
+    # the distinctive last family token -- identical reduction to
+    # ``last_name_from_person``, but applied to a family-only string so the lead
+    # given name of a CJK name can never masquerade as the surname.
+    while len(tokens) > 1 and (re.fullmatch(r"\d{4}", tokens[-1]) or len(tokens[-1]) == 1):
+        tokens.pop()
+    if tokens:
+        return tokens[-1]
+    return ""
 
 
 def authors_last_names(author_field: str, limit: int = 3) -> list[str]:
@@ -178,6 +252,70 @@ def authors_last_names(author_field: str, limit: int = 3) -> list[str]:
     authors = split_authors_bibtex(author_field)
     last_names = [last_name_from_person(a) for a in authors][:limit]
     return [ln for ln in last_names if ln]
+
+
+def _name_tokens(name: str) -> list[str]:
+    """Normalized comparable tokens of a single person name (no last-token pick).
+
+    Splits a "Family, Given" or "Given Family" string into individual
+    normalized tokens (diacritics stripped, lowercased, punctuation removed,
+    4-digit DBLP suffixes and bare single letters dropped). Used to disambiguate
+    which token is the surname when an authoritative family set is available.
+    """
+    name = latex_to_plain(name or "")
+    name = name.replace(",", " ")
+    name = strip_diacritics(name).lower()
+    name = re.sub(r"[^a-z0-9\s-]", " ", name)
+    return [t for t in name.split() if t and len(t) > 1 and not re.fullmatch(r"\d{4}", t)]
+
+
+def entry_surnames_against_structured(author_field: str, family_keys: set[str], limit: int = 3) -> list[str]:
+    """Entry surname keys, disambiguated by an AUTHORITATIVE family-name set.
+
+    The comma-less entry name "Chen Xing" is order-ambiguous: ``last_name_from_person``
+    must guess the surname is the LAST token ("xing"), which is wrong for a
+    family-first CJK name whose family is "Chen". When we hold an authoritative
+    family set (the ``family`` keys of a structured Crossref record for the SAME
+    paper), we can resolve the ambiguity *per author*: if exactly one of an
+    entry author's normalized tokens is a known family key, that token is the
+    surname; otherwise fall back to ``last_name_from_person``.
+
+    This is NOT order-insensitive matching across authors -- each entry author
+    still maps to exactly one surname at its own position, and the downstream
+    ``symmetric_author_match`` still enforces first-author identity and ordering.
+    It only fixes WHICH token within a single ambiguous name is treated as the
+    surname, using the authoritative record as the disambiguator. A genuinely
+    different author cannot be rescued: none of "John Smith"'s tokens are in a
+    {"chen"} family set, so it still reduces to "smith" and still mismatches.
+
+    Args:
+        author_field: BibTeX author string.
+        family_keys: Set of authoritative normalized family keys (from a
+            structured record's ``surname_keys``).
+        limit: Max authors to extract.
+
+    Returns:
+        List of normalized surname keys, disambiguated where possible.
+    """
+    authors = split_authors_bibtex(author_field)[:limit]
+    resolved: list[str] = []
+    for a in authors:
+        default_key = last_name_from_person(a)
+        # A comma-form name ("Chen, Xing") is already unambiguous -- the family
+        # precedes the comma -- so only disambiguate comma-less names.
+        if "," not in a and family_keys:
+            tokens = _name_tokens(a)
+            matches = [t for t in tokens if t in family_keys]
+            # Use the authoritative token only when it is UNAMBIGUOUS: exactly
+            # one token of this name is a known family key. (Two matches would be
+            # ambiguous; zero means this author isn't in the record -> keep the
+            # heuristic so a genuine extra/different author still surfaces.)
+            if len(matches) == 1:
+                resolved.append(matches[0])
+                continue
+        if default_key:
+            resolved.append(default_key)
+    return [k for k in resolved if k]
 
 
 def first_author_surname(entry: dict[str, Any]) -> str:
@@ -208,6 +346,31 @@ def doi_normalize(doi: str | None) -> str | None:
     d = doi.strip()
     d = re.sub(r"^https?://(dx\.)?doi\.org/", "", d, flags=re.IGNORECASE)
     return d.lower()
+
+
+#: arXiv DataCite DOI prefix. arXiv mints versioned DOIs
+#: (``10.48550/arXiv.2010.11929v1``), but only the *unversioned* DOI
+#: (``10.48550/arXiv.2010.11929``) resolves via doi.org -- the versioned form
+#: 404s. Stripping the version suffix is therefore safe ONLY for this prefix;
+#: other DOIs may legitimately end in a letter+digit token.
+_ARXIV_DOI_PREFIX = "10.48550/arxiv."
+
+
+def normalize_doi_for_resolution(doi: str | None) -> str | None:
+    """Normalize a DOI for resolution against doi.org.
+
+    Builds on ``doi_normalize`` (strips URL prefix, lowercases). Additionally,
+    for arXiv DataCite DOIs (prefix ``10.48550/arXiv.``) strips a trailing
+    version suffix (``v1``, ``v2``, ...): the versioned DOI 404s at doi.org but
+    the unversioned one resolves (302). The version strip is scoped to the arXiv
+    prefix so non-arXiv DOIs that legitimately end in ``vN`` are left untouched.
+    """
+    normalized = doi_normalize(doi)
+    if not normalized:
+        return normalized
+    if normalized.startswith(_ARXIV_DOI_PREFIX):
+        normalized = re.sub(r"v\d+$", "", normalized)
+    return normalized
 
 
 def doi_url(doi: str) -> str:
@@ -456,6 +619,7 @@ class RateLimiterRegistry:
         "aclanthology": 30,  # ACL Anthology: 30/min (conservative)
         "openalex": 100,  # OpenAlex: polite pool (~10 req/sec max)
         "europepmc": 20,  # Europe PMC: conservative rate limit
+        "openreview": 30,  # OpenReview: 30/min (conservative; keyless public read)
     }
 
     def __init__(self, limits: dict[str, int] | None = None) -> None:
@@ -1095,18 +1259,52 @@ class PublishedRecord:
     type: str | None = None
     method: str | None = None  # how found
     confidence: float = 0.0
+    # True when ``authors[*]["family"]`` comes from an AUTHORITATIVE structured
+    # source -- Crossref's separate ``given``/``family`` fields -- False when the
+    # split was SYNTHESIZED by last-token tokenization of a flat name string
+    # (Semantic Scholar, DBLP, OpenAlex ``display_name``, Crossref ``literal``).
+    # OpenAlex exposes only a flat ``display_name`` in the works response (no
+    # given/family split), so it is treated as unstructured here. Drives
+    # ``surname_keys``:
+    # an authoritative ``family`` is trusted verbatim (only normalized), while a
+    # synthesized one is unreliable for CJK/family-first names and is re-derived
+    # from the full name via ``last_name_from_person``.
+    structured_names: bool = False
 
     def surname_keys(self, limit: int = 3) -> list[str]:
         """Canonical surname comparison keys derived from ``self.authors``.
 
-        Single source of truth for turning a record author into a surname key:
-        each ``family`` field is reduced via ``last_name_from_person`` (the same
-        function the BibTeX-entry side uses through ``authors_last_names``), so
-        the entry and record sides are provably symmetric. Mirrors
-        ``authors_last_names`` exactly -- truncate to ``limit`` first, then drop
-        empties -- so neither side can drift from the other.
+        Single source of truth for turning a record author into a surname key.
+        How a key is derived depends on whether the source gave us an
+        AUTHORITATIVE family name:
+
+        * ``structured_names`` is True (Crossref/OpenAlex separate
+          ``given``/``family`` fields): trust the explicit ``family`` verbatim,
+          only NORMALIZING it (strip diacritics, lowercase, drop a trailing
+          4-digit DBLP homonym suffix) -- but WITHOUT the last-token reduction.
+          That reduction corrupts family-first CJK names: e.g. an entry
+          "Chen Xing" reduces to ``xing`` while a Crossref record
+          ``{"given": "Xing", "family": "Chen"}`` is authoritatively ``chen`` --
+          same person, two keys, a false AUTHOR_MISMATCH. Trusting ``family``
+          keeps the authoritative side correct.
+        * Otherwise (flat ``name`` from S2/DBLP that we tokenized ourselves):
+          there is no reliable family split, so reconstruct the full name and
+          route it through ``last_name_from_person`` exactly as the BibTeX-entry
+          side does, so the two sides stay symmetric.
+
+        Truncate to ``limit`` first, then drop empties, mirroring
+        ``authors_last_names`` so neither side can drift.
         """
-        keys = [last_name_from_person(a.get("family", "") or "") for a in self.authors][:limit]
+        keys: list[str] = []
+        for a in self.authors[:limit]:
+            family = (a.get("family") or "").strip()
+            if self.structured_names and family:
+                keys.append(_normalize_surname_key(family))
+            else:
+                # No authoritative family split: rebuild the flattened name and
+                # reduce it with the same last-token heuristic the entry uses.
+                full = f"{a.get('given', '') or ''} {family}".strip()
+                keys.append(last_name_from_person(full))
         return [k for k in keys if k]
 
     @property
@@ -1134,11 +1332,19 @@ def crossref_message_to_record(msg: dict[str, Any]) -> PublishedRecord | None:
     if title:
         title = re.sub(r"<[^>]*>", "", title)  # strip HTML tags
 
-    # Authors - handle given/family and literal formats
+    # Authors - handle given/family and literal formats. Crossref returns
+    # AUTHORITATIVE separate given/family fields, so a real ``family`` is
+    # trusted verbatim by ``surname_keys`` (no last-token misparse). A ``literal``
+    # name we had to split ourselves is NOT authoritative -- if every author came
+    # from a literal we leave ``structured_names`` False and let ``surname_keys``
+    # fall back to ``last_name_from_person``.
     authors = []
+    has_structured_family = False
     for a in msg.get("author", []) or []:
         given = a.get("given") or ""
         family = a.get("family") or ""
+        if family:
+            has_structured_family = True
         # Handle literal name format when given/family are missing
         if not (given or family) and a.get("literal"):
             lit = a["literal"]
@@ -1176,6 +1382,7 @@ def crossref_message_to_record(msg: dict[str, Any]) -> PublishedRecord | None:
         number=issue,
         pages=msg.get("page"),
         type=typ,
+        structured_names=has_structured_family,
     )
 
 
@@ -1256,6 +1463,93 @@ def dblp_hit_to_record(hit: dict[str, Any]) -> PublishedRecord | None:
         volume=volume,
         number=number,
         pages=pages,
+        type=record_type,
+    )
+
+
+def dblp_hit_to_candidate_record(hit: dict[str, Any]) -> PublishedRecord | None:
+    """Permissive DBLP hit -> ``PublishedRecord`` for cascade candidate search.
+
+    Unlike :func:`dblp_hit_to_record` (which is preprint-strict for
+    publication-*resolution*: it drops hits lacking a DOI/``ee`` URL, lacking a
+    venue/year, or labelled with an arXiv/CoRR venue), this converter is built
+    for the fact-checker *cascade*, which only needs candidates to *score*
+    against. DBLP authoritatively indexes ICML/ICLR/NeurIPS papers that are
+    frequently DOI-less, so we keep any hit with a clear title + authors and we
+    retain the arXiv/CoRR copy rather than discarding it outright.
+
+    Args:
+        hit: A DBLP search ``hit`` dict (``{"info": {...}}``).
+
+    Returns:
+        ``PublishedRecord`` or ``None`` if the hit lacks a usable title or any
+        author.
+    """
+    if not hit:
+        return None
+    info = hit.get("info", {}) or {}
+    title = info.get("title") or ""
+    title = re.sub(r"<[^>]*>", "", title).strip()  # strip HTML tags
+    if not title:
+        return None
+
+    # Parse authors (same logic as dblp_hit_to_record, including the 4-digit
+    # homonym-disambiguation-suffix stripping).
+    authors_field = info.get("authors", {}).get("author")
+    authors_list: list[str] = []
+    if isinstance(authors_field, list):
+        for a in authors_field:
+            if isinstance(a, dict):
+                authors_list.append(a.get("text") or a.get("name") or "")
+            elif isinstance(a, str):
+                authors_list.append(a)
+    elif isinstance(authors_field, dict):
+        authors_list.append(authors_field.get("text") or authors_field.get("name") or "")
+
+    authors: list[dict[str, str]] = []
+    for full in authors_list:
+        full = full.strip()
+        if not full:
+            continue
+        parts = full.split()
+        if len(parts) >= 2 and re.fullmatch(r"\d{4}", parts[-1]):
+            parts = parts[:-1]
+        if len(parts) >= 2:
+            authors.append({"given": " ".join(parts[:-1]), "family": parts[-1]})
+        else:
+            authors.append({"given": "", "family": parts[0]})
+
+    if not authors:
+        return None
+
+    venue = info.get("journal") or info.get("venue")
+    year = None
+    try:
+        year = int(info.get("year")) if info.get("year") else None
+    except Exception:
+        pass
+
+    doi = doi_normalize(info.get("doi"))
+    ee = info.get("ee")
+    venue_lower = safe_lower(venue) if venue else ""
+    typ = safe_lower(info.get("type"))
+    is_conference = (
+        "conference" in typ
+        or "proceedings" in typ
+        or re.search(r"proceedings|conference|workshop|symposium", venue_lower)
+    )
+    record_type = "proceedings-article" if is_conference else "journal-article"
+
+    return PublishedRecord(
+        doi=doi or "",
+        url=ee,
+        title=title or None,
+        authors=authors,
+        journal=venue,
+        year=year,
+        volume=info.get("volume"),
+        number=info.get("number"),
+        pages=info.get("pages"),
         type=record_type,
     )
 
@@ -1642,6 +1936,7 @@ class AsyncRateLimiterRegistry:
         "aclanthology": 30,  # ACL Anthology: 30/min (conservative)
         "openalex": 100,  # OpenAlex: polite pool (~10 req/sec max)
         "europepmc": 20,  # Europe PMC: conservative rate limit
+        "openreview": 30,  # OpenReview: 30/min (conservative; keyless public read)
     }
 
     def __init__(self, limits: dict[str, int] | None = None) -> None:

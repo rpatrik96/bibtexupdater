@@ -6,8 +6,10 @@ This tool validates that bibliographic entries in BibTeX files:
 2. Have matching metadata (title, authors, year, venue)
 
 It outputs detailed reports categorizing mismatches:
-- VERIFIED: Entry matches an external record
+- VERIFIED: Every claimed field positively confirmed against an external record
 - NOT_FOUND: No matching record found in any database
+- UNCONFIRMED: Record found and nothing contradicted, but a claimed field could
+  not be positively confirmed (e.g. preprint-only venue, incomplete authors)
 - HALLUCINATED: Very low match score, likely fabricated
 - TITLE_MISMATCH: Title differs significantly
 - AUTHOR_MISMATCH: Author list differs
@@ -32,7 +34,7 @@ import re
 import sys
 import threading
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 from urllib.parse import urlparse
@@ -44,9 +46,11 @@ from rapidfuzz.fuzz import token_sort_ratio
 from bibtex_updater.calibration import calibrate_result
 from bibtex_updater.matching import (
     EXPANDED_VENUE_ALIASES,
-    combined_author_score,
+    MatchOutcome,
     get_canonical_venue,
     is_near_miss_title,
+    is_preprint_or_series_venue,
+    symmetric_author_match,
     title_edit_distance,
 )
 from bibtex_updater.sources import (
@@ -57,8 +61,10 @@ from bibtex_updater.sources import (
     MAX_TOP_K,
     AuthorIntersectionResult,
     OpenAlexClient,
+    OpenReviewClient,
     cross_source_author_intersection,
     openalex_work_to_candidate_record,
+    openreview_note_to_candidate_record,
     select_top_k_by_title_similarity,
 )
 from bibtex_updater.utils import (
@@ -76,11 +82,14 @@ from bibtex_updater.utils import (
     arxiv_atom_to_record,
     authors_last_names,
     crossref_message_to_record,
-    dblp_hit_to_record,
+    dblp_hit_to_candidate_record,
+    entry_surnames_against_structured,
     first_author_surname,
     is_valid_arxiv_id,
     # Matching
     jaccard_similarity,
+    # DOI normalization (arXiv-version-aware)
+    normalize_doi_for_resolution,
     # Text normalization
     normalize_title_for_match,
     s2_data_to_record,
@@ -184,6 +193,13 @@ class FactCheckStatus(Enum):
     # Academic verification statuses
     VERIFIED = "verified"
     NOT_FOUND = "not_found"
+    # A matching record was found and nothing contradicts the entry, but at
+    # least one claimed field could not be POSITIVELY CONFIRMED (e.g. only a
+    # preprint record was found so the claimed published venue is unconfirmable,
+    # or the cited author list is a consistent-but-incomplete subset). This is a
+    # "could not fully confirm / needs review" verdict -- abstention, NOT a
+    # problem and NOT a verification.
+    UNCONFIRMED = "unconfirmed"
     TITLE_MISMATCH = "title_mismatch"
     AUTHOR_MISMATCH = "author_mismatch"
     YEAR_MISMATCH = "year_mismatch"
@@ -192,6 +208,7 @@ class FactCheckStatus(Enum):
     HALLUCINATED = "hallucinated"
     API_ERROR = "api_error"
     ARXIV_ID_MISMATCH = "arxiv_id_mismatch"  # Entry's cited arXiv ID resolves to a different paper
+    DOI_MISMATCH = "doi_mismatch"  # Entry's cited DOI resolves to a different paper
 
     # Pre-API validation statuses
     FUTURE_DATE = "future_date"  # Year is in the future
@@ -220,9 +237,39 @@ class FactCheckStatus(Enum):
     SKIPPED = "skipped"  # Entry type not verifiable
 
 
+# Fix B: statuses that mean "could not verify" (abstention) rather than
+# "positive evidence of a problem". These are NOT hallucinations -- the tool
+# simply failed to locate a matching record. Kept module-level so the JSONL
+# writer and the summary buckets stay in sync.
+ABSTAINED_STATUS_VALUES = frozenset(
+    {
+        FactCheckStatus.NOT_FOUND.value,
+        # A record was found but a claimed field could not be positively
+        # confirmed (preprint-only venue, incomplete author list). "Could not
+        # fully confirm" is abstention, not a problem.
+        FactCheckStatus.UNCONFIRMED.value,
+        FactCheckStatus.BOOK_NOT_FOUND.value,
+        FactCheckStatus.WORKING_PAPER_NOT_FOUND.value,
+        FactCheckStatus.URL_NOT_FOUND.value,
+    }
+)
+
+
+def _is_abstained_status(status: FactCheckStatus) -> bool:
+    """True when ``status`` is an abstention (could-not-verify), not a problem."""
+    return status.value in ABSTAINED_STATUS_VALUES
+
+
 @dataclass
 class FieldComparison:
-    """Result of comparing a single field between entry and API record."""
+    """Result of comparing a single field between entry and API record.
+
+    ``matches`` is the legacy two-valued flag (kept for reporting/JSONL and
+    backward compatibility): True only for a positive confirmation (MATCH).
+    ``outcome`` carries the three-valued verdict so the status gate can tell a
+    real MISMATCH apart from a NON_COMPARABLE / PARTIAL ("could not confirm").
+    When ``outcome`` is None it defaults to MATCH if ``matches`` else MISMATCH.
+    """
 
     field_name: str
     entry_value: str | None
@@ -230,6 +277,33 @@ class FieldComparison:
     similarity_score: float
     matches: bool
     note: str | None = None
+    outcome: MatchOutcome | None = None
+
+    @property
+    def resolved_outcome(self) -> MatchOutcome:
+        """Three-valued verdict, defaulting from ``matches`` when unset."""
+        if self.outcome is not None:
+            return self.outcome
+        return MatchOutcome.MATCH if self.matches else MatchOutcome.MISMATCH
+
+    @property
+    def is_confirmed(self) -> bool:
+        """True only for a positive confirmation (MATCH)."""
+        return self.resolved_outcome is MatchOutcome.MATCH
+
+    @property
+    def is_mismatch(self) -> bool:
+        """True only for a real contradiction (MISMATCH)."""
+        return self.resolved_outcome is MatchOutcome.MISMATCH
+
+    @property
+    def is_non_confirming(self) -> bool:
+        """True when the field is neither confirmed nor a mismatch.
+
+        i.e. NON_COMPARABLE or PARTIAL: a record was found and nothing is
+        contradicted, but the claimed field could not be positively confirmed.
+        """
+        return self.resolved_outcome in (MatchOutcome.NON_COMPARABLE, MatchOutcome.PARTIAL)
 
 
 @dataclass
@@ -249,6 +323,14 @@ class FactCheckResult:
     category: EntryCategory | None = None
     url_check: URLCheckResult | None = None
     book_match: BookRecord | None = None
+    # Per-entry verification state carried on the result instead of stashed on
+    # the shared ``FactChecker`` instance. ``check_entry`` runs concurrently
+    # across a ThreadPoolExecutor, so any per-entry value written to ``self``
+    # would be clobbered by sibling entries. These let a caller build a rich
+    # :class:`VerificationResult` from THIS entry's run without re-querying and
+    # without racing on shared mutable state.
+    author_intersection: AuthorIntersectionResult | None = None
+    source_records: dict[str, PublishedRecord | None] = field(default_factory=dict)
 
 
 @dataclass
@@ -260,6 +342,13 @@ class FactCheckerConfig:
     year_tolerance: int = 1
     venue_threshold: float = 0.70
     hallucination_max_score: float = 0.50
+    # Fix B (abstention): when the best title-search candidate scores below this,
+    # the tool could not find the real paper -- it has *no* positive evidence of
+    # fabrication. Such cases ABSTAIN (NOT_FOUND) instead of asserting
+    # HALLUCINATED. Reserve HALLUCINATED for positive-evidence signals
+    # (fabricated DOI, future/invalid year, arXiv-ID misattribution, chimeric
+    # title) that fire *before* the score gate.
+    abstention_below: float = 0.50
     max_candidates_per_source: int = 10
     check_years: bool = True
     check_dois: bool = True
@@ -270,8 +359,20 @@ class FactCheckerConfig:
     # as pointing to a *different* paper. Deliberately low so only clear
     # different-paper cases trip it, not minor preprint/published title edits.
     arxiv_consistency_min_title: float = 0.50
-    # CheckIfExist additions (Item 1 + 2): explicit cascading + top-K retrieval
-    cascade_mode: bool = False
+    # Verify the entry's own DOI points to the entry's paper. Today _validate_doi
+    # only checks the DOI *resolves* (doi.org HEAD); it never checks the DOI
+    # points to the CITED paper. A copy-paste DOI that resolves to a different
+    # work otherwise survives because title/author search VERIFIES the entry
+    # against its real record.
+    check_doi_consistency: bool = True
+    # Below this normalized title score (0-1), the DOI's Crossref record is
+    # treated as a *different* paper. Deliberately low (mirrors arXiv) so only
+    # clear different-paper cases trip it.
+    doi_consistency_min_title: float = 0.50
+    # CheckIfExist additions (Item 1 + 2): cascading + top-K retrieval.
+    # Verification uses the CrossRef -> OpenAlex -> DBLP -> Semantic Scholar
+    # cascade, which short-circuits on a high-confidence match so the slow
+    # keyless-S2 / specialist sources stay off the hot path for easy entries.
     top_k: int = DEFAULT_TOP_K
     cascade_low_confidence: float = CASCADE_LOW_CONFIDENCE
     cascade_high_confidence: float = CASCADE_HIGH_CONFIDENCE
@@ -379,18 +480,34 @@ def build_verification_result(
     Item 5: callers that want per-field similarity scores plus the cross-source
     author intersection get them here without the legacy JSONL output changing.
 
+    The per-entry intersection and source records are carried on ``fc_result``
+    itself (``fc_result.author_intersection`` / ``fc_result.source_records``),
+    so the default is to read them off the result -- this is thread-safe because
+    ``check_entry`` runs concurrently and no longer stashes per-entry state on
+    the shared ``FactChecker`` instance. The explicit ``intersection`` /
+    ``source_records`` arguments still override for callers that compute them
+    separately.
+
     Args:
         fc_result: The classic fact-check result from ``FactChecker.check_entry``.
-        intersection: Optional cross-source author intersection -- normally
-            ``FactChecker.last_author_intersection`` from the same run.
-        source_records: Optional ``source_name -> PublishedRecord`` mapping --
-            normally ``FactChecker.last_source_records``.
+        intersection: Optional cross-source author intersection. Defaults to
+            ``fc_result.author_intersection`` (the value from the SAME run that
+            produced ``fc_result``).
+        source_records: Optional ``source_name -> PublishedRecord`` mapping.
+            Defaults to ``fc_result.source_records`` from the same run.
 
     Returns:
         :class:`VerificationResult`. The numeric ``confidence_score`` falls
         back to ``getattr(fc_result, "confidence_score", overall_confidence*100)``
         so older paths still get a sensible score.
     """
+    # Default to the per-entry state carried on the result itself (thread-safe:
+    # it belongs to THIS entry's run, not to shared instance state).
+    if intersection is None:
+        intersection = fc_result.author_intersection
+    if source_records is None:
+        source_records = fc_result.source_records or None
+
     # Per-field similarity breakdown (0-100 scale, more useful for display).
     breakdown: dict[str, float] = {}
     issues: list[str] = []
@@ -1193,9 +1310,36 @@ class CrossrefClient:
     def __init__(self, http: HttpClient):
         self.http = http
 
-    def search(self, query: str, rows: int = 10) -> list[dict[str, Any]]:
-        """Search Crossref for bibliographic records."""
-        params = {"query.bibliographic": query, "rows": rows}
+    def search(
+        self,
+        query: str,
+        rows: int = 10,
+        title: str | None = None,
+        author: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Search Crossref for bibliographic records.
+
+        Args:
+            query: Free-text bibliographic query (``"<title> <author>"`` blob).
+                Used as the ``query.bibliographic`` fallback.
+            rows: Max records to retrieve.
+            title: Raw (un-normalized, author-free) title. When provided, the
+                client uses Crossref's *fielded* ``query.title`` instead of the
+                generic ``query.bibliographic`` blob, which keeps DOI-less
+                ML-conference titles ranked correctly rather than letting the
+                appended surname pull in unrelated records.
+            author: First-author surname, sent as ``query.author`` to tighten
+                the fielded result set. Only used when ``title`` is supplied.
+
+        Returns:
+            List of Crossref message items, never None. Empty on any error.
+        """
+        if title and title.strip():
+            params: dict[str, Any] = {"query.title": title.strip(), "rows": rows}
+            if author and author.strip():
+                params["query.author"] = author.strip()
+        else:
+            params = {"query.bibliographic": query, "rows": rows}
         try:
             resp = self.http._request("GET", CROSSREF_API, params=params, accept="application/json", service="crossref")
             if resp.status_code != 200:
@@ -1204,6 +1348,28 @@ class CrossrefClient:
             return items
         except Exception:
             return []
+
+    def get_by_doi(self, doi: str) -> dict[str, Any] | None:
+        """Fetch the Crossref ``message`` record a DOI resolves to.
+
+        Uses the Crossref REST ``/works/{doi}`` endpoint for reliable metadata
+        (unlike a doi.org HEAD, which only tells you the DOI resolves). Returns
+        ``None`` on any non-200 / parse failure / network error so callers can
+        treat "cannot determine" as no evidence (FPR-safe), never a flag.
+        """
+        from urllib.parse import quote
+
+        doi = normalize_doi_for_resolution(doi) or (doi or "").strip()
+        if not doi:
+            return None
+        url = f"{CROSSREF_API}/{quote(doi, safe='')}"
+        try:
+            resp = self.http._request("GET", url, accept="application/json", service="crossref")
+            if resp.status_code != 200:
+                return None
+            return resp.json().get("message", {}) or None
+        except Exception:
+            return None
 
 
 class DBLPClient:
@@ -1358,13 +1524,53 @@ def _find_canonical_venue(norm_venue: str) -> str | None:
     return None
 
 
-def venues_match(venue_a: str, venue_b: str, threshold: float = 0.70) -> tuple[bool, float]:
-    """Check if two venue names match, considering aliases. Returns (matches, score).
+@dataclass(frozen=True)
+class VenueMatchResult:
+    """Trichotomy result of :func:`venues_match`.
 
-    P2.5: Now uses EXPANDED_VENUE_ALIASES from matching.py for better venue coverage.
+    ``outcome`` is one of MATCH / MISMATCH / NON_COMPARABLE. NON_COMPARABLE means
+    the claimed published venue cannot be *confirmed* (blank on a side, or the
+    matched record is only a preprint/series) -- it is NOT a match.
     """
+
+    outcome: MatchOutcome
+    score: float
+
+    @property
+    def is_confirmed(self) -> bool:
+        return self.outcome is MatchOutcome.MATCH
+
+    @property
+    def is_mismatch(self) -> bool:
+        return self.outcome is MatchOutcome.MISMATCH
+
+
+def venues_match(venue_a: str, venue_b: str, threshold: float = 0.70) -> VenueMatchResult:
+    """Compare two venue names (alias-aware) into a three-valued outcome.
+
+    P2.5: Uses EXPANDED_VENUE_ALIASES from matching.py for venue coverage.
+
+    The comparison is three-valued so a blank/preprint record can no longer
+    masquerade as positive confirmation:
+
+    - NON_COMPARABLE when either side is empty, OR when the matched record's
+      venue is a preprint/publisher-series (arXiv/CoRR, bioRxiv, PMLR, JMLR
+      W&CP). A preprint record cannot *confirm* the published venue the entry
+      claims -- it says nothing about it -- so it must not read as a match.
+    - MATCH when both sides are populated real venues that canonicalize equal
+      (or fuzzy >= threshold).
+    - MISMATCH when both sides are populated real venues that differ.
+
+    Returns a :class:`VenueMatchResult`.
+    """
+    # Empty on either side: nothing to confirm -> non-comparable.
     if not venue_a or not venue_b:
-        return (True, 1.0) if not venue_a else (False, 0.0)
+        return VenueMatchResult(MatchOutcome.NON_COMPARABLE, 1.0)
+
+    # Preprint / non-specific series on either side: the published venue the
+    # entry cites cannot be confirmed from a preprint record -> non-comparable.
+    if is_preprint_or_series_venue(venue_a) or is_preprint_or_series_venue(venue_b):
+        return VenueMatchResult(MatchOutcome.NON_COMPARABLE, 1.0)
 
     norm_a = normalize_venue(venue_a)
     norm_b = normalize_venue(venue_b)
@@ -1374,12 +1580,46 @@ def venues_match(venue_a: str, venue_b: str, threshold: float = 0.70) -> tuple[b
     canonical_b = get_canonical_venue(norm_b, EXPANDED_VENUE_ALIASES)
     if canonical_a and canonical_b:
         if canonical_a == canonical_b:
-            return (True, 0.95)
-        return (False, 0.0)  # Known different venues
+            return VenueMatchResult(MatchOutcome.MATCH, 0.95)
+        return VenueMatchResult(MatchOutcome.MISMATCH, 0.0)  # Known different venues
 
     # Fall back to fuzzy matching
     score = token_sort_ratio(normalize_title_for_match(norm_a), normalize_title_for_match(norm_b)) / 100.0
-    return (score >= threshold, score)
+    if score >= threshold:
+        return VenueMatchResult(MatchOutcome.MATCH, score)
+    return VenueMatchResult(MatchOutcome.MISMATCH, score)
+
+
+def _doi_resolves(client: httpx.Client, doi: str) -> bool | None:
+    """Probe whether a DOI resolves at doi.org.
+
+    Returns:
+        False  -- the DOI definitively does not exist (404/410, confirmed by a
+                  GET retry to rule out HEAD-hostile hosts).
+        True   -- it resolves (2xx/3xx) or is blocked by a publisher (418/403/
+                  429): a block is not evidence of an invalid DOI.
+        None   -- network error; the caller should treat this as non-evidence
+                  (do not penalize).
+    """
+    url = doi if doi.startswith("http") else f"https://doi.org/{doi}"
+    headers = {"User-Agent": "BibtexFactChecker/1.0"}
+    try:
+        resp = client.head(url, headers=headers)
+    except Exception:
+        return None  # Network errors are not DOI validation failures.
+    # Only 404/410 indicate a DOI that truly doesn't exist. Other 4xx (418
+    # bot-detection, 403 access control, 429 rate limit) are publisher-side
+    # blocks, not evidence of an invalid DOI.
+    if resp.status_code not in (404, 410):
+        return True
+    # Some hosts are HEAD-hostile (return 404/410 to HEAD but resolve to GET).
+    # Retry once with a tiny ranged GET before concluding the DOI is missing.
+    try:
+        retry = client.get(url, headers={**headers, "Range": "bytes=0-0"})
+    except Exception:
+        return None
+    # Definitively missing only if the GET also returns 404/410.
+    return retry.status_code not in (404, 410)
 
 
 # ------------- Fact Checker Core -------------
@@ -1388,7 +1628,7 @@ def venues_match(venue_a: str, venue_b: str, threshold: float = 0.70) -> tuple[b
 class FactChecker:
     """Validates bibliographic entries against external APIs."""
 
-    API_SOURCES = ["crossref", "dblp", "semanticscholar", "openalex"]
+    API_SOURCES = ["crossref", "dblp", "semanticscholar", "openalex", "openreview"]
 
     def __init__(
         self,
@@ -1399,6 +1639,7 @@ class FactChecker:
         logger: logging.Logger,
         openalex: OpenAlexClient | None = None,
         arxiv: ArxivClient | None = None,
+        openreview: OpenReviewClient | None = None,
     ):
         self.crossref = crossref
         self.dblp = dblp
@@ -1409,30 +1650,50 @@ class FactChecker:
         # and tests that don't need preprint verification keep working.
         self.arxiv: ArxivClient | None = arxiv
         # OpenAlex client is optional; tests can pass a fake. The cascade falls
-        # back to creating a default client if not provided but only when
-        # cascade_mode is on -- otherwise legacy parallel-search keeps current
-        # CrossRef/DBLP/S2 behavior.
+        # back to creating a default client if not provided.
         self.openalex: OpenAlexClient | None = openalex
-        # The most recent cross-source author intersection (set by check_entry).
-        self.last_author_intersection: AuthorIntersectionResult | None = None
-        # Per-source records from the most recent check (used by the rich
-        # VerificationResult builder).
-        self.last_source_records: dict[str, PublishedRecord | None] = {}
+        # OpenReview client is optional and lazily built from the shared HTTP
+        # client inside the cascade (mirroring OpenAlex). It is the authoritative
+        # source for ICLR/NeurIPS/TMLR submissions the other sources miss.
+        self.openreview: OpenReviewClient | None = openreview
+        # Per-entry verification state (cross-source author intersection,
+        # per-source records) is NOT stored on the shared instance: check_entry
+        # runs concurrently across a ThreadPoolExecutor, so a sibling entry would
+        # clobber it. It is returned on the FactCheckResult instead. See
+        # FactCheckResult.author_intersection / .source_records.
+        #
         # Memoize fetched+parsed arXiv records by ID: the consistency pre-check
         # and the by-ID candidate query both look up the entry's arXiv ID in one
         # verification pass, so this avoids a duplicate network fetch + parse.
+        # This IS a cross-entry cache (not per-entry verdict state), shared by
+        # all concurrent check_entry calls, so its dict mutation is guarded by a
+        # lock. The actual fetch happens OUTSIDE the lock (double-checked insert)
+        # so a slow network call never serializes the other workers.
         self._arxiv_record_cache: dict[str, PublishedRecord | None] = {}
+        self._arxiv_cache_lock = threading.Lock()
 
     def _arxiv_record(self, arxiv_id: str) -> PublishedRecord | None:
-        """Fetch + parse the arXiv record for an ID, memoized per checker."""
-        if arxiv_id in self._arxiv_record_cache:
-            return self._arxiv_record_cache[arxiv_id]
+        """Fetch + parse the arXiv record for an ID, memoized per checker.
+
+        Thread-safe: the cache dict is shared across concurrent ``check_entry``
+        workers. We read/insert under ``_arxiv_cache_lock`` but perform the
+        network fetch+parse outside it (double-checked locking) so a slow arXiv
+        request does not stall sibling workers.
+        """
+        with self._arxiv_cache_lock:
+            if arxiv_id in self._arxiv_record_cache:
+                return self._arxiv_record_cache[arxiv_id]
         rec: PublishedRecord | None = None
         if self.arxiv is not None:
             xml = self.arxiv.fetch_atom(arxiv_id)
             if xml:
                 rec = arxiv_atom_to_record(xml)
-        self._arxiv_record_cache[arxiv_id] = rec
+        with self._arxiv_cache_lock:
+            # Another worker may have populated the same ID while we fetched;
+            # keep the first cached value so the memo stays a stable cache.
+            if arxiv_id in self._arxiv_record_cache:
+                return self._arxiv_record_cache[arxiv_id]
+            self._arxiv_record_cache[arxiv_id] = rec
         return rec
 
     def _validate_year(self, entry: dict[str, Any]) -> FactCheckStatus | None:
@@ -1466,26 +1727,18 @@ class FactChecker:
         if pre_validated is not None and entry_id in pre_validated:
             return None if pre_validated[entry_id] else FactCheckStatus.DOI_NOT_FOUND
 
-        doi = entry.get("doi", "")
-        if not doi:
+        raw_doi = entry.get("doi", "")
+        if not raw_doi:
             return None
-        doi = doi.strip()
-        if doi.startswith("http"):
-            doi = doi.replace("https://doi.org/", "").replace("http://doi.org/", "")
+        # Normalize: strip URL prefix/lowercase, and for arXiv DataCite DOIs drop
+        # a trailing version suffix (the versioned DOI 404s at doi.org but the
+        # unversioned one resolves). Fall back to the raw string if normalization
+        # yields nothing.
+        doi = normalize_doi_for_resolution(raw_doi) or raw_doi.strip()
 
-        # Reuse the shared httpx.Client to avoid per-entry TCP/TLS overhead
-        try:
-            resp = self.crossref.http.client.head(
-                f"https://doi.org/{doi}",
-                headers={"User-Agent": "BibtexFactChecker/1.0"},
-            )
-            # Only 404/410 indicate a DOI that truly doesn't exist.
-            # Other 4xx (418 bot-detection, 403 access control, 429 rate limit)
-            # are publisher-side blocks, not evidence of an invalid DOI.
-            if resp.status_code in (404, 410):
-                return FactCheckStatus.DOI_NOT_FOUND
-        except Exception:
-            pass  # Network errors are not DOI validation failures
+        # Reuse the shared httpx.Client to avoid per-entry TCP/TLS overhead.
+        if _doi_resolves(self.crossref.http.client, doi) is False:
+            return FactCheckStatus.DOI_NOT_FOUND
         return None
 
     def _check_preprint_status(self, entry: dict[str, Any], best_match: PublishedRecord) -> FactCheckStatus | None:
@@ -1587,12 +1840,17 @@ class FactChecker:
             if arxiv_status is not None:
                 return arxiv_status
 
+        # Pre-search consistency: the entry's own DOI must point to *this* paper.
+        # A copy-paste DOI that resolves to a different work otherwise survives
+        # because title/author search VERIFIES the entry against its real record.
+        if self.config.check_doi_consistency:
+            doi_consistency_status = self._check_doi_consistency(entry)
+            if doi_consistency_status is not None:
+                return doi_consistency_status
+
         query = f"{title_norm} {first_author}".strip()
-        # Item 1: explicit cascade vs. legacy parallel search.
-        if self.config.cascade_mode:
-            candidates = self._query_cascade(entry, query, sources_queried, sources_with_hits, errors)
-        else:
-            candidates = self._query_all_sources(entry, query, sources_queried, sources_with_hits, errors)
+        # Item 1: cascading source order (CrossRef -> OpenAlex -> DBLP -> S2).
+        candidates = self._query_cascade(entry, query, sources_queried, sources_with_hits, errors)
 
         # Authoritative arXiv-by-ID lookup. Added as an extra candidate so valid
         # but not-yet-indexed preprints verify instead of being flagged
@@ -1601,8 +1859,9 @@ class FactChecker:
 
         if not candidates:
             status = FactCheckStatus.API_ERROR if errors else FactCheckStatus.NOT_FOUND
-            self.last_author_intersection = None
-            self.last_source_records = {}
+            # No candidates -> no per-entry intersection/source records. These
+            # ride on the result (not self) so concurrent entries don't clobber
+            # each other.
             return FactCheckResult(
                 entry_key=entry_key,
                 entry_type=entry_type,
@@ -1613,12 +1872,12 @@ class FactChecker:
                 api_sources_queried=sources_queried,
                 api_sources_with_hits=sources_with_hits,
                 errors=errors,
+                author_intersection=None,
+                source_records={},
             )
 
         # P2.4: Detect chimeric titles before sorting
         if self._detect_chimeric_title(entry, candidates):
-            self.last_author_intersection = None
-            self.last_source_records = {}
             return FactCheckResult(
                 entry_key=entry_key,
                 entry_type=entry_type,
@@ -1629,6 +1888,8 @@ class FactChecker:
                 api_sources_queried=sources_queried,
                 api_sources_with_hits=sources_with_hits,
                 errors=["Chimeric title detected: tokens borrowed from multiple different papers"],
+                author_intersection=None,
+                source_records={},
             )
 
         # Sort candidates by score descending
@@ -1636,23 +1897,47 @@ class FactChecker:
         best_score, best_match, _source = candidates[0]
 
         # Item 3: cross-source author intersection -- pick the best record from
-        # each source and intersect their author lists. Stored on the checker
-        # so callers can build a rich VerificationResult without re-querying.
+        # each source and intersect their author lists. Carried on the returned
+        # FactCheckResult (NOT on self) so callers can build a rich
+        # VerificationResult without re-querying and without racing concurrent
+        # check_entry calls.
         best_per_source: dict[str, PublishedRecord | None] = {}
         for _cand_score, cand_rec, cand_source in candidates:
             current = best_per_source.get(cand_source)
             if current is None:
                 best_per_source[cand_source] = cand_rec
             # The list is already sorted desc; first entry per source wins.
-        self.last_source_records = best_per_source
         intersection = cross_source_author_intersection(best_per_source, multi_source_bonus=MULTI_SOURCE_BONUS)
-        self.last_author_intersection = intersection
 
         field_comparisons = self._compare_all_fields(entry, best_match)
         status = self._determine_status(best_score, field_comparisons, sources_with_hits)
 
-        # Post-match: check preprint status
-        if status in (FactCheckStatus.VERIFIED, FactCheckStatus.VENUE_MISMATCH):
+        # FPR guard (Task 2b): an AUTHOR_MISMATCH driven by a candidate from a
+        # source WITHOUT authoritative given/family names (S2 flat names, a DBLP
+        # hit, an OpenAlex display_name) may be a NAME-PARSING artifact rather
+        # than a real author discrepancy. Before trusting it, re-check the SAME
+        # paper against a STRUCTURED source (Crossref by DOI, else Crossref title
+        # search). If the structured comparison MATCHES, the mismatch was a parse
+        # artifact -> recompute the comparison/status against the structured
+        # record. If it still mismatches (or no structured source is reachable),
+        # the AUTHOR_MISMATCH stands. This only changes WHICH surname tokens are
+        # compared; it never relaxes ordering or the match threshold.
+        if status is FactCheckStatus.AUTHOR_MISMATCH and not best_match.structured_names:
+            structured_rec = self._structured_author_recheck(entry, best_match)
+            if structured_rec is not None:
+                best_match = structured_rec
+                field_comparisons = self._compare_all_fields(entry, best_match)
+                status = self._determine_status(best_score, field_comparisons, sources_with_hits)
+
+        # Post-match: check preprint status. UNCONFIRMED is included because a
+        # venue we could not confirm is exactly the case where an independent
+        # preprint-only signal (arXiv-only, no DOI/venue) upgrades the verdict to
+        # the positive-evidence PREPRINT_ONLY.
+        if status in (
+            FactCheckStatus.VERIFIED,
+            FactCheckStatus.VENUE_MISMATCH,
+            FactCheckStatus.UNCONFIRMED,
+        ):
             preprint_status = self._check_preprint_status(entry, best_match)
             if preprint_status is not None:
                 status = preprint_status
@@ -1709,6 +1994,10 @@ class FactChecker:
             api_sources_queried=sources_queried,
             api_sources_with_hits=sources_with_hits,
             errors=errors,
+            # Per-entry state carried on the result (not stashed on self) so
+            # concurrent check_entry calls don't clobber each other.
+            author_intersection=intersection,
+            source_records=best_per_source,
         )
         # Stash the numeric (0-100) confidence as an attribute -- additive only,
         # not part of the JSONL schema so existing consumers keep working.
@@ -1744,6 +2033,68 @@ class FactChecker:
                     return bare
         return None
 
+    def _id_anchored_author_mismatch(
+        self,
+        entry: dict[str, Any],
+        rec: PublishedRecord,
+        source: str,
+        identifier: str,
+        id_kind: str,
+    ) -> FactCheckResult | None:
+        """Flag an ID-resolved record whose title matches but authors are wrong.
+
+        The caller has already confirmed that ``rec`` IS the cited paper (its
+        title matches the entry). This catches the residual case where a
+        hallucinated citation carries a *correct* DOI/arXiv-ID resolving to the
+        exact real paper, but lists SWAPPED or PLACEHOLDER authors.
+
+        Both author sides are reduced to canonical surname keys with the same
+        machinery used everywhere else -- the entry via ``authors_last_names``
+        and the resolved record via ``PublishedRecord.surname_keys`` (both route
+        each name through ``last_name_from_person``) -- then compared with
+        ``symmetric_author_match``.
+
+        FPR-safe gating: a flag fires ONLY on a genuine ``MISMATCH`` (different
+        lead author / transposition / placeholder authors). ``MATCH`` (correct
+        authors), ``PARTIAL`` (consistent-but-incomplete, e.g. "and others"),
+        and ``NON_COMPARABLE`` (missing authors on either side) all return
+        ``None`` so valid citations are never touched.
+        """
+        entry_names = self._entry_surname_keys(entry, rec, limit=10_000)
+        api_names = rec.surname_keys(limit=10_000)
+        # Nothing comparable on either side -> cannot refute (FPR-safe).
+        if not entry_names or not api_names:
+            return None
+        author_result = symmetric_author_match(entry_names, api_names, threshold=self.config.author_threshold)
+        if not author_result.is_mismatch:
+            return None
+
+        self.logger.warning(
+            "%s %s for entry %r resolves to the cited paper but with mismatched "
+            "authors: entry authors %r vs %s authors %r",
+            id_kind,
+            identifier,
+            entry.get("ID", "?"),
+            entry.get("author", ""),
+            source,
+            api_names,
+        )
+        return FactCheckResult(
+            entry_key=entry.get("ID", "unknown"),
+            entry_type=entry.get("ENTRYTYPE", "misc").lower(),
+            status=FactCheckStatus.AUTHOR_MISMATCH,
+            overall_confidence=0.0,
+            field_comparisons=self._compare_all_fields(entry, rec),
+            best_match=rec,
+            api_sources_queried=[source],
+            api_sources_with_hits=[source],
+            errors=[
+                f"{id_kind} {identifier} resolves to the cited paper "
+                f"{rec.title!r}, but the entry's authors do not match the "
+                f"record's authors ({api_names})"
+            ],
+        )
+
     def _check_arxiv_id_consistency(self, entry: dict[str, Any]) -> FactCheckResult | None:
         """Flag entries whose cited arXiv ID resolves to a *different* paper.
 
@@ -1777,7 +2128,13 @@ class FactChecker:
         arxiv_title = normalize_title_for_match(rec.title)
         title_score = token_sort_ratio(entry_title, arxiv_title) / 100.0
         if title_score >= self.config.arxiv_consistency_min_title:
-            return None
+            # Title confirms this IS the cited paper. The arXiv ID is the entry's
+            # OWN identifier, so a genuine author mismatch here is positive
+            # evidence of ID-anchored author fabrication (swapped/placeholder
+            # authors on an otherwise-correct preprint).
+            return self._id_anchored_author_mismatch(
+                entry, rec, source="arxiv", identifier=arxiv_id, id_kind="arXiv ID"
+            )
 
         self.logger.warning(
             "arXiv ID %s for entry %r points to a different paper: entry title "
@@ -1802,6 +2159,178 @@ class FactChecker:
                 f"match entry title {entry.get('title', '')!r}"
             ],
         )
+
+    def _check_doi_consistency(self, entry: dict[str, Any]) -> FactCheckResult | None:
+        """Flag entries whose cited DOI resolves to a *different* paper.
+
+        ``_validate_doi`` only checks that the DOI *resolves* (doi.org HEAD); it
+        never checks that the DOI points to the CITED paper. Title/author search
+        then happily VERIFIES a misattributed entry against its real record, so a
+        copy-paste DOI (e.g. "IBRNet" carrying the DOI of a 3D-detection paper)
+        survives unnoticed. Here we fetch the DOI's Crossref record and require
+        its title to match the entry; a clear mismatch is reported as
+        :class:`FactCheckStatus.DOI_MISMATCH`.
+
+        FPR-safe: returns ``None`` (no flag) when there is nothing to check (no
+        DOI, feature off) OR the determination is uncertain (Crossref fetch
+        failed / non-200 / no record / no title -- e.g. IEEE bot-block or a DOI
+        Crossref doesn't index). Only a SUCCESSFULLY fetched record whose title
+        CLEARLY differs (score below ``doi_consistency_min_title``) trips it.
+        """
+        if not self.config.check_doi_consistency:
+            return None
+        raw_doi = entry.get("doi", "")
+        if not raw_doi:
+            return None
+
+        entry_title = normalize_title_for_match(entry.get("title", ""))
+        if not entry_title:
+            return None
+
+        rec = self._structured_record_by_doi(raw_doi)
+        # Cannot determine -> do NOT flag (keeps FPR low).
+        if rec is None or not rec.title:
+            return None
+
+        doi_title = normalize_title_for_match(rec.title)
+        title_score = token_sort_ratio(entry_title, doi_title) / 100.0
+        if title_score >= self.config.doi_consistency_min_title:
+            # Title confirms this IS the cited paper. The DOI is the entry's OWN
+            # identifier, so a genuine author mismatch here is positive evidence
+            # of ID-anchored author fabrication (swapped/placeholder authors on
+            # an entry that otherwise carries the correct DOI).
+            return self._id_anchored_author_mismatch(entry, rec, source="crossref", identifier=raw_doi, id_kind="DOI")
+
+        self.logger.warning(
+            "DOI %s for entry %r points to a different paper: entry title " "%r vs DOI title %r (title score %.2f)",
+            raw_doi,
+            entry.get("ID", "?"),
+            entry.get("title", ""),
+            rec.title,
+            title_score,
+        )
+        return FactCheckResult(
+            entry_key=entry.get("ID", "unknown"),
+            entry_type=entry.get("ENTRYTYPE", "misc").lower(),
+            status=FactCheckStatus.DOI_MISMATCH,
+            overall_confidence=0.0,
+            field_comparisons={},
+            best_match=rec,
+            api_sources_queried=["crossref"],
+            api_sources_with_hits=["crossref"],
+            errors=[
+                f"DOI {raw_doi} resolves to {rec.title!r}, which does not "
+                f"match entry title {entry.get('title', '')!r}"
+            ],
+        )
+
+    def _structured_record_by_doi(self, raw_doi: str) -> PublishedRecord | None:
+        """Fetch the Crossref ``message`` for ``raw_doi`` as a structured record.
+
+        Shared by ``_check_doi_consistency`` (DOI-target consistency) and
+        ``_structured_author_recheck`` (Task 2b name-parse FPR guard) so the
+        ``get_by_doi`` round-trip is never duplicated. Crossref returns
+        authoritative ``given``/``family`` fields, so the resulting record has
+        ``structured_names=True``. Returns ``None`` on any non-200 / parse / no
+        DOI so callers treat "cannot determine" as no evidence (FPR-safe).
+        """
+        if not raw_doi:
+            return None
+        try:
+            msg = self.crossref.get_by_doi(raw_doi)
+        except Exception:
+            return None
+        if msg is None:
+            return None
+        return crossref_message_to_record(msg)
+
+    def _structured_author_recheck(self, entry: dict[str, Any], best_match: PublishedRecord) -> PublishedRecord | None:
+        """Re-fetch the cited paper from a STRUCTURED source to vet an AUTHOR_MISMATCH.
+
+        Called only when the candidate that produced an AUTHOR_MISMATCH came from
+        a source WITHOUT authoritative given/family names (``best_match`` has
+        ``structured_names`` False). A family-first CJK name flattened by such a
+        source can be mis-tokenized (entry "Chen Xing" vs a flat "Xing Chen"
+        record), so the mismatch may be a parsing artifact rather than a real
+        author discrepancy.
+
+        Strategy (reuses existing fetch paths, no duplicate work):
+          1. If the entry carries a DOI, fetch the structured Crossref record via
+             the shared ``_structured_record_by_doi`` (same call
+             ``_check_doi_consistency`` uses).
+          2. Otherwise, if the entry has a confident title, run a fielded
+             Crossref title+author search and take the single best
+             title-matching hit.
+
+        The returned structured record is handed back ONLY when (a) its title
+        confirms it is the cited paper and (b) the author comparison against its
+        authoritative given/family names is a positive MATCH. In every other
+        case (no structured source reachable, title doesn't confirm, or authors
+        STILL mismatch) we return ``None`` so the original AUTHOR_MISMATCH stands.
+        This narrows surname tokenization only; it never relaxes author ordering
+        or the match threshold.
+        """
+        entry_title = normalize_title_for_match(entry.get("title", ""))
+        if not authors_last_names(entry.get("author", ""), limit=10_000):
+            return None
+
+        # ----- Path 1: DOI present -> authoritative Crossref record. -----
+        raw_doi = entry.get("doi", "") or ""
+        structured: PublishedRecord | None = None
+        if raw_doi:
+            rec = self._structured_record_by_doi(raw_doi)
+            if rec is not None and rec.structured_names and rec.title and entry_title:
+                doi_title = normalize_title_for_match(rec.title)
+                if token_sort_ratio(entry_title, doi_title) / 100.0 >= self.config.doi_consistency_min_title:
+                    structured = rec
+
+        # ----- Path 2: no usable DOI hit -> confident-title Crossref search. -----
+        if structured is None and entry_title:
+            raw_title = entry.get("title", "") or ""
+            first_author = first_author_surname(entry)
+            try:
+                items = self.crossref.search(raw_title, rows=5, title=raw_title, author=first_author)
+            except Exception:
+                items = []
+            best_struct: PublishedRecord | None = None
+            best_title_score = 0.0
+            for item in items or []:
+                rec = crossref_message_to_record(item)
+                if rec is None or not rec.structured_names or not rec.title:
+                    continue
+                ts = token_sort_ratio(entry_title, normalize_title_for_match(rec.title)) / 100.0
+                if ts > best_title_score:
+                    best_title_score, best_struct = ts, rec
+            # Require a CONFIDENT title to be sure we re-checked the same paper.
+            if best_struct is not None and best_title_score >= self.config.title_threshold:
+                structured = best_struct
+
+        if structured is None:
+            return None
+
+        # Re-run the author comparison against authoritative given/family keys.
+        # Same matcher, same threshold, same ordering rules -- only the surname
+        # tokens are now trustworthy. The entry side is disambiguated against the
+        # structured family set (resolving family-first CJK names).
+        api_names = structured.surname_keys(limit=10_000)
+        if not api_names:
+            return None
+        entry_names = self._entry_surname_keys(entry, structured, limit=10_000)
+        author_result = symmetric_author_match(entry_names, api_names, threshold=self.config.author_threshold)
+        if not author_result.is_confirmed:
+            # Still not a positive MATCH (genuine different/swapped/placeholder
+            # authors, or only a partial confirmation) -> keep AUTHOR_MISMATCH.
+            return None
+
+        self.logger.debug(
+            "Author mismatch for entry %r suppressed: structured Crossref record "
+            "confirms authors %r match entry %r (was mis-tokenized by an "
+            "unstructured source)",
+            entry.get("ID", "?"),
+            api_names,
+            entry_names,
+        )
+        return structured
 
     def _query_arxiv_by_id(
         self,
@@ -1837,106 +2366,6 @@ class FactChecker:
         score = self._score_candidate(title_norm, authors_ref, rec)
         return [(score, rec, "arxiv")]
 
-    def _query_all_sources(
-        self,
-        entry: dict[str, Any],
-        query: str,
-        sources_queried: list[str],
-        sources_with_hits: list[str],
-        errors: list[str],
-    ) -> list[tuple[float, PublishedRecord, str]]:
-        """Query all API sources and collect scored candidates (parallel version with early exit).
-
-        P2.1: Early-exit optimization - if any source returns a very high-confidence match (>= 0.95),
-        cancel remaining searches.
-        """
-        candidates: list[tuple[float, PublishedRecord, str]] = []
-        title_norm = normalize_title_for_match(entry.get("title", ""))
-        authors_ref = authors_last_names(entry.get("author", ""), limit=3)
-
-        HIGH_CONFIDENCE_THRESHOLD = 0.95
-
-        def _search_crossref() -> tuple[str, list[tuple[float, PublishedRecord, str]], bool, str | None]:
-            """Search Crossref API."""
-            local_candidates = []
-            had_hits = False
-            error = None
-            try:
-                items = self.crossref.search(query, rows=self.config.max_candidates_per_source)
-                if items:
-                    had_hits = True
-                    for item in items:
-                        rec = crossref_message_to_record(item)
-                        if rec:
-                            score = self._score_candidate(title_norm, authors_ref, rec)
-                            local_candidates.append((score, rec, "crossref"))
-            except Exception as e:
-                error = f"Crossref: {e}"
-            return ("crossref", local_candidates, had_hits, error)
-
-        def _search_dblp() -> tuple[str, list[tuple[float, PublishedRecord, str]], bool, str | None]:
-            """Search DBLP API."""
-            local_candidates = []
-            had_hits = False
-            error = None
-            try:
-                hits = self.dblp.search(query, max_hits=self.config.max_candidates_per_source)
-                if hits:
-                    had_hits = True
-                    for hit in hits:
-                        rec = dblp_hit_to_record(hit)
-                        if rec:
-                            score = self._score_candidate(title_norm, authors_ref, rec)
-                            local_candidates.append((score, rec, "dblp"))
-            except Exception as e:
-                error = f"DBLP: {e}"
-            return ("dblp", local_candidates, had_hits, error)
-
-        def _search_s2() -> tuple[str, list[tuple[float, PublishedRecord, str]], bool, str | None]:
-            """Search Semantic Scholar API."""
-            local_candidates = []
-            had_hits = False
-            error = None
-            try:
-                data = self.s2.search(query, limit=self.config.max_candidates_per_source)
-                if data:
-                    had_hits = True
-                    for item in data:
-                        rec = s2_data_to_record(item)
-                        if rec:
-                            score = self._score_candidate(title_norm, authors_ref, rec)
-                            local_candidates.append((score, rec, "semanticscholar"))
-            except Exception as e:
-                error = f"Semantic Scholar: {e}"
-            return ("semanticscholar", local_candidates, had_hits, error)
-
-        # P2.1: Execute searches in parallel with early exit on high-confidence match
-        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-            futures = {
-                executor.submit(_search_crossref): "crossref",
-                executor.submit(_search_dblp): "dblp",
-                executor.submit(_search_s2): "s2",
-            }
-
-            for future in concurrent.futures.as_completed(futures):
-                try:
-                    source, cands, had_hits, error = future.result()
-                    sources_queried.append(source)
-                    candidates.extend(cands)
-                    if had_hits:
-                        sources_with_hits.append(source)
-                    if error:
-                        errors.append(error)
-
-                    # Note: With max_workers=3 and 3 tasks, all start immediately.
-                    # The break skips processing remaining future results but doesn't stop running tasks.
-                    if any(score >= HIGH_CONFIDENCE_THRESHOLD for score, _, _ in cands):
-                        break
-                except Exception:
-                    pass  # Errors already captured in individual search functions
-
-        return candidates
-
     def _query_cascade(
         self,
         entry: dict[str, Any],
@@ -1945,18 +2374,37 @@ class FactChecker:
         sources_with_hits: list[str],
         errors: list[str],
     ) -> list[tuple[float, PublishedRecord, str]]:
-        """Cascading source order: CrossRef -> Semantic Scholar -> OpenAlex.
+        """Source order: CrossRef -> OpenAlex -> DBLP -> OpenReview -> Semantic Scholar.
 
         Item 1 (CheckIfExist Algorithm 1, Abbonato 2026). Each step retrieves
         ``config.top_k`` candidates and re-ranks them by Levenshtein title
         similarity (Item 2). The cascade short-circuits as soon as a source
         returns a candidate at or above ``cascade_high_confidence``.
 
+        Retrieval (this fix): Crossref and OpenAlex are queried with *fielded
+        title* searches (``query.title`` / ``filter=title.search:``) using the
+        raw, author-free title rather than the normalized ``"title + surname"``
+        blob. The blob fed to the free-text BM25 endpoints returned unrelated
+        papers for DOI-less ML-conference titles (ICML/ICLR/NeurIPS), causing
+        ~61% of valid references to be falsely flagged. DBLP -- which
+        authoritatively indexes those venues -- is added as a cascade step
+        after OpenAlex.
+
+        Order rationale (throughput): the fast, broad sources come first so the
+        slow specialist is only reached on hard entries. OpenAlex runs on the
+        polite pool (~100 req/min) and aggregates Crossref + others; DBLP
+        (~30 req/min) is the CS-conference authority; OpenReview (~30 req/min) is
+        the ICLR/NeurIPS/TMLR submission authority queried before the slow
+        keyless Semantic Scholar (~10 req/min), which is queried last to keep it
+        off the hot path for the easy majority of entries.
+
         Returns:
             List of ``(score, record, source_name)`` tuples, possibly from
             multiple sources if intermediate matches were below threshold.
         """
-        title_norm = normalize_title_for_match(entry.get("title", ""))
+        raw_title = entry.get("title", "") or ""
+        title_norm = normalize_title_for_match(raw_title)
+        first_author = first_author_surname(entry)
         authors_ref = authors_last_names(entry.get("author", ""), limit=3)
         top_k = max(1, min(int(self.config.top_k), MAX_TOP_K))
 
@@ -1973,10 +2421,10 @@ class FactChecker:
                     best_local = score
             return best_local
 
-        # ----- Step 1: CrossRef -----
+        # ----- Step 1: CrossRef (fielded query.title + query.author) -----
         sources_queried.append("crossref")
         try:
-            cr_items = self.crossref.search(query, rows=top_k)
+            cr_items = self.crossref.search(query, rows=top_k, title=raw_title, author=first_author)
         except Exception as exc:
             cr_items = []
             errors.append(f"Crossref: {exc}")
@@ -1991,10 +2439,102 @@ class FactChecker:
         if best_cr >= self.config.cascade_high_confidence:
             return all_candidates
 
-        # ----- Step 2: Semantic Scholar (preprint coverage) -----
+        # ----- Step 2: OpenAlex (high-rate aggregator, broad coverage) -----
+        best_oa = 0.0
+        if self.openalex is None:
+            # Lazily build a default OpenAlex client, reusing the shared HTTP
+            # client reachable through the Crossref client. Without a shared
+            # client we skip OpenAlex rather than fabricate a bare, unthrottled
+            # connection -- this keeps tests hermetic and avoids impolite
+            # off-pool traffic.
+            shared_http = getattr(self.crossref, "http", None)
+            if shared_http is not None:
+                self.openalex = OpenAlexClient(
+                    http=shared_http,
+                    mailto=self.config.openalex_mailto,
+                )
+        if self.openalex is not None:
+            sources_queried.append("openalex")
+            try:
+                # Fielded filter=title.search:<raw title>, free-text fallback.
+                oa_items = self.openalex.search(query, limit=top_k, title=raw_title)
+            except Exception as exc:
+                oa_items = []
+                errors.append(f"OpenAlex: {exc}")
+            oa_records: list[PublishedRecord] = []
+            for item in oa_items or []:
+                rec = openalex_work_to_candidate_record(item)
+                if rec:
+                    oa_records.append(rec)
+            if oa_records:
+                sources_with_hits.append("openalex")
+            best_oa = _ingest("openalex", oa_records)
+            if max(best_cr, best_oa) >= self.config.cascade_high_confidence:
+                return all_candidates
+
+        # ----- Step 3: DBLP (authoritative ICML/ICLR/NeurIPS index) -----
+        # DBLP's q= is a token-AND matcher (not BM25 relevance), so the raw
+        # title + surname locates the exact paper. Uses the permissive
+        # dblp_hit_to_candidate_record so DOI-less / CoRR conference hits are
+        # kept as scorable candidates (the strict resolver converter drops them).
+        best_dblp = 0.0
+        if self.dblp is not None:
+            sources_queried.append("dblp")
+            dblp_query = f"{raw_title} {first_author}".strip()
+            try:
+                dblp_hits = self.dblp.search(dblp_query, max_hits=top_k)
+            except Exception as exc:
+                dblp_hits = []
+                errors.append(f"DBLP: {exc}")
+            dblp_records: list[PublishedRecord] = []
+            for hit in dblp_hits or []:
+                rec = dblp_hit_to_candidate_record(hit)
+                if rec:
+                    dblp_records.append(rec)
+            if dblp_records:
+                sources_with_hits.append("dblp")
+            best_dblp = _ingest("dblp", dblp_records)
+            if max(best_cr, best_oa, best_dblp) >= self.config.cascade_high_confidence:
+                return all_candidates
+
+        # ----- Step 4: OpenReview (authoritative ICLR/NeurIPS/TMLR registry) -----
+        # OpenReview owns the submission record for most ML conferences, which the
+        # DOI/CS-index sources above frequently fail to *positively* confirm
+        # (these land in the "could-not-verify" bucket). It exposes ~Given_Family
+        # profile handles, yielding authoritative family names. Queried before the
+        # slow keyless Semantic Scholar so the ML-venue authority is consulted
+        # first. Lazily built from the shared HTTP client (reachable via Crossref),
+        # mirroring the OpenAlex step; skipped if no shared client is available so
+        # tests stay hermetic and no impolite off-pool traffic is created.
+        best_or = 0.0
+        if self.openreview is None:
+            shared_http = getattr(self.crossref, "http", None)
+            if shared_http is not None:
+                self.openreview = OpenReviewClient(http=shared_http)
+        if self.openreview is not None:
+            sources_queried.append("openreview")
+            try:
+                or_notes = self.openreview.search(query, limit=top_k, title=raw_title, first_author=first_author)
+            except Exception as exc:
+                or_notes = []
+                errors.append(f"OpenReview: {exc}")
+            or_records: list[PublishedRecord] = []
+            for note in or_notes or []:
+                rec = openreview_note_to_candidate_record(note)
+                if rec:
+                    or_records.append(rec)
+            if or_records:
+                sources_with_hits.append("openreview")
+            best_or = _ingest("openreview", or_records)
+            if max(best_cr, best_oa, best_dblp, best_or) >= self.config.cascade_high_confidence:
+                return all_candidates
+
+        # ----- Step 5: Semantic Scholar (preprint coverage; slowest w/o key) -----
         sources_queried.append("semanticscholar")
         try:
-            s2_data = self.s2.search(query, limit=top_k)
+            # Title-led query keeps S2 relevance focused on the paper title.
+            s2_query = f"{raw_title} {first_author}".strip() or query
+            s2_data = self.s2.search(s2_query, limit=top_k)
         except Exception as exc:
             s2_data = []
             errors.append(f"Semantic Scholar: {exc}")
@@ -2005,34 +2545,7 @@ class FactChecker:
                 s2_records.append(rec)
         if s2_records:
             sources_with_hits.append("semanticscholar")
-        best_s2 = _ingest("semanticscholar", s2_records)
-        best_so_far = max(best_cr, best_s2)
-        if best_so_far >= self.config.cascade_high_confidence:
-            return all_candidates
-
-        # ----- Step 3: OpenAlex (aggregator catch-all) -----
-        if self.openalex is None:
-            # Lazily build a default OpenAlex client; reuses the shared HTTP
-            # client when one is reachable through the Crossref client.
-            shared_http = getattr(self.crossref, "http", None)
-            self.openalex = OpenAlexClient(
-                http=shared_http,
-                mailto=self.config.openalex_mailto,
-            )
-        sources_queried.append("openalex")
-        try:
-            oa_items = self.openalex.search(query, limit=top_k)
-        except Exception as exc:
-            oa_items = []
-            errors.append(f"OpenAlex: {exc}")
-        oa_records: list[PublishedRecord] = []
-        for item in oa_items or []:
-            rec = openalex_work_to_candidate_record(item)
-            if rec:
-                oa_records.append(rec)
-        if oa_records:
-            sources_with_hits.append("openalex")
-        _ingest("openalex", oa_records)
+        _ingest("semanticscholar", s2_records)
         return all_candidates
 
     def _score_candidate(self, title_norm: str, authors_ref: list[str], rec: PublishedRecord) -> float:
@@ -2133,6 +2646,24 @@ class FactChecker:
 
         return False
 
+    @staticmethod
+    def _entry_surname_keys(entry: dict[str, Any], record: PublishedRecord, limit: int = 10_000) -> list[str]:
+        """Entry surname keys to compare against ``record``.
+
+        When ``record`` has AUTHORITATIVE given/family names (Crossref), use the
+        record's family set to disambiguate order-ambiguous comma-less entry
+        names (family-first CJK names): ``entry_surnames_against_structured``
+        picks the entry token that matches a known family. Otherwise the record
+        cannot disambiguate anything, so use the plain ``authors_last_names``
+        heuristic. Either way each entry author maps to one surname at its own
+        position -- ordering/first-author checks downstream are untouched.
+        """
+        if record.structured_names:
+            family_keys = set(record.surname_keys(limit=limit))
+            if family_keys:
+                return entry_surnames_against_structured(entry.get("author", ""), family_keys, limit=limit)
+        return authors_last_names(entry.get("author", ""), limit=limit)
+
     def _compare_all_fields(self, entry: dict[str, Any], record: PublishedRecord) -> dict[str, FieldComparison]:
         """Compare all relevant fields between entry and record."""
         comparisons: dict[str, FieldComparison] = {}
@@ -2157,21 +2688,46 @@ class FactChecker:
             f"Edit distance: {edit_dist}" if near_miss else None,
         )
 
-        # Author (P2.3: Ordered author comparison)
+        # Author (symmetric comparison; see FIX C / symmetric_author_match).
+        # Both sides go through the same canonical surname reduction
+        # (last_name_from_person) with a generous limit, then the matcher slices
+        # both sides symmetrically and applies ordered-containment. The legacy
+        # code sliced the entry side to 10 but left the API side at 10_000, so a
+        # correctly cited paper that lists fewer authors (or "and others") scored
+        # below threshold purely from the length asymmetry.
         entry_authors = entry.get("author", "")
-        entry_names = authors_last_names(entry_authors, limit=10)
-        # Route the API side through the same canonical surname reduction as the
-        # entry side. The API side was previously unsliced; keep that.
+        entry_names = self._entry_surname_keys(entry, record, limit=10_000)
         api_names = record.surname_keys(limit=10_000)
-        # Use combined score (Jaccard + sequence similarity)
-        author_score = combined_author_score(entry_names, api_names, jaccard_weight=0.5, sequence_weight=0.5)
+        author_result = symmetric_author_match(entry_names, api_names, threshold=cfg.author_threshold)
         api_authors_str = " and ".join(f"{a.get('given', '')} {a.get('family', '')}".strip() for a in record.authors)
+        # Mirror the venue "no claim" rule: if the entry lists no authors there is
+        # nothing to confirm (vacuously MATCH). A PARTIAL (consistent-but-
+        # incomplete) confirmation is NOT a full confirmation and routes to
+        # UNCONFIRMED; a NON_COMPARABLE result with authors on the entry side but
+        # none in the record also could-not-confirm.
+        if not entry_names:
+            author_outcome = MatchOutcome.MATCH
+            author_confirmed = True
+            author_note = "No authors claimed"
+        else:
+            author_outcome = author_result.outcome
+            author_confirmed = author_result.is_confirmed
+            if author_result.outcome is MatchOutcome.PARTIAL:
+                author_note = "Authors consistent but incomplete"
+            elif author_result.outcome is MatchOutcome.NON_COMPARABLE:
+                author_note = "Authors could not be confirmed (no author data in record)"
+            else:
+                author_note = None
         comparisons["author"] = FieldComparison(
             "author",
             entry_authors,
             api_authors_str,
-            author_score,
-            author_score >= cfg.author_threshold,
+            author_result.score,
+            # ``matches`` is positive-confirmation only: a PARTIAL/NON_COMPARABLE
+            # author check is not a full confirmation, so it is not "matched".
+            author_confirmed,
+            note=author_note,
+            outcome=author_outcome,
         )
 
         # Year
@@ -2194,16 +2750,38 @@ class FactChecker:
             f"Tolerance: ±{cfg.year_tolerance}",
         )
 
-        # Venue (alias-aware matching)
+        # Venue (alias-aware matching, three-valued).
         entry_venue = entry.get("journal") or entry.get("booktitle") or ""
         api_venue = record.journal or ""
-        venue_matches, venue_score = venues_match(entry_venue, api_venue, cfg.venue_threshold)
+        venue_result = venues_match(entry_venue, api_venue, cfg.venue_threshold)
+        # Positive-confirmation gate distinguishes "no claim" from "claim we
+        # could not confirm":
+        #  - The entry makes NO venue claim (preprint @misc/@article with no
+        #    journal/booktitle) -> there is nothing to confirm, so the field is
+        #    vacuously confirmed (MATCH) and must not block VERIFIED.
+        #  - The entry CLAIMS a published venue but the matched record is blank
+        #    or preprint-only -> the claim cannot be confirmed -> NON_COMPARABLE,
+        #    which routes the verdict to UNCONFIRMED (could not verify).
+        if not entry_venue:
+            venue_outcome = MatchOutcome.MATCH
+            venue_confirmed = True
+            venue_note = "No venue claimed"
+        else:
+            venue_outcome = venue_result.outcome
+            venue_confirmed = venue_result.is_confirmed
+            venue_note = (
+                "Claimed venue could not be confirmed (preprint/blank record)"
+                if venue_result.outcome is MatchOutcome.NON_COMPARABLE
+                else None
+            )
         comparisons["venue"] = FieldComparison(
             "venue",
             entry_venue,
             api_venue,
-            venue_score,
-            venue_matches,
+            venue_result.score,
+            venue_confirmed,
+            note=venue_note,
+            outcome=venue_outcome,
         )
 
         return comparisons
@@ -2214,35 +2792,78 @@ class FactChecker:
         comparisons: dict[str, FieldComparison],
         sources_with_hits: list[str],
     ) -> FactCheckStatus:
-        """Determine final status from score and comparisons.
+        """Determine final status from score and field comparisons.
 
-        P2.6: Venue mismatch is prioritized when title+author match.
+        VERIFIED means POSITIVE CONFIRMATION of every claimed field, not merely
+        "nothing was contradicted". Each field comparison is three-valued
+        (MATCH / MISMATCH / NON_COMPARABLE|PARTIAL), and the gate routes them:
+
+        - Any MISMATCH (two different real venues, a swapped/wrong author, a
+          different title/year) is positive evidence of a problem -> the usual
+          PROBLEMATIC statuses (VENUE_MISMATCH / AUTHOR_MISMATCH / ... /
+          PARTIAL_MATCH).
+        - No MISMATCH but some field is NON_COMPARABLE or PARTIAL (preprint-only
+          venue, incomplete author list) -> UNCONFIRMED: a record was found and
+          nothing conflicts, but a claimed field could not be positively
+          confirmed. This is abstention ("could not fully confirm / needs
+          review"), distinct from both VERIFIED and PROBLEMATIC.
+        - Every field CONFIRMED -> VERIFIED.
+
+        Fix B (abstention): a weak best candidate means the title search returned
+        an *unrelated* paper -- the tool simply could not find the real one. That
+        is "I couldn't verify this", NOT "this is fabricated", so we ABSTAIN with
+        NOT_FOUND rather than asserting HALLUCINATED. This sits AFTER the
+        positive-evidence checks in ``check_entry`` (``_validate_year``,
+        ``_validate_doi``, ``_check_arxiv_id_consistency``, ``_detect_chimeric_title``),
+        each of which ``return``s before ``_determine_status`` is ever reached --
+        so abstention can never suppress a true HALLUCINATED verdict backed by
+        positive evidence.
         """
-        if best_score < self.config.hallucination_max_score:
-            return FactCheckStatus.HALLUCINATED
+        # Wrong-paper signature: the best match is too weak to trust. Either the
+        # blended score is below the abstention threshold, or the title itself is
+        # essentially unrelated (very low title score) AND neither title nor
+        # author corroborate the entry. In both cases there is no positive
+        # evidence of fabrication, only a failed lookup -> abstain.
+        title_cmp = comparisons.get("title")
+        author_cmp = comparisons.get("author")
+        title_score = title_cmp.similarity_score if title_cmp else 0.0
+        title_confirmed = bool(title_cmp and title_cmp.is_confirmed)
+        author_confirmed = bool(author_cmp and author_cmp.is_confirmed)
+        wrong_paper_signature = title_score < 0.30 and not title_confirmed and not author_confirmed
 
-        mismatches = [name for name, c in comparisons.items() if not c.matches]
+        if best_score < self.config.abstention_below or wrong_paper_signature:
+            return FactCheckStatus.NOT_FOUND
 
-        if not mismatches:
-            return FactCheckStatus.VERIFIED
+        # Positive evidence of a problem: a field that is a real MISMATCH (both
+        # sides populated and conflicting). These take priority over abstention.
+        mismatches = [name for name, c in comparisons.items() if c.is_mismatch]
 
-        # P2.6: Prioritize venue mismatch when title+author match
-        if "venue" in mismatches:
-            title_ok = comparisons.get("title") and comparisons["title"].matches
-            author_ok = comparisons.get("author") and comparisons["author"].matches
-            if title_ok and author_ok:
+        if mismatches:
+            # P2.6: Prioritize venue mismatch when title+author are confirmed.
+            if "venue" in mismatches and title_confirmed and author_confirmed:
                 return FactCheckStatus.VENUE_MISMATCH
 
-        if len(mismatches) == 1:
-            mismatch_map = {
-                "title": FactCheckStatus.TITLE_MISMATCH,
-                "author": FactCheckStatus.AUTHOR_MISMATCH,
-                "year": FactCheckStatus.YEAR_MISMATCH,
-                "venue": FactCheckStatus.VENUE_MISMATCH,
-            }
-            return mismatch_map.get(mismatches[0], FactCheckStatus.PARTIAL_MATCH)
+            if len(mismatches) == 1:
+                mismatch_map = {
+                    "title": FactCheckStatus.TITLE_MISMATCH,
+                    "author": FactCheckStatus.AUTHOR_MISMATCH,
+                    "year": FactCheckStatus.YEAR_MISMATCH,
+                    "venue": FactCheckStatus.VENUE_MISMATCH,
+                }
+                return mismatch_map.get(mismatches[0], FactCheckStatus.PARTIAL_MATCH)
 
-        return FactCheckStatus.PARTIAL_MATCH
+            return FactCheckStatus.PARTIAL_MATCH
+
+        # No mismatch, but require POSITIVE confirmation of every claimed field.
+        # A NON_COMPARABLE venue (preprint/blank record) or a PARTIAL author
+        # confirmation (consistent-but-incomplete) is not a full confirmation:
+        # the claim could not be verified, so abstain with UNCONFIRMED rather
+        # than reporting VERIFIED.
+        non_confirming = [name for name, c in comparisons.items() if c.is_non_confirming]
+        if non_confirming:
+            return FactCheckStatus.UNCONFIRMED
+
+        return FactCheckStatus.VERIFIED
 
 
 class AcademicVerifier(BaseVerifier):
@@ -2383,21 +3004,13 @@ class FactCheckProcessor:
             return {}
 
         def _check_doi(entry_id: str, doi: str, client: httpx.Client) -> tuple[str, bool]:
-            """Check a single DOI via HEAD request."""
-            try:
-                # Normalize DOI URL
-                if doi.startswith("http"):
-                    url = doi
-                else:
-                    url = f"https://doi.org/{doi}"
-
-                resp = client.head(url, headers={"User-Agent": "BibtexFactChecker/1.0"})
-                # Only 404/410 mean the DOI doesn't exist.
-                # 418/403/429 are publisher bot-detection, not invalid DOIs.
-                return (entry_id, resp.status_code not in (404, 410))
-            except Exception:
-                # Assume valid on error (don't penalize network issues)
-                return (entry_id, True)
+            """Check a single DOI via HEAD (with a GET fallback)."""
+            # Normalize: strip URL prefix/lowercase, and for arXiv DataCite DOIs
+            # drop a trailing version suffix (the versioned DOI 404s at doi.org
+            # but the unversioned one resolves).
+            normalized = normalize_doi_for_resolution(doi) or doi.strip()
+            # None (network error) -> assume valid (don't penalize network issues).
+            return (entry_id, _doi_resolves(client, normalized) is not False)
 
         results: dict[str, bool] = {}
         # Reuse shared httpx.Client if available (avoids TCP/TLS overhead)
@@ -2417,6 +3030,73 @@ class FactCheckProcessor:
                 client.close()
 
         return results
+
+    def _batch_warm_crossref_records(self, entries: list[dict[str, Any]]) -> int:
+        """Pre-fetch every entry DOI's Crossref ``/works`` record in parallel.
+
+        Latency optimization (mirrors :meth:`_batch_validate_dois`). The per-entry
+        DOI checks (``_check_doi_consistency`` and the structured-name author
+        recheck) each call ``CrossrefClient.get_by_doi`` for the entry's DOI. Run
+        serially across the worker pool, those round-trips are gated by the
+        crossref rate limiter (50/min) and dominate wall-clock on large
+        bibliographies.
+
+        Here we issue the SAME ``get_by_doi`` calls once, up front, in a bounded
+        thread pool. ``get_by_doi`` routes through the shared ``HttpClient``, whose
+        responses are stored in the thread-safe SqliteCache keyed by request URL.
+        Warming that cache turns the later per-entry ``get_by_doi`` calls into
+        cache hits, so the same records are used for the same comparisons -- this
+        is purely a change to WHEN the fetch happens, never WHICH record is used
+        (verdict-neutral).
+
+        Thread-safety: this runs BEFORE the main worker pool starts and writes
+        only to the SqliteCache (already thread-safe). It adds no mutable state on
+        ``self`` or the checker, so concurrent ``check_entry`` calls only ever READ
+        the warmed cache.
+
+        Fallback: a DOI whose pre-fetch fails (network error / non-200) is simply
+        not cached. The per-entry ``get_by_doi`` then performs its own fetch
+        exactly as before -- correct result, no speedup for that one DOI.
+
+        Returns:
+            Number of distinct DOIs warmed (best-effort; for logging/tests).
+        """
+        # Only FactChecker has a crossref client whose cache we can warm.
+        if not isinstance(self.checker, FactChecker):
+            return 0
+        crossref = self.checker.crossref
+        # No shared response cache -> warming would not be observed by the
+        # per-entry calls, so skip (each call would re-fetch anyway).
+        if getattr(crossref.http, "cache", None) is None:
+            return 0
+
+        # Dedupe DOIs across entries: identical DOIs share one cache key.
+        dois: set[str] = set()
+        for entry in entries:
+            doi = (entry.get("doi", "") or "").strip()
+            if doi:
+                dois.add(doi)
+        if not dois:
+            return 0
+
+        def _warm_one(doi: str) -> None:
+            # Same call the per-entry path uses; result lands in the shared
+            # cache. Swallow everything so one bad DOI never aborts warming.
+            try:
+                crossref.get_by_doi(doi)
+            except Exception:
+                pass
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=16) as executor:
+            futures = [executor.submit(_warm_one, doi) for doi in dois]
+            for future in concurrent.futures.as_completed(futures):
+                # Results are written straight to the cache; nothing to collect.
+                try:
+                    future.result()
+                except Exception:
+                    pass
+
+        return len(dois)
 
     def process_entries(
         self, entries: list[dict[str, Any]], jsonl_path: str | None = None, max_workers: int = 8
@@ -2440,6 +3120,15 @@ class FactCheckProcessor:
             self.logger.info(
                 "DOI pre-validation complete: %d checked, %d failed", len(pre_validated_dois), failed_count
             )
+
+        # Latency: warm the Crossref /works response cache for all entry DOIs in
+        # parallel up front, so the per-entry DOI checks (consistency + structured
+        # author recheck) hit the cache instead of each making a serial,
+        # rate-limited round-trip. Verdict-neutral; failures fall back to the
+        # existing per-entry fetch. (Mirrors _batch_validate_dois.)
+        warmed = self._batch_warm_crossref_records(entries)
+        if warmed:
+            self.logger.info("Pre-fetched Crossref records for %d DOIs", warmed)
 
         results: list[FactCheckResult | None] = [None] * len(entries)  # Pre-allocate to preserve order
 
@@ -2482,6 +3171,10 @@ class FactCheckProcessor:
                                 "key": result.entry_key,
                                 "category": result.category.value if result.category else None,
                                 "status": result.status.value,
+                                # Fix B: distinct flag so abstentions ("could not
+                                # verify") are unambiguously identifiable and never
+                                # read as confirmed hallucinations downstream.
+                                "abstained": _is_abstained_status(result.status),
                                 "confidence": result.overall_confidence,
                                 # Additive: 0-100 numeric confidence (Item 4).
                                 "confidence_score": float(getattr(result, "confidence_score", 0.0)),
@@ -2536,27 +3229,37 @@ class FactCheckProcessor:
                 if not c.matches:
                     field_mismatches[name] = field_mismatches.get(name, 0) + 1
 
-        # Include new problematic statuses
+        # Three buckets (Fix B). ABSTAINED ("could not verify") is reported
+        # separately from PROBLEMATIC ("positive evidence of a problem"): a
+        # not-found / uncertain entry is the tool failing to locate a record, NOT
+        # evidence of fabrication, so it must never read as a confirmed
+        # hallucination.
+        abstained_statuses = sorted(ABSTAINED_STATUS_VALUES)
+        # Positive-evidence problems only. (not_found / *_not_found moved to the
+        # abstained bucket above.)
         problematic_statuses = [
-            "not_found",
             "hallucinated",
             "title_mismatch",
             "author_mismatch",
             "year_mismatch",
             "venue_mismatch",
-            "url_not_found",
+            # Multiple confirmed mismatches -> positive evidence of a problem.
+            # (Previously omitted, so PARTIAL_MATCH entries fell through all three
+            # buckets and the bucket counts under-summed.)
+            "partial_match",
             "url_content_mismatch",
-            "book_not_found",
-            "working_paper_not_found",
             "future_date",
             "invalid_year",
             "doi_not_found",
+            "arxiv_id_mismatch",
+            "doi_mismatch",
             "preprint_only",
         ]
 
         # Calculate verified rate including new verified statuses
         verified_statuses = ["verified", "url_verified", "url_accessible", "book_verified", "working_paper_verified"]
         verified_count = sum(counts.get(s, 0) for s in verified_statuses)
+        abstained_count = sum(counts.get(s, 0) for s in abstained_statuses)
 
         return {
             "total": len(results),
@@ -2564,6 +3267,10 @@ class FactCheckProcessor:
             "by_category": category_counts,
             "field_mismatch_counts": field_mismatches,
             "verified_rate": verified_count / len(results) if results else 0,
+            "verified_count": verified_count,
+            # Distinct "could not verify" bucket -- abstentions, not hallucinations.
+            "could_not_verify_rate": abstained_count / len(results) if results else 0,
+            "abstained_count": abstained_count,
             "problematic_count": sum(counts.get(s, 0) for s in problematic_statuses),
         }
 
@@ -2639,6 +3346,8 @@ class FactCheckProcessor:
                         "key": r.entry_key,
                         "category": r.category.value if r.category else None,
                         "status": r.status.value,
+                        # Fix B: distinct abstention flag (see process_entries).
+                        "abstained": _is_abstained_status(r.status),
                         "confidence": r.overall_confidence,
                         # Additive: 0-100 numeric confidence (Item 4).
                         "confidence_score": float(getattr(r, "confidence_score", 0.0)),
@@ -2797,11 +3506,6 @@ Examples:
     # CheckIfExist additions
     cascade_opts = p.add_argument_group("cascading source order (CheckIfExist)")
     cascade_opts.add_argument(
-        "--cascade",
-        action="store_true",
-        help="Use explicit CrossRef -> Semantic Scholar -> OpenAlex cascade (Item 1).",
-    )
-    cascade_opts.add_argument(
         "--top-k",
         type=int,
         default=DEFAULT_TOP_K,
@@ -2887,6 +3591,7 @@ def main() -> int:
             "crossref": max(10, int(50 * rate_scale)),
             "semanticscholar": 60 if s2_api_key else max(5, int(10 * rate_scale)),
             "dblp": max(10, int(30 * rate_scale)),
+            "openreview": max(10, int(30 * rate_scale)),
             "openlibrary": max(10, int(30 * rate_scale)),
             "google_books": max(10, int(30 * rate_scale)),
         }
@@ -2908,7 +3613,6 @@ def main() -> int:
         venue_threshold=args.venue_threshold,
         check_dois=not args.no_check_dois,
         check_years=not args.no_check_years,
-        cascade_mode=bool(args.cascade),
         top_k=top_k,
         openalex_mailto=args.openalex_mailto,
     )
@@ -2982,9 +3686,39 @@ def main() -> int:
         if count > 0:
             logger.info("  %s: %d", status.upper(), count)
 
+    # Three clearly distinct buckets (Fix B): VERIFIED, COULD NOT VERIFY
+    # (abstained -- no matching record found, NOT evidence of fabrication), and
+    # PROBLEMATIC (positive evidence of a problem). "Could not verify" must never
+    # be lumped in with either "verified" or "hallucinated".
+    total = summary["total"]
+    verified_n = summary.get("verified_count", 0)
+    abstained_n = summary.get("abstained_count", 0)
+    problematic_n = summary.get("problematic_count", 0)
+    logger.info("Results by bucket:")
+    logger.info(
+        "  (1) VERIFIED:            %d  (%.1f%%)",
+        verified_n,
+        summary["verified_rate"] * 100,
+    )
+    logger.info(
+        "  (2) COULD NOT VERIFY:    %d  (%.1f%%)  -- no matching record found; not evidence of fabrication",
+        abstained_n,
+        summary["could_not_verify_rate"] * 100,
+    )
+    logger.info(
+        "  (3) PROBLEMATIC:         %d  (%.1f%%)  -- positive evidence of a problem",
+        problematic_n,
+        (problematic_n / total * 100) if total else 0.0,
+    )
     logger.info("Verified rate: %.1f%%", summary["verified_rate"] * 100)
-    if summary["problematic_count"] > 0:
-        logger.warning("Problematic entries: %d", summary["problematic_count"])
+    logger.info("Could-not-verify rate: %.1f%%", summary["could_not_verify_rate"] * 100)
+    if problematic_n > 0:
+        logger.warning("Problematic entries (positive evidence): %d", problematic_n)
+    if abstained_n > 0:
+        logger.info(
+            "Could-not-verify entries (abstained, no matching record found): %d",
+            abstained_n,
+        )
 
     # Item 4: numeric confidence summary in the text report.
     numeric_scores = [float(getattr(r, "confidence_score", 0.0)) for r in results]
@@ -3010,9 +3744,17 @@ def main() -> int:
 
     # Exit code
     if args.strict:
-        problem_count = summary["status_counts"].get("not_found", 0) + summary["status_counts"].get("hallucinated", 0)
+        # Fix B: only POSITIVE-evidence problems gate the exit code. Abstentions
+        # (could-not-verify) are reported on their own line and do NOT count as
+        # confirmed hallucinations, so they no longer fail strict mode.
+        problem_count = summary["problematic_count"]
+        if abstained_n > 0:
+            logger.info(
+                "Strict mode: %d could-not-verify entries (abstained; not counted as failures)",
+                abstained_n,
+            )
         if problem_count > 0:
-            logger.warning("Strict mode: %d NOT_FOUND or HALLUCINATED entries found", problem_count)
+            logger.warning("Strict mode: %d PROBLEMATIC entries (positive evidence of a problem)", problem_count)
             return 4
 
     return 0

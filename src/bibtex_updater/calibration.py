@@ -25,33 +25,102 @@ __all__ = [
     "STATUS_BASE_CONFIDENCE",
 ]
 
-# Status-specific base confidences (priors, adjusted by evidence)
-# These represent initial confidence before factoring in match scores
+# Status-specific base confidences (priors), grounded in the fact-checker's
+# THREE-WAY verdict model. The number is "how confident are we that the assigned
+# verdict is the right call", NOT a probability that the entry is correct.
+#
+# Three buckets, with a strict ordering the priors MUST respect:
+#
+#   CLEARLY-CORRECT  (high, ~0.85-0.90): a positive record confirms the entry.
+#       verified / preprint_only / published_version_exists / *_verified.
+#
+#   CLEARLY-PROBLEM  (high): positive evidence the entry is wrong.
+#       - STRONGEST (~0.92-0.95): the evidence is self-contained and not a fuzzy
+#         field comparison -- future_date / invalid_year (arithmetic), a
+#         fabricated DOI that resolves elsewhere (doi_mismatch) or an arXiv ID
+#         that resolves elsewhere (arxiv_id_mismatch), and hallucinated (no real
+#         paper / chimeric title stitched from several papers).
+#       - SOFTER (~0.72-0.80): a single bibliographic field disagrees while the
+#         rest match (title/author/year/venue/url_content mismatch, partial_match).
+#         One fuzzy-compared field is weaker positive evidence than the above.
+#
+#   DON'T-KNOW / abstention  (LOW, near-neutral ~0.40-0.50): the tool could not
+#       decide. By construction this MUST sit below BOTH confident buckets -- an
+#       entry we failed to adjudicate must never report high confidence either
+#       way. Covers not_found / unconfirmed / api_error / doi_not_found and the
+#       book/working-paper/url "not found" variants, plus url_accessible (HTTP
+#       200 with no content check) which only weakly informs the verdict.
+#
+# Anchors (do not creep): confident buckets >= 0.72; abstentions <= 0.50.
+_CONF_CORRECT = 0.88  # CLEARLY-CORRECT anchor
+_PROB_STRONG = 0.93  # CLEARLY-PROBLEM, self-contained positive evidence
+_PROB_SOFT = 0.78  # CLEARLY-PROBLEM, single fuzzy-compared field disagrees
+_ABSTAIN = 0.45  # DON'T-KNOW, near-neutral, strictly below both above
 STATUS_BASE_CONFIDENCE = {
-    "verified": 0.85,
-    "not_found": 0.70,
-    "hallucinated": 0.90,
-    "title_mismatch": 0.80,
-    "author_mismatch": 0.75,
-    "year_mismatch": 0.85,
-    "venue_mismatch": 0.80,
-    "partial_match": 0.65,
-    "api_error": 0.30,
-    "future_date": 0.95,
-    "invalid_year": 0.95,
-    "doi_not_found": 0.85,
-    "preprint_only": 0.90,
-    "published_version_exists": 0.85,
-    "url_verified": 0.90,
-    "url_accessible": 0.70,
-    "url_not_found": 0.85,
-    "url_content_mismatch": 0.75,
-    "book_verified": 0.85,
-    "book_not_found": 0.75,
-    "working_paper_verified": 0.80,
-    "working_paper_not_found": 0.70,
+    # --- CLEARLY-CORRECT: a positive record confirms the entry ---
+    "verified": _CONF_CORRECT,
+    "preprint_only": _CONF_CORRECT,
+    "published_version_exists": _CONF_CORRECT,
+    "url_verified": _CONF_CORRECT,
+    "book_verified": _CONF_CORRECT,
+    "working_paper_verified": _CONF_CORRECT,
+    # --- CLEARLY-PROBLEM (strong): self-contained positive evidence ---
+    "hallucinated": _PROB_STRONG,  # no real paper / chimeric title
+    "future_date": _PROB_STRONG,  # arithmetic, not a fuzzy match
+    "invalid_year": _PROB_STRONG,  # arithmetic, not a fuzzy match
+    "doi_mismatch": _PROB_STRONG,  # cited DOI resolves to a different paper
+    "arxiv_id_mismatch": _PROB_STRONG,  # cited arXiv ID resolves elsewhere
+    # --- CLEARLY-PROBLEM (soft): one disagreeing field, rest match ---
+    "title_mismatch": _PROB_SOFT,
+    "author_mismatch": _PROB_SOFT,
+    "year_mismatch": _PROB_SOFT,
+    "venue_mismatch": _PROB_SOFT,
+    "partial_match": _PROB_SOFT,
+    "url_content_mismatch": _PROB_SOFT,
+    # --- DON'T-KNOW / abstention: could not adjudicate, near-neutral ---
+    "not_found": _ABSTAIN,
+    "unconfirmed": _ABSTAIN,
+    "api_error": _ABSTAIN,
+    "doi_not_found": _ABSTAIN,
+    "url_not_found": _ABSTAIN,
+    "book_not_found": _ABSTAIN,
+    "working_paper_not_found": _ABSTAIN,
+    "url_accessible": _ABSTAIN,  # 200 only, no content check -> weak signal
+    # --- not verifiable ---
     "skipped": 0.0,
 }
+
+# Abstention ("don't-know") statuses. These must stay near-neutral: their
+# confidence is capped below the confident buckets and is NOT boosted by
+# inverting a low match score or by counting how many sources were queried.
+# (Mirrors fact_checker.ABSTAINED_STATUS_VALUES, kept local to avoid importing
+# the concurrently-edited module.)
+_ABSTAIN_STATUSES = frozenset(
+    {
+        "not_found",
+        "unconfirmed",
+        "api_error",
+        "doi_not_found",
+        "url_not_found",
+        "book_not_found",
+        "working_paper_not_found",
+        "url_accessible",
+    }
+)
+
+# Self-contained positive-evidence problems whose verdict does NOT come from a
+# scored title-search candidate (arithmetic on the year, or an identifier that
+# resolves to a different paper). Source coverage is irrelevant to them, so they
+# must not be docked the "few sources returned hits" penalty -- otherwise these
+# strongest problems would calibrate below soft single-field mismatches.
+_SELF_EVIDENT_PROBLEM_STATUSES = frozenset(
+    {
+        "future_date",
+        "invalid_year",
+        "doi_mismatch",
+        "arxiv_id_mismatch",
+    }
+)
 
 # Default field importance weights for confidence decomposition
 # Higher weight = more discriminative for determining correctness
@@ -87,21 +156,32 @@ def compute_confidence_from_scores(
     # Get base confidence from status
     base_conf = STATUS_BASE_CONFIDENCE.get(status, 0.5)
 
+    # Abstentions ("don't-know") return their low base prior unchanged: a verdict
+    # the tool could not make must NOT be inflated by inverting a low match score.
+    # (A high match score would contradict the abstention, so cap at the prior.)
+    if status in _ABSTAIN_STATUSES:
+        if best_match_score is not None and best_match_score > 0.5:
+            # A strong candidate contradicts the abstention -> even less certain.
+            return base_conf * 0.5
+        return base_conf
+
     # Statuses that don't involve API matching (no scores to use)
     no_match_statuses = {
         "future_date",
         "invalid_year",
-        "doi_not_found",
-        "api_error",
+        # Pre-search positive-evidence check: the verdict comes from the DOI's /
+        # arXiv ID's own record, not from a scored title-search candidate.
+        "doi_mismatch",
+        "arxiv_id_mismatch",
         "skipped",
     }
 
     if status in no_match_statuses or best_match_score is None:
         return base_conf
 
-    # For statuses with matches, blend base confidence with actual match score
-    # High match scores boost confidence for positive statuses (verified, mismatches)
-    # Low match scores boost confidence for negative statuses (not_found, hallucinated)
+    # For statuses with matches, blend base confidence with actual match score.
+    # High match scores boost confidence for positive statuses (verified);
+    # low match scores boost confidence for hallucinated.
 
     if status == "verified":
         # Verified: high match score → high confidence
@@ -114,18 +194,14 @@ def compute_confidence_from_scores(
         confidence_in_low_score = 1.0 - best_match_score
         return 0.7 * confidence_in_low_score + 0.3 * base_conf
 
-    elif status == "not_found":
-        # Not found: absence of good matches → confidence depends on coverage
-        # If we have a best_match_score, it should be low
-        if best_match_score < 0.5:
-            # Low score confirms not_found
-            confidence_in_low_score = 1.0 - best_match_score
-            return 0.6 * confidence_in_low_score + 0.4 * base_conf
-        else:
-            # High score contradicts not_found → lower confidence
-            return base_conf * 0.5
-
-    elif status in ("title_mismatch", "author_mismatch", "year_mismatch", "venue_mismatch", "partial_match"):
+    elif status in (
+        "title_mismatch",
+        "author_mismatch",
+        "year_mismatch",
+        "venue_mismatch",
+        "partial_match",
+        "url_content_mismatch",
+    ):
         # Field-specific mismatches: moderate match score expected
         # Use base confidence adjusted by how extreme the mismatch is
         # If overall match is high despite mismatch, confidence should be lower
@@ -220,11 +296,17 @@ def status_aware_confidence(
     error_penalty = 1.0 - (0.15 * min(num_errors, 3))  # Cap at 3 errors for penalty
 
     # Coverage boost/penalty depends on status
-    if status == "not_found":
-        # For NOT_FOUND: more sources checked → more confident nothing exists
-        # Scale with num_queried, not coverage (hits don't matter for not_found)
-        queried_factor = min(num_queried / 3.0, 1.0)  # 3 sources = full confidence
-        coverage_factor = 0.7 + 0.3 * queried_factor
+    if status in _ABSTAIN_STATUSES:
+        # Abstentions stay near-neutral. We deliberately do NOT scale confidence
+        # up with the number of sources queried: "not found in N databases" is
+        # still a don't-know, and querying more sources must not push an
+        # abstention toward a confident verdict. Hold the low prior flat.
+        coverage_factor = 1.0
+    elif status in _SELF_EVIDENT_PROBLEM_STATUSES:
+        # Self-contained problems (year arithmetic, mis-resolving DOI/arXiv ID):
+        # the verdict isn't a scored candidate match, so source coverage is
+        # irrelevant. Don't penalize them for "no hits"; hold the strong prior.
+        coverage_factor = 1.0
     elif status in ("verified", "title_mismatch", "author_mismatch", "year_mismatch", "venue_mismatch"):
         # For positive matches: coverage matters less (one good match is enough)
         # But still penalize if only 1 source and it has errors
@@ -304,8 +386,19 @@ def calibrate_result(
         errors,
     )
 
-    # Blend base confidence with field-level evidence
-    match_statuses = ("verified", "title_mismatch", "author_mismatch", "venue_mismatch", "partial_match")
+    # Blend base confidence with field-level evidence. Only for statuses where a
+    # record was found and per-field scores are meaningful (CLEARLY-CORRECT
+    # `verified` and the soft single-field CLEARLY-PROBLEM mismatches). Abstentions
+    # are excluded so field scores cannot inflate a don't-know.
+    match_statuses = (
+        "verified",
+        "title_mismatch",
+        "author_mismatch",
+        "year_mismatch",
+        "venue_mismatch",
+        "partial_match",
+        "url_content_mismatch",
+    )
     if weighted_field_score is not None and status in match_statuses:
         # For match-based statuses, field decomposition provides additional signal
         return 0.7 * base_confidence + 0.3 * weighted_field_score

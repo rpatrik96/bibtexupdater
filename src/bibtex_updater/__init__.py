@@ -88,6 +88,7 @@ from bibtex_updater.utils import (
     authors_last_names,
     # API converters
     crossref_message_to_record,
+    dblp_hit_to_candidate_record,
     dblp_hit_to_record,
     # DOI/arXiv utilities
     doi_normalize,
@@ -101,6 +102,7 @@ from bibtex_updater.utils import (
     last_name_from_person,
     # Text normalization
     latex_to_plain,
+    normalize_doi_for_resolution,
     normalize_title_for_match,
     openalex_work_to_record,
     s2_data_to_record,
@@ -161,6 +163,7 @@ __all__ = [
     "SqliteCache",
     # Text normalization
     "latex_to_plain",
+    "normalize_doi_for_resolution",
     "normalize_title_for_match",
     "safe_lower",
     "strip_diacritics",
@@ -180,6 +183,7 @@ __all__ = [
     "extract_acl_anthology_id",
     # API converters
     "crossref_message_to_record",
+    "dblp_hit_to_candidate_record",
     "dblp_hit_to_record",
     "europepmc_result_to_record",
     "openalex_work_to_record",

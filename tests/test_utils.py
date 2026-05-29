@@ -53,6 +53,16 @@ class TestStripDiacritics:
         result = strip_diacritics("Ångström")
         assert "A" in result and "ngstr" in result
 
+    def test_strip_diacritics_eszett_folds_to_ss(self):
+        # ß has no NFKD decomposition; fold it so "Reiß" matches "Reiss".
+        assert strip_diacritics("Reiß").lower() == "reiss"
+        assert strip_diacritics("Reiß").lower() == strip_diacritics("Reiss").lower()
+
+    def test_strip_diacritics_nondecomposing_letters(self):
+        # ø/ł/æ/đ etc. lack combining marks but should still fold to ASCII.
+        assert strip_diacritics("Søndergaard").lower() == "sondergaard"
+        assert strip_diacritics("Łukasz").lower() == "lukasz"
+
 
 class TestLatexToPlain:
     """Tests for latex_to_plain function."""
@@ -152,6 +162,16 @@ class TestLastNameFromPerson:
         result = last_name_from_person("Smith, John Jr.")
         assert "smith" in result.lower()
 
+    def test_last_name_trailing_initials_skipped(self):
+        # "Mallikarjun B. R." (surname first, then initials) -> "mallikarjun",
+        # not the naive last token "r".
+        assert last_name_from_person("Mallikarjun B. R.") == "mallikarjun"
+
+    def test_last_name_keeps_real_surname_after_initial(self):
+        # A middle initial must not cause the real trailing surname to be dropped.
+        assert last_name_from_person("John M. Smith") == "smith"
+        assert last_name_from_person("van den Oord, Aaron") == "oord"
+
 
 class TestAuthorsLastNames:
     """Tests for authors_last_names function."""
@@ -225,6 +245,43 @@ class TestDoiNormalize:
     def test_doi_normalize_empty(self):
         result = doi_normalize("")
         assert result is None
+
+
+class TestNormalizeDoiForResolution:
+    """FIX D: arXiv DataCite DOIs must be version-stripped, others left intact."""
+
+    def test_strips_arxiv_version(self):
+        from bibtex_updater import normalize_doi_for_resolution
+
+        assert normalize_doi_for_resolution("10.48550/arXiv.2010.11929v1") == "10.48550/arxiv.2010.11929"
+
+    def test_strips_arxiv_version_multidigit(self):
+        from bibtex_updater import normalize_doi_for_resolution
+
+        assert normalize_doi_for_resolution("10.48550/arXiv.2010.11929v12") == "10.48550/arxiv.2010.11929"
+
+    def test_unversioned_arxiv_unchanged(self):
+        from bibtex_updater import normalize_doi_for_resolution
+
+        assert normalize_doi_for_resolution("10.48550/arXiv.2010.11929") == "10.48550/arxiv.2010.11929"
+
+    def test_non_arxiv_version_like_suffix_preserved(self):
+        from bibtex_updater import normalize_doi_for_resolution
+
+        # Non-arXiv DOI legitimately ending in letter+digit -> must NOT strip.
+        assert normalize_doi_for_resolution("10.1234/journal.v2") == "10.1234/journal.v2"
+
+    def test_strips_url_prefix(self):
+        from bibtex_updater import normalize_doi_for_resolution
+
+        result = normalize_doi_for_resolution("https://doi.org/10.48550/arXiv.2010.11929v3")
+        assert result == "10.48550/arxiv.2010.11929"
+
+    def test_none_and_empty(self):
+        from bibtex_updater import normalize_doi_for_resolution
+
+        assert normalize_doi_for_resolution(None) is None
+        assert normalize_doi_for_resolution("") is None
 
 
 class TestDoiUrl:

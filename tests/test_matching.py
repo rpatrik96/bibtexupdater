@@ -4,10 +4,13 @@ from __future__ import annotations
 
 from bibtex_updater.matching import (
     EXPANDED_VENUE_ALIASES,
+    MatchOutcome,
     author_sequence_similarity,
     combined_author_score,
     get_canonical_venue,
     is_near_miss_title,
+    is_preprint_or_series_venue,
+    symmetric_author_match,
     title_edit_distance,
     word_level_diff,
 )
@@ -211,6 +214,115 @@ class TestCombinedAuthorScore:
         assert 0.55 < score < 0.62
 
 
+# ------------- FIX C: Symmetric Author Matching Tests -------------
+
+
+class TestSymmetricAuthorMatch:
+    """FIX C + positive-confirmation: entry vs API author comparison is symmetric
+    AND three-valued. Containment proves "consistent with", not "complete"."""
+
+    def test_entry_subset_without_sentinel_is_partial(self):
+        """Entry lists first 3 of 8 real authors, NO sentinel -> PARTIAL.
+
+        Consistent but incomplete: not a mismatch (was a legacy false mismatch),
+        but also not a full positive confirmation (the prior softening over-claimed
+        this as a full match).
+        """
+        entry = ["smith", "doe", "jones"]
+        api = ["smith", "doe", "jones", "brown", "wang", "lee", "kim", "patel"]
+        result = symmetric_author_match(entry, api)
+        assert result.outcome is MatchOutcome.PARTIAL
+        assert result.is_confirmed is False
+        assert result.is_mismatch is False
+
+    def test_exact_match_is_confirmed(self):
+        names = ["smith", "doe", "jones"]
+        result = symmetric_author_match(names, names)
+        assert result.outcome is MatchOutcome.MATCH
+        assert result.is_confirmed is True
+        assert result.score == 1.0
+
+    def test_and_others_sentinel_leading_prefix_is_confirmed(self):
+        """'and others' marks a deliberate leading truncation -> CONFIRMED match."""
+        entry = ["smith", "doe", "others"]
+        api = ["smith", "doe", "jones", "brown"]
+        result = symmetric_author_match(entry, api)
+        assert result.outcome is MatchOutcome.MATCH
+        assert result.is_confirmed is True
+
+    def test_et_al_sentinel_leading_prefix_is_confirmed(self):
+        entry = ["smith", "et al"]
+        api = ["smith", "doe", "jones"]
+        result = symmetric_author_match(entry, api)
+        assert result.outcome is MatchOutcome.MATCH
+        assert result.is_confirmed is True
+
+    def test_different_first_author_mismatches(self):
+        """A genuinely swapped/wrong lead author must still be a MISMATCH."""
+        entry = ["wrong", "doe", "jones"]
+        api = ["smith", "doe", "jones"]
+        result = symmetric_author_match(entry, api)
+        assert result.outcome is MatchOutcome.MISMATCH
+        assert result.score == 0.0
+
+    def test_empty_side_is_non_comparable(self):
+        """No usable names on a side -> cannot confirm or refute -> non-comparable."""
+        assert symmetric_author_match([], ["smith"]).outcome is MatchOutcome.NON_COMPARABLE
+        assert symmetric_author_match(["smith"], []).outcome is MatchOutcome.NON_COMPARABLE
+        # Only-sentinel side strips to empty -> non-comparable.
+        assert symmetric_author_match(["others"], ["smith", "doe"]).outcome is MatchOutcome.NON_COMPARABLE
+
+    def test_completely_different_lists_mismatch(self):
+        entry = ["alpha", "beta", "gamma"]
+        api = ["delta", "epsilon", "zeta"]
+        result = symmetric_author_match(entry, api)
+        assert result.outcome is MatchOutcome.MISMATCH
+
+    def test_dropped_interior_author_with_sentinel_is_partial(self):
+        """A sentinel only confirms a LEADING truncation; dropping an interior
+        author (non-prefix subsequence) is still PARTIAL even with 'and others'."""
+        entry = ["smith", "jones", "others"]  # drops interior "doe"
+        api = ["smith", "doe", "jones", "brown"]
+        result = symmetric_author_match(entry, api)
+        assert result.outcome is MatchOutcome.PARTIAL
+        assert result.is_confirmed is False
+
+    def test_same_lead_partial_overlap_scores_symmetrically(self):
+        """Same first author, partially divergent tails -> symmetric slice scoring."""
+        entry = ["smith", "doe", "x"]
+        api = ["smith", "doe", "y", "z", "w"]
+        result = symmetric_author_match(entry, api)
+        # smith,doe,x vs smith,doe,y (sliced to 3) -> not a subsequence, scored.
+        assert result.outcome in (MatchOutcome.MATCH, MatchOutcome.MISMATCH)
+
+
+# ------------- FIX E-venue: Preprint / series venue Tests -------------
+
+
+class TestIsPreprintOrSeriesVenue:
+    """FIX E-venue: preprint/series venues are non-comparable."""
+
+    def test_arxiv_variants(self):
+        for v in ("arXiv", "arXiv preprint arXiv:2010.11929", "CoRR"):
+            assert is_preprint_or_series_venue(v) is True, v
+
+    def test_other_preprint_servers(self):
+        for v in ("bioRxiv", "medRxiv", "chemRxiv", "Some Preprint"):
+            assert is_preprint_or_series_venue(v) is True, v
+
+    def test_pmlr_series(self):
+        for v in ("PMLR", "Proceedings of Machine Learning Research", "JMLR W&CP"):
+            assert is_preprint_or_series_venue(v) is True, v
+
+    def test_real_venue_is_not_preprint(self):
+        for v in ("NeurIPS", "ICML", "Nature", ""):
+            assert is_preprint_or_series_venue(v) is False, v
+
+    def test_jmlr_journal_not_treated_as_series(self):
+        """JMLR is a distinct published journal, NOT the PMLR umbrella series."""
+        assert is_preprint_or_series_venue("Journal of Machine Learning Research") is False
+
+
 # ------------- P2.5: Expanded Venue Aliases Tests -------------
 
 
@@ -299,3 +411,211 @@ class TestExpandedVenueAliases:
         db_venues = ["sigmod", "vldb", "icde"]
         for venue in db_venues:
             assert venue in EXPANDED_VENUE_ALIASES, f"{venue} should be in alias map"
+
+
+class TestVenueAliasExpansion:
+    """Same venue written differently must canonicalize identically.
+
+    Each entry maps a canonical key to a list of spellings (acronym, long form,
+    numbered/dated proceedings, publisher-decorated forms) that should ALL
+    resolve to that single canonical venue.
+    """
+
+    # canonical -> variant spellings that must all map to it
+    _SAME_VENUE = {
+        "neurips": [
+            "NeurIPS",
+            "NIPS",
+            "Advances in Neural Information Processing Systems",
+            "Conference on Neural Information Processing Systems",
+            "Advances in Neural Information Processing Systems 36 (NeurIPS 2023)",
+            "The 36th Conference on Neural Information Processing Systems",
+        ],
+        "icml": [
+            "ICML",
+            "International Conference on Machine Learning",
+            "Proceedings of the 40th International Conference on Machine Learning",
+            "Proceedings of the 40th International Conference on Machine Learning, PMLR",
+        ],
+        "iclr": [
+            "ICLR",
+            "International Conference on Learning Representations",
+            "Proceedings of the International Conference on Learning Representations",
+        ],
+        "cvpr": [
+            "CVPR",
+            "IEEE Conference on Computer Vision and Pattern Recognition",
+            "IEEE/CVF Conference on Computer Vision and Pattern Recognition",
+            "Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition",
+        ],
+        "iccv": [
+            "ICCV",
+            "IEEE International Conference on Computer Vision",
+            "IEEE/CVF International Conference on Computer Vision",
+            "Proceedings of the IEEE/CVF International Conference on Computer Vision",
+        ],
+        "eccv": [
+            "ECCV",
+            "European Conference on Computer Vision",
+        ],
+        "aaai": [
+            "AAAI",
+            "AAAI Conference on Artificial Intelligence",
+            "Proceedings of the AAAI Conference on Artificial Intelligence",
+        ],
+        "acl": [
+            "ACL",
+            "Annual Meeting of the Association for Computational Linguistics",
+            "Findings of ACL",
+            "Findings of the Association for Computational Linguistics: ACL 2023",
+        ],
+        "emnlp": [
+            "EMNLP",
+            "Conference on Empirical Methods in Natural Language Processing",
+            "Findings of EMNLP",
+            "Findings of the Association for Computational Linguistics: EMNLP 2023",
+        ],
+        "naacl": [
+            "NAACL",
+            "NAACL-HLT",
+            "North American Chapter of the Association for Computational Linguistics",
+            "Findings of NAACL",
+        ],
+        "eacl": [
+            "EACL",
+            "Conference of the European Chapter of the Association for Computational Linguistics",
+            "Findings of EACL",
+        ],
+        "coling": [
+            "COLING",
+            "International Conference on Computational Linguistics",
+        ],
+        "kdd": [
+            "KDD",
+            "SIGKDD",
+            "ACM SIGKDD",
+            "ACM SIGKDD Conference on Knowledge Discovery and Data Mining",
+        ],
+        "ijcai": [
+            "IJCAI",
+            "International Joint Conference on Artificial Intelligence",
+        ],
+        "uai": [
+            "UAI",
+            "Conference on Uncertainty in Artificial Intelligence",
+        ],
+        "aistats": [
+            "AISTATS",
+            "International Conference on Artificial Intelligence and Statistics",
+        ],
+        "colt": [
+            "COLT",
+            "Conference on Learning Theory",
+        ],
+        "interspeech": [
+            "INTERSPEECH",
+            "Conference of the International Speech Communication Association",
+        ],
+        "icassp": [
+            "ICASSP",
+            "IEEE International Conference on Acoustics, Speech and Signal Processing",
+        ],
+        "sigir": [
+            "SIGIR",
+            "International ACM SIGIR Conference on Research and Development in Information Retrieval",
+        ],
+        "www": [
+            "WWW",
+            "The Web Conference",
+            "TheWebConf",
+            "ACM Web Conference 2023",
+        ],
+        "jmlr": [
+            "JMLR",
+            "Journal of Machine Learning Research",
+        ],
+        "tmlr": [
+            "TMLR",
+            "Transactions on Machine Learning Research",
+        ],
+        "tpami": [
+            "TPAMI",
+            "IEEE Transactions on Pattern Analysis and Machine Intelligence",
+        ],
+    }
+
+    def test_variant_spellings_canonicalize_to_same_venue(self):
+        """Every spelling variant must resolve to its canonical venue."""
+        for canonical, variants in self._SAME_VENUE.items():
+            for variant in variants:
+                assert get_canonical_venue(variant) == canonical, (
+                    f"{variant!r} should canonicalize to {canonical!r}, " f"got {get_canonical_venue(variant)!r}"
+                )
+
+    def test_bare_acronyms_resolve_to_self(self):
+        """Short bare acronyms must not substring-collide with a different venue.
+
+        Regression: "ACL" used to map to "naacl" because "acl" is a substring of
+        "naacl". The exact-match pass now resolves bare acronyms first.
+        """
+        assert get_canonical_venue("ACL") == "acl"
+        assert get_canonical_venue("KDD") == "kdd"
+        assert get_canonical_venue("UAI") == "uai"
+        assert get_canonical_venue("WWW") == "www"
+
+    def test_findings_track_keeps_base_venue(self):
+        """Findings tracks resolve to their own base venue, not a sibling.
+
+        "Findings of EMNLP" contains "association for computational linguistics"
+        (an ACL alias) once spelled out, so the substring fallback would collapse
+        it into ACL -- the explicit exact-match aliases prevent that.
+        """
+        assert get_canonical_venue("Findings of EMNLP") == "emnlp"
+        assert get_canonical_venue("Findings of the Association for Computational Linguistics: EMNLP 2023") == "emnlp"
+        assert get_canonical_venue("Findings of ACL") == "acl"
+        assert get_canonical_venue("Findings of NAACL") == "naacl"
+
+
+class TestDistinctVenuesStayDistinct:
+    """Aliases must only equate spellings of the SAME venue.
+
+    These guards fail loudly if an alias addition ever merges two genuinely
+    different venues (the original false-``venue_mismatch`` failure mode runs the
+    other direction, but collapsing distinct venues would hide real mismatches).
+    """
+
+    # Pairs that must canonicalize to DIFFERENT, non-None venues.
+    _DISTINCT_PAIRS = [
+        ("ICML", "ICLR"),
+        ("ICCV", "ECCV"),
+        ("ICCV", "CVPR"),
+        ("ECCV", "CVPR"),
+        ("ACL", "NAACL"),
+        ("ACL", "EMNLP"),
+        ("ACL", "EACL"),
+        ("NAACL", "EMNLP"),
+        ("EMNLP", "EACL"),
+        ("NAACL", "EACL"),
+        ("JMLR", "TMLR"),
+        ("NeurIPS", "ICML"),
+        ("Findings of EMNLP", "Findings of ACL"),
+        ("KDD", "SIGIR"),
+        ("UAI", "COLT"),
+        ("ICML", "AISTATS"),
+        ("COLING", "ACL"),
+    ]
+
+    def test_distinct_venue_pairs(self):
+        """Each look-alike pair must map to two different canonical venues."""
+        for left, right in self._DISTINCT_PAIRS:
+            cl, cr = get_canonical_venue(left), get_canonical_venue(right)
+            assert cl is not None, f"{left!r} should canonicalize to a known venue"
+            assert cr is not None, f"{right!r} should canonicalize to a known venue"
+            assert cl != cr, f"{left!r} ({cl}) and {right!r} ({cr}) must stay distinct"
+
+    def test_specific_distinct_keys(self):
+        """Spot-check the canonical keys for the most confusable venues."""
+        assert get_canonical_venue("ICML") != get_canonical_venue("ICLR")
+        assert get_canonical_venue("ICCV") != get_canonical_venue("ECCV")
+        assert get_canonical_venue("JMLR") != get_canonical_venue("TMLR")
+        assert get_canonical_venue("EMNLP") != get_canonical_venue("EACL")
