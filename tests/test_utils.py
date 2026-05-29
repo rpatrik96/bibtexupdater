@@ -578,3 +578,30 @@ class TestGivenNamePositionAudit:
         entry = "D. Acar and Y. Zhao and R. Navarro and M. Mattina"
         worst, _ = given_name_position_audit(entry, self._rec(self.REAL))
         assert worst in ("confirmed", "skip")
+
+    def test_repeated_surname_with_scrambled_order_does_not_escalate(self):
+        # Regression (df33d8b19854): two co-authors named Liu, and the record
+        # returns authors alphabetized (not publication order). A raw positional
+        # pairing put Wanwei Liu opposite Xinwang Liu -> false substitution. With
+        # the unique-surname guard, the repeated 'Liu' positions are skipped.
+        from bibtex_updater.utils import given_name_position_audit
+
+        entry = (
+            "Yufeng Zhang and Jialu Pan and Li Ken Li and Wanwei Liu and "
+            "Zhenbang Chen and Xinwang Liu and Ji Wang"
+        )
+        # Record authors alphabetized by surname (as the real source returned them).
+        rec = self._rec(
+            [
+                ("Zhenbang", "Chen"),
+                ("Li Ken", "Li"),
+                ("Wanwei", "Liu"),
+                ("Xinwang", "Liu"),
+                ("Jialu", "Pan"),
+                ("Ji", "Wang"),
+                ("Yufeng", "Zhang"),
+            ]
+        )
+        worst, findings = given_name_position_audit(entry, rec)
+        assert worst != "escalate"
+        assert not any(f["variety"] == "given_name_substitution" for f in findings)

@@ -443,7 +443,12 @@ def given_name_position_audit(entry_author_field: str, record: "PublishedRecord"
     Gated on ``order_reliable`` AND ``structured_names`` so it never runs on
     synthesized/flat-name sources (where given names and the family split are a
     guess). A position is audited only when its surname is already positionally
-    confirmed -- surname-level disagreements are the surname matcher's job.
+    confirmed AND that surname is UNIQUE on both sides. The uniqueness guard is
+    essential: when a surname repeats (two co-authors named "Liu") OR the record
+    returns authors in a non-publication order (some sources alphabetize), a raw
+    positional pairing can compare two DIFFERENT same-surname authors (Wanwei vs
+    Xinwang Liu) and read a benign reordering as a substitution. Requiring a
+    unique surname means a same-position surname match identifies the SAME author.
     """
     if not getattr(record, "order_reliable", False):
         return "skip", []
@@ -454,6 +459,11 @@ def given_name_position_audit(entry_author_field: str, record: "PublishedRecord"
     entry_pairs = [(last_name_from_person(n), _entry_given_of(n)) for n in entry_names]
     rec_pairs = [(_normalize_surname_key(a.get("family") or ""), a.get("given") or "") for a in record.authors]
 
+    from collections import Counter
+
+    entry_sur_counts = Counter(s for s, _ in entry_pairs if s)
+    rec_sur_counts = Counter(s for s, _ in rec_pairs if s)
+
     findings: list[dict] = []
     rank = {"skip": 0, "confirmed": 1, "soften": 2, "escalate": 3}
     worst = "skip"
@@ -462,6 +472,8 @@ def given_name_position_audit(entry_author_field: str, record: "PublishedRecord"
         r_sur, r_giv = rec_pairs[i]
         if not e_sur or not r_sur or e_sur != r_sur:
             continue  # surname not positionally confirmed here -> not our job
+        if entry_sur_counts[e_sur] > 1 or rec_sur_counts[r_sur] > 1:
+            continue  # repeated surname -> positional pairing is ambiguous, skip
         variety = classify_given_pair(e_giv, r_giv)
         cls = GIVEN_VARIETY_CLASS.get(variety, "skip")
         if cls == "skip":
