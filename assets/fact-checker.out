@@ -1,0 +1,28 @@
+INFO: Loaded 5 entries from demo.bib
+INFO: Total entries to check: 5
+INFO: Using Semantic Scholar API key (authenticated rate limits)
+INFO: Pre-validating DOIs for 5 entries...
+INFO: DOI pre-validation complete: 1 checked, 0 failed
+INFO: Checking 1/5: he2016resnet
+INFO: Checking 2/5: vaswani2017attention
+INFO: Checking 3/5: corrupted_authors
+INFO: Checking 4/5: radford2021clip
+INFO: Checking 5/5: fabricated_paper
+INFO: ============================================================
+INFO: SUMMARY: 5 entries checked
+INFO: By category:
+INFO:   academic: 5
+INFO: By status:
+INFO:   VERIFIED: 2
+INFO:   UNCONFIRMED: 1
+INFO:   AUTHOR_MISMATCH: 1
+INFO:   PARTIAL_MATCH: 1
+INFO: Results by bucket:
+INFO:   (1) VERIFIED:            2  (40.0%)
+INFO:   (2) COULD NOT VERIFY:    1  (20.0%)  -- no matching record found; not evidence of fabrication
+INFO:   (3) PROBLEMATIC:         2  (40.0%)  -- positive evidence of a problem
+INFO: Verified rate: 40.0%
+INFO: Could-not-verify rate: 20.0%
+WARNING: Problematic entries (positive evidence): 2
+INFO: Could-not-verify entries (abstained, no matching record found): 1
+INFO: Numeric confidence (0-100): mean=49.7, min=22.5, max=67.5
