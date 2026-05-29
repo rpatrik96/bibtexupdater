@@ -73,6 +73,7 @@ STATUS_BASE_CONFIDENCE = {
     # --- CLEARLY-PROBLEM (soft): one disagreeing field, rest match ---
     "title_mismatch": _PROB_SOFT,
     "author_mismatch": _PROB_SOFT,
+    "given_name_substitution": _PROB_SOFT,  # surnames match, a given name is a different person
     "year_mismatch": _PROB_SOFT,
     "venue_mismatch": _PROB_SOFT,
     "partial_match": _PROB_SOFT,

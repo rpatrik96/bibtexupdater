@@ -2058,6 +2058,65 @@ class TestDifferentEditionAbstains:
         assert status == FactCheckStatus.AUTHOR_MISMATCH
 
 
+class TestGivenNameSubstitutionRouting:
+    """End-to-end (via _compare_all_fields + _determine_status): a given-name
+    substitution on matching surnames, against an order-reliable structured
+    record, escalates to the distinct GIVEN_NAME_SUBSTITUTION status; an
+    initials-style correct citation is NOT flagged; an unstructured record never
+    escalates.
+    """
+
+    REAL_AUTHORS = [
+        {"given": "Durmus", "family": "Acar"},
+        {"given": "Yue", "family": "Zhao"},
+        {"given": "Ramon", "family": "Navarro"},
+        {"given": "Matthew", "family": "Mattina"},
+    ]
+    TITLE = "Federated Learning Based on Dynamic Regularization"
+
+    def _record(self, order_reliable=True, structured=True):
+        return PublishedRecord(
+            doi="10.1/x",
+            title=self.TITLE,
+            authors=self.REAL_AUTHORS,
+            year=2021,
+            order_reliable=order_reliable,
+            structured_names=structured,
+        )
+
+    def test_substitution_routes_to_given_name_substitution(self, fact_checker):
+        entry = {
+            "title": self.TITLE,
+            "author": "Durmus Acar and Yujing Zhao and Rafael Navarro and Matthew Mattina",
+            "year": "2021",  # no venue claim -> venue vacuously confirmed
+        }
+        comps = fact_checker._compare_all_fields(entry, self._record())
+        assert comps["author"].is_mismatch is True
+        findings = comps["author"].given_name_findings or []
+        assert any(f["variety"] == "given_name_substitution" for f in findings)
+        status = fact_checker._determine_status(0.95, comps, ["crossref"])
+        assert status == FactCheckStatus.GIVEN_NAME_SUBSTITUTION
+
+    def test_initials_style_correct_citation_verifies(self, fact_checker):
+        entry = {
+            "title": self.TITLE,
+            "author": "D. Acar and Y. Zhao and R. Navarro and M. Mattina",
+            "year": "2021",
+        }
+        comps = fact_checker._compare_all_fields(entry, self._record())
+        assert comps["author"].is_mismatch is False
+        assert fact_checker._determine_status(0.95, comps, ["crossref"]) == FactCheckStatus.VERIFIED
+
+    def test_unstructured_record_does_not_escalate(self, fact_checker):
+        entry = {
+            "title": self.TITLE,
+            "author": "Durmus Acar and Yujing Zhao and Rafael Navarro and Matthew Mattina",
+            "year": "2021",
+        }
+        comps = fact_checker._compare_all_fields(entry, self._record(structured=False))
+        assert comps["author"].is_mismatch is False  # audit gated off -> surname-level MATCH
+
+
 class TestDoiOrgRejection:
     """doi.org's own rejection of a DOI: 404/410, or a 400 returned with no
     redirect (a malformed / unregistered DOI like a fabricated '10.77771/...').

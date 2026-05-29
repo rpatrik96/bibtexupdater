@@ -73,6 +73,8 @@ from bibtex_updater.utils import (
     CROSSREF_API,
     DBLP_API_SEARCH,
     S2_API,
+    GivenNameVariety,
+    # Text normalization
     HttpClient,
     # Data classes
     PublishedRecord,
@@ -85,12 +87,12 @@ from bibtex_updater.utils import (
     dblp_hit_to_candidate_record,
     entry_surnames_against_structured,
     first_author_surname,
+    given_name_position_audit,
     is_valid_arxiv_id,
     # Matching
     jaccard_similarity,
     # DOI normalization (arXiv-version-aware)
     normalize_doi_for_resolution,
-    # Text normalization
     normalize_title_for_match,
     s2_data_to_record,
     same_surname_given_order_violation,
@@ -203,6 +205,10 @@ class FactCheckStatus(Enum):
     UNCONFIRMED = "unconfirmed"
     TITLE_MISMATCH = "title_mismatch"
     AUTHOR_MISMATCH = "author_mismatch"
+    # Surnames all align, but a co-author's GIVEN name is a different person's
+    # (e.g. 'Yue' -> 'Yujing' Zhao) -- a swapped/substituted author the surname
+    # check cannot see. Distinct from AUTHOR_MISMATCH so the root cause is clear.
+    GIVEN_NAME_SUBSTITUTION = "given_name_substitution"
     YEAR_MISMATCH = "year_mismatch"
     VENUE_MISMATCH = "venue_mismatch"
     PARTIAL_MATCH = "partial_match"
@@ -279,6 +285,11 @@ class FieldComparison:
     matches: bool
     note: str | None = None
     outcome: MatchOutcome | None = None
+    # Per-author given-name diagnostics (author field only): a list of
+    # {position, variety, entry_given, record_given} from the graded given-name
+    # audit, recording the nuance (diacritic/initial/middle-name/transliteration/
+    # nickname/substitution) so the user and downstream tools see the root cause.
+    given_name_findings: list[dict] | None = None
 
     @property
     def resolved_outcome(self) -> MatchOutcome:
@@ -2854,6 +2865,30 @@ class FactChecker:
             comparisons["author"].matches = False
             comparisons["author"].note = "Same-surname co-authors in a different given-name order (swapped authors)"
 
+        # Graded given-name audit: at every surname-confirmed position (against an
+        # order-preserving, structured record), grade the given name. A genuine
+        # substitution on matching surnames (e.g. 'Yue' -> 'Yujing' Zhao) escalates
+        # to a MISMATCH (routed to GIVEN_NAME_SUBSTITUTION); a low-confidence
+        # transliteration/nickname/initial variant softens an otherwise-confirmed
+        # author check to could-not-verify; benign variants (diacritic, initial,
+        # middle name) leave the verdict alone. Findings are recorded either way so
+        # the user/downstream see the root cause. The cost is asymmetric -- a leaked
+        # wrong author is far worse than a spurious flag -- but escalation is gated
+        # to full-vs-full substitutions on authoritative records, so correct
+        # initials/diacritic/CJK citations are never hard-flagged.
+        gn_class, gn_findings = given_name_position_audit(entry_authors, record)
+        if gn_findings:
+            comparisons["author"].given_name_findings = gn_findings
+        if comparisons["author"].resolved_outcome in (MatchOutcome.MATCH, MatchOutcome.PARTIAL):
+            if gn_class == "escalate":
+                comparisons["author"].outcome = MatchOutcome.MISMATCH
+                comparisons["author"].matches = False
+                comparisons["author"].note = "Given-name substitution on matching surnames (likely a wrong author)"
+            elif gn_class == "soften" and comparisons["author"].resolved_outcome is MatchOutcome.MATCH:
+                comparisons["author"].outcome = MatchOutcome.PARTIAL
+                comparisons["author"].matches = False
+                comparisons["author"].note = "Given-name variant could not be confirmed (translit/nickname/initial)"
+
         # Year (three-valued, mirroring venue/author). An empty or unparseable
         # year on either side cannot confirm OR refute the claim -> NON_COMPARABLE,
         # not a mismatch (the old two-valued flag read a blank record year as a
@@ -3029,6 +3064,13 @@ class FactChecker:
                 return FactCheckStatus.VENUE_MISMATCH
 
             if len(mismatches) == 1:
+                # A lone author mismatch driven by a given-name SUBSTITUTION
+                # (surnames match, a co-author's given name is a different person)
+                # gets its own status so the root cause is explicit.
+                if mismatches == ["author"]:
+                    findings = comparisons["author"].given_name_findings or []
+                    if any(f.get("variety") == GivenNameVariety.SUBSTITUTION for f in findings):
+                        return FactCheckStatus.GIVEN_NAME_SUBSTITUTION
                 mismatch_map = {
                     "title": FactCheckStatus.TITLE_MISMATCH,
                     "author": FactCheckStatus.AUTHOR_MISMATCH,
@@ -3478,6 +3520,7 @@ class FactCheckProcessor:
                         "similarity_score": c.similarity_score,
                         "matches": c.matches,
                         "note": c.note,
+                        **({"given_name_findings": c.given_name_findings} if c.given_name_findings else {}),
                     }
                     for name, c in r.field_comparisons.items()
                 },

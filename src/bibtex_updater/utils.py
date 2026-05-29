@@ -28,6 +28,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
+from rapidfuzz.distance import Levenshtein
 
 # ------------- Constants & Regex -------------
 
@@ -313,6 +314,174 @@ def same_surname_given_order_violation(entry_author_field: str, record: "Publish
         if all(entry_initials) and all(rec_initials) and entry_initials != rec_initials:
             return True
     return False
+
+
+# Graded given-name comparison (runs only after surnames already align). Each
+# tier is a benign-convention equivalence except the last; only a full-vs-full
+# incompatible first given token escalates. Tier -> verdict class is in
+# GIVEN_VARIETY_CLASS below.
+class GivenNameVariety:
+    EXACT = "given_exact"
+    DIACRITIC_HYPHEN = "given_diacritic_hyphen_variant"
+    INITIAL_COMPATIBLE = "given_initial_form"
+    MIDDLE_NAME = "given_middle_name_delta"
+    TRANSLITERATION = "given_transliteration_variant"
+    NICKNAME = "given_nickname_variant"
+    INITIAL_CONFLICT = "given_initial_conflict"
+    SUBSTITUTION = "given_name_substitution"
+    NON_COMPARABLE = "given_non_comparable"
+
+
+#: Verdict class per variety. "confirmed" = benign, verdict unchanged (note only);
+#: "soften" = low-confidence, route to could-not-verify with a note (never a hard
+#: flag); "escalate" = genuine substitution -> PROBLEMATIC; "skip" = nothing to say.
+GIVEN_VARIETY_CLASS: dict[str, str] = {
+    GivenNameVariety.EXACT: "confirmed",
+    GivenNameVariety.DIACRITIC_HYPHEN: "confirmed",
+    GivenNameVariety.INITIAL_COMPATIBLE: "confirmed",
+    GivenNameVariety.MIDDLE_NAME: "confirmed",
+    GivenNameVariety.TRANSLITERATION: "soften",
+    GivenNameVariety.NICKNAME: "soften",
+    GivenNameVariety.INITIAL_CONFLICT: "soften",
+    GivenNameVariety.SUBSTITUTION: "escalate",
+    GivenNameVariety.NON_COMPARABLE: "skip",
+}
+
+#: Close-spelling / romanization variants of a first given token within this edit
+#: distance are treated as a low-confidence TRANSLITERATION (softened, never
+#: escalated), so romanizations like "Sergey"/"Serguei" or "Aleksandr"/"Alexander"
+#: are not hard-flagged. A genuine different name (Yue/Yujing, Ramon/Rafael) is
+#: well beyond this. Tunable via the empirical FP check on the HALLMARK valid set.
+_GIVEN_SOFTEN_MAX_EDIT = 3
+
+#: Curated, finite hypocorism (nickname) groups; any two members are treated as a
+#: benign NICKNAME variant. Deliberately conservative.
+_NICKNAME_GROUPS: tuple[frozenset[str], ...] = (
+    frozenset({"william", "will", "bill", "billy"}),
+    frozenset({"robert", "rob", "bob", "bobby"}),
+    frozenset({"richard", "rich", "rick", "dick"}),
+    frozenset({"james", "jim", "jimmy"}),
+    frozenset({"john", "jack", "johnny"}),
+    frozenset({"joseph", "joe", "joey"}),
+    frozenset({"thomas", "tom", "tommy"}),
+    frozenset({"michael", "mike", "mikey"}),
+    frozenset({"charles", "charlie", "chuck"}),
+    frozenset({"christopher", "chris"}),
+    frozenset({"matthew", "matt"}),
+    frozenset({"anthony", "tony"}),
+    frozenset({"daniel", "dan", "danny"}),
+    frozenset({"david", "dave"}),
+    frozenset({"edward", "ed", "eddie", "ted"}),
+    frozenset({"alexander", "alex", "sasha", "aleksandr"}),
+    frozenset({"benjamin", "ben"}),
+    frozenset({"samuel", "sam"}),
+    frozenset({"nicholas", "nick"}),
+    frozenset({"andrew", "andy", "drew"}),
+    frozenset({"katherine", "kate", "katie", "kathy"}),
+    frozenset({"elizabeth", "liz", "beth", "betty"}),
+    frozenset({"margaret", "maggie", "meg", "peggy"}),
+)
+
+
+def _given_tokens(given: str) -> list[str]:
+    """Normalize a given-name string to comparison tokens: LaTeX-decoded,
+    diacritic-folded, lowercased, hyphens/dots split to spaces."""
+    g = strip_diacritics(latex_to_plain(given or "")).lower()
+    g = re.sub(r"[.\-]", " ", g)
+    g = re.sub(r"[^a-z0-9\s]", " ", g)
+    return [t for t in g.split() if t]
+
+
+def _is_initial_tokens(tokens: list[str]) -> bool:
+    return bool(tokens) and all(len(t) == 1 for t in tokens)
+
+
+def _nickname_equiv(a: str, b: str) -> bool:
+    return any(a in grp and b in grp for grp in _NICKNAME_GROUPS)
+
+
+def classify_given_pair(given_entry: str, given_record: str) -> str:
+    """Classify a single (entry, record) given-name pair into a GivenNameVariety.
+
+    First-hit-wins cascade. Only SUBSTITUTION (two FULL, non-initial first given
+    tokens that are neither a nickname pair nor within a small edit distance)
+    escalates; everything else is a benign convention or a low-confidence variant.
+    """
+    te, tr = _given_tokens(given_entry), _given_tokens(given_record)
+    if not te or not tr:
+        return GivenNameVariety.NON_COMPARABLE
+    if te == tr:
+        return GivenNameVariety.EXACT
+    # Separator/diacritic fold: "Jun-Yan" vs "Junyan", "Jun Yan" vs "Jun-Yan".
+    if "".join(te) == "".join(tr):
+        return GivenNameVariety.DIACRITIC_HYPHEN
+    # Initials on either side: an initials-only string is a benign abbreviation
+    # of the other ONLY if its letters are the leading initials in order.
+    if _is_initial_tokens(te) or _is_initial_tokens(tr):
+        short, long = (te, tr) if _is_initial_tokens(te) else (tr, te)
+        if len(short) <= len(long) and all(short[i] == long[i][0] for i in range(len(short))):
+            return GivenNameVariety.INITIAL_COMPATIBLE
+        return GivenNameVariety.INITIAL_CONFLICT
+    # Both sides carry a full (non-initial) given name from here.
+    if te[0] == tr[0]:
+        # Same first given token, differing middle/extra tokens -> middle-name
+        # presence/absence (benign): "Diederik P." vs "Diederik".
+        return GivenNameVariety.MIDDLE_NAME
+    if _nickname_equiv(te[0], tr[0]):
+        return GivenNameVariety.NICKNAME
+    if Levenshtein.distance(te[0], tr[0]) <= _GIVEN_SOFTEN_MAX_EDIT:
+        return GivenNameVariety.TRANSLITERATION
+    return GivenNameVariety.SUBSTITUTION
+
+
+def given_name_position_audit(entry_author_field: str, record: "PublishedRecord") -> tuple[str, list[dict]]:
+    """Grade given names at every surname-confirmed position against an
+    order-preserving, structured record. Returns ``(worst_class, findings)`` where
+    worst_class is one of "escalate" / "soften" / "confirmed" / "skip" and findings
+    is a per-position list of ``{position, variety, entry_given, record_given}``.
+
+    Gated on ``order_reliable`` AND ``structured_names`` so it never runs on
+    synthesized/flat-name sources (where given names and the family split are a
+    guess). A position is audited only when its surname is already positionally
+    confirmed -- surname-level disagreements are the surname matcher's job.
+    """
+    if not getattr(record, "order_reliable", False):
+        return "skip", []
+    if not getattr(record, "structured_names", False) or not record.authors:
+        return "skip", []
+
+    entry_names = split_authors_bibtex(entry_author_field)
+    entry_pairs = [(last_name_from_person(n), _entry_given_of(n)) for n in entry_names]
+    rec_pairs = [(_normalize_surname_key(a.get("family") or ""), a.get("given") or "") for a in record.authors]
+
+    findings: list[dict] = []
+    rank = {"skip": 0, "confirmed": 1, "soften": 2, "escalate": 3}
+    worst = "skip"
+    for i in range(min(len(entry_pairs), len(rec_pairs))):
+        e_sur, e_giv = entry_pairs[i]
+        r_sur, r_giv = rec_pairs[i]
+        if not e_sur or not r_sur or e_sur != r_sur:
+            continue  # surname not positionally confirmed here -> not our job
+        variety = classify_given_pair(e_giv, r_giv)
+        cls = GIVEN_VARIETY_CLASS.get(variety, "skip")
+        if cls == "skip":
+            continue
+        findings.append({"position": i, "variety": variety, "entry_given": e_giv, "record_given": r_giv})
+        if rank[cls] > rank[worst]:
+            worst = cls
+    return worst, findings
+
+
+def _entry_given_of(name: str) -> str:
+    """Best-effort given-name string for a flat entry author ('Given Family' or
+    'Family, Given'). Mirrors last_name_from_person's surname extraction."""
+    name = latex_to_plain(name or "").strip()
+    if not name:
+        return ""
+    if "," in name:
+        return name.split(",", 1)[1].strip()
+    toks = name.split()
+    return " ".join(toks[:-1]) if len(toks) > 1 else ""
 
 
 def authors_last_names(author_field: str, limit: int = 3) -> list[str]:

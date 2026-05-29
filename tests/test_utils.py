@@ -500,3 +500,81 @@ class TestSameSurnameGivenOrderViolation:
             structured_names=True,
         )
         assert same_surname_given_order_violation("Jiaming Song and Yang Song", rec) is False
+
+
+class TestClassifyGivenPair:
+    """Graded given-name cascade: only a full-vs-full incompatible first token
+    (not a nickname/close-spelling variant) escalates."""
+
+    def _class(self, e, r):
+        from bibtex_updater.utils import GIVEN_VARIETY_CLASS, classify_given_pair
+
+        return GIVEN_VARIETY_CLASS[classify_given_pair(e, r)]
+
+    def test_substitution_escalates(self):
+        assert self._class("Yujing", "Yue") == "escalate"  # d67418 Zhao
+        assert self._class("Rafael", "Ramon") == "escalate"  # d67418 Navarro
+        assert self._class("Yoshua", "Yann") == "escalate"
+
+    def test_benign_variants_confirmed(self):
+        assert self._class("D. P.", "Diederik P.") == "confirmed"  # initials
+        assert self._class("Diederik", "Diederik P.") == "confirmed"  # middle name
+        assert self._class("Stephane", "St{\\'e}phane") == "confirmed"  # diacritic/LaTeX
+        assert self._class("Jun-Yan", "Junyan") == "confirmed"  # hyphen fold
+        assert self._class("Yue", "Yue") == "confirmed"  # exact
+
+    def test_low_confidence_softens(self):
+        assert self._class("Bill", "William") == "soften"  # nickname
+        assert self._class("Sergey", "Serguei") == "soften"  # close romanization
+        assert self._class("Y.", "Jiaming") == "soften"  # initial conflict
+
+    def test_missing_given_is_non_comparable(self):
+        assert self._class("", "Yue") == "skip"
+        assert self._class("Yue", "") == "skip"
+
+
+class TestGivenNamePositionAudit:
+    """The audit escalates a genuine substitution only on an order-reliable,
+    structured record, at surname-confirmed positions."""
+
+    def _rec(self, pairs, order_reliable=True, structured=True):
+        from bibtex_updater.utils import PublishedRecord
+
+        return PublishedRecord(
+            doi="10.1/x",
+            title="T",
+            authors=[{"given": g, "family": f} for g, f in pairs],
+            order_reliable=order_reliable,
+            structured_names=structured,
+        )
+
+    # d67418: real Yue Zhao / Ramon Navarro; entry Yujing Zhao / Rafael Navarro.
+    ENTRY = "Durmus Acar and Yujing Zhao and Rafael Navarro and Matthew Mattina"
+    REAL = [("Durmus", "Acar"), ("Yue", "Zhao"), ("Ramon", "Navarro"), ("Matthew", "Mattina")]
+
+    def test_substitution_escalates_on_structured_record(self):
+        from bibtex_updater.utils import given_name_position_audit
+
+        worst, findings = given_name_position_audit(self.ENTRY, self._rec(self.REAL))
+        assert worst == "escalate"
+        assert any(f["variety"] == "given_name_substitution" for f in findings)
+
+    def test_no_escalation_on_unstructured_record(self):
+        from bibtex_updater.utils import given_name_position_audit
+
+        worst, _ = given_name_position_audit(self.ENTRY, self._rec(self.REAL, structured=False))
+        assert worst == "skip"
+
+    def test_no_escalation_when_not_order_reliable(self):
+        from bibtex_updater.utils import given_name_position_audit
+
+        worst, _ = given_name_position_audit(self.ENTRY, self._rec(self.REAL, order_reliable=False))
+        assert worst == "skip"
+
+    def test_correct_initials_citation_is_confirmed(self):
+        from bibtex_updater.utils import given_name_position_audit
+
+        # Initials-style entry against the real full names -> never escalates.
+        entry = "D. Acar and Y. Zhao and R. Navarro and M. Mattina"
+        worst, _ = given_name_position_audit(entry, self._rec(self.REAL))
+        assert worst in ("confirmed", "skip")
