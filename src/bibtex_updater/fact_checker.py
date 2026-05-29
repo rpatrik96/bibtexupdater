@@ -81,6 +81,7 @@ from bibtex_updater.utils import (
     authors_last_names,
     crossref_message_to_record,
     dblp_hit_to_candidate_record,
+    entry_surnames_against_structured,
     first_author_surname,
     is_valid_arxiv_id,
     # Matching
@@ -1859,6 +1860,23 @@ class FactChecker:
         field_comparisons = self._compare_all_fields(entry, best_match)
         status = self._determine_status(best_score, field_comparisons, sources_with_hits)
 
+        # FPR guard (Task 2b): an AUTHOR_MISMATCH driven by a candidate from a
+        # source WITHOUT authoritative given/family names (S2 flat names, a DBLP
+        # hit, an OpenAlex display_name) may be a NAME-PARSING artifact rather
+        # than a real author discrepancy. Before trusting it, re-check the SAME
+        # paper against a STRUCTURED source (Crossref by DOI, else Crossref title
+        # search). If the structured comparison MATCHES, the mismatch was a parse
+        # artifact -> recompute the comparison/status against the structured
+        # record. If it still mismatches (or no structured source is reachable),
+        # the AUTHOR_MISMATCH stands. This only changes WHICH surname tokens are
+        # compared; it never relaxes ordering or the match threshold.
+        if status is FactCheckStatus.AUTHOR_MISMATCH and not best_match.structured_names:
+            structured_rec = self._structured_author_recheck(entry, best_match)
+            if structured_rec is not None:
+                best_match = structured_rec
+                field_comparisons = self._compare_all_fields(entry, best_match)
+                status = self._determine_status(best_score, field_comparisons, sources_with_hits)
+
         # Post-match: check preprint status. UNCONFIRMED is included because a
         # venue we could not confirm is exactly the case where an independent
         # preprint-only signal (arXiv-only, no DOI/venue) upgrades the verdict to
@@ -1986,7 +2004,7 @@ class FactChecker:
         and ``NON_COMPARABLE`` (missing authors on either side) all return
         ``None`` so valid citations are never touched.
         """
-        entry_names = authors_last_names(entry.get("author", ""), limit=10_000)
+        entry_names = self._entry_surname_keys(entry, rec, limit=10_000)
         api_names = rec.surname_keys(limit=10_000)
         # Nothing comparable on either side -> cannot refute (FPR-safe).
         if not entry_names or not api_names:
@@ -2113,14 +2131,8 @@ class FactChecker:
         if not entry_title:
             return None
 
-        try:
-            msg = self.crossref.get_by_doi(raw_doi)
-        except Exception:
-            return None
+        rec = self._structured_record_by_doi(raw_doi)
         # Cannot determine -> do NOT flag (keeps FPR low).
-        if msg is None:
-            return None
-        rec = crossref_message_to_record(msg)
         if rec is None or not rec.title:
             return None
 
@@ -2158,6 +2170,116 @@ class FactChecker:
                 f"match entry title {entry.get('title', '')!r}"
             ],
         )
+
+    def _structured_record_by_doi(self, raw_doi: str) -> PublishedRecord | None:
+        """Fetch the Crossref ``message`` for ``raw_doi`` as a structured record.
+
+        Shared by ``_check_doi_consistency`` (DOI-target consistency) and
+        ``_structured_author_recheck`` (Task 2b name-parse FPR guard) so the
+        ``get_by_doi`` round-trip is never duplicated. Crossref returns
+        authoritative ``given``/``family`` fields, so the resulting record has
+        ``structured_names=True``. Returns ``None`` on any non-200 / parse / no
+        DOI so callers treat "cannot determine" as no evidence (FPR-safe).
+        """
+        if not raw_doi:
+            return None
+        try:
+            msg = self.crossref.get_by_doi(raw_doi)
+        except Exception:
+            return None
+        if msg is None:
+            return None
+        return crossref_message_to_record(msg)
+
+    def _structured_author_recheck(
+        self, entry: dict[str, Any], best_match: PublishedRecord
+    ) -> PublishedRecord | None:
+        """Re-fetch the cited paper from a STRUCTURED source to vet an AUTHOR_MISMATCH.
+
+        Called only when the candidate that produced an AUTHOR_MISMATCH came from
+        a source WITHOUT authoritative given/family names (``best_match`` has
+        ``structured_names`` False). A family-first CJK name flattened by such a
+        source can be mis-tokenized (entry "Chen Xing" vs a flat "Xing Chen"
+        record), so the mismatch may be a parsing artifact rather than a real
+        author discrepancy.
+
+        Strategy (reuses existing fetch paths, no duplicate work):
+          1. If the entry carries a DOI, fetch the structured Crossref record via
+             the shared ``_structured_record_by_doi`` (same call
+             ``_check_doi_consistency`` uses).
+          2. Otherwise, if the entry has a confident title, run a fielded
+             Crossref title+author search and take the single best
+             title-matching hit.
+
+        The returned structured record is handed back ONLY when (a) its title
+        confirms it is the cited paper and (b) the author comparison against its
+        authoritative given/family names is a positive MATCH. In every other
+        case (no structured source reachable, title doesn't confirm, or authors
+        STILL mismatch) we return ``None`` so the original AUTHOR_MISMATCH stands.
+        This narrows surname tokenization only; it never relaxes author ordering
+        or the match threshold.
+        """
+        entry_title = normalize_title_for_match(entry.get("title", ""))
+        if not authors_last_names(entry.get("author", ""), limit=10_000):
+            return None
+
+        # ----- Path 1: DOI present -> authoritative Crossref record. -----
+        raw_doi = entry.get("doi", "") or ""
+        structured: PublishedRecord | None = None
+        if raw_doi:
+            rec = self._structured_record_by_doi(raw_doi)
+            if rec is not None and rec.structured_names and rec.title and entry_title:
+                doi_title = normalize_title_for_match(rec.title)
+                if token_sort_ratio(entry_title, doi_title) / 100.0 >= self.config.doi_consistency_min_title:
+                    structured = rec
+
+        # ----- Path 2: no usable DOI hit -> confident-title Crossref search. -----
+        if structured is None and entry_title:
+            raw_title = entry.get("title", "") or ""
+            first_author = first_author_surname(entry)
+            try:
+                items = self.crossref.search(raw_title, rows=5, title=raw_title, author=first_author)
+            except Exception:
+                items = []
+            best_struct: PublishedRecord | None = None
+            best_title_score = 0.0
+            for item in items or []:
+                rec = crossref_message_to_record(item)
+                if rec is None or not rec.structured_names or not rec.title:
+                    continue
+                ts = token_sort_ratio(entry_title, normalize_title_for_match(rec.title)) / 100.0
+                if ts > best_title_score:
+                    best_title_score, best_struct = ts, rec
+            # Require a CONFIDENT title to be sure we re-checked the same paper.
+            if best_struct is not None and best_title_score >= self.config.title_threshold:
+                structured = best_struct
+
+        if structured is None:
+            return None
+
+        # Re-run the author comparison against authoritative given/family keys.
+        # Same matcher, same threshold, same ordering rules -- only the surname
+        # tokens are now trustworthy. The entry side is disambiguated against the
+        # structured family set (resolving family-first CJK names).
+        api_names = structured.surname_keys(limit=10_000)
+        if not api_names:
+            return None
+        entry_names = self._entry_surname_keys(entry, structured, limit=10_000)
+        author_result = symmetric_author_match(entry_names, api_names, threshold=self.config.author_threshold)
+        if not author_result.is_confirmed:
+            # Still not a positive MATCH (genuine different/swapped/placeholder
+            # authors, or only a partial confirmation) -> keep AUTHOR_MISMATCH.
+            return None
+
+        self.logger.debug(
+            "Author mismatch for entry %r suppressed: structured Crossref record "
+            "confirms authors %r match entry %r (was mis-tokenized by an "
+            "unstructured source)",
+            entry.get("ID", "?"),
+            api_names,
+            entry_names,
+        )
+        return structured
 
     def _query_arxiv_by_id(
         self,
@@ -2440,6 +2562,24 @@ class FactChecker:
 
         return False
 
+    @staticmethod
+    def _entry_surname_keys(entry: dict[str, Any], record: PublishedRecord, limit: int = 10_000) -> list[str]:
+        """Entry surname keys to compare against ``record``.
+
+        When ``record`` has AUTHORITATIVE given/family names (Crossref), use the
+        record's family set to disambiguate order-ambiguous comma-less entry
+        names (family-first CJK names): ``entry_surnames_against_structured``
+        picks the entry token that matches a known family. Otherwise the record
+        cannot disambiguate anything, so use the plain ``authors_last_names``
+        heuristic. Either way each entry author maps to one surname at its own
+        position -- ordering/first-author checks downstream are untouched.
+        """
+        if record.structured_names:
+            family_keys = set(record.surname_keys(limit=limit))
+            if family_keys:
+                return entry_surnames_against_structured(entry.get("author", ""), family_keys, limit=limit)
+        return authors_last_names(entry.get("author", ""), limit=limit)
+
     def _compare_all_fields(self, entry: dict[str, Any], record: PublishedRecord) -> dict[str, FieldComparison]:
         """Compare all relevant fields between entry and record."""
         comparisons: dict[str, FieldComparison] = {}
@@ -2472,7 +2612,7 @@ class FactChecker:
         # correctly cited paper that lists fewer authors (or "and others") scored
         # below threshold purely from the length asymmetry.
         entry_authors = entry.get("author", "")
-        entry_names = authors_last_names(entry_authors, limit=10_000)
+        entry_names = self._entry_surname_keys(entry, record, limit=10_000)
         api_names = record.surname_keys(limit=10_000)
         author_result = symmetric_author_match(entry_names, api_names, threshold=cfg.author_threshold)
         api_authors_str = " and ".join(f"{a.get('given', '')} {a.get('family', '')}".strip() for a in record.authors)
