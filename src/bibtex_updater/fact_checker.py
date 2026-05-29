@@ -2095,7 +2095,9 @@ class FactChecker:
         # Nothing comparable on either side -> cannot refute (FPR-safe).
         if not entry_names or not api_names:
             return None
-        author_result = symmetric_author_match(entry_names, api_names, threshold=self.config.author_threshold)
+        author_result = symmetric_author_match(
+            entry_names, api_names, threshold=self.config.author_threshold, order_reliable=rec.order_reliable
+        )
         if not author_result.is_mismatch:
             return None
 
@@ -2346,7 +2348,9 @@ class FactChecker:
         if not api_names:
             return None
         entry_names = self._entry_surname_keys(entry, structured, limit=10_000)
-        author_result = symmetric_author_match(entry_names, api_names, threshold=self.config.author_threshold)
+        author_result = symmetric_author_match(
+            entry_names, api_names, threshold=self.config.author_threshold, order_reliable=structured.order_reliable
+        )
         if not author_result.is_confirmed:
             # Still not a positive MATCH (genuine different/swapped/placeholder
             # authors, or only a partial confirmation) -> keep AUTHOR_MISMATCH.
@@ -2784,7 +2788,9 @@ class FactChecker:
         entry_authors = entry.get("author", "")
         entry_names = self._entry_surname_keys(entry, record, limit=10_000)
         api_names = record.surname_keys(limit=10_000)
-        author_result = symmetric_author_match(entry_names, api_names, threshold=cfg.author_threshold)
+        author_result = symmetric_author_match(
+            entry_names, api_names, threshold=cfg.author_threshold, order_reliable=record.order_reliable
+        )
         api_authors_str = " and ".join(f"{a.get('given', '')} {a.get('family', '')}".strip() for a in record.authors)
         # Mirror the venue "no claim" rule: if the entry lists no authors there is
         # nothing to confirm (vacuously MATCH). A PARTIAL (consistent-but-

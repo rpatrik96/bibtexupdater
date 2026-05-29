@@ -224,6 +224,7 @@ def openalex_work_to_candidate_record(work: dict[str, Any]) -> PublishedRecord |
         journal=journal,
         year=year,
         type=work_type,
+        order_reliable=True,
     )
 
 
@@ -451,6 +452,7 @@ def openreview_note_to_candidate_record(note: dict[str, Any]) -> PublishedRecord
         year=year,
         type="conference",
         structured_names=all_structured,
+        order_reliable=True,
     )
 
 

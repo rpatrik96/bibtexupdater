@@ -296,6 +296,61 @@ class TestSymmetricAuthorMatch:
         assert result.outcome in (MatchOutcome.MATCH, MatchOutcome.MISMATCH)
 
 
+class TestAuthorOrderSensitivity:
+    """Author ORDER is a reliable signal when the matched record comes from an
+    order-preserving source (Crossref/OpenAlex/DBLP/OpenReview return authors in
+    publication order -- verified empirically). A citation that lists the SAME
+    authors in a DIFFERENT order (a swapped-authors corruption that keeps the lead
+    author) is then a real MISMATCH. Against an order-unreliable source (Semantic
+    Scholar's synthesized names) order is ignored, preserving the prior behavior.
+    """
+
+    def test_reordered_authors_mismatch_when_order_reliable(self):
+        # Same set, lead author unchanged, interior authors scrambled (the OSAKA
+        # swapped_authors signature). Old behavior: high Jaccard -> MATCH.
+        entry = ["caccia", "lin", "rodriguez", "ostapenko"]
+        api = ["caccia", "rodriguez", "ostapenko", "lin"]
+        r = symmetric_author_match(entry, api, order_reliable=True)
+        assert r.outcome is MatchOutcome.MISMATCH
+
+    def test_reordered_authors_not_flagged_when_order_unreliable(self):
+        entry = ["caccia", "lin", "rodriguez", "ostapenko"]
+        api = ["caccia", "rodriguez", "ostapenko", "lin"]
+        r = symmetric_author_match(entry, api, order_reliable=False)
+        assert r.outcome is not MatchOutcome.MISMATCH
+
+    def test_order_insensitive_is_the_default(self):
+        entry = ["caccia", "lin", "rodriguez", "ostapenko"]
+        api = ["caccia", "rodriguez", "ostapenko", "lin"]
+        assert symmetric_author_match(entry, api).outcome is not MatchOutcome.MISMATCH
+
+    def test_correct_full_order_still_matches_when_order_reliable(self):
+        names = ["smith", "doe", "jones"]
+        assert symmetric_author_match(names, names, order_reliable=True).outcome is MatchOutcome.MATCH
+
+    def test_leading_prefix_with_sentinel_still_confirmed_when_order_reliable(self):
+        # Correct order, explicitly truncated -> still a confirmation (order kept).
+        r = symmetric_author_match(["smith", "doe", "others"], ["smith", "doe", "jones", "brown"], order_reliable=True)
+        assert r.outcome is MatchOutcome.MATCH
+
+    def test_in_order_subsequence_still_partial_when_order_reliable(self):
+        # Interior author dropped but SAME relative order -> PARTIAL, not an
+        # order-mismatch (order was preserved, the claim is just incomplete).
+        entry = ["smith", "jones", "others"]
+        api = ["smith", "doe", "jones", "brown"]
+        assert symmetric_author_match(entry, api, order_reliable=True).outcome is MatchOutcome.PARTIAL
+
+    def test_first_author_swap_mismatch_regardless_of_flag(self):
+        r = symmetric_author_match(["wrong", "doe"], ["smith", "doe"], order_reliable=True)
+        assert r.outcome is MatchOutcome.MISMATCH
+
+    def test_low_overlap_different_paper_mismatches_via_score(self):
+        # Genuinely different authors (same lead by coincidence) -> MISMATCH via the
+        # score path, not the order rule (overlap below the gate).
+        r = symmetric_author_match(["alpha", "beta", "gamma"], ["alpha", "delta", "epsilon"], order_reliable=True)
+        assert r.outcome is MatchOutcome.MISMATCH
+
+
 # ------------- FIX E-venue: Preprint / series venue Tests -------------
 
 

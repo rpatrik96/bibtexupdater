@@ -1270,6 +1270,12 @@ class PublishedRecord:
     # synthesized one is unreliable for CJK/family-first names and is re-derived
     # from the full name via ``last_name_from_person``.
     structured_names: bool = False
+    # True when this source returns authors in PUBLICATION ORDER (Crossref,
+    # OpenAlex, DBLP, OpenReview -- verified empirically). The author matcher then
+    # treats a reordered author list as a real swapped-authors mismatch. Semantic
+    # Scholar (synthesized names, less reliable ordering) leaves this False so
+    # order is ignored.
+    order_reliable: bool = False
 
     def surname_keys(self, limit: int = 3) -> list[str]:
         """Canonical surname comparison keys derived from ``self.authors``.
@@ -1383,6 +1389,7 @@ def crossref_message_to_record(msg: dict[str, Any]) -> PublishedRecord | None:
         pages=msg.get("page"),
         type=typ,
         structured_names=has_structured_family,
+        order_reliable=True,
     )
 
 
@@ -1551,6 +1558,7 @@ def dblp_hit_to_candidate_record(hit: dict[str, Any]) -> PublishedRecord | None:
         number=info.get("number"),
         pages=info.get("pages"),
         type=record_type,
+        order_reliable=True,
     )
 
 

@@ -252,6 +252,7 @@ def symmetric_author_match(
     api_names: list[str],
     threshold: float = 0.80,
     prefix_n: int = 5,
+    order_reliable: bool = False,
 ) -> AuthorMatchResult:
     """Compare entry vs API author surnames on a *symmetric* basis (trichotomy).
 
@@ -312,6 +313,21 @@ def symmetric_author_match(
     # with a sentinel -- the elision is not a simple leading truncation.
     if _is_ordered_subsequence(a, b) or _is_ordered_subsequence(b, a):
         return AuthorMatchResult(MatchOutcome.PARTIAL, 1.0)
+
+    # Author ORDER mismatch. Having reached here, the lists share the lead author
+    # and are neither equal, a leading prefix, nor an in-order subsequence -- the
+    # shared authors appear in a DIFFERENT relative order. When the matched record
+    # comes from an order-preserving source (Crossref/OpenAlex/DBLP/OpenReview all
+    # return authors in publication order), and the two lists overlap
+    # substantially, that reordering is a real swapped-authors defect in the
+    # citation, not a retrieval artifact -> MISMATCH. Sources that synthesize
+    # names without a reliable order (Semantic Scholar) pass order_reliable=False
+    # and fall through to the order-agnostic score below.
+    if order_reliable:
+        common = set(a) & set(b)
+        overlap = len(common) / max(1, min(len(a), len(b)))
+        if overlap >= 0.6:
+            return AuthorMatchResult(MatchOutcome.MISMATCH, 0.0)
 
     # Symmetric slice + combined (Jaccard + LCS) score.
     n = min(len(a), len(b), prefix_n)
