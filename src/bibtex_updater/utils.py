@@ -239,6 +239,82 @@ def _normalize_surname_key(family: str) -> str:
     return ""
 
 
+def _given_initial_from_full(name: str) -> str:
+    """First alphabetic initial of the GIVEN name in a flat person string.
+
+    Handles 'Family, Given' (given = after the comma) and 'Given ... Family'
+    (given = everything but the last token). Returns '' when no given name is
+    present (mononym / surname-only).
+    """
+    name = latex_to_plain(name or "").strip()
+    if not name:
+        return ""
+    if "," in name:
+        given = name.split(",", 1)[1].strip()
+    else:
+        toks = name.split()
+        given = " ".join(toks[:-1]) if len(toks) > 1 else ""
+    given = strip_diacritics(given).lower().strip()
+    for ch in given:
+        if ch.isalpha():
+            return ch
+    return ""
+
+
+def _given_initial(given: str) -> str:
+    """First alphabetic initial of an already-isolated given-name string."""
+    g = strip_diacritics(latex_to_plain(given or "")).lower().strip()
+    for ch in g:
+        if ch.isalpha():
+            return ch
+    return ""
+
+
+def same_surname_given_order_violation(entry_author_field: str, record: "PublishedRecord") -> bool:
+    """Detect a swap/mismatch between two authors who share a surname.
+
+    Surname-only matching is blind to a swap of two co-authors with the SAME
+    surname (e.g. 'Yang Song' <-> 'Jiaming Song'): both reduce to 'song', so the
+    ordered surname lists look identical. When the matched record is from an
+    order-preserving source (``order_reliable``), compare the GIVEN-name initials
+    of each shared-surname run, in document order; a difference is a real
+    author-order/identity corruption the surname check cannot see.
+
+    Conservative by construction -- fires ONLY when, for a surname appearing >= 2
+    times, BOTH sides have the SAME count (aligned runs) AND every author in the
+    run has a usable given initial on both sides. A dropped/added same-surname
+    author (unequal counts) or any missing given name leaves this to the
+    surname-level logic instead.
+    """
+    if not getattr(record, "order_reliable", False) or not record.authors:
+        return False
+
+    entry_pairs = [
+        (last_name_from_person(n), _given_initial_from_full(n)) for n in split_authors_bibtex(entry_author_field)
+    ]
+    rec_pairs: list[tuple[str, str]] = []
+    for a in record.authors:
+        family = (a.get("family") or "").strip()
+        if record.structured_names and family:
+            surname = _normalize_surname_key(family)
+        else:
+            surname = last_name_from_person(f"{a.get('given', '') or ''} {family}".strip())
+        rec_pairs.append((surname, _given_initial(a.get("given", ""))))
+
+    from collections import Counter
+
+    entry_counts = Counter(sk for sk, _ in entry_pairs if sk)
+    rec_counts = Counter(sk for sk, _ in rec_pairs if sk)
+    for surname, n in entry_counts.items():
+        if n < 2 or rec_counts.get(surname, 0) != n:
+            continue  # not a shared-surname run aligned on both sides
+        entry_initials = [gi for sk, gi in entry_pairs if sk == surname]
+        rec_initials = [gi for sk, gi in rec_pairs if sk == surname]
+        if all(entry_initials) and all(rec_initials) and entry_initials != rec_initials:
+            return True
+    return False
+
+
 def authors_last_names(author_field: str, limit: int = 3) -> list[str]:
     """Extract last names from BibTeX author field.
 

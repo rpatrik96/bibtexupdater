@@ -434,3 +434,69 @@ class TestAtomicReplace:
         assert excinfo.value.errno == errno.EACCES
         # Source must remain untouched on failure.
         assert src.exists()
+
+
+class TestSameSurnameGivenOrderViolation:
+    """A swap of two co-authors sharing a surname (e.g. 'Yang Song' <-> 'Jiaming
+    Song') is invisible to surname-only matching; against an order-preserving
+    record, comparing given-name initials catches it. Conservative: aligned
+    shared-surname runs with given names on both sides only."""
+
+    def _record(self, names, order_reliable=True, structured=True):
+        from bibtex_updater.utils import PublishedRecord
+
+        authors = []
+        for n in names:
+            given, family = n.rsplit(" ", 1)
+            authors.append({"given": given, "family": family})
+        return PublishedRecord(
+            doi="10.1/x", title="T", authors=authors, order_reliable=order_reliable, structured_names=structured
+        )
+
+    # SDEdit: real order has Yang Song then Jiaming Song; entry swaps them.
+    SDEDIT_REAL = ["Chenlin Meng", "Yutong He", "Yang Song", "Jiaming Song", "Jun-Yan Zhu"]
+    SDEDIT_ENTRY = "Chenlin Meng and Yutong He and Jiaming Song and Yang Song and Jun-Yan Zhu"
+
+    def test_same_surname_swap_is_violation(self):
+        from bibtex_updater.utils import same_surname_given_order_violation
+
+        assert same_surname_given_order_violation(self.SDEDIT_ENTRY, self._record(self.SDEDIT_REAL)) is True
+
+    def test_correct_order_is_not_a_violation(self):
+        from bibtex_updater.utils import same_surname_given_order_violation
+
+        entry = " and ".join(self.SDEDIT_REAL)  # same order as the record
+        assert same_surname_given_order_violation(entry, self._record(self.SDEDIT_REAL)) is False
+
+    def test_no_check_when_record_not_order_reliable(self):
+        from bibtex_updater.utils import same_surname_given_order_violation
+
+        rec = self._record(self.SDEDIT_REAL, order_reliable=False)
+        assert same_surname_given_order_violation(self.SDEDIT_ENTRY, rec) is False
+
+    def test_no_shared_surname_run_is_not_a_violation(self):
+        from bibtex_updater.utils import same_surname_given_order_violation
+
+        entry = "Alice Smith and Bob Jones and Carol Lee"
+        rec = self._record(["Alice Smith", "Bob Jones", "Carol Lee"])
+        assert same_surname_given_order_violation(entry, rec) is False
+
+    def test_unequal_surname_counts_skipped(self):
+        from bibtex_updater.utils import same_surname_given_order_violation
+
+        # Entry dropped one 'Song' -> counts differ -> left to surname-level logic.
+        entry = "Chenlin Meng and Yutong He and Yang Song and Jiajun Wu and Jun-Yan Zhu and Stefano Ermon"
+        assert same_surname_given_order_violation(entry, self._record(self.SDEDIT_REAL)) is False
+
+    def test_missing_given_names_skipped(self):
+        from bibtex_updater.utils import PublishedRecord, same_surname_given_order_violation
+
+        # Record authors have no given names -> cannot disambiguate -> no violation.
+        rec = PublishedRecord(
+            doi="10.1/x",
+            title="T",
+            authors=[{"given": "", "family": "Song"}, {"given": "", "family": "Song"}],
+            order_reliable=True,
+            structured_names=True,
+        )
+        assert same_surname_given_order_violation("Jiaming Song and Yang Song", rec) is False

@@ -93,6 +93,7 @@ from bibtex_updater.utils import (
     # Text normalization
     normalize_title_for_match,
     s2_data_to_record,
+    same_surname_given_order_violation,
     strip_diacritics,
 )
 
@@ -2821,6 +2822,19 @@ class FactChecker:
             note=author_note,
             outcome=author_outcome,
         )
+
+        # Same-surname given-name swap. Surname-only matching is blind to a swap of
+        # two co-authors who share a surname (e.g. 'Yang Song' <-> 'Jiaming Song' --
+        # both reduce to 'song'). When the matched record preserves author order,
+        # compare the given-name initials of each shared-surname run; a difference
+        # is a real corruption that an otherwise-confirming author check missed.
+        if (
+            comparisons["author"].resolved_outcome in (MatchOutcome.MATCH, MatchOutcome.PARTIAL)
+            and same_surname_given_order_violation(entry_authors, record)
+        ):
+            comparisons["author"].outcome = MatchOutcome.MISMATCH
+            comparisons["author"].matches = False
+            comparisons["author"].note = "Same-surname co-authors in a different given-name order (swapped authors)"
 
         # Year (three-valued, mirroring venue/author). An empty or unparseable
         # year on either side cannot confirm OR refute the claim -> NON_COMPARABLE,
