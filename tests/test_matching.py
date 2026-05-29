@@ -411,3 +411,215 @@ class TestExpandedVenueAliases:
         db_venues = ["sigmod", "vldb", "icde"]
         for venue in db_venues:
             assert venue in EXPANDED_VENUE_ALIASES, f"{venue} should be in alias map"
+
+
+class TestVenueAliasExpansion:
+    """Same venue written differently must canonicalize identically.
+
+    Each entry maps a canonical key to a list of spellings (acronym, long form,
+    numbered/dated proceedings, publisher-decorated forms) that should ALL
+    resolve to that single canonical venue.
+    """
+
+    # canonical -> variant spellings that must all map to it
+    _SAME_VENUE = {
+        "neurips": [
+            "NeurIPS",
+            "NIPS",
+            "Advances in Neural Information Processing Systems",
+            "Conference on Neural Information Processing Systems",
+            "Advances in Neural Information Processing Systems 36 (NeurIPS 2023)",
+            "The 36th Conference on Neural Information Processing Systems",
+        ],
+        "icml": [
+            "ICML",
+            "International Conference on Machine Learning",
+            "Proceedings of the 40th International Conference on Machine Learning",
+            "Proceedings of the 40th International Conference on Machine Learning, PMLR",
+        ],
+        "iclr": [
+            "ICLR",
+            "International Conference on Learning Representations",
+            "Proceedings of the International Conference on Learning Representations",
+        ],
+        "cvpr": [
+            "CVPR",
+            "IEEE Conference on Computer Vision and Pattern Recognition",
+            "IEEE/CVF Conference on Computer Vision and Pattern Recognition",
+            "Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition",
+        ],
+        "iccv": [
+            "ICCV",
+            "IEEE International Conference on Computer Vision",
+            "IEEE/CVF International Conference on Computer Vision",
+            "Proceedings of the IEEE/CVF International Conference on Computer Vision",
+        ],
+        "eccv": [
+            "ECCV",
+            "European Conference on Computer Vision",
+        ],
+        "aaai": [
+            "AAAI",
+            "AAAI Conference on Artificial Intelligence",
+            "Proceedings of the AAAI Conference on Artificial Intelligence",
+        ],
+        "acl": [
+            "ACL",
+            "Annual Meeting of the Association for Computational Linguistics",
+            "Findings of ACL",
+            "Findings of the Association for Computational Linguistics: ACL 2023",
+        ],
+        "emnlp": [
+            "EMNLP",
+            "Conference on Empirical Methods in Natural Language Processing",
+            "Findings of EMNLP",
+            "Findings of the Association for Computational Linguistics: EMNLP 2023",
+        ],
+        "naacl": [
+            "NAACL",
+            "NAACL-HLT",
+            "North American Chapter of the Association for Computational Linguistics",
+            "Findings of NAACL",
+        ],
+        "eacl": [
+            "EACL",
+            "Conference of the European Chapter of the Association for Computational Linguistics",
+            "Findings of EACL",
+        ],
+        "coling": [
+            "COLING",
+            "International Conference on Computational Linguistics",
+        ],
+        "kdd": [
+            "KDD",
+            "SIGKDD",
+            "ACM SIGKDD",
+            "ACM SIGKDD Conference on Knowledge Discovery and Data Mining",
+        ],
+        "ijcai": [
+            "IJCAI",
+            "International Joint Conference on Artificial Intelligence",
+        ],
+        "uai": [
+            "UAI",
+            "Conference on Uncertainty in Artificial Intelligence",
+        ],
+        "aistats": [
+            "AISTATS",
+            "International Conference on Artificial Intelligence and Statistics",
+        ],
+        "colt": [
+            "COLT",
+            "Conference on Learning Theory",
+        ],
+        "interspeech": [
+            "INTERSPEECH",
+            "Conference of the International Speech Communication Association",
+        ],
+        "icassp": [
+            "ICASSP",
+            "IEEE International Conference on Acoustics, Speech and Signal Processing",
+        ],
+        "sigir": [
+            "SIGIR",
+            "International ACM SIGIR Conference on Research and Development in Information Retrieval",
+        ],
+        "www": [
+            "WWW",
+            "The Web Conference",
+            "TheWebConf",
+            "ACM Web Conference 2023",
+        ],
+        "jmlr": [
+            "JMLR",
+            "Journal of Machine Learning Research",
+        ],
+        "tmlr": [
+            "TMLR",
+            "Transactions on Machine Learning Research",
+        ],
+        "tpami": [
+            "TPAMI",
+            "IEEE Transactions on Pattern Analysis and Machine Intelligence",
+        ],
+    }
+
+    def test_variant_spellings_canonicalize_to_same_venue(self):
+        """Every spelling variant must resolve to its canonical venue."""
+        for canonical, variants in self._SAME_VENUE.items():
+            for variant in variants:
+                assert get_canonical_venue(variant) == canonical, (
+                    f"{variant!r} should canonicalize to {canonical!r}, "
+                    f"got {get_canonical_venue(variant)!r}"
+                )
+
+    def test_bare_acronyms_resolve_to_self(self):
+        """Short bare acronyms must not substring-collide with a different venue.
+
+        Regression: "ACL" used to map to "naacl" because "acl" is a substring of
+        "naacl". The exact-match pass now resolves bare acronyms first.
+        """
+        assert get_canonical_venue("ACL") == "acl"
+        assert get_canonical_venue("KDD") == "kdd"
+        assert get_canonical_venue("UAI") == "uai"
+        assert get_canonical_venue("WWW") == "www"
+
+    def test_findings_track_keeps_base_venue(self):
+        """Findings tracks resolve to their own base venue, not a sibling.
+
+        "Findings of EMNLP" contains "association for computational linguistics"
+        (an ACL alias) once spelled out, so the substring fallback would collapse
+        it into ACL -- the explicit exact-match aliases prevent that.
+        """
+        assert get_canonical_venue("Findings of EMNLP") == "emnlp"
+        assert (
+            get_canonical_venue("Findings of the Association for Computational Linguistics: EMNLP 2023")
+            == "emnlp"
+        )
+        assert get_canonical_venue("Findings of ACL") == "acl"
+        assert get_canonical_venue("Findings of NAACL") == "naacl"
+
+
+class TestDistinctVenuesStayDistinct:
+    """Aliases must only equate spellings of the SAME venue.
+
+    These guards fail loudly if an alias addition ever merges two genuinely
+    different venues (the original false-``venue_mismatch`` failure mode runs the
+    other direction, but collapsing distinct venues would hide real mismatches).
+    """
+
+    # Pairs that must canonicalize to DIFFERENT, non-None venues.
+    _DISTINCT_PAIRS = [
+        ("ICML", "ICLR"),
+        ("ICCV", "ECCV"),
+        ("ICCV", "CVPR"),
+        ("ECCV", "CVPR"),
+        ("ACL", "NAACL"),
+        ("ACL", "EMNLP"),
+        ("ACL", "EACL"),
+        ("NAACL", "EMNLP"),
+        ("EMNLP", "EACL"),
+        ("NAACL", "EACL"),
+        ("JMLR", "TMLR"),
+        ("NeurIPS", "ICML"),
+        ("Findings of EMNLP", "Findings of ACL"),
+        ("KDD", "SIGIR"),
+        ("UAI", "COLT"),
+        ("ICML", "AISTATS"),
+        ("COLING", "ACL"),
+    ]
+
+    def test_distinct_venue_pairs(self):
+        """Each look-alike pair must map to two different canonical venues."""
+        for left, right in self._DISTINCT_PAIRS:
+            cl, cr = get_canonical_venue(left), get_canonical_venue(right)
+            assert cl is not None, f"{left!r} should canonicalize to a known venue"
+            assert cr is not None, f"{right!r} should canonicalize to a known venue"
+            assert cl != cr, f"{left!r} ({cl}) and {right!r} ({cr}) must stay distinct"
+
+    def test_specific_distinct_keys(self):
+        """Spot-check the canonical keys for the most confusable venues."""
+        assert get_canonical_venue("ICML") != get_canonical_venue("ICLR")
+        assert get_canonical_venue("ICCV") != get_canonical_venue("ECCV")
+        assert get_canonical_venue("JMLR") != get_canonical_venue("TMLR")
+        assert get_canonical_venue("EMNLP") != get_canonical_venue("EACL")

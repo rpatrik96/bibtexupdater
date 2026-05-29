@@ -332,11 +332,18 @@ EXPANDED_VENUE_ALIASES: dict[str, set[str]] = {
         "neural information processing systems",
         "conference on neural information processing systems",
         "annual conference on neural information processing systems",
+        # Numbered proceedings, e.g. "The 36th Conference on Neural ..." -- the
+        # ordinal/year is stripped during normalization, leaving these forms.
+        "th conference on neural information processing systems",
+        "th annual conference on neural information processing systems",
     },
     "icml": {
         "international conference on machine learning",
         "proceedings of the international conference on machine learning",
+        # "Proceedings of the Nth International Conference on Machine Learning":
+        # the ordinal year is removed by normalization, leaving "th ...".
         "proceedings of the th international conference on machine learning",
+        "th international conference on machine learning",
     },
     "iclr": {
         "international conference on learning representations",
@@ -344,34 +351,84 @@ EXPANDED_VENUE_ALIASES: dict[str, set[str]] = {
     },
     "aaai": {
         "association for the advancement of artificial intelligence",
+        "aaai conference on artificial intelligence",
         "proceedings of the aaai conference on artificial intelligence",
     },
     "cvpr": {
         "computer vision and pattern recognition",
         "ieee conference on computer vision and pattern recognition",
         "ieee/cvf conference on computer vision and pattern recognition",
+        "conference on computer vision and pattern recognition",
     },
     "iccv": {
         "international conference on computer vision",
         "ieee international conference on computer vision",
         "ieee/cvf international conference on computer vision",
     },
-    "eccv": {"european conference on computer vision"},
+    "eccv": {
+        "european conference on computer vision",
+    },
     "acl": {
         "association for computational linguistics",
         "annual meeting of the association for computational linguistics",
+        # Findings track of ACL -- a distinct track of the SAME venue.
+        "findings of acl",
+        "findings of the association for computational linguistics: acl",
     },
     "emnlp": {
         "empirical methods in natural language processing",
         "conference on empirical methods in natural language processing",
+        # Findings track of EMNLP. The exact-match pass resolves these before
+        # the substring fallback would otherwise collapse them into "acl".
+        "findings of emnlp",
+        "findings of the association for computational linguistics: emnlp",
     },
-    "naacl": {"north american chapter of the association for computational linguistics"},
-    "kdd": {"knowledge discovery and data mining"},
-    "ijcai": {"international joint conference on artificial intelligence"},
-    "uai": {"uncertainty in artificial intelligence"},
-    "aistats": {"artificial intelligence and statistics"},
-    "jmlr": {"journal of machine learning research"},
-    "tmlr": {"transactions on machine learning research"},
+    "naacl": {
+        "north american chapter of the association for computational linguistics",
+        "annual conference of the north american chapter of the association for computational linguistics",
+        "naacl-hlt",
+        "naacl hlt",
+        "findings of naacl",
+        "findings of the association for computational linguistics: naacl",
+    },
+    "kdd": {
+        "knowledge discovery and data mining",
+        "sigkdd",
+        "acm sigkdd",
+        "acm sigkdd conference on knowledge discovery and data mining",
+        "acm sigkdd international conference on knowledge discovery and data mining",
+    },
+    "ijcai": {
+        "international joint conference on artificial intelligence",
+    },
+    "uai": {
+        "uncertainty in artificial intelligence",
+        "conference on uncertainty in artificial intelligence",
+    },
+    "aistats": {
+        "artificial intelligence and statistics",
+        "international conference on artificial intelligence and statistics",
+    },
+    "colt": {
+        "conference on learning theory",
+        "annual conference on learning theory",
+        "annual conference on computational learning theory",
+    },
+    "interspeech": {
+        "conference of the international speech communication association",
+        "annual conference of the international speech communication association",
+    },
+    "icassp": {
+        "international conference on acoustics, speech and signal processing",
+        "ieee international conference on acoustics, speech and signal processing",
+        "ieee international conference on acoustics, speech, and signal processing",
+    },
+    "jmlr": {
+        "journal of machine learning research",
+    },
+    "tmlr": {
+        "transactions on machine learning research",
+    },
     # Systems/DB (new)
     "sigmod": {
         "acm sigmod",
@@ -406,10 +463,12 @@ EXPANDED_VENUE_ALIASES: dict[str, set[str]] = {
     },
     "www": {
         "the web conference",
+        "thewebconf",
         "world wide web",
         "international world wide web conference",
         "international conference on world wide web",
         "proceedings of the web conference",
+        "acm web conference",
     },
     "wsdm": {
         "web search and data mining",
@@ -453,6 +512,9 @@ EXPANDED_VENUE_ALIASES: dict[str, set[str]] = {
     "eacl": {
         "european chapter of the association for computational linguistics",
         "proceedings of the european chapter of the association for computational linguistics",
+        "conference of the european chapter of the association for computational linguistics",
+        "findings of eacl",
+        "findings of the association for computational linguistics: eacl",
     },
     "conll": {
         "conference on computational natural language learning",
@@ -539,13 +601,24 @@ def get_canonical_venue(venue: str, aliases: dict[str, set[str]] | None = None) 
     if not venue_norm:
         return None
 
+    # Pass 1: exact equality against every canonical key and alias, including
+    # short acronyms (len <= 3). This must run before any substring matching so
+    # that a bare acronym ("ACL", "KDD", "UAI") maps to its own canonical venue
+    # instead of substring-colliding with a *different* acronym that merely
+    # contains it ("acl" is a substring of "naacl"). Exact match is always safe.
+    for canonical, alias_set in aliases.items():
+        if venue_norm == canonical or venue_norm in alias_set:
+            return canonical
+
+    # Pass 2: substring matching for spelled-out / decorated forms. Skip names
+    # <= 3 chars here: short acronyms are substrings of longer venue names and of
+    # each other, so substring-matching them produces false collisions (handled
+    # exactly by Pass 1 above).
     for canonical, alias_set in aliases.items():
         all_names = alias_set | {canonical}
         for name in all_names:
             if len(name) <= 3:
                 continue
-            if name == venue_norm:
-                return canonical
             # Generic single-word *journal* names ("nature"/"science") are
             # prefixes of distinct sibling journals ("Nature Physics", "Science
             # Robotics"), so substring matching would wrongly collapse them and
