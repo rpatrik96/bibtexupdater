@@ -100,9 +100,24 @@ def safe_lower(x: str | None) -> str:
 # This only equates variant spellings of one name; it never merges distinct names.
 _NONDECOMPOSING_FOLD = str.maketrans(
     {
-        "ß": "ss", "ẞ": "ss", "ø": "o", "Ø": "O", "đ": "d", "Đ": "D",
-        "ł": "l", "Ł": "L", "æ": "ae", "Æ": "AE", "œ": "oe", "Œ": "OE",
-        "ð": "d", "Ð": "D", "þ": "th", "Þ": "TH", "ı": "i", "ŧ": "t",
+        "ß": "ss",
+        "ẞ": "ss",
+        "ø": "o",
+        "Ø": "O",
+        "đ": "d",
+        "Đ": "D",
+        "ł": "l",
+        "Ł": "L",
+        "æ": "ae",
+        "Æ": "AE",
+        "œ": "oe",
+        "Œ": "OE",
+        "ð": "d",
+        "Ð": "D",
+        "þ": "th",
+        "Þ": "TH",
+        "ı": "i",
+        "ŧ": "t",
     }
 )
 
@@ -254,9 +269,7 @@ def _name_tokens(name: str) -> list[str]:
     return [t for t in name.split() if t and len(t) > 1 and not re.fullmatch(r"\d{4}", t)]
 
 
-def entry_surnames_against_structured(
-    author_field: str, family_keys: set[str], limit: int = 3
-) -> list[str]:
+def entry_surnames_against_structured(author_field: str, family_keys: set[str], limit: int = 3) -> list[str]:
     """Entry surname keys, disambiguated by an AUTHORITATIVE family-name set.
 
     The comma-less entry name "Chen Xing" is order-ambiguous: ``last_name_from_person``

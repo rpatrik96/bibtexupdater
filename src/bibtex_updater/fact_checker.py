@@ -2199,13 +2199,10 @@ class FactChecker:
             # identifier, so a genuine author mismatch here is positive evidence
             # of ID-anchored author fabrication (swapped/placeholder authors on
             # an entry that otherwise carries the correct DOI).
-            return self._id_anchored_author_mismatch(
-                entry, rec, source="crossref", identifier=raw_doi, id_kind="DOI"
-            )
+            return self._id_anchored_author_mismatch(entry, rec, source="crossref", identifier=raw_doi, id_kind="DOI")
 
         self.logger.warning(
-            "DOI %s for entry %r points to a different paper: entry title "
-            "%r vs DOI title %r (title score %.2f)",
+            "DOI %s for entry %r points to a different paper: entry title " "%r vs DOI title %r (title score %.2f)",
             raw_doi,
             entry.get("ID", "?"),
             entry.get("title", ""),
@@ -2247,9 +2244,7 @@ class FactChecker:
             return None
         return crossref_message_to_record(msg)
 
-    def _structured_author_recheck(
-        self, entry: dict[str, Any], best_match: PublishedRecord
-    ) -> PublishedRecord | None:
+    def _structured_author_recheck(self, entry: dict[str, Any], best_match: PublishedRecord) -> PublishedRecord | None:
         """Re-fetch the cited paper from a STRUCTURED source to vet an AUTHOR_MISMATCH.
 
         Called only when the candidate that produced an AUTHOR_MISMATCH came from
@@ -2519,9 +2514,7 @@ class FactChecker:
         if self.openreview is not None:
             sources_queried.append("openreview")
             try:
-                or_notes = self.openreview.search(
-                    query, limit=top_k, title=raw_title, first_author=first_author
-                )
+                or_notes = self.openreview.search(query, limit=top_k, title=raw_title, first_author=first_author)
             except Exception as exc:
                 or_notes = []
                 errors.append(f"OpenReview: {exc}")

@@ -175,9 +175,7 @@ class TestDoiConsistency:
     def test_consistency_check_disabled_by_config(self, dead_sources, logger):
         """With the guard disabled the wrong DOI is not flagged (opt-out works)."""
         crossref, dblp, s2 = dead_sources
-        crossref.get_by_doi = MagicMock(
-            return_value=_crossref_message("A Completely Different Paper", "10.0/x")
-        )
+        crossref.get_by_doi = MagicMock(return_value=_crossref_message("A Completely Different Paper", "10.0/x"))
         config = FactCheckerConfig(check_doi_consistency=False)
         checker = FactChecker(crossref, dblp, s2, config, logger)
 

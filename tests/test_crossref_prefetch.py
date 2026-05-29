@@ -159,9 +159,7 @@ class TestPrefetchWarmsCache:
                 "Delving into Localization Errors for Monocular 3D Object Detection",
                 "10.1109/CVPR46437.2021.00469",
             ),
-            "CVPR52729.2023.01457": _works_payload(
-                "Segment Anything in High Quality", "10.1109/CVPR52729.2023.01457"
-            ),
+            "CVPR52729.2023.01457": _works_payload("Segment Anything in High Quality", "10.1109/CVPR52729.2023.01457"),
         }
         http, transport = _make_http(routes, tmp_path)
         checker = _checker(http, logger)
@@ -238,9 +236,7 @@ class TestVerdictNeutral:
                 "10.1109/CVPR46437.2021.00469",
             ),
             # Wrong DOI -> DOI_MISMATCH for ImageBind.
-            "CVPR52729.2023.01457": _works_payload(
-                "Segment Anything in High Quality", "10.1109/CVPR52729.2023.01457"
-            ),
+            "CVPR52729.2023.01457": _works_payload("Segment Anything in High Quality", "10.1109/CVPR52729.2023.01457"),
         }
         http, _ = _make_http(routes, tmp_path)
         checker = _checker(http, logger)
@@ -266,9 +262,7 @@ class TestVerdictNeutral:
                 "Delving into Localization Errors for Monocular 3D Object Detection",
                 "10.1109/CVPR46437.2021.00469",
             ),
-            "CVPR52729.2023.01457": _works_payload(
-                "Segment Anything in High Quality", "10.1109/CVPR52729.2023.01457"
-            ),
+            "CVPR52729.2023.01457": _works_payload("Segment Anything in High Quality", "10.1109/CVPR52729.2023.01457"),
         }
         entries = [_ibrnet_entry(), _imagebind_entry()]
 

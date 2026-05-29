@@ -549,8 +549,7 @@ class TestVenueAliasExpansion:
         for canonical, variants in self._SAME_VENUE.items():
             for variant in variants:
                 assert get_canonical_venue(variant) == canonical, (
-                    f"{variant!r} should canonicalize to {canonical!r}, "
-                    f"got {get_canonical_venue(variant)!r}"
+                    f"{variant!r} should canonicalize to {canonical!r}, " f"got {get_canonical_venue(variant)!r}"
                 )
 
     def test_bare_acronyms_resolve_to_self(self):
@@ -572,10 +571,7 @@ class TestVenueAliasExpansion:
         it into ACL -- the explicit exact-match aliases prevent that.
         """
         assert get_canonical_venue("Findings of EMNLP") == "emnlp"
-        assert (
-            get_canonical_venue("Findings of the Association for Computational Linguistics: EMNLP 2023")
-            == "emnlp"
-        )
+        assert get_canonical_venue("Findings of the Association for Computational Linguistics: EMNLP 2023") == "emnlp"
         assert get_canonical_venue("Findings of ACL") == "acl"
         assert get_canonical_venue("Findings of NAACL") == "naacl"
 

@@ -49,12 +49,7 @@ ABSTAIN_STATUSES = (
     "url_accessible",
 )
 # Every status the calibrator must price (excludes "skipped" = not verifiable).
-ALL_VERDICT_STATUSES = (
-    CORRECT_STATUSES
-    + PROBLEM_STRONG_STATUSES
-    + PROBLEM_SOFT_STATUSES
-    + ABSTAIN_STATUSES
-)
+ALL_VERDICT_STATUSES = CORRECT_STATUSES + PROBLEM_STRONG_STATUSES + PROBLEM_SOFT_STATUSES + ABSTAIN_STATUSES
 
 
 def _end_to_end(status, *, found, match_score):
@@ -86,6 +81,7 @@ def _natural_problem_conf(status):
         return _end_to_end(status, found=True, match_score=0.6)
     # Self-contained problems: no scored candidate.
     return _end_to_end(status, found=False, match_score=None)
+
 
 # ------------- Fixtures -------------
 
@@ -586,10 +582,7 @@ class TestBucketCoherence:
         """Prior invariant: max(abstention) < min(either confident bucket)."""
         max_abstain = max(STATUS_BASE_CONFIDENCE[s] for s in ABSTAIN_STATUSES)
         min_correct = min(STATUS_BASE_CONFIDENCE[s] for s in CORRECT_STATUSES)
-        min_problem = min(
-            STATUS_BASE_CONFIDENCE[s]
-            for s in PROBLEM_STRONG_STATUSES + PROBLEM_SOFT_STATUSES
-        )
+        min_problem = min(STATUS_BASE_CONFIDENCE[s] for s in PROBLEM_STRONG_STATUSES + PROBLEM_SOFT_STATUSES)
         assert max_abstain < min_correct
         assert max_abstain < min_problem
 
@@ -606,9 +599,7 @@ class TestBucketCoherence:
         adjudicate must not report higher confidence than a decided one.
         """
         # Confident verdicts under their natural evidence context.
-        correct_confs = [
-            _end_to_end(s, found=True, match_score=0.95) for s in CORRECT_STATUSES
-        ]
+        correct_confs = [_end_to_end(s, found=True, match_score=0.95) for s in CORRECT_STATUSES]
         strong_confs = [_natural_problem_conf(s) for s in PROBLEM_STRONG_STATUSES]
         soft_confs = [_natural_problem_conf(s) for s in PROBLEM_SOFT_STATUSES]
         # Abstentions: vary found/score to prove neither inflates them.
@@ -619,9 +610,7 @@ class TestBucketCoherence:
 
         worst_confident = min(correct_confs + strong_confs + soft_confs)
         best_abstain = max(abstain_confs)
-        assert best_abstain < worst_confident, (
-            f"abstention {best_abstain:.3f} >= confident {worst_confident:.3f}"
-        )
+        assert best_abstain < worst_confident, f"abstention {best_abstain:.3f} >= confident {worst_confident:.3f}"
 
     def test_strong_problems_ge_soft_problems_end_to_end(self):
         """End-to-end (each status under its natural evidence context):

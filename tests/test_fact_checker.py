@@ -873,9 +873,7 @@ class TestFactCheckProcessor:
         # problematic = partial_match (now included so buckets fully partition)
         assert summary["problematic_count"] == 1
         # All four entries are accounted for across the three buckets.
-        assert (
-            summary["verified_count"] + summary["abstained_count"] + summary["problematic_count"] == summary["total"]
-        )
+        assert summary["verified_count"] + summary["abstained_count"] + summary["problematic_count"] == summary["total"]
 
     def test_generate_json_report(self, processor, sample_published_record):
         results = [

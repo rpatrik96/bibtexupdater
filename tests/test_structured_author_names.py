@@ -115,16 +115,12 @@ class TestSurnameKeysUsesFamily:
 
     def test_crossref_literal_only_is_not_structured(self):
         """A literal-only Crossref author was split by us, so it is unstructured."""
-        rec = crossref_message_to_record(
-            {"DOI": "10.1/x", "title": ["t"], "author": [{"literal": "Xing Chen"}]}
-        )
+        rec = crossref_message_to_record({"DOI": "10.1/x", "title": ["t"], "author": [{"literal": "Xing Chen"}]})
         assert rec is not None
         assert rec.structured_names is False
 
     def test_s2_flat_name_is_not_structured(self):
-        rec = s2_data_to_record(
-            {"doi": "10.1/x", "title": "t", "authors": [{"name": "Xing Chen"}], "venue": "J"}
-        )
+        rec = s2_data_to_record({"doi": "10.1/x", "title": "t", "authors": [{"name": "Xing Chen"}], "venue": "J"})
         assert rec is not None
         assert rec.structured_names is False
 
@@ -162,18 +158,14 @@ class TestCjkFlipMatches:
         """Documents the bug: without disambiguation "Chen Xing" -> "xing"."""
         from bibtex_updater.utils import authors_last_names
 
-        rec = PublishedRecord(
-            doi="10.1/x", authors=[{"given": "Xing", "family": "Chen"}], structured_names=True
-        )
+        rec = PublishedRecord(doi="10.1/x", authors=[{"given": "Xing", "family": "Chen"}], structured_names=True)
         naive_entry = authors_last_names("Chen Xing", limit=10_000)  # ["xing"]
         result = symmetric_author_match(naive_entry, rec.surname_keys(10_000), threshold=0.8)
         assert result.outcome is MatchOutcome.MISMATCH  # the old false positive
 
     def test_comma_form_entry_already_unambiguous(self):
         """A comma-form entry "Chen, Xing" is already family-first -> "chen"."""
-        rec = PublishedRecord(
-            doi="10.1/x", authors=[{"given": "Xing", "family": "Chen"}], structured_names=True
-        )
+        rec = PublishedRecord(doi="10.1/x", authors=[{"given": "Xing", "family": "Chen"}], structured_names=True)
         family_keys = set(rec.surname_keys(10_000))
         keys = entry_surnames_against_structured("Chen, Xing", family_keys, limit=10_000)
         assert keys == ["chen"]
@@ -274,9 +266,7 @@ class TestCascadeStructuredFallback:
             {"given": "Alice", "family": "Smith"},
             {"given": "Bob", "family": "Jones"},
         ]
-        crossref.get_by_doi = MagicMock(
-            return_value=_crossref_message(entry["title"], entry["doi"], different_authors)
-        )
+        crossref.get_by_doi = MagicMock(return_value=_crossref_message(entry["title"], entry["doi"], different_authors))
         crossref.search = MagicMock(return_value=[])
         s2.search = MagicMock(
             return_value=[
@@ -348,12 +338,8 @@ class TestGuardsPreserved:
             {"given": "Real", "family": "Researcher"},
             {"given": "Actual", "family": "Scientist"},
         ]
-        crossref.get_by_doi = MagicMock(
-            return_value=_crossref_message(entry["title"], entry["doi"], real_authors)
-        )
-        crossref.search = MagicMock(
-            return_value=[_crossref_message(entry["title"], entry["doi"], real_authors)]
-        )
+        crossref.get_by_doi = MagicMock(return_value=_crossref_message(entry["title"], entry["doi"], real_authors))
+        crossref.search = MagicMock(return_value=[_crossref_message(entry["title"], entry["doi"], real_authors)])
         checker = FactChecker(crossref, dblp, s2, FactCheckerConfig(), logger)
 
         result = checker.check_entry(entry)
@@ -391,12 +377,8 @@ class TestGuardsPreserved:
             {"given": "Genuine", "family": "Person"},
             {"given": "Another", "family": "Individual"},
         ]
-        crossref.get_by_doi = MagicMock(
-            return_value=_crossref_message(entry["title"], entry["doi"], real_authors)
-        )
-        crossref.search = MagicMock(
-            return_value=[_crossref_message(entry["title"], entry["doi"], real_authors)]
-        )
+        crossref.get_by_doi = MagicMock(return_value=_crossref_message(entry["title"], entry["doi"], real_authors))
+        crossref.search = MagicMock(return_value=[_crossref_message(entry["title"], entry["doi"], real_authors)])
         checker = FactChecker(crossref, dblp, s2, FactCheckerConfig(), logger)
 
         result = checker.check_entry(entry)
