@@ -122,7 +122,7 @@ class TestQueryCascade:
         dblp = MagicMock()
         s2 = MagicMock()
         s2.search.return_value = list(s2_items)
-        config = FactCheckerConfig(cascade_mode=True, top_k=3)
+        config = FactCheckerConfig(top_k=3)
         if config_override:
             for k, v in config_override.items():
                 setattr(config, k, v)

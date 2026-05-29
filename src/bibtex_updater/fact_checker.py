@@ -81,7 +81,6 @@ from bibtex_updater.utils import (
     authors_last_names,
     crossref_message_to_record,
     dblp_hit_to_candidate_record,
-    dblp_hit_to_record,
     first_author_surname,
     is_valid_arxiv_id,
     # Matching
@@ -359,12 +358,10 @@ class FactCheckerConfig:
     # treated as a *different* paper. Deliberately low (mirrors arXiv) so only
     # clear different-paper cases trip it.
     doi_consistency_min_title: float = 0.50
-    # CheckIfExist additions (Item 1 + 2): explicit cascading + top-K retrieval.
-    # Default on: the cascade (CrossRef -> OpenAlex -> S2) short-circuits on a
-    # high-confidence match, so the slow keyless-S2 / specialist sources stay
-    # off the hot path for easy entries. Set False to fall back to the legacy
-    # parallel CrossRef+DBLP+S2 fan-out (queries every source on every entry).
-    cascade_mode: bool = True
+    # CheckIfExist additions (Item 1 + 2): cascading + top-K retrieval.
+    # Verification uses the CrossRef -> OpenAlex -> DBLP -> Semantic Scholar
+    # cascade, which short-circuits on a high-confidence match so the slow
+    # keyless-S2 / specialist sources stay off the hot path for easy entries.
     top_k: int = DEFAULT_TOP_K
     cascade_low_confidence: float = CASCADE_LOW_CONFIDENCE
     cascade_high_confidence: float = CASCADE_HIGH_CONFIDENCE
@@ -1625,9 +1622,7 @@ class FactChecker:
         # and tests that don't need preprint verification keep working.
         self.arxiv: ArxivClient | None = arxiv
         # OpenAlex client is optional; tests can pass a fake. The cascade falls
-        # back to creating a default client if not provided but only when
-        # cascade_mode is on -- otherwise legacy parallel-search keeps current
-        # CrossRef/DBLP/S2 behavior.
+        # back to creating a default client if not provided.
         self.openalex: OpenAlexClient | None = openalex
         # The most recent cross-source author intersection (set by check_entry).
         self.last_author_intersection: AuthorIntersectionResult | None = None
@@ -1804,11 +1799,8 @@ class FactChecker:
                 return doi_consistency_status
 
         query = f"{title_norm} {first_author}".strip()
-        # Item 1: explicit cascade vs. legacy parallel search.
-        if self.config.cascade_mode:
-            candidates = self._query_cascade(entry, query, sources_queried, sources_with_hits, errors)
-        else:
-            candidates = self._query_all_sources(entry, query, sources_queried, sources_with_hits, errors)
+        # Item 1: cascading source order (CrossRef -> OpenAlex -> DBLP -> S2).
+        candidates = self._query_cascade(entry, query, sources_queried, sources_with_hits, errors)
 
         # Authoritative arXiv-by-ID lookup. Added as an extra candidate so valid
         # but not-yet-indexed preprints verify instead of being flagged
@@ -2200,106 +2192,6 @@ class FactChecker:
         authors_ref = authors_last_names(entry.get("author", ""), limit=3)
         score = self._score_candidate(title_norm, authors_ref, rec)
         return [(score, rec, "arxiv")]
-
-    def _query_all_sources(
-        self,
-        entry: dict[str, Any],
-        query: str,
-        sources_queried: list[str],
-        sources_with_hits: list[str],
-        errors: list[str],
-    ) -> list[tuple[float, PublishedRecord, str]]:
-        """Query all API sources and collect scored candidates (parallel version with early exit).
-
-        P2.1: Early-exit optimization - if any source returns a very high-confidence match (>= 0.95),
-        cancel remaining searches.
-        """
-        candidates: list[tuple[float, PublishedRecord, str]] = []
-        title_norm = normalize_title_for_match(entry.get("title", ""))
-        authors_ref = authors_last_names(entry.get("author", ""), limit=3)
-
-        HIGH_CONFIDENCE_THRESHOLD = 0.95
-
-        def _search_crossref() -> tuple[str, list[tuple[float, PublishedRecord, str]], bool, str | None]:
-            """Search Crossref API."""
-            local_candidates = []
-            had_hits = False
-            error = None
-            try:
-                items = self.crossref.search(query, rows=self.config.max_candidates_per_source)
-                if items:
-                    had_hits = True
-                    for item in items:
-                        rec = crossref_message_to_record(item)
-                        if rec:
-                            score = self._score_candidate(title_norm, authors_ref, rec)
-                            local_candidates.append((score, rec, "crossref"))
-            except Exception as e:
-                error = f"Crossref: {e}"
-            return ("crossref", local_candidates, had_hits, error)
-
-        def _search_dblp() -> tuple[str, list[tuple[float, PublishedRecord, str]], bool, str | None]:
-            """Search DBLP API."""
-            local_candidates = []
-            had_hits = False
-            error = None
-            try:
-                hits = self.dblp.search(query, max_hits=self.config.max_candidates_per_source)
-                if hits:
-                    had_hits = True
-                    for hit in hits:
-                        rec = dblp_hit_to_record(hit)
-                        if rec:
-                            score = self._score_candidate(title_norm, authors_ref, rec)
-                            local_candidates.append((score, rec, "dblp"))
-            except Exception as e:
-                error = f"DBLP: {e}"
-            return ("dblp", local_candidates, had_hits, error)
-
-        def _search_s2() -> tuple[str, list[tuple[float, PublishedRecord, str]], bool, str | None]:
-            """Search Semantic Scholar API."""
-            local_candidates = []
-            had_hits = False
-            error = None
-            try:
-                data = self.s2.search(query, limit=self.config.max_candidates_per_source)
-                if data:
-                    had_hits = True
-                    for item in data:
-                        rec = s2_data_to_record(item)
-                        if rec:
-                            score = self._score_candidate(title_norm, authors_ref, rec)
-                            local_candidates.append((score, rec, "semanticscholar"))
-            except Exception as e:
-                error = f"Semantic Scholar: {e}"
-            return ("semanticscholar", local_candidates, had_hits, error)
-
-        # P2.1: Execute searches in parallel with early exit on high-confidence match
-        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-            futures = {
-                executor.submit(_search_crossref): "crossref",
-                executor.submit(_search_dblp): "dblp",
-                executor.submit(_search_s2): "s2",
-            }
-
-            for future in concurrent.futures.as_completed(futures):
-                try:
-                    source, cands, had_hits, error = future.result()
-                    sources_queried.append(source)
-                    candidates.extend(cands)
-                    if had_hits:
-                        sources_with_hits.append(source)
-                    if error:
-                        errors.append(error)
-
-                    # Note: With max_workers=3 and 3 tasks, all start immediately.
-                    # The break skips processing remaining future results but doesn't stop running tasks.
-                    if any(score >= HIGH_CONFIDENCE_THRESHOLD for score, _, _ in cands):
-                        break
-                except Exception:
-                    pass  # Errors already captured in individual search functions
-
-        return candidates
 
     def _query_cascade(
         self,
@@ -3314,15 +3206,6 @@ Examples:
     # CheckIfExist additions
     cascade_opts = p.add_argument_group("cascading source order (CheckIfExist)")
     cascade_opts.add_argument(
-        "--no-cascade",
-        action="store_true",
-        help=(
-            "Disable the default CrossRef -> OpenAlex -> Semantic Scholar cascade "
-            "and use the legacy parallel CrossRef+DBLP+S2 fan-out (queries every "
-            "source on every entry; slower under rate limits)."
-        ),
-    )
-    cascade_opts.add_argument(
         "--top-k",
         type=int,
         default=DEFAULT_TOP_K,
@@ -3429,7 +3312,6 @@ def main() -> int:
         venue_threshold=args.venue_threshold,
         check_dois=not args.no_check_dois,
         check_years=not args.no_check_years,
-        cascade_mode=not args.no_cascade,
         top_k=top_k,
         openalex_mailto=args.openalex_mailto,
     )

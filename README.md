@@ -216,21 +216,18 @@ For `filter_bibliography.py` only (no dependencies required):
 - **Structured reports**: JSON and JSONL output formats
 - **CI/CD integration**: Strict mode with exit codes for automation
 
-#### Cascading verification (default; disable with `--no-cascade`)
+#### Cascading verification
 
-Inspired by [Abbonato 2026 (CheckIfExist)](https://arxiv.org/abs/2602.15871), the cascade explicitly orders sources CrossRef → OpenAlex → Semantic Scholar and short-circuits as soon as one source produces a high-confidence match. Combined with top-K candidate retrieval and cross-source author intersection, it catches `swapped_authors` / chimeric citations that single-source verification misses.
+Inspired by [Abbonato 2026 (CheckIfExist)](https://arxiv.org/abs/2602.15871), verification orders sources CrossRef → OpenAlex → DBLP → Semantic Scholar and short-circuits as soon as one source produces a high-confidence match. Combined with top-K candidate retrieval and cross-source author intersection, it catches `swapped_authors` / chimeric citations that single-source verification misses.
 
-The order is throughput-aware: CrossRef and OpenAlex (polite pool, ~100 req/min) come first, so the slow keyless Semantic Scholar fallback (~10 req/min) is only reached on hard entries. This is the default; `--no-cascade` falls back to the legacy parallel CrossRef+DBLP+S2 fan-out, which queries every source on every entry and is gated by the slowest rate limit. Set a Semantic Scholar API key (`--s2-api-key` or `S2_API_KEY`) to lift S2 from ~10 to ~60 req/min.
+The order is throughput-aware: CrossRef and OpenAlex (polite pool, ~100 req/min) come first, so the slow keyless Semantic Scholar fallback (~10 req/min) is only reached on hard entries. Set a Semantic Scholar API key (`--s2-api-key` or `S2_API_KEY`) to lift S2 from ~10 to ~60 req/min.
 
 ```bash
-# Cascading verification with top-3 candidates per source (cascade is the default)
+# Verification with top-3 candidates per source
 bibtex-check references.bib --top-k 3 --jsonl out.jsonl
 
 # Polite OpenAlex pool (recommended)
 bibtex-check references.bib --openalex-mailto you@example.com
-
-# Legacy parallel fan-out (queries CrossRef + DBLP + S2 on every entry)
-bibtex-check references.bib --no-cascade
 ```
 
 A 0–100 numeric `confidence_score` (additive in the JSONL output) summarizes per-field similarity with explicit penalty/bonus contributions:
