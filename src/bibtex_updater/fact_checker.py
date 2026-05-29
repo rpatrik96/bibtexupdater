@@ -34,7 +34,7 @@ import re
 import sys
 import threading
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 from urllib.parse import urlparse
@@ -321,6 +321,14 @@ class FactCheckResult:
     category: EntryCategory | None = None
     url_check: URLCheckResult | None = None
     book_match: BookRecord | None = None
+    # Per-entry verification state carried on the result instead of stashed on
+    # the shared ``FactChecker`` instance. ``check_entry`` runs concurrently
+    # across a ThreadPoolExecutor, so any per-entry value written to ``self``
+    # would be clobbered by sibling entries. These let a caller build a rich
+    # :class:`VerificationResult` from THIS entry's run without re-querying and
+    # without racing on shared mutable state.
+    author_intersection: AuthorIntersectionResult | None = None
+    source_records: dict[str, PublishedRecord | None] = field(default_factory=dict)
 
 
 @dataclass
@@ -470,18 +478,34 @@ def build_verification_result(
     Item 5: callers that want per-field similarity scores plus the cross-source
     author intersection get them here without the legacy JSONL output changing.
 
+    The per-entry intersection and source records are carried on ``fc_result``
+    itself (``fc_result.author_intersection`` / ``fc_result.source_records``),
+    so the default is to read them off the result -- this is thread-safe because
+    ``check_entry`` runs concurrently and no longer stashes per-entry state on
+    the shared ``FactChecker`` instance. The explicit ``intersection`` /
+    ``source_records`` arguments still override for callers that compute them
+    separately.
+
     Args:
         fc_result: The classic fact-check result from ``FactChecker.check_entry``.
-        intersection: Optional cross-source author intersection -- normally
-            ``FactChecker.last_author_intersection`` from the same run.
-        source_records: Optional ``source_name -> PublishedRecord`` mapping --
-            normally ``FactChecker.last_source_records``.
+        intersection: Optional cross-source author intersection. Defaults to
+            ``fc_result.author_intersection`` (the value from the SAME run that
+            produced ``fc_result``).
+        source_records: Optional ``source_name -> PublishedRecord`` mapping.
+            Defaults to ``fc_result.source_records`` from the same run.
 
     Returns:
         :class:`VerificationResult`. The numeric ``confidence_score`` falls
         back to ``getattr(fc_result, "confidence_score", overall_confidence*100)``
         so older paths still get a sensible score.
     """
+    # Default to the per-entry state carried on the result itself (thread-safe:
+    # it belongs to THIS entry's run, not to shared instance state).
+    if intersection is None:
+        intersection = fc_result.author_intersection
+    if source_records is None:
+        source_records = fc_result.source_records or None
+
     # Per-field similarity breakdown (0-100 scale, more useful for display).
     breakdown: dict[str, float] = {}
     issues: list[str] = []
@@ -1625,26 +1649,44 @@ class FactChecker:
         # OpenAlex client is optional; tests can pass a fake. The cascade falls
         # back to creating a default client if not provided.
         self.openalex: OpenAlexClient | None = openalex
-        # The most recent cross-source author intersection (set by check_entry).
-        self.last_author_intersection: AuthorIntersectionResult | None = None
-        # Per-source records from the most recent check (used by the rich
-        # VerificationResult builder).
-        self.last_source_records: dict[str, PublishedRecord | None] = {}
+        # Per-entry verification state (cross-source author intersection,
+        # per-source records) is NOT stored on the shared instance: check_entry
+        # runs concurrently across a ThreadPoolExecutor, so a sibling entry would
+        # clobber it. It is returned on the FactCheckResult instead. See
+        # FactCheckResult.author_intersection / .source_records.
+        #
         # Memoize fetched+parsed arXiv records by ID: the consistency pre-check
         # and the by-ID candidate query both look up the entry's arXiv ID in one
         # verification pass, so this avoids a duplicate network fetch + parse.
+        # This IS a cross-entry cache (not per-entry verdict state), shared by
+        # all concurrent check_entry calls, so its dict mutation is guarded by a
+        # lock. The actual fetch happens OUTSIDE the lock (double-checked insert)
+        # so a slow network call never serializes the other workers.
         self._arxiv_record_cache: dict[str, PublishedRecord | None] = {}
+        self._arxiv_cache_lock = threading.Lock()
 
     def _arxiv_record(self, arxiv_id: str) -> PublishedRecord | None:
-        """Fetch + parse the arXiv record for an ID, memoized per checker."""
-        if arxiv_id in self._arxiv_record_cache:
-            return self._arxiv_record_cache[arxiv_id]
+        """Fetch + parse the arXiv record for an ID, memoized per checker.
+
+        Thread-safe: the cache dict is shared across concurrent ``check_entry``
+        workers. We read/insert under ``_arxiv_cache_lock`` but perform the
+        network fetch+parse outside it (double-checked locking) so a slow arXiv
+        request does not stall sibling workers.
+        """
+        with self._arxiv_cache_lock:
+            if arxiv_id in self._arxiv_record_cache:
+                return self._arxiv_record_cache[arxiv_id]
         rec: PublishedRecord | None = None
         if self.arxiv is not None:
             xml = self.arxiv.fetch_atom(arxiv_id)
             if xml:
                 rec = arxiv_atom_to_record(xml)
-        self._arxiv_record_cache[arxiv_id] = rec
+        with self._arxiv_cache_lock:
+            # Another worker may have populated the same ID while we fetched;
+            # keep the first cached value so the memo stays a stable cache.
+            if arxiv_id in self._arxiv_record_cache:
+                return self._arxiv_record_cache[arxiv_id]
+            self._arxiv_record_cache[arxiv_id] = rec
         return rec
 
     def _validate_year(self, entry: dict[str, Any]) -> FactCheckStatus | None:
@@ -1810,8 +1852,9 @@ class FactChecker:
 
         if not candidates:
             status = FactCheckStatus.API_ERROR if errors else FactCheckStatus.NOT_FOUND
-            self.last_author_intersection = None
-            self.last_source_records = {}
+            # No candidates -> no per-entry intersection/source records. These
+            # ride on the result (not self) so concurrent entries don't clobber
+            # each other.
             return FactCheckResult(
                 entry_key=entry_key,
                 entry_type=entry_type,
@@ -1822,12 +1865,12 @@ class FactChecker:
                 api_sources_queried=sources_queried,
                 api_sources_with_hits=sources_with_hits,
                 errors=errors,
+                author_intersection=None,
+                source_records={},
             )
 
         # P2.4: Detect chimeric titles before sorting
         if self._detect_chimeric_title(entry, candidates):
-            self.last_author_intersection = None
-            self.last_source_records = {}
             return FactCheckResult(
                 entry_key=entry_key,
                 entry_type=entry_type,
@@ -1838,6 +1881,8 @@ class FactChecker:
                 api_sources_queried=sources_queried,
                 api_sources_with_hits=sources_with_hits,
                 errors=["Chimeric title detected: tokens borrowed from multiple different papers"],
+                author_intersection=None,
+                source_records={},
             )
 
         # Sort candidates by score descending
@@ -1845,17 +1890,17 @@ class FactChecker:
         best_score, best_match, _source = candidates[0]
 
         # Item 3: cross-source author intersection -- pick the best record from
-        # each source and intersect their author lists. Stored on the checker
-        # so callers can build a rich VerificationResult without re-querying.
+        # each source and intersect their author lists. Carried on the returned
+        # FactCheckResult (NOT on self) so callers can build a rich
+        # VerificationResult without re-querying and without racing concurrent
+        # check_entry calls.
         best_per_source: dict[str, PublishedRecord | None] = {}
         for _cand_score, cand_rec, cand_source in candidates:
             current = best_per_source.get(cand_source)
             if current is None:
                 best_per_source[cand_source] = cand_rec
             # The list is already sorted desc; first entry per source wins.
-        self.last_source_records = best_per_source
         intersection = cross_source_author_intersection(best_per_source, multi_source_bonus=MULTI_SOURCE_BONUS)
-        self.last_author_intersection = intersection
 
         field_comparisons = self._compare_all_fields(entry, best_match)
         status = self._determine_status(best_score, field_comparisons, sources_with_hits)
@@ -1942,6 +1987,10 @@ class FactChecker:
             api_sources_queried=sources_queried,
             api_sources_with_hits=sources_with_hits,
             errors=errors,
+            # Per-entry state carried on the result (not stashed on self) so
+            # concurrent check_entry calls don't clobber each other.
+            author_intersection=intersection,
+            source_records=best_per_source,
         )
         # Stash the numeric (0-100) confidence as an attribute -- additive only,
         # not part of the JSONL schema so existing consumers keep working.

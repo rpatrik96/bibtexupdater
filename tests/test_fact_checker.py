@@ -17,6 +17,7 @@ from bibtex_updater.fact_checker import (
     FactCheckStatus,
     FieldComparison,
     SemanticScholarClient,
+    build_verification_result,
 )
 from bibtex_updater.matching import MatchOutcome
 from bibtex_updater.utils import PublishedRecord
@@ -611,6 +612,177 @@ class TestFactCheckerCheckEntry:
         result = fact_checker.check_entry(entry)
         assert result.status == FactCheckStatus.NOT_FOUND
         assert result.status != FactCheckStatus.HALLUCINATED
+
+
+# ------------- Thread-safety of per-entry state -------------
+
+
+class TestCheckEntryThreadSafety:
+    """check_entry runs concurrently across a ThreadPoolExecutor (see
+    FactCheckProcessor.process_entries). Per-entry verification state (the
+    cross-source author intersection and the per-source records) must therefore
+    live on each FactCheckResult, NOT on the shared FactChecker instance, or
+    concurrent entries clobber each other and produce nondeterministic verdicts.
+    """
+
+    @staticmethod
+    def _matching_record(entry: dict) -> PublishedRecord:
+        """Build a record that matches an entry exactly (so it VERIFIES)."""
+        # surname -> {"given","family"} so the author intersection is non-trivial
+        # and entry-specific.
+        family = entry["author"].split(",")[0].strip()
+        return PublishedRecord(
+            doi=f"10.9999/{entry['ID']}",
+            title=entry["title"],
+            authors=[{"given": "A", "family": family}],
+            journal=entry["journal"],
+            year=int(entry["year"]),
+        )
+
+    def _install_per_entry_cascade(self, checker, monkeypatch, barrier=None):
+        """Stub the cascade so each entry resolves to its OWN matching record.
+
+        If ``barrier`` is given, every worker blocks on it inside the cascade so
+        all entries are guaranteed to be *interleaved* inside check_entry at the
+        same time -- the exact window where shared-instance state would race.
+        """
+
+        def fake_cascade(entry, query, sq, sh, errors):
+            sq.append("crossref")
+            sh.append("crossref")
+            rec = self._matching_record(entry)
+            if barrier is not None:
+                # Force all workers to sit inside check_entry simultaneously.
+                barrier.wait(timeout=10)
+            return [(0.99, rec, "crossref")]
+
+        monkeypatch.setattr(checker, "_query_cascade", fake_cascade)
+        monkeypatch.setattr(checker, "_query_arxiv_by_id", lambda *a, **k: [])
+
+    @staticmethod
+    def _entry(i: int) -> dict:
+        return {
+            "ID": f"entry{i}",
+            "ENTRYTYPE": "article",
+            "title": f"Unique Paper Title Number {i}",
+            "author": f"Surname{i}, Given",
+            "journal": f"Journal {i}",
+            "year": str(2000 + (i % 20)),
+        }
+
+    def test_no_per_entry_state_left_on_instance(self, fact_checker, monkeypatch):
+        """After check_entry, nothing entry-specific lives on the shared self."""
+        self._install_per_entry_cascade(fact_checker, monkeypatch)
+        result = fact_checker.check_entry(self._entry(1))
+        assert result.status == FactCheckStatus.VERIFIED
+        # The old racy attributes must be gone entirely.
+        assert not hasattr(fact_checker, "last_author_intersection")
+        assert not hasattr(fact_checker, "last_source_records")
+        # Per-entry state rides on the result instead.
+        assert result.source_records  # populated
+        assert "crossref" in result.source_records
+        assert result.author_intersection is not None
+
+    def test_result_carries_its_own_records(self, fact_checker, monkeypatch):
+        """Each result's source_records/intersection describe ITS entry."""
+        self._install_per_entry_cascade(fact_checker, monkeypatch)
+        r3 = fact_checker.check_entry(self._entry(3))
+        r7 = fact_checker.check_entry(self._entry(7))
+        # The per-source record for each result is the one matching its entry.
+        assert r3.source_records["crossref"].doi == "10.9999/entry3"
+        assert r7.source_records["crossref"].doi == "10.9999/entry7"
+        # A sequential second call must not have mutated the first result.
+        assert r3.source_records["crossref"].doi == "10.9999/entry3"
+
+    def test_concurrent_check_entry_no_cross_contamination(self, fact_checker, monkeypatch):
+        """Interleaved concurrent check_entry calls must not cross-contaminate
+        the per-entry records, the intersection, or the rich VerificationResult.
+        """
+        import concurrent.futures
+        import threading
+
+        n = 16
+        entries = [self._entry(i) for i in range(n)]
+        # Barrier forces all n workers to be *inside* check_entry simultaneously,
+        # maximizing the chance a shared-state bug would surface.
+        barrier = threading.Barrier(n)
+        self._install_per_entry_cascade(fact_checker, monkeypatch, barrier=barrier)
+
+        def run(entry):
+            res = fact_checker.check_entry(entry)
+            rich = build_verification_result(res)
+            return entry["ID"], res, rich
+
+        out: dict[str, tuple] = {}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=n) as ex:
+            for key, res, rich in ex.map(run, entries):
+                out[key] = (res, rich)
+
+        assert len(out) == n
+        for i in range(n):
+            key = f"entry{i}"
+            res, rich = out[key]
+            assert res.status == FactCheckStatus.VERIFIED, key
+            # Each result's source record matches its OWN entry (the bug would
+            # leave a sibling entry's record here).
+            assert res.source_records["crossref"].doi == f"10.9999/{key}", key
+            # The rich result, built from res alone (no self.last_*), is entry-
+            # specific: it reflects this entry's own matched metadata.
+            assert rich.bibtex_key == key
+            assert rich.matched_metadata is not None
+            assert rich.matched_metadata["doi"] == f"10.9999/{key}", key
+
+        # And the shared instance still holds no per-entry leftovers.
+        assert not hasattr(fact_checker, "last_author_intersection")
+        assert not hasattr(fact_checker, "last_source_records")
+
+    def test_arxiv_record_cache_is_thread_safe(self, fact_checker, monkeypatch):
+        """The cross-entry arXiv memo is guarded: concurrent lookups of distinct
+        IDs all populate the cache without losing entries, the fetch runs outside
+        the lock, and a given ID is fetched at most once.
+        """
+        import concurrent.futures
+        import threading
+
+        # Real ArxivClient is None on the fixture; install a fake that records
+        # how many times each ID is fetched (a cache miss == one fetch).
+        fetch_counts: dict[str, int] = {}
+        counts_lock = threading.Lock()
+
+        class _FakeArxiv:
+            def fetch_atom(self, arxiv_id: str) -> str:
+                with counts_lock:
+                    fetch_counts[arxiv_id] = fetch_counts.get(arxiv_id, 0) + 1
+                # Return a minimal value; parsing is monkeypatched below.
+                return f"<atom>{arxiv_id}</atom>"
+
+        fact_checker.arxiv = _FakeArxiv()
+        # Parse step: map the xml back to a per-id record (no real XML needed).
+        monkeypatch.setattr(
+            "bibtex_updater.fact_checker.arxiv_atom_to_record",
+            lambda xml: PublishedRecord(doi=None, title=xml, authors=[]),
+        )
+
+        ids = [f"2401.{i:05d}" for i in range(8)]
+        # Hammer each ID from several threads at once -> exercises the double-
+        # checked insert: at most one fetch per ID despite the concurrency.
+        tasks = ids * 6
+
+        def run(arxiv_id):
+            return arxiv_id, fact_checker._arxiv_record(arxiv_id)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=12) as ex:
+            results = list(ex.map(run, tasks))
+
+        # Every lookup returned the correct per-id record.
+        for arxiv_id, rec in results:
+            assert rec is not None
+            assert rec.title == f"<atom>{arxiv_id}</atom>"
+        # The cache holds exactly the distinct IDs, none lost to races.
+        assert set(fact_checker._arxiv_record_cache.keys()) == set(ids)
+        # Each distinct ID was fetched at most once despite 6x concurrent hits.
+        for arxiv_id in ids:
+            assert fetch_counts[arxiv_id] == 1, (arxiv_id, fetch_counts[arxiv_id])
 
 
 # ------------- FactCheckProcessor Tests -------------
