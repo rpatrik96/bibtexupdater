@@ -3038,6 +3038,73 @@ class FactCheckProcessor:
 
         return results
 
+    def _batch_warm_crossref_records(self, entries: list[dict[str, Any]]) -> int:
+        """Pre-fetch every entry DOI's Crossref ``/works`` record in parallel.
+
+        Latency optimization (mirrors :meth:`_batch_validate_dois`). The per-entry
+        DOI checks (``_check_doi_consistency`` and the structured-name author
+        recheck) each call ``CrossrefClient.get_by_doi`` for the entry's DOI. Run
+        serially across the worker pool, those round-trips are gated by the
+        crossref rate limiter (50/min) and dominate wall-clock on large
+        bibliographies.
+
+        Here we issue the SAME ``get_by_doi`` calls once, up front, in a bounded
+        thread pool. ``get_by_doi`` routes through the shared ``HttpClient``, whose
+        responses are stored in the thread-safe SqliteCache keyed by request URL.
+        Warming that cache turns the later per-entry ``get_by_doi`` calls into
+        cache hits, so the same records are used for the same comparisons -- this
+        is purely a change to WHEN the fetch happens, never WHICH record is used
+        (verdict-neutral).
+
+        Thread-safety: this runs BEFORE the main worker pool starts and writes
+        only to the SqliteCache (already thread-safe). It adds no mutable state on
+        ``self`` or the checker, so concurrent ``check_entry`` calls only ever READ
+        the warmed cache.
+
+        Fallback: a DOI whose pre-fetch fails (network error / non-200) is simply
+        not cached. The per-entry ``get_by_doi`` then performs its own fetch
+        exactly as before -- correct result, no speedup for that one DOI.
+
+        Returns:
+            Number of distinct DOIs warmed (best-effort; for logging/tests).
+        """
+        # Only FactChecker has a crossref client whose cache we can warm.
+        if not isinstance(self.checker, FactChecker):
+            return 0
+        crossref = self.checker.crossref
+        # No shared response cache -> warming would not be observed by the
+        # per-entry calls, so skip (each call would re-fetch anyway).
+        if getattr(crossref.http, "cache", None) is None:
+            return 0
+
+        # Dedupe DOIs across entries: identical DOIs share one cache key.
+        dois: set[str] = set()
+        for entry in entries:
+            doi = (entry.get("doi", "") or "").strip()
+            if doi:
+                dois.add(doi)
+        if not dois:
+            return 0
+
+        def _warm_one(doi: str) -> None:
+            # Same call the per-entry path uses; result lands in the shared
+            # cache. Swallow everything so one bad DOI never aborts warming.
+            try:
+                crossref.get_by_doi(doi)
+            except Exception:
+                pass
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=16) as executor:
+            futures = [executor.submit(_warm_one, doi) for doi in dois]
+            for future in concurrent.futures.as_completed(futures):
+                # Results are written straight to the cache; nothing to collect.
+                try:
+                    future.result()
+                except Exception:
+                    pass
+
+        return len(dois)
+
     def process_entries(
         self, entries: list[dict[str, Any]], jsonl_path: str | None = None, max_workers: int = 8
     ) -> list[FactCheckResult]:
@@ -3060,6 +3127,15 @@ class FactCheckProcessor:
             self.logger.info(
                 "DOI pre-validation complete: %d checked, %d failed", len(pre_validated_dois), failed_count
             )
+
+        # Latency: warm the Crossref /works response cache for all entry DOIs in
+        # parallel up front, so the per-entry DOI checks (consistency + structured
+        # author recheck) hit the cache instead of each making a serial,
+        # rate-limited round-trip. Verdict-neutral; failures fall back to the
+        # existing per-entry fetch. (Mirrors _batch_validate_dois.)
+        warmed = self._batch_warm_crossref_records(entries)
+        if warmed:
+            self.logger.info("Pre-fetched Crossref records for %d DOIs", warmed)
 
         results: list[FactCheckResult | None] = [None] * len(entries)  # Pre-allocate to preserve order
 
