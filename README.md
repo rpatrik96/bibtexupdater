@@ -240,9 +240,9 @@ A 0–100 numeric `confidence_score` (additive in the JSONL output) summarizes p
 
 `VERIFIED` requires every claimed field to be *positively confirmed* against the matched record — not merely "not contradicted". When a record is found but a claimed field can't be confirmed (e.g. a published venue backed only by a preprint, or an incomplete author list), the entry is reported as **could-not-verify** (`UNCONFIRMED`/`NOT_FOUND`), distinct from a **problematic** flag (`*_mismatch`, `doi_mismatch`, chimeric, …) which is positive evidence of a defect. A "could-not-verify" is *not* a clean pass: it means the tool couldn't decide, and such entries warrant review.
 
-#### Author order (`--ignore-author-order`)
+#### Author handling
 
-All four sources return authors in as-published order, so an author-order difference usually indicates a real citation error and is flagged by default. Pass `--ignore-author-order` to treat an author list as confirmed when the author *set* matches regardless of order. This is opt-in because it also stops detecting `swapped_authors` hallucinations (same people, reordered). Surname comparison uses each source's structured `family` field where available (so family-first/CJK names like "Chen Xing" ↔ "Xing Chen" are not falsely flagged), falling back to a Crossref structured-name lookup when the matched source lacks one.
+All four sources return authors in as-published order, so an author-order difference is treated as a real citation error (e.g. a transposed or wrong lead author) and flagged — it is not an API artifact. Surname comparison uses each source's structured `family` field where available, so family-first/CJK names like "Chen Xing" ↔ "Xing Chen" are not falsely flagged; when the matched source lacks structured names (Semantic Scholar flat names, DBLP), a Crossref structured-name lookup is used to vet a potential author mismatch before reporting it.
 
 #### Non-generative-AI mode (`--non-generative`)
 
