@@ -2480,3 +2480,86 @@ class TestFirstAuthorGivenNameSubstitution:
         entry = {"title": self.TITLE, "author": "Denny Zhou and Nathanael Schaerli", "year": "2023"}
         comps = fact_checker._compare_all_fields(entry, record)
         assert comps["author"].is_mismatch is False
+
+    def test_lead_substitution_when_entry_duplicates_surname(self, fact_checker):
+        # Refinement: the real Least-to-Most leak had the entry citing
+        # "Shunyu Zhou" as lead AND re-listing the canonical lead "Denny Zhou"
+        # at the tail. The OLD repeated-surname guard skipped the lead-position
+        # audit because the surname 'zhou' appeared TWICE in the entry, even
+        # though the record had it only ONCE (at position 0). The refined
+        # guard requires BOTH sides to repeat before declaring positional
+        # ambiguity, so the lead audit now fires for this shape.
+        record = PublishedRecord(
+            doi="10.1/x",
+            title=self.TITLE,
+            authors=[
+                {"given": "Denny", "family": "Zhou"},
+                {"given": "Nathanael", "family": "Schaerli"},
+            ],
+            year=2023,
+            structured_names=True,
+            order_reliable=True,
+        )
+        entry = {
+            "title": self.TITLE,
+            "author": "Shunyu Zhou and Nathanael Schaerli and Denny Zhou",
+            "year": "2023",
+        }
+        comps = fact_checker._compare_all_fields(entry, record)
+        assert comps["author"].is_mismatch is True
+        status = fact_checker._determine_status(0.95, comps, ["crossref"])
+        assert status == FactCheckStatus.GIVEN_NAME_SUBSTITUTION
+
+    def test_lead_both_sides_repeat_with_benign_given_match_abstains(self, fact_checker):
+        # When BOTH entry AND record have the lead surname repeated, there is
+        # genuine positional ambiguity. If the entry's lead given matches the
+        # record's position-0 same-surname given via a benign class (here:
+        # initial-compatible "Y." vs "Yang"), the audit abstains rather than
+        # escalating. Entry order matches record order, so the separate
+        # same-surname swap detector also stays quiet.
+        record = PublishedRecord(
+            doi="10.1/x",
+            title=self.TITLE,
+            authors=[
+                {"given": "Yang", "family": "Song"},
+                {"given": "Jiaming", "family": "Song"},
+            ],
+            year=2023,
+            structured_names=True,
+            order_reliable=True,
+        )
+        # Entry: lead "Y. Song" (initial-compatible with record's "Yang Song")
+        # then "Jiaming Song" -- order preserved.
+        entry = {
+            "title": self.TITLE,
+            "author": "Y. Song and Jiaming Song",
+            "year": "2023",
+        }
+        comps = fact_checker._compare_all_fields(entry, record)
+        # "Y." is an INITIAL_COMPATIBLE benign match for "Yang" -> not a mismatch.
+        assert comps["author"].is_mismatch is False
+
+    def test_lead_both_sides_repeat_with_no_benign_match_escalates(self, fact_checker):
+        # Same both-sides-repeat shape, but the entry's lead given matches
+        # NEITHER of the record's same-surname givens via any benign class
+        # (EXACT/INITIAL/ABBREVIATION/etc.). That is a real substitution
+        # whichever record author the entry meant -> escalate.
+        record = PublishedRecord(
+            doi="10.1/x",
+            title=self.TITLE,
+            authors=[
+                {"given": "Jiaming", "family": "Song"},
+                {"given": "Yang", "family": "Song"},
+            ],
+            year=2023,
+            structured_names=True,
+            order_reliable=True,
+        )
+        # Entry leads with "Phantom Song" -- not Jiaming, not Yang.
+        entry = {
+            "title": self.TITLE,
+            "author": "Phantom Song and Jiaming Song and Yang Song",
+            "year": "2023",
+        }
+        comps = fact_checker._compare_all_fields(entry, record)
+        assert comps["author"].is_mismatch is True
