@@ -2112,11 +2112,15 @@ class FactChecker:
 
     @staticmethod
     def _arxiv_id_from_entry(entry: dict[str, Any]) -> str | None:
-        """Extract a bare arXiv ID from an entry's eprint/url/howpublished fields.
+        """Extract a bare arXiv ID from an entry's eprint/url/howpublished/doi fields.
 
         Recognizes both modern (``2602.01031``) and legacy (``cs/0001001``) IDs,
-        from an explicit ``eprint`` (with an arXiv ``archivePrefix``/``journal``)
-        or from an ``arxiv.org/abs/<id>`` URL / ``arXiv:<id>`` string.
+        from an explicit ``eprint`` (with an arXiv ``archivePrefix``/``journal``),
+        an ``arxiv.org/abs/<id>`` URL / ``arXiv:<id>`` string, OR an arXiv
+        DataCite DOI of the form ``10.48550/arXiv.<id>``. The DataCite path is
+        critical for HALLMARK 2026-synthetic batches that carry an arXiv DOI
+        as the sole identifier -- without it, ``_check_arxiv_id_consistency``
+        (and its downstream ``_id_anchored_author_mismatch``) never fires.
         """
         eprint = (entry.get("eprint") or "").strip()
         archive = (entry.get("archiveprefix") or entry.get("archivePrefix") or "").strip().lower()
@@ -2135,6 +2139,17 @@ class FactChecker:
                 m = re.search(r"arxiv:\s*([0-9]{4}\.[0-9]{4,5}(?:v\d+)?)", value, flags=re.IGNORECASE)
             if m:
                 bare = re.sub(r"v\d+$", "", m.group(1).strip())
+                if is_valid_arxiv_id(bare):
+                    return bare
+
+        # arXiv DataCite DOI: ``10.48550/arXiv.YYMM.NNNNN(vN)?``. Case-insensitive
+        # because BibTeX entries vary on the ``arXiv`` casing. The version suffix
+        # is stripped before validation, matching the rest of the helper.
+        doi = (entry.get("doi") or "").strip()
+        if doi:
+            m = re.match(r"^10\.48550/arxiv\.(\d{4}\.\d{4,5})(v\d+)?$", doi, flags=re.IGNORECASE)
+            if m:
+                bare = m.group(1)
                 if is_valid_arxiv_id(bare):
                     return bare
         return None
