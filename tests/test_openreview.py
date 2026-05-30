@@ -305,7 +305,18 @@ class TestOpenReviewCascadeWiring:
         }
         sources_queried: list = []
         fc._query_cascade(entry, "Some ICLR Paper Doe", sources_queried, [], [])
-        assert sources_queried == ["crossref", "openalex", "dblp", "openreview", "semanticscholar"]
+        # FIX X4: when every primary source returns nothing usable, the
+        # relaxed-author retrieval fallback runs (title-only retry on
+        # Crossref + OpenAlex) and appends two fallback source names.
+        assert sources_queried == [
+            "crossref",
+            "openalex",
+            "dblp",
+            "openreview",
+            "semanticscholar",
+            "crossref-fallback",
+            "openalex-fallback",
+        ]
         # OpenReview got the raw title + reduced first-author surname.
         kwargs = openreview.search.call_args.kwargs
         assert kwargs["title"] == "Some ICLR Paper"

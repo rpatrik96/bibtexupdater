@@ -594,6 +594,9 @@ class TestFactCheckerCheckEntry:
         # queries five sources: crossref -> openalex -> dblp -> openreview ->
         # semanticscholar (OpenAlex and OpenReview are lazily built from the
         # shared crossref.http mock).
+        # FIX X4: when every primary source returns nothing usable, the
+        # relaxed-author retrieval fallback runs (title-only retry on
+        # Crossref + OpenAlex) and appends two fallback source names.
         result = fact_checker.check_entry(sample_entry)
         assert result.status == FactCheckStatus.NOT_FOUND
         assert result.api_sources_queried == [
@@ -602,6 +605,8 @@ class TestFactCheckerCheckEntry:
             "dblp",
             "openreview",
             "semanticscholar",
+            "crossref-fallback",
+            "openalex-fallback",
         ]
 
     def test_weak_unrelated_match_abstains(self, fact_checker, monkeypatch):

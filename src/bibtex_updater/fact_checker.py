@@ -2792,7 +2792,86 @@ class FactChecker:
         if s2_records:
             sources_with_hits.append("semanticscholar")
         _ingest("semanticscholar", s2_records)
+
+        # FIX X4: relaxed-author retrieval fallback. For DOI-less, title-and-
+        # author-strict cascade queries that returned zero usable candidates,
+        # retry Crossref + OpenAlex with title-only (drop the author param).
+        # For HALLUCINATED entries the cascade today exits ``not_found``,
+        # hiding the hallucination. The relaxed retrieval surfaces a
+        # wrong-paper candidate the strict gates rejected, which the existing
+        # ``_score_candidate`` + ``_has_full_confirmation`` + ``_determine_status``
+        # gates then route to AUTHOR_MISMATCH (the realistic transition).
+        # NEVER ``not_found -> VERIFIED``: the scoring gate still requires a
+        # strong title + author confirmation. Gated on the standard cascade
+        # producing zero usable candidates (below ``abstention_below``) and
+        # runs ONCE per entry.
+        usable = [c for c in all_candidates if c[0] >= self.config.abstention_below]
+        if not usable and raw_title.strip():
+            self._relaxed_author_retrieval(
+                entry, raw_title, top_k, all_candidates, sources_queried, sources_with_hits, errors
+            )
         return all_candidates
+
+    def _relaxed_author_retrieval(
+        self,
+        entry: dict[str, Any],
+        raw_title: str,
+        top_k: int,
+        all_candidates: list[tuple[float, PublishedRecord, str]],
+        sources_queried: list[str],
+        sources_with_hits: list[str],
+        errors: list[str],
+    ) -> None:
+        """Title-only retry on Crossref + OpenAlex when the strict cascade
+        returned nothing usable. Tags fallback candidates with the
+        ``-fallback`` source-name suffix so downstream consumers (and tests)
+        can see the relaxed-retrieval provenance. Scoring is unchanged:
+        the existing ``_score_candidate`` is reused, and the candidate must
+        still pass the ``abstention_below`` floor to anchor a verdict; a
+        wrong-paper candidate that passes the title gate but fails the
+        author gate routes to AUTHOR_MISMATCH, not VERIFIED.
+        """
+        title_norm = normalize_title_for_match(raw_title)
+        authors_ref = authors_last_names(entry.get("author", ""), limit=3)
+
+        def _ingest_fallback(source_name: str, records: list[PublishedRecord]) -> None:
+            ranked = select_top_k_by_title_similarity(raw_title, records, k=top_k)
+            for _title_score, rec in ranked:
+                score = self._score_candidate(title_norm, authors_ref, rec)
+                all_candidates.append((score, rec, source_name))
+
+        # ----- Crossref title-only retry -----
+        sources_queried.append("crossref-fallback")
+        try:
+            cr_items = self.crossref.search(raw_title, rows=top_k, title=raw_title)
+        except Exception as exc:
+            cr_items = []
+            errors.append(f"Crossref (fallback): {exc}")
+        cr_records: list[PublishedRecord] = []
+        for item in cr_items or []:
+            rec = crossref_message_to_record(item)
+            if rec:
+                cr_records.append(rec)
+        if cr_records:
+            sources_with_hits.append("crossref-fallback")
+        _ingest_fallback("crossref-fallback", cr_records)
+
+        # ----- OpenAlex title-only retry -----
+        if self.openalex is not None:
+            sources_queried.append("openalex-fallback")
+            try:
+                oa_items = self.openalex.search(raw_title, limit=top_k, title=raw_title)
+            except Exception as exc:
+                oa_items = []
+                errors.append(f"OpenAlex (fallback): {exc}")
+            oa_records: list[PublishedRecord] = []
+            for item in oa_items or []:
+                rec = openalex_work_to_candidate_record(item)
+                if rec:
+                    oa_records.append(rec)
+            if oa_records:
+                sources_with_hits.append("openalex-fallback")
+            _ingest_fallback("openalex-fallback", oa_records)
 
     def _score_candidate(self, title_norm: str, authors_ref: list[str], rec: PublishedRecord) -> float:
         """Score a candidate record against the entry."""
