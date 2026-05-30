@@ -2218,6 +2218,109 @@ class FactChecker:
             ],
         )
 
+    def _id_anchored_field_mismatch(
+        self,
+        entry: dict[str, Any],
+        rec: PublishedRecord,
+        source: str,
+        identifier: str,
+        id_kind: str,
+    ) -> FactCheckResult | None:
+        """Flag an ID-resolved record whose title matches but venue/year is wrong.
+
+        Venue/year analogue of :meth:`_id_anchored_author_mismatch`. The caller
+        has already confirmed (via title score) that ``rec`` IS the cited paper.
+        The remaining hallucination pattern in the "DOI-resolved + unconfirmed"
+        bucket is: DOI resolves to the real paper (Crossref agrees on title +
+        authors), but the entry's claimed venue or year does not match the
+        DOI-resolved record's published venue / year.
+
+        FPR-safe gating mirrors the author-side helper:
+          * Venue: only a HARD MISMATCH from ``venues_match`` (two real
+            published venues that canonicalize differently). NON_COMPARABLE
+            (preprint/series record, blank entry venue) abstains, so the
+            existing FIX 3 / FIX 5 preprint-twin behaviour is preserved.
+          * Year: a populated, parseable mismatch beyond ``year_tolerance``
+            on a NON-preprint record. A preprint twin (`_doi_is_preprint`)
+            never anchors a published year.
+          * Blank entry venue / year -> nothing to refute -> abstain.
+
+        Venue mismatch takes precedence (matches ``_determine_status``'s
+        priority). The caller -- ``_check_doi_consistency`` after a title
+        confirm -- is the only call site.
+        """
+        # ----- Venue check (hard MISMATCH only) -----
+        entry_venue = entry.get("journal") or entry.get("booktitle") or ""
+        rec_venue = rec.journal or ""
+        if entry_venue and rec_venue and not is_preprint_or_series_venue(rec_venue):
+            venue_result = venues_match(entry_venue, rec_venue, self.config.venue_threshold)
+            if venue_result.is_mismatch:
+                self.logger.warning(
+                    "%s %s for entry %r resolves to the cited paper but with mismatched "
+                    "venue: entry venue %r vs %s venue %r",
+                    id_kind,
+                    identifier,
+                    entry.get("ID", "?"),
+                    entry_venue,
+                    source,
+                    rec_venue,
+                )
+                return FactCheckResult(
+                    entry_key=entry.get("ID", "unknown"),
+                    entry_type=entry.get("ENTRYTYPE", "misc").lower(),
+                    status=FactCheckStatus.VENUE_MISMATCH,
+                    overall_confidence=0.0,
+                    field_comparisons=self._compare_all_fields(entry, rec),
+                    best_match=rec,
+                    api_sources_queried=[source],
+                    api_sources_with_hits=[source],
+                    errors=[
+                        f"{id_kind} {identifier} resolves to the cited paper "
+                        f"{rec.title!r}, but the entry's venue {entry_venue!r} "
+                        f"does not match the record's venue {rec_venue!r}"
+                    ],
+                )
+
+        # ----- Year check (hard MISMATCH beyond tolerance, non-preprint only) -----
+        entry_year = entry.get("year", "")
+        api_year = str(rec.year) if rec.year else ""
+        if entry_year and api_year:
+            # Preprint/series records can't anchor a PUBLISHED year (proceedings
+            # year drifts from arXiv year); mirror ``_compare_all_fields``.
+            record_is_preprint = _doi_is_preprint(rec.doi) or is_preprint_or_series_venue(rec_venue)
+            if not record_is_preprint:
+                try:
+                    year_diff = abs(int(entry_year) - int(api_year))
+                except ValueError:
+                    year_diff = None
+                if year_diff is not None and year_diff > self.config.year_tolerance:
+                    self.logger.warning(
+                        "%s %s for entry %r resolves to the cited paper but with mismatched "
+                        "year: entry year %r vs %s year %r",
+                        id_kind,
+                        identifier,
+                        entry.get("ID", "?"),
+                        entry_year,
+                        source,
+                        api_year,
+                    )
+                    return FactCheckResult(
+                        entry_key=entry.get("ID", "unknown"),
+                        entry_type=entry.get("ENTRYTYPE", "misc").lower(),
+                        status=FactCheckStatus.YEAR_MISMATCH,
+                        overall_confidence=0.0,
+                        field_comparisons=self._compare_all_fields(entry, rec),
+                        best_match=rec,
+                        api_sources_queried=[source],
+                        api_sources_with_hits=[source],
+                        errors=[
+                            f"{id_kind} {identifier} resolves to the cited paper "
+                            f"{rec.title!r}, but the entry's year {entry_year!r} "
+                            f"does not match the record's year {api_year!r}"
+                        ],
+                    )
+        return None
+
     def _check_arxiv_id_consistency(self, entry: dict[str, Any]) -> FactCheckResult | None:
         """Flag entries whose cited arXiv ID resolves to a *different* paper.
 
@@ -2321,8 +2424,23 @@ class FactChecker:
             # Title confirms this IS the cited paper. The DOI is the entry's OWN
             # identifier, so a genuine author mismatch here is positive evidence
             # of ID-anchored author fabrication (swapped/placeholder authors on
-            # an entry that otherwise carries the correct DOI).
-            return self._id_anchored_author_mismatch(entry, rec, source="crossref", identifier=raw_doi, id_kind="DOI")
+            # an entry that otherwise carries the correct DOI). Author check
+            # takes priority over venue/year because a swapped author is a
+            # stronger hallucination signal than a venue/year typo.
+            author_finding = self._id_anchored_author_mismatch(
+                entry, rec, source="crossref", identifier=raw_doi, id_kind="DOI"
+            )
+            if author_finding is not None:
+                return author_finding
+            # FIX X3: also check venue + year on the DOI-resolved record. Catches
+            # the dominant pattern in the HALLUCINATED + has DOI + unconfirmed
+            # bucket -- DOI resolves to the real paper, but the entry mis-cites
+            # the venue or year (e.g. AAAI cited as AISTATS, year 2021 cited
+            # as 2026). The helper is FPR-safe: hard MISMATCH only, never
+            # NON_COMPARABLE, and preprint-twin records can't anchor the year.
+            return self._id_anchored_field_mismatch(
+                entry, rec, source="crossref", identifier=raw_doi, id_kind="DOI"
+            )
 
         self.logger.warning(
             "DOI %s for entry %r points to a different paper: entry title " "%r vs DOI title %r (title score %.2f)",
