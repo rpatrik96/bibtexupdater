@@ -99,8 +99,12 @@ class TestBuildOpenReviewPaperhash:
     def test_normalization(self, title, last, expected):
         assert build_openreview_paperhash(title, last) == expected
 
-    def test_diacritics_stripped_in_author(self):
-        assert build_openreview_paperhash("A Title", "Müller") == "muller|a_title"
+    def test_diacritics_preserved_in_author(self):
+        # FIX B1: OpenReview's paperhash index keys on the Unicode-preserved
+        # surname ("müller" vs "muller"); stripping diacritics here returned 0
+        # notes for accented author names. Preserve diacritics so the paperhash
+        # matches OpenReview's index.
+        assert build_openreview_paperhash("A Title", "Müller") == "müller|a_title"
 
     def test_collapses_whitespace(self):
         assert build_openreview_paperhash("A   Spaced    Title", "x") == "x|a_spaced_title"

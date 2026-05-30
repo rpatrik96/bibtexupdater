@@ -92,7 +92,7 @@ from bibtex_updater.utils import (
     is_valid_arxiv_id,
     # Matching
     jaccard_similarity,
-    # DOI normalization (arXiv-version-aware)
+    latex_to_plain,
     normalize_doi_for_resolution,
     normalize_title_for_match,
     s2_data_to_record,
@@ -2588,7 +2588,13 @@ class FactChecker:
         # kept as scorable candidates (the strict resolver converter drops them).
         if self.dblp is not None:
             sources_queried.append("dblp")
-            dblp_query = f"{raw_title} {first_author}".strip()
+            # FIX B2: latex-strip + Unicode-fold the DBLP retrieval query so
+            # ``{B}rain {S}urgeon`` and ``Müller`` index correctly. This is a
+            # RETRIEVAL change only -- the downstream matcher still applies
+            # fuzzy logic to DBLP's response, so leak risk is zero.
+            dblp_title = latex_to_plain(raw_title or "")
+            dblp_first_author = strip_diacritics(first_author or "")
+            dblp_query = f"{dblp_title} {dblp_first_author}".strip()
             try:
                 dblp_hits = self.dblp.search(dblp_query, max_hits=top_k)
             except Exception as exc:

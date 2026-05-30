@@ -32,6 +32,7 @@ from bibtex_updater.utils import (
     OPENREVIEW_API,
     PublishedRecord,
     last_name_from_person,
+    latex_to_plain,
     normalize_title_for_match,
     strip_diacritics,
 )
@@ -253,18 +254,31 @@ def build_openreview_paperhash(title: str, first_author_last_name: str) -> str |
     """Construct OpenReview's ``paperhash`` exact-match key for a paper.
 
     OpenReview indexes every note under ``<firstauthor_lastname>|<title>`` where
-    the title is lowercased, stripped of all non-alphanumeric characters (colons,
+    the title is lowercased, stripped of non-alphanumeric punctuation (colons,
     hyphens, apostrophes are *removed*, not spaced -- "Few-Shot" -> "fewshot",
     "BERT:" -> "bert"), whitespace-collapsed, and spaces become underscores. The
-    author prefix is the first author's last name, lowercased + diacritics-free.
-    Verified live against the Kingma/He/Vaswani/Devlin/Brown/Ho papers.
+    author prefix is the first author's last name, lowercased.
+
+    FIX B1: the paperhash index PRESERVES author diacritics
+    (``Müller`` -> ``müller``), and OpenReview returns 0 notes for the folded
+    ``muller`` form. The folding is dropped here. We also LaTeX-strip the title
+    so ``{B}rain {S}urgeon`` -> ``brain_surgeon`` and ``log_{2}(T)`` ->
+    ``log_2_t``, matching OpenReview's plain-text title index.
 
     Returns ``None`` when either component is empty (an un-hashable entry).
     """
-    last = strip_diacritics(first_author_last_name or "").lower().strip()
-    last = re.sub(r"[^a-z0-9]", "", last)
-    norm_title = strip_diacritics(title or "").lower()
-    norm_title = re.sub(r"[^a-z0-9\s]", "", norm_title)
+    # Preserve diacritics in the surname: OpenReview's index keys on the raw
+    # lower-cased unicode form. Allow any unicode letter / digit; only strip
+    # punctuation and whitespace.
+    last = (first_author_last_name or "").lower().strip()
+    last = re.sub(r"[\W_]+", "", last, flags=re.UNICODE)
+    norm_title = latex_to_plain(title or "").lower()
+    # Drop punctuation (colon, hyphen, brace remnants), keep unicode word
+    # characters + spaces.
+    norm_title = re.sub(r"[^\w\s]", "", norm_title, flags=re.UNICODE)
+    # Underscores remaining from LaTeX subscripts (``log_2``) act like spaces
+    # in OpenReview's hash; collapse them with whitespace.
+    norm_title = norm_title.replace("_", " ")
     norm_title = "_".join(norm_title.split())
     if not last or not norm_title:
         return None
@@ -312,13 +326,33 @@ class OpenReviewClient:
         Returns:
             List of OpenReview note dicts (never ``None``). Empty on any error,
             on a missing title/author, or when nothing matches.
+
+        FIX B1: when paperhash returns 0 notes (LaTeX escapes in the title,
+        author-name spelling drift, etc.), fall back to ``/notes/search?term=``
+        with the plain title so the cascade still gets a chance to confirm the
+        venue. A fabricated paper still returns 0 notes under both queries:
+        the index is closed-world over OpenReview-hosted submissions.
         """
         per_page = max(1, min(int(limit), MAX_TOP_K))
         paperhash = build_openreview_paperhash(title or "", first_author or "")
-        if not paperhash:
+        notes: list[dict[str, Any]] = []
+        if paperhash:
+            params = {"paperhash": paperhash, "limit": per_page}
+            notes = self._fetch(params)
+        if notes:
+            return notes
+        # FIX B1 fallback: term= search against the LaTeX-stripped title.
+        # Gated to require first_author (and a built paperhash) so this only
+        # fires when paperhash was attempted and missed (LaTeX escapes / author
+        # spelling drift); never on author-less searches where the cascade
+        # already gave up.
+        if not first_author or not paperhash:
             return []
-        params = {"paperhash": paperhash, "limit": per_page}
-        return self._fetch(params)
+        plain_title = latex_to_plain(title or "").strip()
+        if not plain_title:
+            return []
+        term_params = {"term": plain_title, "limit": per_page}
+        return self._fetch(term_params)
 
     def _fetch(self, params: dict[str, Any]) -> list[dict[str, Any]]:
         """Issue a single OpenReview ``/notes`` request, return the note list.
