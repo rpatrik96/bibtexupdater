@@ -2264,3 +2264,219 @@ class TestResolveWhatCanBeResolved:
         cands = [(0.99, good, "dblp"), (0.40, unrelated, "s2")]
         _score, rec, _src = fact_checker._select_best_candidate(entry, cands)
         assert rec is good
+
+
+class TestCrossSourceAuthorFabrication:
+    """FIX A: cross-source extra-author / fabrication detection. The prefix-slice
+    ``symmetric_author_match`` waves through a 13-author entry that gets the
+    first 5 authors right but appends fabricated trailing authors (Leak A /
+    OSAKA). When two or more order-reliable candidate records agree that the
+    extra entry authors are absent from the real paper, the author check is
+    downgraded to MISMATCH and the status routes to AUTHOR_MISMATCH.
+    """
+
+    # Real OSAKA authors (arXiv:2003.05856 / NeurIPS 2020), 11 authors.
+    REAL_AUTHORS = [
+        {"given": "Massimo", "family": "Caccia"},
+        {"given": "Pau", "family": "Rodriguez"},
+        {"given": "Oleksiy", "family": "Ostapenko"},
+        {"given": "Fabrice", "family": "Normandin"},
+        {"given": "Min", "family": "Lin"},
+        {"given": "Lucas", "family": "Page-Caccia"},
+        {"given": "Issam Hadj", "family": "Laradji"},
+        {"given": "Irina", "family": "Rish"},
+        {"given": "Alexandre", "family": "Lacoste"},
+        {"given": "David", "family": "Vazquez"},
+        {"given": "Laurent", "family": "Charlin"},
+    ]
+    TITLE = "Online Fast Adaptation and Knowledge Accumulation: a New Approach to Continual Learning"
+
+    # Entry with the documented OSAKA defect: first 5 correct, two fabricated
+    # trailing surnames (Castrejon, Pineau) absent from the real paper.
+    OSAKA_ENTRY_AUTHORS = (
+        "Massimo Caccia and Pau Rodriguez and Oleksiy Ostapenko and "
+        "Fabrice Normandin and Min Lin and Alexandre Lacoste and Laurent "
+        "Charlin and Issam Laradji and Irina Rish and Alexande Lacoste and "
+        "David Vazquez and Lluis Castrejon and Joelle Pineau"
+    )
+
+    def _crossref(self):
+        return PublishedRecord(
+            doi="10.1/x",
+            title=self.TITLE,
+            authors=self.REAL_AUTHORS,
+            year=2020,
+            structured_names=True,
+            order_reliable=True,
+        )
+
+    def _dblp(self):
+        return PublishedRecord(
+            doi="10.1/x",
+            title=self.TITLE,
+            authors=self.REAL_AUTHORS,
+            year=2020,
+            structured_names=False,
+            order_reliable=True,
+        )
+
+    def test_osaka_shape_flags_when_two_sources_agree(self, fact_checker):
+        # Two order-reliable sources both lack Castrejon/Pineau -> MISMATCH.
+        entry = {"title": self.TITLE, "author": self.OSAKA_ENTRY_AUTHORS, "year": "2020"}
+        per_source = {"crossref": self._crossref(), "dblp": self._dblp()}
+        comps = fact_checker._compare_all_fields(entry, self._crossref(), per_source_records=per_source)
+        assert comps["author"].is_mismatch is True
+        status = fact_checker._determine_status(0.95, comps, ["crossref", "dblp"])
+        assert status == FactCheckStatus.AUTHOR_MISMATCH
+
+    def test_single_source_does_not_flag(self, fact_checker):
+        # Only one order-reliable source -> below the corroboration threshold,
+        # keep the prefix-slice MATCH (a single source's record might be a stub).
+        entry = {"title": self.TITLE, "author": self.OSAKA_ENTRY_AUTHORS, "year": "2020"}
+        per_source = {"crossref": self._crossref()}
+        comps = fact_checker._compare_all_fields(entry, self._crossref(), per_source_records=per_source)
+        # No flag for fabrication: the symmetric author match still returns MATCH
+        # because the prefix slice agrees and there is no cross-source signal.
+        assert comps["author"].note is None or "fabricated" not in (comps["author"].note or "")
+
+    def test_legitimate_full_match_not_flagged(self, fact_checker):
+        # An entry whose authors exactly match the real list MUST verify
+        # cleanly across two sources.
+        entry = {
+            "title": self.TITLE,
+            "author": (
+                "Massimo Caccia and Pau Rodriguez and Oleksiy Ostapenko and Fabrice Normandin and Min Lin "
+                "and Lucas Page-Caccia and Issam Hadj Laradji and Irina Rish and Alexandre Lacoste "
+                "and David Vazquez and Laurent Charlin"
+            ),
+            "year": "2020",
+        }
+        per_source = {"crossref": self._crossref(), "dblp": self._dblp()}
+        comps = fact_checker._compare_all_fields(entry, self._crossref(), per_source_records=per_source)
+        assert comps["author"].is_mismatch is False
+        assert comps["author"].is_confirmed is True
+
+    def test_entry_shorter_than_candidate_not_flagged(self, fact_checker):
+        # A shorter entry (e.g. only the first few authors) is consistent with
+        # the candidate -- not fabrication. symmetric_author_match returns
+        # PARTIAL (leading prefix), so FIX A's MATCH-gated check stays off.
+        entry = {
+            "title": self.TITLE,
+            "author": "Massimo Caccia and Pau Rodriguez and Oleksiy Ostapenko",
+            "year": "2020",
+        }
+        per_source = {"crossref": self._crossref(), "dblp": self._dblp()}
+        comps = fact_checker._compare_all_fields(entry, self._crossref(), per_source_records=per_source)
+        # Not a MISMATCH -- either MATCH (sentinel-aware leading head) or PARTIAL.
+        assert comps["author"].is_mismatch is False
+
+    def test_ordinalclip_shape_short_candidate_with_fabricated_trailing(self, fact_checker):
+        # Leak C / OrdinalCLIP shape: the candidate records are SHORTER than the
+        # entry (e.g. an API stub with only 3 of the real authors), and the
+        # entry's trailing surnames are fabricated. ``symmetric_author_match``
+        # returns PARTIAL (the candidate is a leading prefix of the entry), so
+        # the original code routed to UNCONFIRMED -- which buries a real
+        # fabrication signal. With two order-reliable sources agreeing on the
+        # short list, the trailing entry surnames are absent from BOTH unions,
+        # so FIX A escalates from PARTIAL to MISMATCH.
+        short_authors = [
+            {"given": "Shaoyuan", "family": "Li"},
+            {"given": "Hua", "family": "Liu"},
+            {"given": "Wei", "family": "Hu"},
+        ]
+        cr_rec = PublishedRecord(
+            doi="10.1/x",
+            title="OrdinalCLIP",
+            authors=short_authors,
+            year=2022,
+            structured_names=True,
+            order_reliable=True,
+        )
+        dblp_rec = PublishedRecord(
+            doi="10.1/x",
+            title="OrdinalCLIP",
+            authors=short_authors,
+            year=2022,
+            structured_names=False,
+            order_reliable=True,
+        )
+        entry = {
+            "title": "OrdinalCLIP",
+            "author": "Shaoyuan Li and Hua Liu and Wei Hu and Phantom One and Phantom Two and Phantom Three",
+            "year": "2022",
+        }
+        per_source = {"crossref": cr_rec, "dblp": dblp_rec}
+        comps = fact_checker._compare_all_fields(entry, cr_rec, per_source_records=per_source)
+        assert comps["author"].is_mismatch is True
+        status = fact_checker._determine_status(0.95, comps, ["crossref", "dblp"])
+        assert status == FactCheckStatus.AUTHOR_MISMATCH
+
+    def test_sentinel_entry_not_flagged(self, fact_checker):
+        # "and others" on the entry side suppresses the fabrication check: the
+        # citation is explicitly truncated, so a trailing surname's absence
+        # cannot be read as fabrication.
+        entry = {
+            "title": self.TITLE,
+            "author": (
+                "Massimo Caccia and Pau Rodriguez and Oleksiy Ostapenko and Fabrice Normandin "
+                "and Lluis Castrejon and Joelle Pineau and others"
+            ),
+            "year": "2020",
+        }
+        per_source = {"crossref": self._crossref(), "dblp": self._dblp()}
+        comps = fact_checker._compare_all_fields(entry, self._crossref(), per_source_records=per_source)
+        # No fabrication note: sentinel suppresses the check.
+        assert "fabricated" not in (comps["author"].note or "")
+
+
+class TestFirstAuthorGivenNameSubstitution:
+    """FIX B: the existing ``given_name_position_audit`` previously skipped the
+    first author when Crossref returned a ``literal`` (no given/family split)
+    for the lead author. Leak B (Least-to-Most: "Shunyu Zhou" cited where the
+    real lead is "Denny Zhou") slipped through because the synthesized-empty
+    family produced an empty surname key -- the audit's surname-key pairing
+    silently dropped position 0. The fix routes empty-family records through
+    ``last_name_from_person`` on the reconstructed name, symmetric with
+    ``PublishedRecord.surname_keys``.
+    """
+
+    TITLE = "Least-to-Most Prompting Enables Complex Reasoning"
+
+    def test_literal_lead_substitution_flags(self, fact_checker):
+        # Crossref literal-author record: ``given`` carries the full flat name,
+        # ``family`` is empty. The audit must still pair position 0 and detect
+        # SUBSTITUTION.
+        record = PublishedRecord(
+            doi="10.1/x",
+            title=self.TITLE,
+            authors=[
+                {"given": "Denny Zhou", "family": ""},
+                {"given": "Nathanael", "family": "Schaerli"},
+            ],
+            year=2023,
+            structured_names=True,
+            order_reliable=True,
+        )
+        entry = {"title": self.TITLE, "author": "Shunyu Zhou and Nathanael Schaerli", "year": "2023"}
+        comps = fact_checker._compare_all_fields(entry, record)
+        assert comps["author"].is_mismatch is True
+        status = fact_checker._determine_status(0.95, comps, ["crossref"])
+        assert status == FactCheckStatus.GIVEN_NAME_SUBSTITUTION
+
+    def test_literal_lead_correct_given_verifies(self, fact_checker):
+        # The same record/path with the CORRECT lead author must still verify
+        # (no false positive on the empty-family code path).
+        record = PublishedRecord(
+            doi="10.1/x",
+            title=self.TITLE,
+            authors=[
+                {"given": "Denny Zhou", "family": ""},
+                {"given": "Nathanael", "family": "Schaerli"},
+            ],
+            year=2023,
+            structured_names=True,
+            order_reliable=True,
+        )
+        entry = {"title": self.TITLE, "author": "Denny Zhou and Nathanael Schaerli", "year": "2023"}
+        comps = fact_checker._compare_all_fields(entry, record)
+        assert comps["author"].is_mismatch is False

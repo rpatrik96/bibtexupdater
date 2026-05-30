@@ -474,7 +474,23 @@ def given_name_position_audit(entry_author_field: str, record: "PublishedRecord"
 
     entry_names = split_authors_bibtex(entry_author_field)
     entry_pairs = [(last_name_from_person(n), _entry_given_of(n)) for n in entry_names]
-    rec_pairs = [(_normalize_surname_key(a.get("family") or ""), a.get("given") or "") for a in record.authors]
+    # Surname-key derivation mirrors ``PublishedRecord.surname_keys``: a trusted
+    # ``family`` is normalized verbatim; an empty family (Crossref ``literal``
+    # author with no given/family split) falls back to ``last_name_from_person``
+    # on the reconstructed full name so the audit still pairs position 0 against
+    # a record whose lead author arrived as a literal. Without this fallback the
+    # audit silently skipped a real lead-author given-name SUBSTITUTION (Leak B:
+    # "Shunyu Zhou" cited where the real lead is "Denny Zhou" and Crossref only
+    # had a ``literal`` for the lead).
+    rec_pairs: list[tuple[str, str]] = []
+    for a in record.authors:
+        family = (a.get("family") or "").strip()
+        given = (a.get("given") or "").strip()
+        if record.structured_names and family:
+            surname_key = _normalize_surname_key(family)
+        else:
+            surname_key = last_name_from_person(f"{given} {family}".strip())
+        rec_pairs.append((surname_key, given))
 
     from collections import Counter
 

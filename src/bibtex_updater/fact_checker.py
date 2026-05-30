@@ -1969,7 +1969,7 @@ class FactChecker:
             # The list is already sorted desc; first entry per source wins.
         intersection = cross_source_author_intersection(best_per_source, multi_source_bonus=MULTI_SOURCE_BONUS)
 
-        field_comparisons = self._compare_all_fields(entry, best_match)
+        field_comparisons = self._compare_all_fields(entry, best_match, per_source_records=best_per_source)
         status = self._determine_status(best_score, field_comparisons, sources_with_hits)
 
         # FPR guard (Task 2b): an AUTHOR_MISMATCH driven by a candidate from a
@@ -1986,7 +1986,7 @@ class FactChecker:
             structured_rec = self._structured_author_recheck(entry, best_match)
             if structured_rec is not None:
                 best_match = structured_rec
-                field_comparisons = self._compare_all_fields(entry, best_match)
+                field_comparisons = self._compare_all_fields(entry, best_match, per_source_records=best_per_source)
                 status = self._determine_status(best_score, field_comparisons, sources_with_hits)
 
         # Post-match: check preprint status. UNCONFIRMED is included because a
@@ -2784,8 +2784,126 @@ class FactChecker:
                 return entry_surnames_against_structured(entry.get("author", ""), family_keys, limit=limit)
         return authors_last_names(entry.get("author", ""), limit=limit)
 
-    def _compare_all_fields(self, entry: dict[str, Any], record: PublishedRecord) -> dict[str, FieldComparison]:
-        """Compare all relevant fields between entry and record."""
+    #: FIX A (cross-source extra-author / fabrication detection).
+    #: ``symmetric_author_match`` uses a first-N prefix slice (``prefix_n=5``) for
+    #: its Jaccard+LCS score, so a 13-author entry that gets the first 5 right but
+    #: appends fabricated authors beyond position 5 (Leak A / OSAKA) currently
+    #: passes as MATCH -- positions beyond the slice contribute nothing. The
+    #: cross-source check repairs this: across the per-source candidate records
+    #: from ORDER-RELIABLE sources (Crossref/OpenAlex/DBLP/OpenReview, with
+    #: stable enough author lists to trust as a fabrication signal), compute the
+    #: UNION of full author surname sets. An entry author whose surname key is
+    #: absent from the union is positive evidence the citation invented an
+    #: author the real record does not contain. ``_MIN_EXTRA_AUTHORS_FOR_FLAG``
+    #: requires at least this many absent-everywhere entry surnames before
+    #: flagging, so a single transcription typo or a CJK family-first re-pairing
+    #: artifact never trips it. ``_MIN_ORDER_RELIABLE_SOURCES_FOR_FLAG`` requires
+    #: independent corroboration from at least this many sources: a single
+    #: source's record can be a truncated stub or a partial DBLP listing, but
+    #: an author absent from TWO independent order-reliable sources is far less
+    #: likely to be a stub artifact. An ``and others``/``et al`` sentinel on the
+    #: entry side suppresses the check (the elision means there are unlisted
+    #: authors, so absence cannot be read as fabrication).
+    _MIN_EXTRA_AUTHORS_FOR_FLAG: int = 2
+    _MIN_ORDER_RELIABLE_SOURCES_FOR_FLAG: int = 2
+
+    @staticmethod
+    def _record_full_surname_union(
+        per_source_records: dict[str, PublishedRecord | None] | None,
+    ) -> tuple[set[str], int]:
+        """Union of full-author surname keys across ORDER-RELIABLE candidate records.
+
+        Returns ``(union_keys, source_count)`` where ``source_count`` is how
+        many order-reliable sources contributed at least one usable surname.
+        Order-unreliable sources (S2, ad-hoc free-text searches) are excluded:
+        their author lists are flat/synthesized and may be truncated or
+        unreliable in a way that would cause cross-source false positives.
+
+        Empty records (no authors) and ``None`` entries are dropped silently.
+        """
+        if not per_source_records:
+            return set(), 0
+        union: set[str] = set()
+        source_count = 0
+        for _src, rec in per_source_records.items():
+            if rec is None or not rec.authors or not rec.order_reliable:
+                continue
+            keys = set(rec.surname_keys(limit=10_000))
+            if keys:
+                union |= keys
+                source_count += 1
+        return union, source_count
+
+    def _detect_author_fabrication(
+        self,
+        entry_author_field: str,
+        entry_surname_keys: list[str],
+        per_source_records: dict[str, PublishedRecord | None] | None,
+    ) -> list[str] | None:
+        """Return entry surnames absent from every order-reliable record.
+
+        Gated to limit false positives:
+
+        * Skip when the entry side carries an ``and others`` / ``et al``
+          sentinel (the citation is explicitly truncated, so absence on the
+          record side is consistent with the elision -- not fabrication).
+        * Require at least ``_MIN_ORDER_RELIABLE_SOURCES_FOR_FLAG`` order-
+          reliable sources to have contributed an author list (a lone source's
+          record might be a truncated stub).
+        * Require at least ``_MIN_EXTRA_AUTHORS_FOR_FLAG`` entry surname keys
+          to be absent from the union (a single missing surname could be a
+          name-parsing artifact or a single transcription typo).
+
+        Returns the absent-everywhere surname keys (already deduped) when ALL
+        gates pass; returns ``None`` otherwise (no flag).
+        """
+        from bibtex_updater.utils import split_authors_bibtex
+
+        entry_names = split_authors_bibtex(entry_author_field or "")
+        # Drop "and others" / "et al" sentinel forms: their presence means the
+        # entry's author list is explicitly truncated, so missing trailing
+        # authors are not fabrication.
+        sentinel_lower = {"others", "et al", "etal", "al"}
+        if any(n and n.strip().lower() in sentinel_lower for n in entry_names):
+            return None
+
+        union, source_count = self._record_full_surname_union(per_source_records)
+        if source_count < self._MIN_ORDER_RELIABLE_SOURCES_FOR_FLAG:
+            return None
+        if not union:
+            return None
+
+        # Compare deduped entry surname keys against the cross-source union.
+        seen: set[str] = set()
+        absent: list[str] = []
+        for k in entry_surname_keys:
+            if not k or k in seen:
+                continue
+            seen.add(k)
+            if k not in union:
+                absent.append(k)
+        if len(absent) < self._MIN_EXTRA_AUTHORS_FOR_FLAG:
+            return None
+        return absent
+
+    def _compare_all_fields(
+        self,
+        entry: dict[str, Any],
+        record: PublishedRecord,
+        per_source_records: dict[str, PublishedRecord | None] | None = None,
+    ) -> dict[str, FieldComparison]:
+        """Compare all relevant fields between entry and record.
+
+        ``per_source_records`` (optional) is the per-source ``best_per_source``
+        dict carried from :meth:`check_entry`. When supplied, the cross-source
+        extra-author / fabrication check (FIX A) runs after the regular author
+        comparison: an entry author whose surname is absent from EVERY order-
+        reliable candidate's full author set is positive evidence of
+        fabrication the prefix-slice ``symmetric_author_match`` misses (Leak A /
+        OSAKA, Leak C / OrdinalCLIP). The check is gated (see
+        :meth:`_detect_author_fabrication`) so single-source stubs and
+        explicitly-truncated citations never trip it.
+        """
         comparisons: dict[str, FieldComparison] = {}
         cfg = self.config
 
@@ -2851,6 +2969,36 @@ class FactChecker:
             note=author_note,
             outcome=author_outcome,
         )
+
+        # FIX A: cross-source extra-author / fabrication detection. When the
+        # author check has tentatively MATCHed (or returned PARTIAL because the
+        # candidate is a leading prefix of the entry) but multiple order-
+        # reliable sources agree that several entry authors are absent from the
+        # real paper, treat that as positive evidence of fabrication. Without
+        # this check, ``symmetric_author_match``'s prefix-slice score waves
+        # through a 13-author entry (Leak A / OSAKA) where the first 5 authors
+        # are correct but trailing authors were invented -- positions beyond the
+        # slice never affect the score. PARTIAL is included so that a record
+        # that happens to be shorter than the entry (Leak C / OrdinalCLIP --
+        # API stub with 3 authors, entry has 6 with the trailing 3 invented)
+        # still escalates rather than abstaining as UNCONFIRMED. Only fires
+        # when at least 2 entry surnames are absent from EVERY order-reliable
+        # candidate's full surname set AND at least 2 such sources contributed
+        # -- so a single truncated stub or a CJK family-first re-pairing
+        # artifact never trips it. Sentinel-truncated citations ("and others"/
+        # "et al") are suppressed by the helper.
+        if (
+            comparisons["author"].resolved_outcome in (MatchOutcome.MATCH, MatchOutcome.PARTIAL)
+            and per_source_records
+        ):
+            absent = self._detect_author_fabrication(entry_authors, entry_names, per_source_records)
+            if absent:
+                comparisons["author"].outcome = MatchOutcome.MISMATCH
+                comparisons["author"].matches = False
+                comparisons["author"].note = (
+                    "Entry authors absent from every order-reliable candidate's full author list "
+                    f"(likely fabricated): {', '.join(absent)}"
+                )
 
         # Same-surname given-name swap. Surname-only matching is blind to a swap of
         # two co-authors who share a surname (e.g. 'Yang Song' <-> 'Jiaming Song' --
