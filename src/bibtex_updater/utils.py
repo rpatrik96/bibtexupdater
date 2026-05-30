@@ -278,7 +278,7 @@ def _given_initial(given: str) -> str:
     return ""
 
 
-def same_surname_given_order_violation(entry_author_field: str, record: "PublishedRecord") -> bool:
+def same_surname_given_order_violation(entry_author_field: str, record: PublishedRecord) -> bool:
     """Detect a swap/mismatch between two authors who share a surname.
 
     Surname-only matching is blind to a swap of two co-authors with the SAME
@@ -450,7 +450,7 @@ def classify_given_pair(given_entry: str, given_record: str) -> str:
     return GivenNameVariety.SUBSTITUTION
 
 
-def given_name_position_audit(entry_author_field: str, record: "PublishedRecord") -> tuple[str, list[dict]]:
+def given_name_position_audit(entry_author_field: str, record: PublishedRecord) -> tuple[str, list[dict]]:
     """Grade given names at every surname-confirmed position against an
     order-preserving, structured record. Returns ``(worst_class, findings)`` where
     worst_class is one of "escalate" / "soften" / "confirmed" / "skip" and findings

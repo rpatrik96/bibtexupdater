@@ -622,8 +622,7 @@ class TestGivenNamePositionAudit:
         from bibtex_updater.utils import given_name_position_audit
 
         entry = (
-            "Yufeng Zhang and Jialu Pan and Li Ken Li and Wanwei Liu and "
-            "Zhenbang Chen and Xinwang Liu and Ji Wang"
+            "Yufeng Zhang and Jialu Pan and Li Ken Li and Wanwei Liu and " "Zhenbang Chen and Xinwang Liu and Ji Wang"
         )
         # Record authors alphabetized by surname (as the real source returned them).
         rec = self._rec(

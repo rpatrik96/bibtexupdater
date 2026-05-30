@@ -860,9 +860,7 @@ _SERIES_MARKERS: tuple[str, ...] = (
 #: the published venue, exactly like a preprint server -- so a venue comparison
 #: against it is non-comparable, not a mismatch. Not added as a venue *alias*
 #: (OpenReview is not a venue), only as a non-comparable platform string.
-_PLATFORM_MARKERS: tuple[str, ...] = (
-    "openreview",
-)
+_PLATFORM_MARKERS: tuple[str, ...] = ("openreview",)
 
 
 def is_preprint_or_series_venue(venue: str) -> bool:

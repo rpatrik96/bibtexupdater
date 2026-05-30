@@ -2986,12 +2986,7 @@ class FactChecker:
         # diacritic/punctuation fold inside ``normalize_title_for_match`` means
         # legitimate Unicode variants ("Réseau" vs "Reseau") still hit edit
         # distance 0 and are NOT touched by this gate.
-        strict_title_nearmiss = (
-            cfg.strict
-            and 0 < edit_dist <= 1
-            and entry_title
-            and api_title
-        )
+        strict_title_nearmiss = cfg.strict and 0 < edit_dist <= 1 and entry_title and api_title
         title_matches = title_score >= cfg.title_threshold and not near_miss and not strict_title_nearmiss
         # In strict mode the near-miss flag is the union of the fuzzy-near-miss
         # and the Levenshtein-1 near-miss; ``note`` carries the edit distance
@@ -3112,10 +3107,7 @@ class FactChecker:
         # -- so a single truncated stub or a CJK family-first re-pairing
         # artifact never trips it. Sentinel-truncated citations ("and others"/
         # "et al") are suppressed by the helper.
-        if (
-            comparisons["author"].resolved_outcome in (MatchOutcome.MATCH, MatchOutcome.PARTIAL)
-            and per_source_records
-        ):
+        if comparisons["author"].resolved_outcome in (MatchOutcome.MATCH, MatchOutcome.PARTIAL) and per_source_records:
             absent = self._detect_author_fabrication(entry_authors, entry_names, per_source_records)
             if absent:
                 comparisons["author"].outcome = MatchOutcome.MISMATCH
@@ -3130,10 +3122,10 @@ class FactChecker:
         # both reduce to 'song'). When the matched record preserves author order,
         # compare the given-name initials of each shared-surname run; a difference
         # is a real corruption that an otherwise-confirming author check missed.
-        if (
-            comparisons["author"].resolved_outcome in (MatchOutcome.MATCH, MatchOutcome.PARTIAL)
-            and same_surname_given_order_violation(entry_authors, record)
-        ):
+        if comparisons["author"].resolved_outcome in (
+            MatchOutcome.MATCH,
+            MatchOutcome.PARTIAL,
+        ) and same_surname_given_order_violation(entry_authors, record):
             comparisons["author"].outcome = MatchOutcome.MISMATCH
             comparisons["author"].matches = False
             comparisons["author"].note = "Same-surname co-authors in a different given-name order (swapped authors)"

@@ -22,28 +22,30 @@ OUT_DIR = Path(__file__).parent.parent / "assets"
 OUT_DIR.mkdir(exist_ok=True)
 
 # Colorblind-safe palette (Wong 2011)
-VERIFIED = "#0072B2"      # blue
-CNV = "#E69F00"           # orange (could-not-verify)
-PROBLEMATIC = "#D55E00"   # vermillion (FP on valid, catch on hallucinated)
-LEAK = "#882255"          # dark purple (the bad-on-hallucinated case)
+VERIFIED = "#0072B2"  # blue
+CNV = "#E69F00"  # orange (could-not-verify)
+PROBLEMATIC = "#D55E00"  # vermillion (FP on valid, catch on hallucinated)
+LEAK = "#882255"  # dark purple (the bad-on-hallucinated case)
 
 # Apples-to-apples numbers (post-correction gold)
 # dev: 502 VALID, 617 HALLUCINATED
 # test: 301 VALID, 530 HALLUCINATED
 NUMBERS = {
     "dev": {
-        "n_valid": 502, "n_hall": 617,
-        "valid_pre":  {"verified": 453, "cnv": 36, "problematic": 13},
-        "valid_post": {"verified": 460, "cnv": 33, "problematic":  9},
-        "hall_pre":   {"verified":   3, "cnv": 232, "problematic": 382},
-        "hall_post":  {"verified":   4, "cnv": 243, "problematic": 370},  # Least-to-Most caught -> -1 leak
+        "n_valid": 502,
+        "n_hall": 617,
+        "valid_pre": {"verified": 453, "cnv": 36, "problematic": 13},
+        "valid_post": {"verified": 460, "cnv": 33, "problematic": 9},
+        "hall_pre": {"verified": 3, "cnv": 232, "problematic": 382},
+        "hall_post": {"verified": 4, "cnv": 243, "problematic": 370},  # Least-to-Most caught -> -1 leak
     },
     "test": {
-        "n_valid": 301, "n_hall": 530,
-        "valid_pre":  {"verified": 243, "cnv": 31, "problematic": 27},
+        "n_valid": 301,
+        "n_hall": 530,
+        "valid_pre": {"verified": 243, "cnv": 31, "problematic": 27},
         "valid_post": {"verified": 251, "cnv": 32, "problematic": 18},
-        "hall_pre":   {"verified":   2, "cnv": 230, "problematic": 298},
-        "hall_post":  {"verified":   2, "cnv": 234, "problematic": 294},
+        "hall_pre": {"verified": 2, "cnv": 230, "problematic": 298},
+        "hall_post": {"verified": 2, "cnv": 234, "problematic": 294},
     },
 }
 
@@ -71,32 +73,66 @@ def stacked_bar(ax, split: str):
 
     x = np.arange(len(bars))
     width = 0.55
-    ax.bar(x, bottom, width, color=[VERIFIED, PROBLEMATIC],
-           label="correct verdict", edgecolor="white", linewidth=0.5)
-    ax.bar(x, middle, width, bottom=bottom, color=CNV,
-           label="could-not-verify", edgecolor="white", linewidth=0.5)
-    ax.bar(x, top, width, bottom=[bottom[i] + middle[i] for i in range(2)],
-           color=[PROBLEMATIC, LEAK], label="wrong verdict (FP / leak)",
-           edgecolor="white", linewidth=0.5)
+    ax.bar(x, bottom, width, color=[VERIFIED, PROBLEMATIC], label="correct verdict", edgecolor="white", linewidth=0.5)
+    ax.bar(x, middle, width, bottom=bottom, color=CNV, label="could-not-verify", edgecolor="white", linewidth=0.5)
+    ax.bar(
+        x,
+        top,
+        width,
+        bottom=[bottom[i] + middle[i] for i in range(2)],
+        color=[PROBLEMATIC, LEAK],
+        label="wrong verdict (FP / leak)",
+        edgecolor="white",
+        linewidth=0.5,
+    )
 
     # Annotate the headline cells
-    ax.text(0, bottom[0] / 2, f"verified\n{bottom[0]:.1f}%",
-            ha="center", va="center", color="white", fontsize=9, fontweight="bold")
-    ax.text(0, bottom[0] + middle[0] / 2, f"CNV {middle[0]:.1f}%",
-            ha="center", va="center", color="black", fontsize=8)
-    ax.text(0, bottom[0] + middle[0] + top[0] / 2, f"FP {top[0]:.2f}%",
-            ha="center", va="center", color="white", fontsize=8, fontweight="bold")
-    ax.text(1, bottom[1] / 2, f"caught\n{bottom[1]:.1f}%",
-            ha="center", va="center", color="white", fontsize=9, fontweight="bold")
-    ax.text(1, bottom[1] + middle[1] / 2, f"CNV {middle[1]:.1f}%",
-            ha="center", va="center", color="black", fontsize=8)
+    ax.text(
+        0,
+        bottom[0] / 2,
+        f"verified\n{bottom[0]:.1f}%",
+        ha="center",
+        va="center",
+        color="white",
+        fontsize=9,
+        fontweight="bold",
+    )
+    ax.text(0, bottom[0] + middle[0] / 2, f"CNV {middle[0]:.1f}%", ha="center", va="center", color="black", fontsize=8)
+    ax.text(
+        0,
+        bottom[0] + middle[0] + top[0] / 2,
+        f"FP {top[0]:.2f}%",
+        ha="center",
+        va="center",
+        color="white",
+        fontsize=8,
+        fontweight="bold",
+    )
+    ax.text(
+        1,
+        bottom[1] / 2,
+        f"caught\n{bottom[1]:.1f}%",
+        ha="center",
+        va="center",
+        color="white",
+        fontsize=9,
+        fontweight="bold",
+    )
+    ax.text(1, bottom[1] + middle[1] / 2, f"CNV {middle[1]:.1f}%", ha="center", va="center", color="black", fontsize=8)
     leak_pct = top[1]
     if leak_pct >= 0.2:
-        ax.text(1, bottom[1] + middle[1] + top[1] / 2, f"LEAK {leak_pct:.2f}%",
-                ha="center", va="center", color="white", fontsize=8, fontweight="bold")
+        ax.text(
+            1,
+            bottom[1] + middle[1] + top[1] / 2,
+            f"LEAK {leak_pct:.2f}%",
+            ha="center",
+            va="center",
+            color="white",
+            fontsize=8,
+            fontweight="bold",
+        )
     else:
-        ax.text(1, 102, f"leak {leak_pct:.2f}%",
-                ha="center", va="center", color=LEAK, fontsize=8, fontweight="bold")
+        ax.text(1, 102, f"leak {leak_pct:.2f}%", ha="center", va="center", color=LEAK, fontsize=8, fontweight="bold")
 
     ax.set_xticks(x)
     ax.set_xticklabels(bars)
@@ -130,24 +166,37 @@ def fpr_leak_comparison(ax):
     x = np.arange(len(splits))
     width = 0.18
     # FPR bars
-    ax.bar(x - 1.6 * width, fpr_pre, width, color=PROBLEMATIC, alpha=0.5,
-           label="FPR pre-fix", edgecolor="white", linewidth=0.5)
-    ax.bar(x - 0.6 * width, fpr_post, width, color=PROBLEMATIC,
-           label="FPR post-fix", edgecolor="white", linewidth=0.5)
+    ax.bar(
+        x - 1.6 * width,
+        fpr_pre,
+        width,
+        color=PROBLEMATIC,
+        alpha=0.5,
+        label="FPR pre-fix",
+        edgecolor="white",
+        linewidth=0.5,
+    )
+    ax.bar(x - 0.6 * width, fpr_post, width, color=PROBLEMATIC, label="FPR post-fix", edgecolor="white", linewidth=0.5)
     # Leak bars
-    ax.bar(x + 0.6 * width, leak_pre, width, color=LEAK, alpha=0.5,
-           label="leak pre-fix", edgecolor="white", linewidth=0.5)
-    ax.bar(x + 1.6 * width, leak_post, width, color=LEAK,
-           label="leak post-fix", edgecolor="white", linewidth=0.5)
+    ax.bar(
+        x + 0.6 * width, leak_pre, width, color=LEAK, alpha=0.5, label="leak pre-fix", edgecolor="white", linewidth=0.5
+    )
+    ax.bar(x + 1.6 * width, leak_post, width, color=LEAK, label="leak post-fix", edgecolor="white", linewidth=0.5)
 
     for i, (pre, post) in enumerate(zip(fpr_pre, fpr_post)):
         ax.text(i - 1.6 * width, pre + 0.15, f"{pre:.2f}", ha="center", fontsize=8)
         ax.text(i - 0.6 * width, post + 0.15, f"{post:.2f}", ha="center", fontsize=8, fontweight="bold")
         # Δ arrow
         delta = (post - pre) / pre * 100
-        ax.annotate(f"{delta:+.0f}%", xy=(i - 0.6 * width, post),
-                    xytext=(i - 1.1 * width, max(pre, post) + 1.2),
-                    fontsize=9, color=PROBLEMATIC, fontweight="bold", ha="center")
+        ax.annotate(
+            f"{delta:+.0f}%",
+            xy=(i - 0.6 * width, post),
+            xytext=(i - 1.1 * width, max(pre, post) + 1.2),
+            fontsize=9,
+            color=PROBLEMATIC,
+            fontweight="bold",
+            ha="center",
+        )
     for i, (pre, post) in enumerate(zip(leak_pre, leak_post)):
         ax.text(i + 0.6 * width, pre + 0.15, f"{pre:.2f}", ha="center", fontsize=8)
         ax.text(i + 1.6 * width, post + 0.15, f"{post:.2f}", ha="center", fontsize=8, fontweight="bold")
@@ -174,7 +223,9 @@ def main():
 
     fig.suptitle(
         "bibtex-check v1.1.0 — HALLMARK v1.0 corrected gold (dev + held-out test)",
-        fontsize=12, fontweight="bold", y=1.02,
+        fontsize=12,
+        fontweight="bold",
+        y=1.02,
     )
     fig.tight_layout()
     png = OUT_DIR / "accuracy_v1_1_0.png"
