@@ -48,6 +48,7 @@ from bibtex_updater.matching import (
     EXPANDED_VENUE_ALIASES,
     MatchOutcome,
     get_canonical_venue,
+    has_explicit_truncation_indicator,
     is_near_miss_title,
     is_preprint_or_series_venue,
     symmetric_author_match,
@@ -240,6 +241,22 @@ class FactCheckStatus(Enum):
     WORKING_PAPER_VERIFIED = "working_paper_verified"
     WORKING_PAPER_NOT_FOUND = "working_paper_not_found"
 
+    # --strict-mode statuses (arXiv 2026 hallucination policy). Distinct from
+    # the default-mode flags so JSONL consumers can tell "default *_mismatch"
+    # apart from "strict-only escalation". TITLE_NEAR_MISS is a Levenshtein <= 1
+    # title (Privacys/Privacy, Schema Variable/Schema-Variable, ...). AUTHOR_
+    # TRUNCATED is a silent leading-prefix author list with no sentinel and no
+    # explicit truncation indicator -- the cited author dropped trailing names
+    # without disclosing it. STRICT_WARN_PREPRINT_YEAR is an abstain-ish status:
+    # the year cannot be anchored because the matched record is the arXiv twin,
+    # so the user is told to decide. STRICT_WARN_CNV promotes the
+    # could-not-verify abstentions (not_found / unconfirmed) to their own bucket
+    # under --strict-warn-cnv so CI can fail on them.
+    TITLE_NEAR_MISS = "title_near_miss"
+    AUTHOR_TRUNCATED = "author_truncated"
+    STRICT_WARN_PREPRINT_YEAR = "strict_warn_preprint_year"
+    STRICT_WARN_CNV = "strict_warn_cnv"
+
     # General
     SKIPPED = "skipped"  # Entry type not verifiable
 
@@ -258,6 +275,10 @@ ABSTAINED_STATUS_VALUES = frozenset(
         FactCheckStatus.BOOK_NOT_FOUND.value,
         FactCheckStatus.WORKING_PAPER_NOT_FOUND.value,
         FactCheckStatus.URL_NOT_FOUND.value,
+        # --strict: the matched record is the preprint twin, so the cited
+        # PUBLISHED year cannot be anchored from it. Abstention, not a
+        # problem -- the user opts to trust the citation or not.
+        FactCheckStatus.STRICT_WARN_PREPRINT_YEAR.value,
     }
 )
 
@@ -389,6 +410,23 @@ class FactCheckerConfig:
     cascade_low_confidence: float = CASCADE_LOW_CONFIDENCE
     cascade_high_confidence: float = CASCADE_HIGH_CONFIDENCE
     openalex_mailto: str = DEFAULT_OPENALEX_MAILTO
+    # --strict mode (arXiv 2026 hallucination policy). When True, the
+    # checker raises its bar in a few asymmetric-cost places where a leaked
+    # hallucinated reference is far worse than a false positive: Levenshtein-1
+    # title near-miss, year tolerance 0 (preprint-twin year abstains rather
+    # than tolerating), single-source single-extra-author detection, no
+    # alphabetization escape for same-multiset author swaps, and silent
+    # author-list truncation flags as AUTHOR_TRUNCATED. Default-mode behaviour
+    # is unchanged when ``strict`` is False; every strict gate is conditional
+    # on ``cfg.strict``.
+    strict: bool = False
+    # --strict-warn-cnv subflag (requires ``strict``). Promotes the
+    # could-not-verify abstentions (NOT_FOUND / UNCONFIRMED) to a new
+    # STRICT_WARN_CNV status so callers / CI can fail on them. CNV is kept
+    # distinct from PROBLEMATIC so the principled three-way verdict (verified
+    # / could-not-verify / problematic) is preserved -- this just adds a
+    # fourth class users can opt into for exhaustive review.
+    strict_warn_cnv: bool = False
 
 
 # ------------- Item 5: Rich VerificationResult -------------
@@ -1914,6 +1952,7 @@ class FactChecker:
 
         if not candidates:
             status = FactCheckStatus.API_ERROR if errors else FactCheckStatus.NOT_FOUND
+            status = self._apply_strict_warn_cnv(status)
             # No candidates -> no per-entry intersection/source records. These
             # ride on the result (not self) so concurrent entries don't clobber
             # each other.
@@ -2001,6 +2040,13 @@ class FactChecker:
             preprint_status = self._check_preprint_status(entry, best_match)
             if preprint_status is not None:
                 status = preprint_status
+
+        # --strict-warn-cnv: promote could-not-verify abstentions (NOT_FOUND /
+        # UNCONFIRMED) to STRICT_WARN_CNV so opt-in users can fail CI on
+        # exhaustive review. Kept distinct from PROBLEMATIC: the three-way
+        # verdict (verified / could-not-verify / problematic) is preserved;
+        # STRICT_WARN_CNV is a fourth class users opt into.
+        status = self._apply_strict_warn_cnv(status)
 
         # P3.1+P3.2+P3.3: Use calibrated confidence instead of raw best_score
         field_comp_dict = {
@@ -2867,8 +2913,20 @@ class FactChecker:
         if any(n and n.strip().lower() in sentinel_lower for n in entry_names):
             return None
 
+        # --strict (arXiv 2026, rule 3): the asymmetric leak cost dominates,
+        # so a single canonical source with a single absent-everywhere entry
+        # surname is enough evidence to flag. Default mode keeps the two-of-
+        # each conservative thresholds (corroboration across two order-reliable
+        # sources, two missing surnames) to keep its FP rate intact.
+        if self.config.strict:
+            min_sources = 1
+            min_absent = 1
+        else:
+            min_sources = self._MIN_ORDER_RELIABLE_SOURCES_FOR_FLAG
+            min_absent = self._MIN_EXTRA_AUTHORS_FOR_FLAG
+
         union, source_count = self._record_full_surname_union(per_source_records)
-        if source_count < self._MIN_ORDER_RELIABLE_SOURCES_FOR_FLAG:
+        if source_count < min_sources:
             return None
         if not union:
             return None
@@ -2882,7 +2940,7 @@ class FactChecker:
             seen.add(k)
             if k not in union:
                 absent.append(k)
-        if len(absent) < self._MIN_EXTRA_AUTHORS_FOR_FLAG:
+        if len(absent) < min_absent:
             return None
         return absent
 
@@ -2916,14 +2974,34 @@ class FactChecker:
         # Detect near-miss: high fuzzy score but character-level differences
         edit_dist = title_edit_distance(entry_title, api_title)
         near_miss = is_near_miss_title(entry_title, api_title, title_score, cfg.title_threshold)
-        title_matches = title_score >= cfg.title_threshold and not near_miss
+        # Strict mode (arXiv 2026): also flag a Levenshtein <= 1 normalized-title
+        # difference as a near-miss ("Subspace Differential Privacys" vs "...
+        # Privacy", "Chain of-Thought" vs "Chain-of-Thought"). The existing
+        # diacritic/punctuation fold inside ``normalize_title_for_match`` means
+        # legitimate Unicode variants ("Réseau" vs "Reseau") still hit edit
+        # distance 0 and are NOT touched by this gate.
+        strict_title_nearmiss = (
+            cfg.strict
+            and 0 < edit_dist <= 1
+            and entry_title
+            and api_title
+        )
+        title_matches = title_score >= cfg.title_threshold and not near_miss and not strict_title_nearmiss
+        # In strict mode the near-miss flag is the union of the fuzzy-near-miss
+        # and the Levenshtein-1 near-miss; ``note`` carries the edit distance
+        # either way so the JSONL/HTML report tells the user the root cause.
+        title_note = None
+        if strict_title_nearmiss:
+            title_note = f"Strict near-miss: edit distance {edit_dist}"
+        elif near_miss:
+            title_note = f"Edit distance: {edit_dist}"
         comparisons["title"] = FieldComparison(
             "title",
             entry_title,
             api_title,
             title_score,
             title_matches,
-            f"Edit distance: {edit_dist}" if near_miss else None,
+            title_note,
         )
 
         # Author (symmetric comparison; see FIX C / symmetric_author_match).
@@ -2937,7 +3015,11 @@ class FactChecker:
         entry_names = self._entry_surname_keys(entry, record, limit=10_000)
         api_names = record.surname_keys(limit=10_000)
         author_result = symmetric_author_match(
-            entry_names, api_names, threshold=cfg.author_threshold, order_reliable=record.order_reliable
+            entry_names,
+            api_names,
+            threshold=cfg.author_threshold,
+            order_reliable=record.order_reliable,
+            strict=cfg.strict,
         )
         api_authors_str = " and ".join(f"{a.get('given', '')} {a.get('family', '')}".strip() for a in record.authors)
         # Mirror the venue "no claim" rule: if the entry lists no authors there is
@@ -2969,6 +3051,43 @@ class FactChecker:
             note=author_note,
             outcome=author_outcome,
         )
+
+        # --strict rule 5: silent author-list truncation. A PARTIAL author
+        # outcome where the ENTRY side is shorter (entry is a leading-prefix
+        # or in-order subsequence of the canonical list) without an explicit
+        # "and others"/"et al" sentinel is treated by default as consistent-
+        # but-incomplete (PARTIAL -> UNCONFIRMED). Under the arXiv 2026 policy
+        # a citation that silently drops co-authors is a hallucination signal:
+        # escalate to AUTHOR_TRUNCATED unless the citation discloses its
+        # truncation elsewhere (a trailing "...", ``\ldots``, or "et al." in
+        # note/howpublished/title). The mirror case (record shorter than entry
+        # -- entry invented trailing authors) is rule 3's territory
+        # (_detect_author_fabrication) and routed through AUTHOR_MISMATCH; we
+        # gate on ``len(entry_names) <= len(api_names)`` here so the two rules
+        # don't fight over the same shape.
+        if (
+            cfg.strict
+            and comparisons["author"].resolved_outcome is MatchOutcome.PARTIAL
+            and entry_names
+            and len(entry_names) <= len(api_names)
+            and not has_explicit_truncation_indicator(
+                entry_authors,
+                entry.get("note"),
+                entry.get("howpublished"),
+                entry.get("title"),
+            )
+        ):
+            comparisons["author"].outcome = MatchOutcome.MISMATCH
+            comparisons["author"].matches = False
+            comparisons["author"].note = (
+                "Strict mode: silent author-list truncation "
+                "(entry is a leading-prefix/subsequence of canonical without sentinel)"
+            )
+            # Tag for the status gate so _determine_status can route this lone
+            # MISMATCH to AUTHOR_TRUNCATED instead of AUTHOR_MISMATCH.
+            comparisons["author"].given_name_findings = (comparisons["author"].given_name_findings or []) + [
+                {"variety": "strict_truncated"}
+            ]
 
         # FIX A: cross-source extra-author / fabrication detection. When the
         # author check has tentatively MATCHed (or returned PARTIAL because the
@@ -3065,18 +3184,32 @@ class FactChecker:
         else:
             try:
                 year_diff = abs(int(entry_year) - int(api_year))
-                if year_diff <= cfg.year_tolerance:
+                # --strict (arXiv 2026): tolerance 0 for two POPULATED parseable
+                # years. The default 1-year tolerance accepts the common
+                # preprint-vs-publication year drift; in strict mode the
+                # asymmetric leak cost outweighs that convenience and we
+                # require an exact match. The preprint-twin path is preserved
+                # but routes through a distinct STRICT_WARN_PREPRINT_YEAR
+                # status (handled by ``_determine_status``) so the user sees
+                # "I cannot anchor this year because the matched record is a
+                # preprint" instead of a tolerated MATCH.
+                effective_tolerance = 0 if cfg.strict else cfg.year_tolerance
+                if year_diff <= effective_tolerance:
                     year_outcome = MatchOutcome.MATCH
-                    year_note = f"Tolerance: ±{cfg.year_tolerance}"
+                    year_note = f"Tolerance: ±{effective_tolerance}"
                 elif record_is_preprint:
                     # A preprint/series record is posted in an earlier year than the
                     # proceedings/journal version, so its year cannot refute the
                     # entry's claimed PUBLISHED year -> non-comparable, not a mismatch.
                     year_outcome = MatchOutcome.NON_COMPARABLE
-                    year_note = "Year could not be confirmed (preprint/series record)"
+                    year_note = (
+                        "Strict: year could not be anchored (preprint/series record)"
+                        if cfg.strict
+                        else "Year could not be confirmed (preprint/series record)"
+                    )
                 else:
                     year_outcome = MatchOutcome.MISMATCH
-                    year_note = f"Tolerance: ±{cfg.year_tolerance}"
+                    year_note = f"Tolerance: ±{effective_tolerance}"
                 year_score = 1.0 if year_outcome is not MatchOutcome.MISMATCH else 0.0
             except ValueError:
                 year_outcome = MatchOutcome.NON_COMPARABLE
@@ -3167,6 +3300,22 @@ class FactChecker:
 
         return comparisons
 
+    def _apply_strict_warn_cnv(self, status: FactCheckStatus) -> FactCheckStatus:
+        """Promote could-not-verify abstentions to STRICT_WARN_CNV under opt-in.
+
+        Only fires when both ``cfg.strict`` and ``cfg.strict_warn_cnv`` are
+        set. NOT_FOUND and UNCONFIRMED (the two CNV statuses for academic
+        entries) are routed to STRICT_WARN_CNV; everything else is returned
+        unchanged. Kept distinct from the PROBLEMATIC bucket on purpose --
+        the user's spec preserves the three-way verdict and adds CNV as a
+        fourth opt-in class users can fail CI on.
+        """
+        if not (self.config.strict and self.config.strict_warn_cnv):
+            return status
+        if status in (FactCheckStatus.NOT_FOUND, FactCheckStatus.UNCONFIRMED):
+            return FactCheckStatus.STRICT_WARN_CNV
+        return status
+
     def _determine_status(
         self,
         best_score: float,
@@ -3232,6 +3381,18 @@ class FactChecker:
                     findings = comparisons["author"].given_name_findings or []
                     if any(f.get("variety") == GivenNameVariety.SUBSTITUTION for f in findings):
                         return FactCheckStatus.GIVEN_NAME_SUBSTITUTION
+                    # --strict rule 5: silent author-list truncation. Tagged
+                    # by ``_compare_all_fields`` so the gate routes it to its
+                    # own status rather than the generic AUTHOR_MISMATCH.
+                    if any(f.get("variety") == "strict_truncated" for f in findings):
+                        return FactCheckStatus.AUTHOR_TRUNCATED
+                # --strict rule 1: a lone title MISMATCH whose note marks it as
+                # a strict near-miss (Levenshtein <= 1) gets its own status so
+                # callers can see "near-miss vs real title mismatch" at a glance.
+                if mismatches == ["title"]:
+                    note = comparisons["title"].note or ""
+                    if note.startswith("Strict near-miss"):
+                        return FactCheckStatus.TITLE_NEAR_MISS
                 mismatch_map = {
                     "title": FactCheckStatus.TITLE_MISMATCH,
                     "author": FactCheckStatus.AUTHOR_MISMATCH,
@@ -3249,6 +3410,17 @@ class FactChecker:
         # than reporting VERIFIED.
         non_confirming = [name for name, c in comparisons.items() if c.is_non_confirming]
         if non_confirming:
+            # --strict rule 2: if the sole non-confirming field is the year
+            # AND the matched record is a preprint twin (the year note says
+            # so), route to STRICT_WARN_PREPRINT_YEAR so the user is told
+            # "year cannot be anchored because the record is a preprint"
+            # instead of a generic UNCONFIRMED. Only fires in strict mode.
+            if (
+                self.config.strict
+                and non_confirming == ["year"]
+                and (comparisons["year"].note or "").startswith("Strict: year could not be anchored")
+            ):
+                return FactCheckStatus.STRICT_WARN_PREPRINT_YEAR
             return FactCheckStatus.UNCONFIRMED
 
         return FactCheckStatus.VERIFIED
@@ -3642,6 +3814,9 @@ class FactCheckProcessor:
             "arxiv_id_mismatch",
             "doi_mismatch",
             "preprint_only",
+            # --strict escalations (positive evidence under arXiv 2026 policy).
+            FactCheckStatus.TITLE_NEAR_MISS.value,
+            FactCheckStatus.AUTHOR_TRUNCATED.value,
         ]
 
         # Calculate verified rate including new verified statuses
@@ -3772,7 +3947,23 @@ Examples:
     p.add_argument(
         "--strict",
         action="store_true",
-        help="Exit with code 4 if NOT_FOUND or HALLUCINATED entries found",
+        help=(
+            "Strict evaluation mode (arXiv 2026 hallucination policy). "
+            "Raises the bar on title (Levenshtein-1 near-miss), year (tolerance 0, "
+            "preprint-twin year abstains), author-set (single-source single-extra "
+            "flag), author order (no alphabetization escape), and silent author-list "
+            "truncation (flagged as AUTHOR_TRUNCATED). Exit code 4 if any PROBLEMATIC "
+            "entries remain. Also settable via BIBTEX_CHECK_STRICT=1."
+        ),
+    )
+    p.add_argument(
+        "--strict-warn-cnv",
+        action="store_true",
+        help=(
+            "Requires --strict. Promotes could-not-verify abstentions "
+            "(NOT_FOUND / UNCONFIRMED) to STRICT_WARN_CNV so CI integrations "
+            "can fail on them. Without this flag, CNV stays as today."
+        ),
     )
     p.add_argument("--verbose", "-v", action="store_true", help="Enable debug logging")
 
@@ -3949,6 +4140,24 @@ def main() -> int:
         )
         logger.info("non-generative-AI mode active")
 
+    # --strict evaluation mode (arXiv 2026 hallucination policy). CLI flag
+    # wins; env var also honored, mirroring --non-generative. --strict-warn-cnv
+    # requires --strict.
+    strict_env = _os.environ.get("BIBTEX_CHECK_STRICT", "").strip() in {"1", "true", "yes", "on"}
+    strict_mode = bool(args.strict or strict_env)
+    strict_warn_cnv = bool(getattr(args, "strict_warn_cnv", False))
+    if strict_warn_cnv and not strict_mode:
+        logger.error("--strict-warn-cnv requires --strict")
+        return 2
+    if strict_mode:
+        logger.info(
+            "strict evaluation mode active (arXiv 2026 policy): "
+            "title Lev-1 near-miss, year tolerance 0, single-source author-fab, "
+            "no alphabetization escape, silent author-truncation flagged"
+        )
+    if strict_warn_cnv:
+        logger.info("strict-warn-cnv active: NOT_FOUND/UNCONFIRMED promoted to STRICT_WARN_CNV")
+
     # Load entries from all BibTeX files
     entries = []
     for path in args.bibfiles:
@@ -4009,6 +4218,8 @@ def main() -> int:
         check_years=not args.no_check_years,
         top_k=top_k,
         openalex_mailto=args.openalex_mailto,
+        strict=strict_mode,
+        strict_warn_cnv=strict_warn_cnv,
     )
 
     # Setup API clients
@@ -4142,11 +4353,14 @@ def main() -> int:
         logger.info("JSONL report streamed to %s (%d entries)", args.jsonl, len(results))
 
     # Exit code
-    if args.strict:
+    if strict_mode:
         # Fix B: only POSITIVE-evidence problems gate the exit code. Abstentions
         # (could-not-verify) are reported on their own line and do NOT count as
-        # confirmed hallucinations, so they no longer fail strict mode.
+        # confirmed hallucinations, so they no longer fail strict mode -- unless
+        # the user opts into --strict-warn-cnv, in which case STRICT_WARN_CNV
+        # entries also fail CI.
         problem_count = summary["problematic_count"]
+        cnv_warn_count = summary["status_counts"].get(FactCheckStatus.STRICT_WARN_CNV.value, 0)
         if abstained_n > 0:
             logger.info(
                 "Strict mode: %d could-not-verify entries (abstained; not counted as failures)",
@@ -4154,6 +4368,12 @@ def main() -> int:
             )
         if problem_count > 0:
             logger.warning("Strict mode: %d PROBLEMATIC entries (positive evidence of a problem)", problem_count)
+            return 4
+        if strict_warn_cnv and cnv_warn_count > 0:
+            logger.warning(
+                "Strict mode (warn-cnv): %d STRICT_WARN_CNV entries (could-not-verify, opt-in fail)",
+                cnv_warn_count,
+            )
             return 4
 
     return 0

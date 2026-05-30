@@ -27,6 +27,7 @@ __all__ = [
     "MatchOutcome",
     "AuthorMatchResult",
     "symmetric_author_match",
+    "has_explicit_truncation_indicator",
     "EXPANDED_VENUE_ALIASES",
     "get_canonical_venue",
     "is_preprint_or_series_venue",
@@ -229,6 +230,43 @@ def _has_author_sentinel(names: list[str]) -> bool:
     return any(n and n.lower() in _AUTHOR_SENTINELS for n in names)
 
 
+#: Explicit truncation indicators that a citation may use OUTSIDE the structured
+#: author field to disclose that the author list is incomplete. ``--strict``'s
+#: "silent truncation" rule (rule 5) does NOT flag entries that disclose their
+#: truncation: a citation that says "..." or ``\ldots`` or a trailing
+#: ``, et al.`` outside the author field has *already announced* the omission.
+#: That is the cited author's responsibility, not a hallucination signal.
+_EXPLICIT_TRUNCATION_MARKERS: tuple[str, ...] = (
+    "...",
+    "\\ldots",
+    "\\dots",
+    "et al",
+    "et al.",
+)
+
+
+def has_explicit_truncation_indicator(*fields: str | None) -> bool:
+    """True if any of ``fields`` carries a disclosed-truncation marker.
+
+    Catches the cases the structured ``and others`` / ``et al`` sentinel inside
+    the BibTeX ``author`` field does not: a trailing ``...`` / ``\\ldots`` in
+    the rendered citation, or a trailing ``, et al.`` placed in a sibling
+    field (``note``, ``howpublished``, even the title) rather than as a proper
+    author token. Used by ``--strict`` to refuse to escalate a leading-prefix
+    author list to AUTHOR_TRUNCATED when the citation already discloses that
+    its author list is truncated.
+    """
+    for raw in fields:
+        if not raw:
+            continue
+        text = raw.lower()
+        # Cheap substring check; the markers are short and distinctive enough
+        # that a false positive on real prose is exceedingly unlikely.
+        if any(marker in text for marker in _EXPLICIT_TRUNCATION_MARKERS):
+            return True
+    return False
+
+
 def _strip_author_sentinels(names: list[str]) -> list[str]:
     """Drop "others"/"et al" sentinels from a surname list."""
     return [n for n in names if n and n.lower() not in _AUTHOR_SENTINELS]
@@ -266,6 +304,7 @@ def symmetric_author_match(
     threshold: float = 0.80,
     prefix_n: int = 5,
     order_reliable: bool = False,
+    strict: bool = False,
 ) -> AuthorMatchResult:
     """Compare entry vs API author surnames on a *symmetric* basis (trichotomy).
 
@@ -288,6 +327,15 @@ def symmetric_author_match(
     6. Otherwise score a symmetric slice (Jaccard + LCS): >= threshold is a MATCH,
        below is a MISMATCH (real conflict beyond the shared lead author).
 
+    ``strict`` (arXiv 2026 / hallucination-leak mode): the cost is asymmetric --
+    a leaked wrong/swapped author is far worse than an FP. Two relaxations are
+    removed:
+      * The alphabetization guard (a same-multiset record sorted A-Z is treated
+        as a record-side sort artifact) is DISABLED. An order-reliable source
+        with the same multiset but a different lead is a real swap.
+      * The hard first-author guard no longer requires a differing multiset:
+        a different lead author against an order-reliable source is a MISMATCH
+        even if the multiset matches.
     Returns an :class:`AuthorMatchResult` carrying the trichotomy and a 0-1 score.
     """
     a_has_sentinel = _has_author_sentinel(entry_names)
@@ -303,7 +351,11 @@ def symmetric_author_match(
     # also DIFFERS is a real mismatch (a genuinely wrong/extra lead author).
     # When the multisets are identical the lead difference is pure reordering --
     # deferred to the same-multiset block below, which decides swap vs artifact.
+    # In strict mode, a same-multiset lead difference against an order-reliable
+    # source is also a real swap (the alphabetization escape clause is dropped).
     if a[0] != b[0] and sorted(a) != sorted(b):
+        return AuthorMatchResult(MatchOutcome.MISMATCH, 0.0)
+    if strict and a[0] != b[0] and order_reliable:
         return AuthorMatchResult(MatchOutcome.MISMATCH, 0.0)
 
     # Exact (sentinel-stripped) equality: full positive confirmation.
@@ -340,7 +392,11 @@ def symmetric_author_match(
     #     (e.g. Crossref NeurIPS/ICML proceedings deposits), not a publication
     #     swap. This was a false-positive source on valid multi-author papers.
     if sorted(a) == sorted(b):
-        if order_reliable and not _looks_alphabetized(b):
+        # ``strict`` disables the alphabetization escape: against an order-
+        # reliable source a same-multiset reordering is a real swap even if
+        # the record looks alphabetized (the arXiv-2026 policy treats the
+        # asymmetric leak cost as far worse than the FP it introduces).
+        if order_reliable and (strict or not _looks_alphabetized(b)):
             return AuthorMatchResult(MatchOutcome.MISMATCH, 0.0)
         return AuthorMatchResult(MatchOutcome.MATCH, 1.0)
 
