@@ -1,4 +1,4 @@
-"""Generate the v1.1.0 accuracy figure (assets/accuracy_v1_1_0.png + .pdf).
+"""Generate the v1.2.0 accuracy figure (assets/accuracy_v1_2_0.png + .pdf).
 
 A two-panel figure:
   Left: stacked-bar 3-way verdict distribution per split (dev/test) for VALID
@@ -35,17 +35,17 @@ NUMBERS = {
         "n_valid": 503,
         "n_hall": 616,
         "valid_pre": {"verified": 453, "cnv": 37, "problematic": 13},
-        "valid_post": {"verified": 475, "cnv": 20, "problematic": 8},
+        "valid_post": {"verified": 475, "cnv": 18, "problematic": 10},
         "hall_pre": {"verified": 3, "cnv": 231, "problematic": 382},
-        "hall_post": {"verified": 4, "cnv": 240, "problematic": 372},
+        "hall_post": {"verified": 4, "cnv": 149, "problematic": 463},
     },
     "test": {
         "n_valid": 302,
         "n_hall": 529,
         "valid_pre": {"verified": 243, "cnv": 32, "problematic": 27},
-        "valid_post": {"verified": 271, "cnv": 24, "problematic": 7},
+        "valid_post": {"verified": 280, "cnv": 15, "problematic": 7},
         "hall_pre": {"verified": 2, "cnv": 229, "problematic": 298},
-        "hall_post": {"verified": 4, "cnv": 218, "problematic": 307},
+        "hall_post": {"verified": 3, "cnv": 136, "problematic": 390},
     },
 }
 
@@ -204,7 +204,7 @@ def fpr_leak_comparison(ax):
     ax.set_xticks(x)
     ax.set_xticklabels(splits)
     ax.set_ylabel("rate (%)")
-    ax.set_title("v1.1.0 vs v1.0.0 baseline (corrected gold)", fontweight="bold")
+    ax.set_title("v1.2.0 vs v1.0.0 baseline (corrected gold)", fontweight="bold")
     ax.legend(loc="upper right", fontsize=8, frameon=False)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
@@ -222,14 +222,14 @@ def main():
     fpr_leak_comparison(ax_cmp)
 
     fig.suptitle(
-        "bibtex-check v1.1.0 — HALLMARK v1.0 corrected gold (dev + held-out test)",
+        "bibtex-check v1.2.0 — HALLMARK v1.0 corrected gold (dev + held-out test)",
         fontsize=12,
         fontweight="bold",
         y=1.02,
     )
     fig.tight_layout()
-    png = OUT_DIR / "accuracy_v1_1_0.png"
-    pdf = OUT_DIR / "accuracy_v1_1_0.pdf"
+    png = OUT_DIR / "accuracy_v1_2_0.png"
+    pdf = OUT_DIR / "accuracy_v1_2_0.pdf"
     fig.savefig(png, dpi=180, bbox_inches="tight")
     fig.savefig(pdf, bbox_inches="tight")
     print(f"wrote {png} + {pdf}")

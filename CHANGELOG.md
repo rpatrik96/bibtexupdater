@@ -7,6 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-05-30
+
+Catch-rate release. Four new behavioral capabilities targeted at the `could-not-verify` HALLUCINATED bucket and one residual `wrong_venue` leak class. Converted ~110 abstentions to caught problematics across dev+test, caught the SCoRe wrong-venue leak (the v1.1.0 `cheap_fix` target), and kept the held-out FPR steady.
+
+### bibtex-check accuracy (HALLMARK v1.0 corrected gold)
+
+| | v1.1.0 | v1.2.0 | Δ |
+|---|---|---|---|
+| dev_public FPR | 1.59% | **1.99%** | +2 FPs (X2/X4 trade-offs documented) |
+| test_public FPR (held-out) | 2.32% | **2.32%** | unchanged |
+| **dev_public caught-on-hallucinated** | 60.4% | **75.2%** | **+14.8pp** |
+| **test_public caught-on-hallucinated** | 58.0% | **73.7%** | **+15.7pp** |
+| dev_public leak | 0.65% (4) | 0.65% (4) | unchanged |
+| test_public leak | 0.76% (4) | **0.57% (3)** | **−1 leak (SCoRe caught)** |
+
+The +14.8pp / +15.7pp catch-rate increases came from the X3 ID-anchored field-mismatch helper + the X4 relaxed-author retrieval fallback unblocking entries the v1.1.0 cascade abstained on. The SCoRe leak (entry claimed NeurIPS, real venue is ICLR 2021) was caught by the new cross-source venue verification (X1).
+
+### Known minor regressions
+
+The catch-rate work introduces a small, characterized FP set on dev_public (test FPR is unchanged):
+
+- `ed071a6dfa34` (Improving Robustness using Generated Data): `verified` → `arxiv_id_mismatch`. X2 extracted the arXiv ID from the DataCite DOI, and `_check_arxiv_id_consistency` flagged a divergence — flagged for investigation as a v1.2.1 target.
+- `e59d381d98e6` (2026-synthetic VALID — Self-Supervised Learning via Flow-Guided Neural Operator): `verified` → `given_name_substitution`. Narrow X2+`1e37f7c` interaction class: 2026 arXiv-DOI VALID entries where the structured-record competitor disagrees with the arXiv record on author given-name spelling. Documented as a known v1.2.1 target.
+- `f185501f556e` (Beyond log2(T) regret — dev) and `d07ee00b0c0f` (𝒩-WL Graph Neural Networks — test): both `not_found` → `partial_match` via X4's relaxed-author fallback retrieving a wrong-paper candidate. This is the documented X4 trade-off (`not_found → partial_match` on DOI-less entries when the relaxed retrieval surfaces a near-title match with different authors).
+
+Offsetting clears (v1.1.0 FPs that v1.2.0 verifies correctly): `adf6c58262bf` (Community Concealment from Unsupervised Graph Learning) and `e51140f8b514` (RLang — Rodríguez-Sánchez). Net: dev +2 FPs, test 0.
+
+### Added
+
+- **`_detect_cross_source_venue_mismatch`** (`fact_checker.py`) — the venue analogue of `_detect_author_fabrication`. When ≥2 order-reliable sources contributed candidate records and agree on a canonical venue that differs from the entry's canonical venue (and the entry's venue is a recognized published venue, not blank/preprint), downgrade the venue outcome to `MISMATCH` and route the status to `VENUE_MISMATCH`. Catches the SCoRe-shape residual leak (entry claims NeurIPS, every authoritative source agrees on ICLR).
+- **arXiv DataCite DOI extraction** in `_arxiv_id_from_entry` (`fact_checker.py`). Mines `entry["doi"]` for `10.48550/arXiv.<id>` (case-insensitive, version-stripping). The rest of the arXiv-ID-anchored machinery is unchanged: `_check_arxiv_id_consistency` fetches the arXiv record, `_id_anchored_author_mismatch` fires when the fetched authors disagree. Unblocks the HALLUCINATED + arXiv-DataCite-DOI cluster (HALLMARK's 2026-synthetic batch).
+- **`_id_anchored_field_mismatch`** (`fact_checker.py`) — the field analogue of `_id_anchored_author_mismatch`. Fires when (a) entry DOI resolves via Crossref, (b) the DOI record's title confirms the entry, AND (c) `compare_venue` returns a hard MISMATCH (not NON_COMPARABLE) OR `compare_year` returns a hard MISMATCH beyond tolerance (gated against preprint-twin records via the existing `_doi_is_preprint` helper). Emits `VENUE_MISMATCH` / `YEAR_MISMATCH` on DOI-confirmed entries.
+- **Relaxed-author retrieval fallback** in `_query_cascade` (`fact_checker.py`). When the standard cascade returns zero candidates (or all candidates fall below `abstention_below`), retry Crossref and OpenAlex with the raw title (no first-author constraint). Tagged `from_fallback=True` so downstream scoring reflects the weaker retrieval signal. The transition is **never** `not_found → VERIFIED`; the realistic transition is `not_found → AUTHOR_MISMATCH` (the cascade now finds a wrong-paper candidate whose authors disagree).
+- **Order-reliable structured-record preference in selection** (`fact_checker.py:_select_best_candidate`, new constant `_ORDER_RELIABLE_PREFERENCE_BAND = 0.02`). Inside a 0.02 score sub-band, an order-reliable candidate (DBLP / OpenReview / Crossref structured) wins selection over an order-unreliable one (e.g. an arXiv-API record). Without this, the arXiv DataCite DOI extraction would let arXiv records (preprint venue → NON_COMPARABLE → fewer hard mismatches in the confirmation-key tiebreak) win selection over structured records and skip the given-name audit. The narrow 0.02 sub-band preserves arXiv-API wins when it's clearly the better match.
+
+### Changed
+
+- Status taxonomy gains `VENUE_MISMATCH` and `YEAR_MISMATCH` as DOI-anchored findings (previously these statuses were only emitted by the unconditional field comparison; now also from the `_id_anchored_field_mismatch` helper on DOI-confirmed records).
+
+### Tests
+
+1088 → 1122 passing (+30 fix tests + 4 regression-fix tests). New modules: `tests/test_cross_source_venue.py`, `tests/test_arxiv_datacite_doi.py`, `tests/test_id_anchored_field_mismatch.py`, `tests/test_relaxed_author_fallback.py`, plus 4 new tests in `tests/test_fact_checker.py::TestOrderReliablePreferenceOverArxivOnly`.
+
+### Migration notes
+
+This is a **minor** release (semver MINOR), not a patch — the four new fixes add new behavioral capabilities (new finding sources, new candidate pool entries, new fallback cascade step). Existing entries that were `verified` in v1.1.0 stay `verified` in v1.2.0 (verified against the corrected gold spot-check); new catches come from the previously-abstaining could-not-verify pool.
+
 ## [1.1.0] - 2026-05-30
 
 Carries the v1.0.0 false-positive work to held-out (HALLMARK v1.0 `test_public`), adds an opt-in `--strict` evaluation mode aligned with [arXiv's 2026 hallucinated-reference policy](https://www.nature.com/articles/d41586-026-01595-5), cuts the could-not-verify bucket on real refs by ~70%, and corrects 30 HALLMARK mislabels upstream via [hallmark#9](https://github.com/rpatrik96/hallmark/pull/9).

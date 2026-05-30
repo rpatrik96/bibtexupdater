@@ -18,7 +18,7 @@ Concretely, of the 8 HALLMARK-labeled hallucinations the default tool returned `
 | `1cc022db3273` | dev | `Chain-of-Thought` vs `Chain of-Thought` | hyphen-only → **not a leak** |
 | `f6a47b5e621f` | test | `Language-Guided` vs `Language Guided` | hyphen-only → **not a leak** |
 
-That leaves **5 residual leaks** in default mode (2 dev + 3 test), all of which `--strict` catches except the SCoRe wrong-venue case (a v1.1.1 `cheap_fix` target via cross-source venue verification):
+That leaves **4 residual leaks** in default mode (2 dev + 2 test), all of which `--strict` catches:
 
 | key | split | type | what's wrong | catch |
 |---|---|---|---|---|
@@ -26,16 +26,17 @@ That leaves **5 residual leaks** in default mode (2 dev + 3 test), all of which 
 | `aff3df193dde` | dev | author-list truncation | 8 of 11 canonical authors, reordered, no `and others` sentinel | `--strict` `AUTHOR_TRUNCATED` |
 | `fe58db6e7124` | test | letter-add title | `Explanations` (extra `s`) vs `Explanation` | `--strict` `TITLE_NEAR_MISS` (Lev-1) |
 | `0400a5cc0574` | test | letter-add title | `Models` (extra `s`) vs `Model` (Pedagogically-Inspired Data Synthesis) | `--strict` `TITLE_NEAR_MISS` (Lev-1) |
-| `cb518c15992d` | test | wrong venue | claims NeurIPS; real venue is ICLR 2021 (Tao Yu et al., *SCoRe*, OpenReview `oyZxhRI2RiE`) | **v1.1.1 cheap_fix target** — cross-source venue verification (OpenReview/Crossref/DBLP agree on ICLR; venue swap to NeurIPS is unambiguous) |
 
-A sixth case, `db9a596a4d3f` (Least-to-Most — first author `Shunyu Zhou` substituted for canonical `Denny Zhou`), was a leak under v1.0.0 but is now **caught by default** in v1.1.0 as `GIVEN_NAME_SUBSTITUTION`. Documented below as a historical "what the benchmark taught us" case.
+**Caught in v1.2.0** (was the v1.1.1 `cheap_fix` target): `cb518c15992d` (SCoRe — entry claimed NeurIPS, real venue is ICLR 2021). Now flagged `venue_mismatch` by the new `_detect_cross_source_venue_mismatch` helper when ≥2 order-reliable sources agree on a canonical venue different from the entry's. Documented below as a historical "what the benchmark taught us" case.
 
-Numbers (post-correction gold × post-fix v1.1.0):
+A second historical case, `db9a596a4d3f` (Least-to-Most — first author `Shunyu Zhou` substituted for canonical `Denny Zhou`), was a leak under v1.0.0 but is **caught by default since v1.1.0** as `GIVEN_NAME_SUBSTITUTION`.
+
+Numbers (post-correction gold × post-fix v1.2.0):
 
 | split | FPR | benchmark leak rate (raw) | policy-adjusted residual leaks |
 |---|---|---|---|
-| dev_public | 1.59% | 0.65% (4/616) | **2** (1 letter-add title + 1 author-truncation; hyphen-only cases excluded) |
-| test_public | 2.32% | 0.76% (4/529) | **3** (2 letter-add title + 1 wrong-venue; hyphen-only case excluded) |
+| dev_public | 1.99% | 0.65% (4/616) | **2** (1 letter-add title + 1 author-truncation; hyphen-only cases excluded) |
+| test_public | 2.32% | 0.57% (3/529) | **2** (2 letter-add title; hyphen-only case excluded) |
 
 The doc is a snapshot of the v1.1.0 release; it will be refreshed when the gold or the verdict gate moves.
 

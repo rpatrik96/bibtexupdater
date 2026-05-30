@@ -210,15 +210,16 @@ For `filter_bibliography.py` only (no dependencies required):
 
 ![Reference fact-checker](assets/fact-checker.gif)
 
-**v1.1.0** generalizes the v1.0.0 false-positive work to held-out and adds a `--strict` evaluation mode tuned for [arXiv's 2026 hallucinated-reference policy](https://www.nature.com/articles/d41586-026-01595-5) (1-year ban followed by peer-review-first requirement). Against the corrected HALLMARK v1.0 gold:
+**v1.2.0** carries v1.1.0's held-out FPR work into the *catch-rate* dimension: ~110 previously-abstained hallucinations are now flagged as `problematic`, the SCoRe wrong-venue leak class is caught, and a `--strict` evaluation mode tuned for [arXiv's 2026 hallucinated-reference policy](https://www.nature.com/articles/d41586-026-01595-5) (1-year ban followed by peer-review-first requirement) is available for high-stakes audits. Against the corrected HALLMARK v1.0 gold:
 
-- **FPR (held-out test_public): 8.94% → 2.32%** (−74%) — and 2.58% → 1.59% (−38%) on dev_public
-- **Leak rate: 0.65% dev, 0.76% test (raw benchmark); 0.32% dev, 0.57% test (policy-adjusted)** — remaining "leaks" are mostly 1-character title perturbations; **hyphen-only differences are explicitly *not* counted as leaks in default mode** (hyphenation is bibliographic noise that varies across DBLP/Crossref/publisher records — flagging it would generate false positives on most legit refs). `--strict` catches every 1-char title diff (Levenshtein-1, hyphen included) for arXiv-style high-stakes audits, plus tolerance-0 year, single-source author-fab detection, and truncated-author flagging. See [docs/KNOWN_LEAKS.md](docs/KNOWN_LEAKS.md) for the per-leak enumeration and policy
+- **Held-out test FPR steady at 2.32%** (8.94% in v1.0.0 → 2.32% in v1.1.0+v1.2.0; **−74%** vs v1.0.0). Dev FPR 1.59% → 1.99% (+0.4pp; 3 small documented regression FPs)
+- **Caught-on-hallucinated**: dev 60% → **75%**, test 58% → **74%** (+15pp on both splits) — driven by the new cross-source venue verification (catches SCoRe-shape leaks), the ID-anchored venue/year mismatch helper, and the relaxed-author retrieval fallback
+- **Leak rate**: 0.65% dev (4 entries), 0.57% test (3 entries; SCoRe caught — was 4 in v1.1.0); policy-adjusted 0.32% / 0.38% — remaining "leaks" are mostly 1-character title perturbations; **hyphen-only differences are explicitly *not* counted as leaks in default mode** (hyphenation is bibliographic noise that varies across DBLP/Crossref/publisher records — flagging it would generate false positives on most legit refs). `--strict` catches every 1-char title diff (Levenshtein-1, hyphen included) for arXiv-style high-stakes audits, plus tolerance-0 year, single-source author-fab detection, and truncated-author flagging. See [docs/KNOWN_LEAKS.md](docs/KNOWN_LEAKS.md) for the per-leak enumeration and policy
 - **Could-not-verify** on real refs dropped ~70% via venue + retrieval refinements (OpenReview/PMLR track-suffix normalization, TMLR/JMLR ISO-4 alias expansion, diacritic-preserving paperhash)
 
 The "leak" headline is mostly benchmark noise: [HALLMARK PR #9](https://github.com/rpatrik96/hallmark/pull/9) corrects 30 entries — including **FlashAttention, DDPM, Imagen, SimCLR, Performers, ViT-vs-CNN, Chain-of-Thought (Wei), Zero-Shot Reasoner (Kojima), MERLOT** — that the v1.0 auto-labeller flagged as fabricated but are in fact real, correctly-cited papers (arXiv DOIs register with DataCite, not CrossRef, so the auto-labeller's "no resolve" check returned false). The corrected leak rate isolates genuine catch opportunities.
 
-![bibtex-check v1.1.0 accuracy](assets/accuracy_v1_1_0.png)
+![bibtex-check v1.2.0 accuracy](assets/accuracy_v1_2_0.png)
 
 - **Multi-source validation**: Crossref, OpenAlex, DBLP, OpenReview, Semantic Scholar
 - **Detailed mismatch detection**: Title, author, year, venue comparisons
