@@ -505,8 +505,36 @@ def given_name_position_audit(entry_author_field: str, record: "PublishedRecord"
         r_sur, r_giv = rec_pairs[i]
         if not e_sur or not r_sur or e_sur != r_sur:
             continue  # surname not positionally confirmed here -> not our job
-        if entry_sur_counts[e_sur] > 1 or rec_sur_counts[r_sur] > 1:
-            continue  # repeated surname -> positional pairing is ambiguous, skip
+        # Repeated-surname ambiguity guard. The OLD rule -- skip if EITHER side
+        # had the surname repeated -- was over-conservative: a true cross-pairing
+        # risk only exists when BOTH sides have the surname multiple times (e.g.
+        # the canonical 'Yang Song' / 'Jiaming Song' co-authors that both appear
+        # in entry AND record, where the positional pairing could be flipped).
+        # When ONLY ONE side repeats the surname, the OTHER side's unique
+        # occurrence pins the pairing -- and at position 0 (LEAD AUTHOR) the
+        # natural pairing is unambiguous regardless. Specifically: the
+        # Least-to-Most leak ("Shunyu Zhou" at entry pos 0 vs canonical lead
+        # "Denny Zhou") was silently skipped because the entry had TWO 'zhou's
+        # (Shunyu at 0, Denny re-listed at the tail) while the record had ONE
+        # 'zhou' (Denny at 0). The OLD guard tripped on the entry-side repeat
+        # even though the record-side 'zhou' uniquely pinned the comparison.
+        both_repeat = entry_sur_counts[e_sur] > 1 and rec_sur_counts[r_sur] > 1
+        if both_repeat and i != 0:
+            continue
+        if both_repeat and i == 0:
+            # At the lead, both-side surname repetition is still genuine
+            # ambiguity (e.g. two real 'Song' lead-co-authors). Only audit if
+            # the entry's lead given matches NO record same-surname given via a
+            # benign classification; if any record author with that surname
+            # could explain the entry given as a benign variant, abstain.
+            same_surname_givens = [g for s, g in rec_pairs if s == r_sur]
+            best_class_rank = -1
+            for cand_g in same_surname_givens:
+                cls_cand = GIVEN_VARIETY_CLASS.get(classify_given_pair(e_giv, cand_g), "skip")
+                best_class_rank = max(best_class_rank, rank[cls_cand])
+            if best_class_rank < rank["escalate"]:
+                # Some record author with that surname is a benign match -> abstain.
+                continue
         variety = classify_given_pair(e_giv, r_giv)
         cls = GIVEN_VARIETY_CLASS.get(variety, "skip")
         if cls == "skip":
