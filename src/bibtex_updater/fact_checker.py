@@ -2886,6 +2886,71 @@ class FactChecker:
                 source_count += 1
         return union, source_count
 
+    def _detect_cross_source_venue_mismatch(
+        self,
+        entry_venue: str,
+        per_source_records: dict[str, PublishedRecord | None] | None,
+    ) -> str | None:
+        """Cross-source venue analogue of :meth:`_detect_author_fabrication`.
+
+        Catches the SCoRe-shape leak (entry claims one venue, multiple
+        order-reliable sources agree the real paper appeared somewhere else)
+        that the standard venue block misses when the best-scoring candidate
+        happens to be the entry's own preprint twin (NON_COMPARABLE -> no
+        mismatch flag).
+
+        Fires only when (a) at least 2 order-reliable sources contributed a
+        published-venue candidate, (b) those venues canonicalize to the SAME
+        venue, (c) the entry's venue is itself canonicalizable AND (d)
+        canonicalizes to something different from the cross-source consensus.
+        Non-canonicalizable / preprint / blank entry venues abstain; a single
+        dissenting source can never outvote two agreeing sources because we
+        require a true consensus on the canonical mismatch.
+
+        Returns the cross-source consensus canonical venue when ALL gates
+        pass; returns ``None`` otherwise (no flag).
+        """
+        if not entry_venue or not per_source_records:
+            return None
+        entry_canonical = get_canonical_venue(entry_venue)
+        # An entry venue we cannot canonicalize is not a recognized published
+        # venue we can refute with cross-source consensus -- abstain.
+        if not entry_canonical:
+            return None
+
+        canonical_to_sources: dict[str, set[str]] = {}
+        for src, rec in per_source_records.items():
+            if rec is None or not rec.order_reliable:
+                continue
+            rec_venue = rec.journal or ""
+            if not rec_venue:
+                continue
+            # A preprint / series record cannot anchor a published venue claim
+            # -- per the venue trichotomy, it is NON_COMPARABLE, not evidence.
+            if is_preprint_or_series_venue(rec_venue):
+                continue
+            rec_canonical = get_canonical_venue(rec_venue)
+            if not rec_canonical:
+                continue
+            canonical_to_sources.setdefault(rec_canonical, set()).add(src)
+
+        if not canonical_to_sources:
+            return None
+
+        # Need at least 2 order-reliable sources agreeing on a canonical venue
+        # that differs from the entry's canonical venue. Sources agreeing with
+        # the entry never count as "consensus on a mismatch".
+        for canonical, sources in canonical_to_sources.items():
+            if canonical == entry_canonical:
+                continue
+            if len(sources) >= self._MIN_ORDER_RELIABLE_SOURCES_FOR_FLAG:
+                # FPR guard: refuse the flag if ANOTHER source agrees with the
+                # entry's canonical venue (genuine ambiguity, not consensus).
+                if entry_canonical in canonical_to_sources:
+                    return None
+                return canonical
+        return None
+
     def _detect_author_fabrication(
         self,
         entry_author_field: str,
@@ -3265,6 +3330,29 @@ class FactChecker:
             note=venue_note,
             outcome=venue_outcome,
         )
+
+        # FIX X1: cross-source venue verification (SCoRe-shape wrong_venue).
+        # When the venue comparison did NOT already MISMATCH (e.g. the best
+        # candidate is a preprint twin returning NON_COMPARABLE, or matches a
+        # source that happened to mis-cite the same venue as the entry),
+        # consult the per-source records: if >= 2 order-reliable sources agree
+        # on a canonical venue that differs from the entry's canonical venue,
+        # downgrade the outcome to MISMATCH. Gated to mirror
+        # ``_detect_author_fabrication`` (corroboration across two sources;
+        # single dissenter never trips it; preprint records never anchor).
+        if (
+            comparisons["venue"].resolved_outcome is not MatchOutcome.MISMATCH
+            and entry_venue
+            and per_source_records
+        ):
+            consensus = self._detect_cross_source_venue_mismatch(entry_venue, per_source_records)
+            if consensus:
+                comparisons["venue"].outcome = MatchOutcome.MISMATCH
+                comparisons["venue"].matches = False
+                comparisons["venue"].note = (
+                    "Cross-source venue mismatch: order-reliable sources agree "
+                    f"the real venue is {consensus!r}, not {entry_venue!r}"
+                )
 
         # Different-edition / reprint guard. A record with essentially the SAME
         # title (>= title_threshold) but published >= _EDITION_YEAR_GAP years away,
