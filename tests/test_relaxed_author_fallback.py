@@ -95,9 +95,7 @@ class TestRelaxedAuthorRetrievalFallback:
         }
         authors = [{"given": "John", "family": "Smith"}]
         crossref.search = MagicMock(
-            return_value=[
-                _crossref_message(entry["title"], "10.0/x", authors=authors, venue="ICML", year=2021)
-            ]
+            return_value=[_crossref_message(entry["title"], "10.0/x", authors=authors, venue="ICML", year=2021)]
         )
         checker = FactChecker(crossref, dblp, s2, FactCheckerConfig(), logger)
 
@@ -217,9 +215,7 @@ class TestRelaxedAuthorRetrievalFallback:
         authors = [{"given": "John", "family": "Smith"}]
         # The strict (author-included) search already returns a strong hit.
         crossref.search = MagicMock(
-            return_value=[
-                _crossref_message(entry["title"], "10.0/x", authors=authors, venue="ICML", year=2021)
-            ]
+            return_value=[_crossref_message(entry["title"], "10.0/x", authors=authors, venue="ICML", year=2021)]
         )
         checker = FactChecker(crossref, dblp, s2, FactCheckerConfig(), logger)
 

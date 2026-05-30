@@ -63,10 +63,7 @@ def _score_entry() -> dict[str, str]:
         "ID": "score2021",
         "ENTRYTYPE": "inproceedings",
         "title": "SCoRe: Pre-Training for Context Representation in Conversational Semantic Parsing",
-        "author": (
-            "Yu, Tao and Zhang, Rui and Polozov, Alex and "
-            "Meek, Christopher and Awadallah, Ahmed Hassan"
-        ),
+        "author": ("Yu, Tao and Zhang, Rui and Polozov, Alex and " "Meek, Christopher and Awadallah, Ahmed Hassan"),
         "booktitle": "NeurIPS",
         "year": "2021",
     }
