@@ -210,9 +210,15 @@ For `filter_bibliography.py` only (no dependencies required):
 
 ![Reference fact-checker](assets/fact-checker.gif)
 
-**v1.0.0** cut false positives on valid references from **61% → 9%** and brought hallucinations leaking through as "verified" to **0%**, with honest three-way verdicts (validated on HALLMARK dev_public):
+**v1.1.0** generalizes the v1.0.0 false-positive work to held-out and adds a `--strict` evaluation mode tuned for [arXiv's 2026 hallucinated-reference policy](https://www.nature.com/articles/d41586-026-01595-5) (1-year ban followed by peer-review-first requirement). Against the corrected HALLMARK v1.0 gold:
 
-![bibtex-check v1.0.0 accuracy](assets/accuracy_v1_0_0.png)
+- **FPR (held-out test_public): 8.97% → 6.00%** (−33%) — and 2.59% → 1.79% (−31%) on dev_public
+- **Leak rate: 0.65% dev, 0.38% test** — most remaining "leaks" are 1-character title perturbations the default mode deliberately abstains on (catching them is an FPR tradeoff); `--strict` mode catches them too via Levenshtein-1 + tolerance-0 year + single-source author-fab detection + truncated-author flagging
+- **Could-not-verify** on real refs dropped ~70% via venue + retrieval refinements (OpenReview/PMLR track-suffix normalization, TMLR/JMLR ISO-4 alias expansion, diacritic-preserving paperhash)
+
+The "leak" headline is mostly benchmark noise: [HALLMARK PR #9](https://github.com/rpatrik96/hallmark/pull/9) corrects 30 entries — including **FlashAttention, DDPM, Imagen, SimCLR, Performers, ViT-vs-CNN, Chain-of-Thought (Wei), Zero-Shot Reasoner (Kojima), MERLOT** — that the v1.0 auto-labeller flagged as fabricated but are in fact real, correctly-cited papers (arXiv DOIs register with DataCite, not CrossRef, so the auto-labeller's "no resolve" check returned false). The corrected leak rate isolates genuine catch opportunities.
+
+![bibtex-check v1.1.0 accuracy](assets/accuracy_v1_1_0.png)
 
 - **Multi-source validation**: Crossref, OpenAlex, DBLP, OpenReview, Semantic Scholar
 - **Detailed mismatch detection**: Title, author, year, venue comparisons
@@ -247,9 +253,30 @@ A 0–100 numeric `confidence_score` (additive in the JSONL output) summarizes p
 
 `VERIFIED` requires every claimed field to be *positively confirmed* against the matched record — not merely "not contradicted". When a record is found but a claimed field can't be confirmed (e.g. a published venue backed only by a preprint, or an incomplete author list), the entry is reported as **could-not-verify** (`UNCONFIRMED`/`NOT_FOUND`), distinct from a **problematic** flag (`*_mismatch`, `doi_mismatch`, chimeric, …) which is positive evidence of a defect. A "could-not-verify" is *not* a clean pass: it means the tool couldn't decide, and such entries warrant review.
 
+For full transparency, every residual `VERIFIED`-on-a-real-leak case against the corrected HALLMARK v1.0 gold is enumerated in [`docs/KNOWN_LEAKS.md`](docs/KNOWN_LEAKS.md), with the perturbation, the default verdict, and the `--strict` rule that catches it.
+
 #### Author handling
 
-All sources return authors in as-published order, so an author-order difference is treated as a real citation error (e.g. a transposed or wrong lead author) and flagged — it is not an API artifact. Surname comparison uses each source's structured `family` field where available (Crossref, OpenAlex, OpenReview `~Given_Family` handles), so family-first/CJK names like "Chen Xing" ↔ "Xing Chen" are not falsely flagged; when the matched source lacks structured names (Semantic Scholar flat names, DBLP), a Crossref structured-name lookup is used to vet a potential author mismatch before reporting it.
+All sources return authors in as-published order, so a *multiset-equal* reordering is treated as a real swapped-authors defect — *except* when the API record is alphabetized (Crossref NeurIPS/ICML proceedings deposits, prefix `10.52202`, sort contributors A–Z; that's a record-sort artifact, not a swap). Surname comparison uses each source's structured `family` field where available (Crossref, OpenAlex, OpenReview `~Given_Family` handles), so family-first/CJK names like "Chen Xing" ↔ "Xing Chen" match cleanly; when the matched source lacks structured names, a Crossref structured-name lookup vets a potential author mismatch before reporting it.
+
+The **lead author's given name** is graded via `classify_given_pair`: diacritic / initial / abbreviation / nickname / transliteration variants pass; a true substitution (e.g. "Shunyu Zhou" vs canonical "Denny Zhou") flags as `GIVEN_NAME_SUBSTITUTION`. The **cross-source author-fabrication** check downgrades the author outcome to `AUTHOR_MISMATCH` when the entry contributes ≥2 surnames absent from every order-reliable candidate's full author set (no `and others` sentinel, ≥2 sources contributing), catching fabricated trailing authors that slip past the prefix-N slice. DBLP-scraped XML entities (`&apos;`, `&amp;`) are decoded before any matching, so `d'Amore`, `D'Hondt`, `Ch'ng` no longer trigger spurious mismatches.
+
+#### Strict mode (`--strict`)
+
+For high-stakes submissions where the asymmetric cost is leak ≫ FP — [arXiv as of May 2026 imposes a 1-year ban for incontrovertible hallucinated references, thereafter requiring submissions to be accepted by a reputable peer-reviewed venue first](https://www.researchinformation.info/news/arxiv-imposes-one-year-ban-for-unchecked-ai-generated-content/) — `--strict` (or `BIBTEX_CHECK_STRICT=1`) tightens the verdict gate:
+
+- **Title:** Levenshtein-1 catches 1-character typos and added/removed hyphens (`"Privacy"`/`"Privacys"`, `"Schema Variable"`/`"Schema-Variable"`).
+- **Year:** tolerance 0; a preprint-twin record returns `STRICT_WARN_PREPRINT_YEAR` instead of silently confirming.
+- **Author-set:** even a single entry-side surname absent from a single complete canonical record flags `AUTHOR_MISMATCH` (the default requires ≥2 absent across ≥2 sources, to avoid false positives on stub records).
+- **Author order:** the alphabetized-record escape is disabled — every same-multiset reordering on an order-reliable source flags.
+- **Truncated author list without an `and others`/`et al` sentinel** flags `AUTHOR_TRUNCATED` (silent truncation is a misrepresentation; an explicit sentinel discloses it).
+
+The companion `--strict-warn-cnv` subflag (requires `--strict`) promotes `unconfirmed`/`not_found` to a fourth visible category `STRICT_WARN_CNV`, so CI integrations can fail on entries the tool couldn't anchor. Default mode keeps the principled three-way verdict unchanged.
+
+```bash
+# Strict pass for an arXiv submission
+bibtex-check references.bib --strict --strict-warn-cnv --jsonl strict.jsonl
+```
 
 #### Non-generative-AI mode (`--non-generative`)
 

@@ -7,6 +7,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-05-30
+
+Carries the v1.0.0 false-positive work to held-out (HALLMARK v1.0 `test_public`), adds an opt-in `--strict` evaluation mode aligned with [arXiv's 2026 hallucinated-reference policy](https://www.nature.com/articles/d41586-026-01595-5), cuts the could-not-verify bucket on real refs by ~70%, and corrects 30 HALLMARK mislabels upstream via [hallmark#9](https://github.com/rpatrik96/hallmark/pull/9).
+
+### bibtex-check accuracy (HALLMARK v1.0 corrected gold, apples-to-apples)
+
+| | Pre-fix | Post-fix | Δ |
+|---|---|---|---|
+| dev_public FPR | 2.59% | **1.79%** | −31% |
+| test_public FPR (held-out) | 8.97% | **5.98%** | −33% |
+| dev_public leak | 0.49% | 0.65% (3 fpr-tradeoff title typos + 1 reordered subset) | +1 |
+| test_public leak | 0.38% | 0.38% (2 fpr-tradeoff title typos) | 0 |
+
+### Added
+
+- **`--strict` mode** (`BIBTEX_CHECK_STRICT=1`) for high-stakes submissions where leak ≫ FP. Tightens title (Levenshtein-1), year (tolerance 0), author-set (single-source single-extra), author-order (no alphabetization escape), and silent-truncation checks. New statuses `TITLE_NEAR_MISS`, `AUTHOR_TRUNCATED`, `STRICT_WARN_PREPRINT_YEAR`.
+- **`--strict-warn-cnv`** (requires `--strict`) promotes `unconfirmed`/`not_found` to a fourth visible category `STRICT_WARN_CNV`, distinct from `PROBLEMATIC`.
+- **Cross-source author-fabrication detection** (`fact_checker.py:_detect_author_fabrication`): when the entry has ≥2 surnames absent from every order-reliable candidate's full author set (≥2 sources contributing, no `and others` sentinel), the author outcome downgrades to `AUTHOR_MISMATCH`. Catches fabricated trailing authors that slip past the prefix-N slice.
+- **`_PLATFORM_MARKERS`** (`matching.py`): OpenReview / `OpenReview.net` treated as a hosting-platform venue (NON_COMPARABLE), like arXiv/PMLR. Also adds `ssrn` to preprint-server markers.
+- **`_looks_alphabetized`** (`matching.py`) detects A–Z-sorted record author lists.
+- **`_strip_track_decorations`** (`matching.py`) normalizes OpenReview venue strings like `"ICLR 2023 poster"` / `"NeurIPS 2022 oral"` to bare acronyms before alias lookup. Deliberately leaves `findings` and `workshop` intact — those are distinct sub-venues.
+
+### Changed
+
+- **`latex_to_plain`** (`utils.py`) now `html.unescape`s before LaTeX-stripping — DBLP-scraped `&apos;`/`&amp;` no longer survive normalization (cleared the d'Amore / Ch'ng / D'Hondt FP cluster).
+- **`symmetric_author_match`** (`matching.py`) no longer fires order-`MISMATCH` when the API record is alphabetized (record-sort artifact common in Crossref proceedings deposits, prefix `10.52202` NeurIPS). Preserves swap detection against non-alphabetized sources. The previous d302fb5 multiset rule was net-negative on HALLMARK v1.0 (every "swapped_authors" leak turned out to be a benchmark mislabel); this change keeps the defense-in-depth for real swaps while eliminating the alphabetization-driven FPs.
+- **`_compare_all_fields`** (`fact_checker.py`) routes a preprint/series record's year to `NON_COMPARABLE` (mirroring the existing venue logic): a preprint can't refute a published year.
+- **`given_name_position_audit`** (`utils.py`) no longer abstains when only one side has a repeated surname; the unique side uniquely pins the pairing, so a position-0 substitution still flags correctly (catches lead-author swaps like `"Shunyu Zhou"` / `"Denny Zhou"` even when the entry repeats the canonical name elsewhere).
+- **`get_canonical_venue`** (`matching.py`) accepts word-boundary substring matches for single-token venue acronyms (4–7 chars), so OpenReview venues like `"ICLR 2023 poster"` canonicalize to `iclr` even when the alias-to-full ratio is below 0.4. Word-boundary anchoring prevents `acl`-inside-`naacl` collisions.
+- **`_normalize_venue_for_matching`** (`matching.py`) strips OpenReview `venueid` patterns (`ICLR.cc/2024/Conference`), drops trailing periods, and collapses `". "` → `" "` before alias lookup, so dotted ISO-4 forms like `"Trans. Mach. Learn. Res."` canonicalize.
+- **`EXPANDED_VENUE_ALIASES`** (`matching.py`) gains dotted ISO-4 forms and bare acronyms for `tmlr` (incl. `"accepted by tmlr"`) and `jmlr`.
+- **`OpenReviewClient.search`** (`sources.py`): paperhash now preserves Unicode surname spellings (Müller stays `müller`) because OpenReview's index keys on the literal form. When paperhash misses, a `/notes/search?term=<title>` fallback runs — gated to require both title and `first_author`, so author-less searches still return `[]`.
+- **DBLP cascade query** (`fact_checker.py:_query_cascade`) LaTeX-strips the title and Unicode-folds the first-author surname before forming the query, so titles with `{B}race {G}roups` and accented surnames (`György`) hit DBLP's token-AND matcher.
+
+### Fixed
+
+- 5 previously-flagged `author_mismatch` FPs cleared by HTML-entity decoding + alphabetization gate (`d'Amore`, `Ch'ng`, KL-Gaussian, CARE, RLHF).
+- Preprint-year FPs cleared by the `NON_COMPARABLE` routing.
+- Lead-author given-name substitution (Least-to-Most: `"Shunyu Zhou"` → canonical `"Denny Zhou"`) now flags as `GIVEN_NAME_SUBSTITUTION` (the repeated-surname guard previously skipped position 0 when the entry repeated the canonical name).
+
+### Transparency
+
+- **`docs/KNOWN_LEAKS.md`**: enumerates every residual `VERIFIED`-on-a-real-leak case against the corrected HALLMARK v1.0 gold (5 dev + 2 test), with the BibTeX-style entry, the canonical paper, the precise perturbation, and the `--strict` rule that catches it. `--strict` catches 6/6 default-mode leaks (4 `TITLE_NEAR_MISS`, 1 `AUTHOR_TRUNCATED`, plus the Least-to-Most case now caught in default mode too). Linked from the README's "Verdicts" subsection.
+
+### Upstream HALLMARK dataset
+
+[hallmark#9](https://github.com/rpatrik96/hallmark/pull/9) corrects 30 entries the v1.0 auto-labeller flagged as fabricated but are in fact real, correctly-cited papers (3 batches; includes FlashAttention, DDPM, Imagen, SimCLR, Performers, ViT-vs-CNN, Chain-of-Thought (Wei), Zero-Shot Reasoner (Kojima), MERLOT, SimSiam, AdaFed, …). Failure mode: arXiv DOIs register with DataCite, not CrossRef, so the auto-labeller's CrossRef-resolution check returned "no resolve" for legitimate arXiv-published papers. Three of the corrections override prior-audit rejections (DDPM-Dhariwal, FlashAttention, Imagen) on independent arXiv-grounded evidence; full provenance + conflict notes live in `scripts/patch_mislabels.py`.
+
+### Test suite
+
+1064 → 1088 passing tests (+24 strict-mode tests; +8 cross-source author-fab + lead-given-name tests; +3 regression tests for FIX 1/2/3/5).
+
 ## [0.10.0] - 2026-05-28
 
 ### Changed
