@@ -2271,6 +2271,130 @@ class TestResolveWhatCanBeResolved:
         assert rec is good
 
 
+class TestOrderReliablePreferenceOverArxivOnly:
+    """Regression for the Least-to-Most (db9a596a4d3f) shape introduced by X2
+    (commit a7c95e9). ``_arxiv_id_from_entry`` now feeds the arXiv API record
+    into the candidate pool for arXiv-DataCite-DOI entries. That arXiv record
+    carries ``order_reliable=False`` (the arXiv public listing doesn't expose a
+    canonical author ordering for downstream comparison) and its preprint venue
+    routes to ``NON_COMPARABLE`` -- which means the confirmation-key tiebreak
+    awards it FEWER hard mismatches than a tied DBLP/OpenReview record whose
+    published venue contradicts an entry venue claim. The arXiv-only candidate
+    wins selection, the order-gated ``given_name_position_audit`` silently
+    abstains (it requires ``order_reliable=True``), and the entry's lead-author
+    substitution ('Shunyu Zhou' vs canonical 'Denny Zhou') disappears -- the
+    entry routes to UNCONFIRMED instead of GIVEN_NAME_SUBSTITUTION.
+
+    Fix: among candidates tied at the top of the title+author score (within the
+    narrow ``_ORDER_RELIABLE_PREFERENCE_BAND``), an ``order_reliable`` candidate
+    is preferred over an order-unreliable one regardless of the
+    confirmation-key tiebreak. The audit then runs against the right record.
+    """
+
+    def _entry(self) -> dict[str, str]:
+        # Mirrors the Least-to-Most defect shape: entry venue = ICLR, an arXiv
+        # API hit will route its own venue to NON_COMPARABLE so the
+        # confirmation tiebreak prefers it over a structured competitor.
+        return {
+            "title": "Least-to-Most Prompting Enables Complex Reasoning in Large Language Models",
+            "author": "Shunyu Zhou and Denny Zhou",
+            "booktitle": "ICLR",
+            "year": "2023",
+        }
+
+    def _structured_dblp(self) -> PublishedRecord:
+        # ICLR proceedings record from DBLP: order_reliable=True (DBLP author
+        # lists preserve publication order). structured_names=False mirrors
+        # DBLP's synthesized given/family split -- the given-name audit still
+        # fires because its gate is ``order_reliable``, not ``structured_names``.
+        return PublishedRecord(
+            doi="",
+            title="Least-to-Most Prompting Enables Complex Reasoning in Large Language Models",
+            authors=[{"given": "Denny", "family": "Zhou"}, {"given": "Other", "family": "Author"}],
+            journal="ICLR",
+            year=2023,
+            order_reliable=True,
+            structured_names=False,
+        )
+
+    def _arxiv_only(self) -> PublishedRecord:
+        # arXiv API record (the X2 candidate-pool addition): same title+author
+        # surnames, but order_reliable=False -- the arXiv listing's first author
+        # is not a trustworthy ordering signal for downstream audits.
+        return PublishedRecord(
+            doi="10.48550/arxiv.2205.10625",
+            title="Least-to-Most Prompting Enables Complex Reasoning in Large Language Models",
+            authors=[{"given": "Denny", "family": "Zhou"}],
+            journal="",
+            year=2023,
+            order_reliable=False,
+            structured_names=False,
+        )
+
+    def test_order_reliable_candidate_wins_over_arxiv_only_when_tied(self, fact_checker):
+        # Both score 1.0 on title+author. Without the order-reliable preference,
+        # the arXiv-only record wins the confirmation tiebreak (NON_COMPARABLE
+        # venue contributes no mismatch, while the DBLP record's ICLR venue
+        # matches and contributes a confirmation -- but with my chosen entry
+        # they tie on confirmations and the order-reliable preference settles
+        # it). Assert selection picks the order-reliable DBLP record.
+        cands = [(1.0, self._arxiv_only(), "arxiv"), (1.0, self._structured_dblp(), "dblp")]
+        _score, rec, src = fact_checker._select_best_candidate(self._entry(), cands)
+        assert src == "dblp"
+        assert rec.order_reliable is True
+
+    def test_given_name_audit_fires_after_order_reliable_selection(self, fact_checker):
+        # End-to-end: the selected record is the order-reliable DBLP one, so
+        # the given-name position audit runs and surfaces the lead-author
+        # substitution. With the arXiv-only record selected (no fix), the audit
+        # would have abstained (it requires order_reliable=True).
+        cands = [(1.0, self._arxiv_only(), "arxiv"), (1.0, self._structured_dblp(), "dblp")]
+        _score, rec, _src = fact_checker._select_best_candidate(self._entry(), cands)
+        comps = fact_checker._compare_all_fields(self._entry(), rec)
+        # The audit attaches its per-position findings to the author comparison
+        # at the lead-author substitution position. The mere presence of the
+        # finding is what the regression is about; the downstream status route
+        # to GIVEN_NAME_SUBSTITUTION is exercised by the production bib runs.
+        findings = comps["author"].given_name_findings or []
+        assert any(
+            f.get("position") == 0
+            and f.get("variety") == "given_name_substitution"
+            and f.get("entry_given") == "Shunyu"
+            and f.get("record_given") == "Denny"
+            for f in findings
+        ), f"expected lead-author given-name substitution finding, got {findings!r}"
+
+    def test_audit_abstains_when_only_arxiv_only_candidate_is_present(self, fact_checker):
+        # Pre-fix invariant: with only an order-unreliable candidate in the
+        # pool, the audit cannot fire -- this confirms the audit's gate, and
+        # documents why the X2 regression surfaced when the arXiv record began
+        # winning selection over a structurally-available DBLP/Crossref hit.
+        cands = [(1.0, self._arxiv_only(), "arxiv")]
+        _score, rec, _src = fact_checker._select_best_candidate(self._entry(), cands)
+        comps = fact_checker._compare_all_fields(self._entry(), rec)
+        assert rec.order_reliable is False
+        assert not (comps["author"].given_name_findings or [])
+
+    def test_arxiv_only_still_wins_when_clearly_better(self, fact_checker):
+        # X2 invariant: an arXiv-only candidate that is clearly better on
+        # title+author (outside the narrow order-reliable preference sub-band)
+        # still wins. The sub-band is 0.02; with a 0.05 gap, the arXiv record
+        # is the unambiguous best match and should be selected.
+        weak_structured = PublishedRecord(
+            doi="10.1/wrong",
+            title="A Completely Different Paper",
+            authors=[{"given": "Wrong", "family": "Author"}],
+            journal="ICML",
+            year=2023,
+            order_reliable=True,
+            structured_names=True,
+        )
+        cands = [(1.0, self._arxiv_only(), "arxiv"), (0.95, weak_structured, "crossref")]
+        _score, rec, src = fact_checker._select_best_candidate(self._entry(), cands)
+        assert src == "arxiv"
+        assert rec.order_reliable is False
+
+
 class TestCrossSourceAuthorFabrication:
     """FIX A: cross-source extra-author / fabrication detection. The prefix-slice
     ``symmetric_author_match`` waves through a 13-author entry that gets the

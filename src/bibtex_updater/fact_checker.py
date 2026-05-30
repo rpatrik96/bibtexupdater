@@ -2438,9 +2438,7 @@ class FactChecker:
             # the venue or year (e.g. AAAI cited as AISTATS, year 2021 cited
             # as 2026). The helper is FPR-safe: hard MISMATCH only, never
             # NON_COMPARABLE, and preprint-twin records can't anchor the year.
-            return self._id_anchored_field_mismatch(
-                entry, rec, source="crossref", identifier=raw_doi, id_kind="DOI"
-            )
+            return self._id_anchored_field_mismatch(entry, rec, source="crossref", identifier=raw_doi, id_kind="DOI")
 
         self.logger.warning(
             "DOI %s for entry %r points to a different paper: entry title " "%r vs DOI title %r (title score %.2f)",
@@ -2915,6 +2913,25 @@ class FactChecker:
     #: title+author), narrow enough not to promote an unrelated lower-ranked paper.
     _SELECTION_SCORE_BAND = 0.05
 
+    #: Sub-band inside ``_SELECTION_SCORE_BAND`` within which an
+    #: ``order_reliable`` candidate is preferred over an order-unreliable one.
+    #: Targets the X2 regression on ``db9a596a4d3f`` (Least-to-Most): the arXiv
+    #: API record now reaches the pool via ``_arxiv_id_from_entry`` carrying
+    #: ``order_reliable=False`` (no canonical author ordering on the public
+    #: arXiv listing). Its preprint venue routes to ``NON_COMPARABLE``, and in
+    #: the confirmation-key tiebreak that buys it FEWER hard mismatches than a
+    #: tied DBLP/OpenReview record whose ICLR venue contradicts an entry's
+    #: published venue claim -> the arXiv candidate wins selection. The
+    #: given-name position audit is gated on ``order_reliable``, so once the
+    #: arXiv-only record wins, the audit silently abstains and the entry's
+    #: lead-author substitution (Shunyu Zhou vs canonical Denny Zhou) never
+    #: surfaces. A narrow sub-band (0.02 << 0.05) preserves X2's intent: a
+    #: clearly-better arXiv-only candidate (no order-reliable competitor within
+    #: 0.02 of its score) still wins, but an order-reliable candidate
+    #: effectively tied on title+author score is no longer demoted by a
+    #: venue-NON_COMPARABLE confirmation-key win.
+    _ORDER_RELIABLE_PREFERENCE_BAND = 0.02
+
     def _select_best_candidate(
         self, entry: dict[str, Any], candidates: list[tuple[float, PublishedRecord, str]]
     ) -> tuple[float, PublishedRecord, str]:
@@ -2927,6 +2944,14 @@ class FactChecker:
         preprint that cannot. This is the selection half of "resolve what can be
         resolved": reaching the proceedings record is useless unless it is then
         actually selected over the tied preprint.
+
+        Within a narrower sub-band (``_ORDER_RELIABLE_PREFERENCE_BAND``), an
+        ``order_reliable`` candidate is preferred over an order-unreliable one
+        regardless of the confirmation-key tiebreak. This routes the downstream
+        order-gated audits (given-name position, same-surname order violation)
+        at the candidate that can actually answer them, fixing the Least-to-Most
+        regression introduced when X2 began feeding arXiv API records into the
+        pool with ``order_reliable=False``.
         """
         ordered = sorted(candidates, key=lambda x: x[0], reverse=True)
         top = ordered[0][0]
@@ -2939,6 +2964,19 @@ class FactChecker:
             confirmed = sum(1 for c in comparisons.values() if c.is_confirmed)
             mismatches = sum(1 for c in comparisons.values() if c.is_mismatch)
             return (confirmed, -mismatches, cand[0])
+
+        # Order-reliable preference sub-band: among candidates within
+        # ``_ORDER_RELIABLE_PREFERENCE_BAND`` of the top score, an
+        # ``order_reliable`` candidate is preferred over an order-unreliable
+        # one. Outside that sub-band the regular confirmation tiebreak applies,
+        # so a clearly-better arXiv-only candidate still wins when no
+        # order-reliable competitor is close in score.
+        sub_band = [c for c in band if c[0] >= top - self._ORDER_RELIABLE_PREFERENCE_BAND]
+        if len(sub_band) > 1:
+            order_reliable = [c for c in sub_band if c[1].order_reliable]
+            unreliable = [c for c in sub_band if not c[1].order_reliable]
+            if order_reliable and unreliable:
+                return max(order_reliable, key=confirmation_key)
 
         return max(band, key=confirmation_key)
 
@@ -3552,11 +3590,7 @@ class FactChecker:
         # downgrade the outcome to MISMATCH. Gated to mirror
         # ``_detect_author_fabrication`` (corroboration across two sources;
         # single dissenter never trips it; preprint records never anchor).
-        if (
-            comparisons["venue"].resolved_outcome is not MatchOutcome.MISMATCH
-            and entry_venue
-            and per_source_records
-        ):
+        if comparisons["venue"].resolved_outcome is not MatchOutcome.MISMATCH and entry_venue and per_source_records:
             consensus = self._detect_cross_source_venue_mismatch(entry_venue, per_source_records)
             if consensus:
                 comparisons["venue"].outcome = MatchOutcome.MISMATCH
