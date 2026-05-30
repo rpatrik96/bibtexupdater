@@ -27,6 +27,7 @@ __all__ = [
     "MatchOutcome",
     "AuthorMatchResult",
     "symmetric_author_match",
+    "has_explicit_truncation_indicator",
     "EXPANDED_VENUE_ALIASES",
     "get_canonical_venue",
     "is_preprint_or_series_venue",
@@ -229,6 +230,43 @@ def _has_author_sentinel(names: list[str]) -> bool:
     return any(n and n.lower() in _AUTHOR_SENTINELS for n in names)
 
 
+#: Explicit truncation indicators that a citation may use OUTSIDE the structured
+#: author field to disclose that the author list is incomplete. ``--strict``'s
+#: "silent truncation" rule (rule 5) does NOT flag entries that disclose their
+#: truncation: a citation that says "..." or ``\ldots`` or a trailing
+#: ``, et al.`` outside the author field has *already announced* the omission.
+#: That is the cited author's responsibility, not a hallucination signal.
+_EXPLICIT_TRUNCATION_MARKERS: tuple[str, ...] = (
+    "...",
+    "\\ldots",
+    "\\dots",
+    "et al",
+    "et al.",
+)
+
+
+def has_explicit_truncation_indicator(*fields: str | None) -> bool:
+    """True if any of ``fields`` carries a disclosed-truncation marker.
+
+    Catches the cases the structured ``and others`` / ``et al`` sentinel inside
+    the BibTeX ``author`` field does not: a trailing ``...`` / ``\\ldots`` in
+    the rendered citation, or a trailing ``, et al.`` placed in a sibling
+    field (``note``, ``howpublished``, even the title) rather than as a proper
+    author token. Used by ``--strict`` to refuse to escalate a leading-prefix
+    author list to AUTHOR_TRUNCATED when the citation already discloses that
+    its author list is truncated.
+    """
+    for raw in fields:
+        if not raw:
+            continue
+        text = raw.lower()
+        # Cheap substring check; the markers are short and distinctive enough
+        # that a false positive on real prose is exceedingly unlikely.
+        if any(marker in text for marker in _EXPLICIT_TRUNCATION_MARKERS):
+            return True
+    return False
+
+
 def _strip_author_sentinels(names: list[str]) -> list[str]:
     """Drop "others"/"et al" sentinels from a surname list."""
     return [n for n in names if n and n.lower() not in _AUTHOR_SENTINELS]
@@ -247,11 +285,26 @@ def _is_leading_prefix(short: list[str], long: list[str]) -> bool:
     return len(short) <= len(long) and short == long[: len(short)]
 
 
+def _looks_alphabetized(names: list[str]) -> bool:
+    """True if surname keys are sorted A-Z over >=3 names.
+
+    A record whose authors are in alphabetical order has very likely *sorted*
+    its contributor list (Crossref NeurIPS/ICML proceedings deposits do this,
+    e.g. the 10.52202 prefix) rather than preserving title-page order, so its
+    author *order* cannot be trusted to detect a publication-order swap. Require
+    >=3 names: with one or two authors, alphabetical order coincides too often to
+    carry any signal.
+    """
+    return len(names) >= 3 and names == sorted(names)
+
+
 def symmetric_author_match(
     entry_names: list[str],
     api_names: list[str],
     threshold: float = 0.80,
     prefix_n: int = 5,
+    order_reliable: bool = False,
+    strict: bool = False,
 ) -> AuthorMatchResult:
     """Compare entry vs API author surnames on a *symmetric* basis (trichotomy).
 
@@ -274,6 +327,15 @@ def symmetric_author_match(
     6. Otherwise score a symmetric slice (Jaccard + LCS): >= threshold is a MATCH,
        below is a MISMATCH (real conflict beyond the shared lead author).
 
+    ``strict`` (arXiv 2026 / hallucination-leak mode): the cost is asymmetric --
+    a leaked wrong/swapped author is far worse than an FP. Two relaxations are
+    removed:
+      * The alphabetization guard (a same-multiset record sorted A-Z is treated
+        as a record-side sort artifact) is DISABLED. An order-reliable source
+        with the same multiset but a different lead is a real swap.
+      * The hard first-author guard no longer requires a differing multiset:
+        a different lead author against an order-reliable source is a MISMATCH
+        even if the multiset matches.
     Returns an :class:`AuthorMatchResult` carrying the trichotomy and a 0-1 score.
     """
     a_has_sentinel = _has_author_sentinel(entry_names)
@@ -285,9 +347,15 @@ def symmetric_author_match(
     if not a or not b:
         return AuthorMatchResult(MatchOutcome.NON_COMPARABLE, 1.0)
 
-    # Hard first-author signal: an outright different lead author is a real
-    # mismatch. Both sides are already canonicalized surname keys.
-    if a[0] != b[0]:
+    # Hard first-author signal: a different lead author whose author multiset
+    # also DIFFERS is a real mismatch (a genuinely wrong/extra lead author).
+    # When the multisets are identical the lead difference is pure reordering --
+    # deferred to the same-multiset block below, which decides swap vs artifact.
+    # In strict mode, a same-multiset lead difference against an order-reliable
+    # source is also a real swap (the alphabetization escape clause is dropped).
+    if a[0] != b[0] and sorted(a) != sorted(b):
+        return AuthorMatchResult(MatchOutcome.MISMATCH, 0.0)
+    if strict and a[0] != b[0] and order_reliable:
         return AuthorMatchResult(MatchOutcome.MISMATCH, 0.0)
 
     # Exact (sentinel-stripped) equality: full positive confirmation.
@@ -312,6 +380,25 @@ def symmetric_author_match(
     # with a sentinel -- the elision is not a simple leading truncation.
     if _is_ordered_subsequence(a, b) or _is_ordered_subsequence(b, a):
         return AuthorMatchResult(MatchOutcome.PARTIAL, 1.0)
+
+    # Same author multiset, different order (a genuine reordering; requires full
+    # multiset equality, not mere overlap -- a single differing author such as a
+    # record-side typo 'Ren'/'Rent' is NOT a reordering and falls through to the
+    # order-agnostic score below). Against an order-preserving source this is a
+    # real swapped-authors defect -> MISMATCH. Two exclusions, where the order
+    # carries no signal so the shared author set is a positive confirmation:
+    #   * Semantic Scholar (order_reliable=False) -- flat, unordered names.
+    #   * An alphabetized API order (sorted A-Z) -- a record-side sort artifact
+    #     (e.g. Crossref NeurIPS/ICML proceedings deposits), not a publication
+    #     swap. This was a false-positive source on valid multi-author papers.
+    if sorted(a) == sorted(b):
+        # ``strict`` disables the alphabetization escape: against an order-
+        # reliable source a same-multiset reordering is a real swap even if
+        # the record looks alphabetized (the arXiv-2026 policy treats the
+        # asymmetric leak cost as far worse than the FP it introduces).
+        if order_reliable and (strict or not _looks_alphabetized(b)):
+            return AuthorMatchResult(MatchOutcome.MISMATCH, 0.0)
+        return AuthorMatchResult(MatchOutcome.MATCH, 1.0)
 
     # Symmetric slice + combined (Jaccard + LCS) score.
     n = min(len(a), len(b), prefix_n)
@@ -425,9 +512,20 @@ EXPANDED_VENUE_ALIASES: dict[str, set[str]] = {
     },
     "jmlr": {
         "journal of machine learning research",
+        # ISO-4 abbreviated form. Period-stripping in
+        # ``_normalize_venue_for_matching`` turns ``J. Mach. Learn. Res.`` into
+        # ``j mach learn res`` before lookup.
+        "j mach learn res",
+        # ``jmlr workshop and conference proceedings`` is intentionally NOT here:
+        # it is caught by ``_SERIES_MARKERS`` as PMLR-style umbrella series.
     },
     "tmlr": {
         "transactions on machine learning research",
+        # ISO-4 abbreviated form. ``Trans. Mach. Learn. Res.`` -> ``trans mach
+        # learn res`` after the period-strip in ``_normalize_venue_for_matching``.
+        "trans mach learn res",
+        # OpenReview / Zotero exports often say ``Accepted by TMLR``.
+        "accepted by tmlr",
     },
     # Systems/DB (new)
     "sigmod": {
@@ -561,6 +659,57 @@ EXPANDED_VENUE_ALIASES: dict[str, set[str]] = {
 GENERIC_SINGLE_WORD_VENUES: frozenset[str] = frozenset({"nature", "science", "pnas"})
 
 
+#: OpenReview ``venueid`` shape: ``Acronym.cc/YYYY/<Track>``. Unique to
+#: OpenReview-hosted submissions (no real venue string uses ``.cc/YYYY/``), so a
+#: prefix-strip to the bare acronym is leak-safe: a hallucinated entry's venue
+#: would not match this shape at all.
+_OPENREVIEW_VENUEID_RE = re.compile(
+    r"^([a-z]+)\.cc/\d{4}/[a-z0-9_\-/]+$",
+    re.IGNORECASE,
+)
+
+#: Track / decoration tokens that ML conferences attach to a base venue string
+#: (``ICLR 2023 poster``, ``NeurIPS 2022 oral``, ``ICML 2023 spotlight``,
+#: ``ICLR 2023 Notable top-5%``). Every token is a generic ML-conference
+#: qualifier with NO standalone venue identity, so stripping it from a
+#: fabricated entry (``FakeConf 2023 poster`` -> ``fakeconf 2023``) still does
+#: not canonicalize to any real venue. ``workshop`` is intentionally excluded
+#: -- workshops are distinct venues from their host conference's main track and
+#: must not be conflated (``ICLR 2023 Workshop on X`` should NOT match the
+#: ICLR proceedings).
+_TRACK_DECORATION_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\bnotable\s+top[\s\-]*\d+%?", re.IGNORECASE),
+    re.compile(r"\btop[\s\-]*\d+%?", re.IGNORECASE),
+    re.compile(r"\bdatasets\s+and\s+benchmarks(?:\s+track)?\b", re.IGNORECASE),
+    re.compile(r"\bconference\s+track\b", re.IGNORECASE),
+    re.compile(r"\bmain\s+track\b", re.IGNORECASE),
+    re.compile(r"\blong\s+paper\b", re.IGNORECASE),
+    re.compile(r"\bshort\s+paper\b", re.IGNORECASE),
+    # NOTE: "findings" deliberately NOT stripped here -- "ACL Findings" / "EMNLP
+    # Findings" are distinct sub-venues with their own canonical aliases above.
+    re.compile(r"\b(poster|oral|spotlight|highlight|demo|demonstration|tutorial)\b", re.IGNORECASE),
+)
+
+
+def _strip_track_decorations(venue_norm: str) -> str:
+    """Strip well-known track / decoration suffixes from a lowercased venue.
+
+    Conference records (especially OpenReview) routinely tag the venue string
+    with a track or decoration (``ICLR 2023 poster``, ``NeurIPS 2022 Datasets
+    and Benchmarks Track``, ``ICML 2023 spotlight``, ``ICLR 2023 Notable
+    top-5%``). These tokens are generic ML-conference qualifiers -- not
+    standalone venues -- so stripping them lifts the bare acronym to the
+    surface for alias lookup. A fabricated venue (``FakeConf 2023 poster``)
+    still does not canonicalize after stripping, so no new false-MATCH path is
+    opened. ``workshop`` is intentionally NOT stripped: workshops are distinct
+    venues from their host conference's main proceedings.
+    """
+    out = venue_norm
+    for pat in _TRACK_DECORATION_PATTERNS:
+        out = pat.sub(" ", out)
+    return " ".join(out.split()).strip()
+
+
 def _normalize_venue_for_matching(venue: str) -> str:
     """Normalize venue string for matching.
 
@@ -572,14 +721,32 @@ def _normalize_venue_for_matching(venue: str) -> str:
     """
     venue_norm = venue.lower().strip()
 
+    # FIX A2: OpenReview venueid pre-pass -- ``ICLR.cc/2024/Conference`` ->
+    # ``iclr``, ``NeurIPS.cc/2022/Datasets_and_Benchmarks_Track`` -> ``neurips``.
+    # The ``.cc/YYYY/...`` shape is unique to OpenReview venueids, so leak risk
+    # is zero (no real venue string uses it).
+    m = _OPENREVIEW_VENUEID_RE.match(venue_norm)
+    if m:
+        venue_norm = m.group(1).lower()
+
+    # FIX C1: ISO-4 abbreviated journal forms use period-separated tokens
+    # (``Trans. Mach. Learn. Res.``). Drop the trailing periods so the bare
+    # tokens line up with the alias map ("trans mach learn res").
+    venue_norm = venue_norm.replace(".", " ")
+
     # Remove common prefixes
-    for prefix in ["proceedings of the ", "proceedings of ", "proc. ", "in "]:
+    for prefix in ["proceedings of the ", "proceedings of ", "proc. ", "proc ", "in "]:
         if venue_norm.startswith(prefix):
             venue_norm = venue_norm[len(prefix) :]
 
     # Remove years
     venue_norm = re.sub(r"\b\d{4}\b", "", venue_norm)
     venue_norm = " ".join(venue_norm.split()).strip()
+
+    # FIX A3: strip track / decoration suffixes (``ICLR 2023 poster`` ->
+    # ``iclr``, ``NeurIPS 2022 Datasets and Benchmarks Track`` -> ``neurips``)
+    # AFTER year removal so the year-strip fires first.
+    venue_norm = _strip_track_decorations(venue_norm)
 
     return venue_norm
 
@@ -631,6 +798,21 @@ def get_canonical_venue(venue: str, aliases: dict[str, set[str]] | None = None) 
             # Require substantial overlap for substring matching
             shorter, longer = sorted([name, venue_norm], key=len)
             if len(shorter) / len(longer) < 0.4:
+                # FIX A1: the 0.4 ratio gate rejects a clean substring match like
+                # ``len('iclr') / len('iclr poster') = 0.36`` even though ``iclr``
+                # appears at a word boundary. For 4-7 char single-token acronyms
+                # we accept a word-boundary match instead. This is strictly more
+                # conservative than the substring branch below: every word-boundary
+                # match is also a substring match, but ``acl`` does NOT word-
+                # boundary-match inside ``naacl`` (no boundary between ``na`` and
+                # ``acl``), so the historical naacl/acl collision stays excluded.
+                if (
+                    4 <= len(name) <= 7
+                    and " " not in name
+                    and name == canonical
+                    and re.search(rf"\b{re.escape(name)}\b", venue_norm)
+                ):
+                    return canonical
                 continue  # Too different in length for substring match
             if name in venue_norm or venue_norm in name:
                 return canonical
@@ -653,6 +835,12 @@ _PREPRINT_SERVER_MARKERS: tuple[str, ...] = (
     "chemrxiv",
     "preprint",
     "corr",  # arXiv's "Computing Research Repository" DBLP label
+    # FIX C3: SSRN is a working-paper / preprint server. CrossRef returns
+    # ``SSRN Electronic Journal`` for SSRN copies of papers later published at
+    # JMLR / conference venues, so an SSRN-side venue must be non-comparable
+    # (not a hard mismatch) and let another source confirm the venue. Unique
+    # acronym -- no real journal name contains ``ssrn``.
+    "ssrn",
 )
 
 #: Publisher-*series* markers (matched against the lowercased raw venue). These
@@ -667,18 +855,30 @@ _SERIES_MARKERS: tuple[str, ...] = (
     "w&cp",
 )
 
+#: Hosting-*platform* markers. A record whose venue is only the platform name
+#: (OpenReview hosts ICLR, NeurIPS, TMLR, and many workshops) says nothing about
+#: the published venue, exactly like a preprint server -- so a venue comparison
+#: against it is non-comparable, not a mismatch. Not added as a venue *alias*
+#: (OpenReview is not a venue), only as a non-comparable platform string.
+_PLATFORM_MARKERS: tuple[str, ...] = ("openreview",)
+
 
 def is_preprint_or_series_venue(venue: str) -> bool:
     """True if ``venue`` names a preprint server or non-specific publisher series.
 
     Such venues (arXiv/CoRR, bioRxiv, "Proceedings of Machine Learning Research",
-    PMLR/JMLR W&CP) cannot pin a single published venue, so a venue comparison
-    against them is *non-comparable* rather than a mismatch. The distinct journal
-    "Journal of Machine Learning Research" (JMLR) is deliberately NOT matched.
+    PMLR/JMLR W&CP, and hosting platforms like OpenReview) cannot pin a single
+    published venue, so a venue comparison against them is *non-comparable*
+    rather than a mismatch. The distinct journal "Journal of Machine Learning
+    Research" (JMLR) is deliberately NOT matched.
     """
     if not venue:
         return False
     raw = venue.lower().strip()
     if not raw:
         return False
-    return any(m in raw for m in _PREPRINT_SERVER_MARKERS) or any(m in raw for m in _SERIES_MARKERS)
+    return (
+        any(m in raw for m in _PREPRINT_SERVER_MARKERS)
+        or any(m in raw for m in _SERIES_MARKERS)
+        or any(m in raw for m in _PLATFORM_MARKERS)
+    )

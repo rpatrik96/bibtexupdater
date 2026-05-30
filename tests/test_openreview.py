@@ -99,8 +99,12 @@ class TestBuildOpenReviewPaperhash:
     def test_normalization(self, title, last, expected):
         assert build_openreview_paperhash(title, last) == expected
 
-    def test_diacritics_stripped_in_author(self):
-        assert build_openreview_paperhash("A Title", "Müller") == "muller|a_title"
+    def test_diacritics_preserved_in_author(self):
+        # FIX B1: OpenReview's paperhash index keys on the Unicode-preserved
+        # surname ("müller" vs "muller"); stripping diacritics here returned 0
+        # notes for accented author names. Preserve diacritics so the paperhash
+        # matches OpenReview's index.
+        assert build_openreview_paperhash("A Title", "Müller") == "müller|a_title"
 
     def test_collapses_whitespace(self):
         assert build_openreview_paperhash("A   Spaced    Title", "x") == "x|a_spaced_title"
@@ -301,7 +305,18 @@ class TestOpenReviewCascadeWiring:
         }
         sources_queried: list = []
         fc._query_cascade(entry, "Some ICLR Paper Doe", sources_queried, [], [])
-        assert sources_queried == ["crossref", "openalex", "dblp", "openreview", "semanticscholar"]
+        # FIX X4: when every primary source returns nothing usable, the
+        # relaxed-author retrieval fallback runs (title-only retry on
+        # Crossref + OpenAlex) and appends two fallback source names.
+        assert sources_queried == [
+            "crossref",
+            "openalex",
+            "dblp",
+            "openreview",
+            "semanticscholar",
+            "crossref-fallback",
+            "openalex-fallback",
+        ]
         # OpenReview got the raw title + reduced first-author surname.
         kwargs = openreview.search.call_args.kwargs
         assert kwargs["title"] == "Some ICLR Paper"

@@ -172,6 +172,27 @@ class TestLastNameFromPerson:
         assert last_name_from_person("John M. Smith") == "smith"
         assert last_name_from_person("van den Oord, Aaron") == "oord"
 
+    def test_last_name_decodes_html_entity_apostrophe(self):
+        # DBLP/XML-scraped fields carry "&apos;"; without decoding, the entity
+        # letters survive punctuation-stripping ("d&apos;Amore" -> "daposamore")
+        # and spuriously fail to match the clean record ("damore").
+        assert last_name_from_person("Francesco d&apos;Amore") == "damore"
+        assert last_name_from_person("Shin-Fang Ch&apos;ng") == "chng"
+
+
+class TestHtmlEntityTitleDecoding:
+    """HTML/XML entities in titles must decode before fuzzy matching."""
+
+    def test_amp_entity_does_not_leak_amp_token(self):
+        result = normalize_title_for_match("Parameter Allocation &amp; Regularization")
+        assert "amp" not in result.split()
+        assert "allocation regularization" in result
+
+    def test_apos_entity_in_title(self):
+        result = normalize_title_for_match("An Extension of the D&apos;Hondt Method")
+        assert "apos" not in result
+        assert "hondt" in result
+
 
 class TestAuthorsLastNames:
     """Tests for authors_last_names function."""
@@ -434,3 +455,187 @@ class TestAtomicReplace:
         assert excinfo.value.errno == errno.EACCES
         # Source must remain untouched on failure.
         assert src.exists()
+
+
+class TestSameSurnameGivenOrderViolation:
+    """A swap of two co-authors sharing a surname (e.g. 'Yang Song' <-> 'Jiaming
+    Song') is invisible to surname-only matching; against an order-preserving
+    record, comparing given-name initials catches it. Conservative: aligned
+    shared-surname runs with given names on both sides only."""
+
+    def _record(self, names, order_reliable=True, structured=True):
+        from bibtex_updater.utils import PublishedRecord
+
+        authors = []
+        for n in names:
+            given, family = n.rsplit(" ", 1)
+            authors.append({"given": given, "family": family})
+        return PublishedRecord(
+            doi="10.1/x", title="T", authors=authors, order_reliable=order_reliable, structured_names=structured
+        )
+
+    # SDEdit: real order has Yang Song then Jiaming Song; entry swaps them.
+    SDEDIT_REAL = ["Chenlin Meng", "Yutong He", "Yang Song", "Jiaming Song", "Jun-Yan Zhu"]
+    SDEDIT_ENTRY = "Chenlin Meng and Yutong He and Jiaming Song and Yang Song and Jun-Yan Zhu"
+
+    def test_same_surname_swap_is_violation(self):
+        from bibtex_updater.utils import same_surname_given_order_violation
+
+        assert same_surname_given_order_violation(self.SDEDIT_ENTRY, self._record(self.SDEDIT_REAL)) is True
+
+    def test_correct_order_is_not_a_violation(self):
+        from bibtex_updater.utils import same_surname_given_order_violation
+
+        entry = " and ".join(self.SDEDIT_REAL)  # same order as the record
+        assert same_surname_given_order_violation(entry, self._record(self.SDEDIT_REAL)) is False
+
+    def test_no_check_when_record_not_order_reliable(self):
+        from bibtex_updater.utils import same_surname_given_order_violation
+
+        rec = self._record(self.SDEDIT_REAL, order_reliable=False)
+        assert same_surname_given_order_violation(self.SDEDIT_ENTRY, rec) is False
+
+    def test_no_shared_surname_run_is_not_a_violation(self):
+        from bibtex_updater.utils import same_surname_given_order_violation
+
+        entry = "Alice Smith and Bob Jones and Carol Lee"
+        rec = self._record(["Alice Smith", "Bob Jones", "Carol Lee"])
+        assert same_surname_given_order_violation(entry, rec) is False
+
+    def test_unequal_surname_counts_skipped(self):
+        from bibtex_updater.utils import same_surname_given_order_violation
+
+        # Entry dropped one 'Song' -> counts differ -> left to surname-level logic.
+        entry = "Chenlin Meng and Yutong He and Yang Song and Jiajun Wu and Jun-Yan Zhu and Stefano Ermon"
+        assert same_surname_given_order_violation(entry, self._record(self.SDEDIT_REAL)) is False
+
+    def test_missing_given_names_skipped(self):
+        from bibtex_updater.utils import PublishedRecord, same_surname_given_order_violation
+
+        # Record authors have no given names -> cannot disambiguate -> no violation.
+        rec = PublishedRecord(
+            doi="10.1/x",
+            title="T",
+            authors=[{"given": "", "family": "Song"}, {"given": "", "family": "Song"}],
+            order_reliable=True,
+            structured_names=True,
+        )
+        assert same_surname_given_order_violation("Jiaming Song and Yang Song", rec) is False
+
+
+class TestClassifyGivenPair:
+    """Graded given-name cascade: only a full-vs-full incompatible first token
+    (not a nickname/close-spelling variant) escalates."""
+
+    def _class(self, e, r):
+        from bibtex_updater.utils import GIVEN_VARIETY_CLASS, classify_given_pair
+
+        return GIVEN_VARIETY_CLASS[classify_given_pair(e, r)]
+
+    def test_substitution_escalates(self):
+        assert self._class("Yujing", "Yue") == "escalate"  # d67418 Zhao
+        assert self._class("Rafael", "Ramon") == "escalate"  # d67418 Navarro
+        assert self._class("Yoshua", "Yann") == "escalate"
+
+    def test_benign_variants_confirmed(self):
+        assert self._class("D. P.", "Diederik P.") == "confirmed"  # initials
+        assert self._class("Diederik", "Diederik P.") == "confirmed"  # middle name
+        assert self._class("Stephane", "St{\\'e}phane") == "confirmed"  # diacritic/LaTeX
+        assert self._class("Jun-Yan", "Junyan") == "confirmed"  # hyphen fold
+        assert self._class("Yue", "Yue") == "confirmed"  # exact
+
+    def test_abbreviation_prefix_is_confirmed(self):
+        # Diminutives/abbreviations where one full token is a prefix of the other.
+        assert self._class("Tim", "Timothy A.") == "confirmed"
+        assert self._class("Chris", "Christopher") == "confirmed"
+        assert self._class("Dan", "Daniel") == "confirmed"
+        # Genuine substitutions are NOT prefixes -> still escalate.
+        assert self._class("Yujing", "Yue") == "escalate"
+        assert self._class("Rafael", "Ramon") == "escalate"
+
+    def test_low_confidence_softens(self):
+        assert self._class("Bill", "William") == "soften"  # nickname
+        assert self._class("Sergey", "Serguei") == "soften"  # close romanization
+        assert self._class("Y.", "Jiaming") == "soften"  # initial conflict
+
+    def test_missing_given_is_non_comparable(self):
+        assert self._class("", "Yue") == "skip"
+        assert self._class("Yue", "") == "skip"
+
+
+class TestGivenNamePositionAudit:
+    """The audit escalates a genuine substitution only on an order-reliable,
+    structured record, at surname-confirmed positions."""
+
+    def _rec(self, pairs, order_reliable=True, structured=True):
+        from bibtex_updater.utils import PublishedRecord
+
+        return PublishedRecord(
+            doi="10.1/x",
+            title="T",
+            authors=[{"given": g, "family": f} for g, f in pairs],
+            order_reliable=order_reliable,
+            structured_names=structured,
+        )
+
+    # d67418: real Yue Zhao / Ramon Navarro; entry Yujing Zhao / Rafael Navarro.
+    ENTRY = "Durmus Acar and Yujing Zhao and Rafael Navarro and Matthew Mattina"
+    REAL = [("Durmus", "Acar"), ("Yue", "Zhao"), ("Ramon", "Navarro"), ("Matthew", "Mattina")]
+
+    def test_substitution_escalates_on_structured_record(self):
+        from bibtex_updater.utils import given_name_position_audit
+
+        worst, findings = given_name_position_audit(self.ENTRY, self._rec(self.REAL))
+        assert worst == "escalate"
+        assert any(f["variety"] == "given_name_substitution" for f in findings)
+
+    def test_escalates_on_unstructured_but_order_reliable_record(self):
+        # Loosened gate: a DBLP/OpenAlex record (order-reliable but synthesized
+        # names) DOES drive escalation -- this is the d67418 path, where the
+        # substitution surfaces only via a non-structured source.
+        from bibtex_updater.utils import given_name_position_audit
+
+        worst, findings = given_name_position_audit(self.ENTRY, self._rec(self.REAL, structured=False))
+        assert worst == "escalate"
+        assert any(f["variety"] == "given_name_substitution" for f in findings)
+
+    def test_no_escalation_when_not_order_reliable(self):
+        # Semantic Scholar (not order_reliable) is still excluded.
+        from bibtex_updater.utils import given_name_position_audit
+
+        worst, _ = given_name_position_audit(self.ENTRY, self._rec(self.REAL, order_reliable=False))
+        assert worst == "skip"
+
+    def test_correct_initials_citation_is_confirmed(self):
+        from bibtex_updater.utils import given_name_position_audit
+
+        # Initials-style entry against the real full names -> never escalates.
+        entry = "D. Acar and Y. Zhao and R. Navarro and M. Mattina"
+        worst, _ = given_name_position_audit(entry, self._rec(self.REAL))
+        assert worst in ("confirmed", "skip")
+
+    def test_repeated_surname_with_scrambled_order_does_not_escalate(self):
+        # Regression (df33d8b19854): two co-authors named Liu, and the record
+        # returns authors alphabetized (not publication order). A raw positional
+        # pairing put Wanwei Liu opposite Xinwang Liu -> false substitution. With
+        # the unique-surname guard, the repeated 'Liu' positions are skipped.
+        from bibtex_updater.utils import given_name_position_audit
+
+        entry = (
+            "Yufeng Zhang and Jialu Pan and Li Ken Li and Wanwei Liu and " "Zhenbang Chen and Xinwang Liu and Ji Wang"
+        )
+        # Record authors alphabetized by surname (as the real source returned them).
+        rec = self._rec(
+            [
+                ("Zhenbang", "Chen"),
+                ("Li Ken", "Li"),
+                ("Wanwei", "Liu"),
+                ("Xinwang", "Liu"),
+                ("Jialu", "Pan"),
+                ("Ji", "Wang"),
+                ("Yufeng", "Zhang"),
+            ]
+        )
+        worst, findings = given_name_position_audit(entry, rec)
+        assert worst != "escalate"
+        assert not any(f["variety"] == "given_name_substitution" for f in findings)

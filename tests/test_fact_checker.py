@@ -241,6 +241,19 @@ class TestFactCheckerFieldComparison:
         comparisons = fact_checker._compare_all_fields(entry, record)
         assert comparisons["year"].matches is False
 
+    def test_compare_year_preprint_record_does_not_mismatch(self, fact_checker):
+        """Regression (ea48d1a613c3): a correct citation of a PUBLISHED version
+        whose matched record is the arXiv PREPRINT twin (posted years earlier)
+        must not read as a year_mismatch -- a preprint cannot refute a published
+        year -> NON_COMPARABLE."""
+        from bibtex_updater.matching import MatchOutcome
+
+        entry = {"title": "Test", "year": "2022", "author": "Author"}
+        record = PublishedRecord(doi="10.48550/arXiv.1910.03834", title="Test", year=2019)
+        comparisons = fact_checker._compare_all_fields(entry, record)
+        assert comparisons["year"].outcome is MatchOutcome.NON_COMPARABLE
+        assert comparisons["year"].matches is False
+
     def test_compare_no_venue_claim_is_vacuously_confirmed(self, fact_checker):
         """Entry makes NO venue claim -> nothing to confirm -> vacuous MATCH.
 
@@ -581,6 +594,9 @@ class TestFactCheckerCheckEntry:
         # queries five sources: crossref -> openalex -> dblp -> openreview ->
         # semanticscholar (OpenAlex and OpenReview are lazily built from the
         # shared crossref.http mock).
+        # FIX X4: when every primary source returns nothing usable, the
+        # relaxed-author retrieval fallback runs (title-only retry on
+        # Crossref + OpenAlex) and appends two fallback source names.
         result = fact_checker.check_entry(sample_entry)
         assert result.status == FactCheckStatus.NOT_FOUND
         assert result.api_sources_queried == [
@@ -589,6 +605,8 @@ class TestFactCheckerCheckEntry:
             "dblp",
             "openreview",
             "semanticscholar",
+            "crossref-fallback",
+            "openalex-fallback",
         ]
 
     def test_weak_unrelated_match_abstains(self, fact_checker, monkeypatch):
@@ -1855,3 +1873,822 @@ class TestSemanticScholarGetPaper:
         result = client.get_paper("DOI:10.1234/test")
         assert result is not None
         assert result["title"] == "Test"
+
+
+class TestPreprintDoiVenue:
+    """A matched record that IS a preprint (arXiv/bioRxiv DOI) cannot confirm the
+    claimed *published* venue, even when its venue STRING is an unrecognized
+    repository name (e.g. 'UvA-DARE') that the string-based preprint heuristic
+    misses. Such a record routes venue to NON_COMPARABLE, never a MISMATCH.
+    """
+
+    def test_arxiv_doi_record_with_repository_venue_string_is_non_comparable(self, fact_checker):
+        # Regression: 'Adam' (entry: ICLR 2015) matched its arXiv-DOI preprint
+        # whose Crossref/OpenAlex 'journal' came back as the institutional repo
+        # 'UvA-DARE (University of Amsterdam)'. is_preprint_or_series_venue does
+        # NOT recognize that string, so the old code fell through to a venue
+        # MISMATCH against 'ICLR'. The arXiv DOI is the authoritative preprint
+        # signal -> NON_COMPARABLE.
+        entry = {
+            "title": "Adam: A Method for Stochastic Optimization",
+            "author": "Kingma, Diederik P. and Ba, Jimmy",
+            "booktitle": "International Conference on Learning Representations (ICLR)",
+            "year": "2015",
+        }
+        record = PublishedRecord(
+            doi="10.48550/arxiv.1412.6980",
+            title="Adam: A Method for Stochastic Optimization",
+            authors=[
+                {"given": "Diederik P.", "family": "Kingma"},
+                {"given": "Jimmy", "family": "Ba"},
+            ],
+            journal="UvA-DARE (University of Amsterdam)",
+            year=2014,
+            structured_names=True,
+        )
+        comparisons = fact_checker._compare_all_fields(entry, record)
+        venue = comparisons["venue"]
+        assert venue.outcome is MatchOutcome.NON_COMPARABLE
+        assert venue.is_mismatch is False
+        assert venue.matches is False
+
+    def test_biorxiv_doi_record_is_non_comparable(self, fact_checker):
+        entry = {"title": "T", "author": "Smith, John", "journal": "Nature", "year": "2021"}
+        record = PublishedRecord(
+            doi="10.1101/2021.01.01.123456",
+            title="T",
+            authors=[{"given": "John", "family": "Smith"}],
+            journal="Some Repository",
+            year=2021,
+            structured_names=True,
+        )
+        comparisons = fact_checker._compare_all_fields(entry, record)
+        assert comparisons["venue"].outcome is MatchOutcome.NON_COMPARABLE
+
+    def test_published_doi_record_with_different_venue_still_mismatches(self, fact_checker):
+        # Guard: a NON-preprint (real publisher) DOI with a genuinely different,
+        # populated venue must STILL be a venue MISMATCH. Year matches here so the
+        # different-edition rule does not apply.
+        entry = {"title": "T", "author": "Smith, John", "booktitle": "NeurIPS", "year": "2020"}
+        record = PublishedRecord(
+            doi="10.1145/3422622",
+            title="T",
+            authors=[{"given": "John", "family": "Smith"}],
+            journal="Communications of the ACM",
+            year=2020,
+            structured_names=True,
+        )
+        comparisons = fact_checker._compare_all_fields(entry, record)
+        assert comparisons["venue"].is_mismatch is True
+
+
+class TestYearNonComparable:
+    """An empty or unparseable year on either side cannot confirm OR refute the
+    claimed year -> NON_COMPARABLE (abstention), not a YEAR_MISMATCH.
+    """
+
+    def test_empty_record_year_is_non_comparable_not_mismatch(self, fact_checker):
+        # Regression: 'DDPM' matched a DBLP 'CoRR 2020' record carrying no year.
+        # The old code set year_matches=False -> read as a YEAR_MISMATCH.
+        entry = {
+            "title": "Denoising Diffusion Probabilistic Models",
+            "author": "Ho, Jonathan",
+            "booktitle": "Advances in Neural Information Processing Systems (NeurIPS)",
+            "year": "2020",
+        }
+        record = PublishedRecord(
+            doi="",
+            title="Denoising Diffusion Probabilistic Models",
+            authors=[{"given": "Jonathan", "family": "Ho"}],
+            journal="CoRR 2020",
+            year=None,
+        )
+        comparisons = fact_checker._compare_all_fields(entry, record)
+        year = comparisons["year"]
+        assert year.outcome is MatchOutcome.NON_COMPARABLE
+        assert year.is_mismatch is False
+
+    def test_no_entry_year_claim_is_vacuous_match(self, fact_checker):
+        entry = {"title": "T", "author": "A"}  # no year claimed
+        record = PublishedRecord(doi="", title="T", year=2020)
+        comparisons = fact_checker._compare_all_fields(entry, record)
+        assert comparisons["year"].outcome is MatchOutcome.MATCH
+        assert comparisons["year"].matches is True
+
+    def test_small_year_error_same_venue_still_mismatches(self, fact_checker):
+        # Guard: a genuine small year error (both years present, beyond tolerance,
+        # gap below the different-edition threshold) on an otherwise-matching
+        # record must STILL flag YEAR_MISMATCH.
+        entry = {"title": "T", "author": "A", "year": "2010", "journal": "Nature"}
+        record = PublishedRecord(doi="10.1/x", title="T", journal="Nature", year=2013)
+        comparisons = fact_checker._compare_all_fields(entry, record)
+        assert comparisons["year"].is_mismatch is True
+
+
+class TestDifferentEditionAbstains:
+    """A matched record with the SAME title but published in a substantially
+    different year, whose claimed venue is NOT positively confirmed, is almost
+    certainly a different edition/reprint of the same work (or a same-title
+    decoy) -- it can neither confirm nor refute the entry. Abstain (UNCONFIRMED),
+    do not flag a *_MISMATCH.
+    """
+
+    def test_identical_title_large_year_gap_blank_venue_abstains(self, fact_checker):
+        # Regression: 'Attention Is All You Need' (entry: NeurIPS 2017) matched a
+        # 2025 same-title item with a blank venue -> old code: YEAR_MISMATCH.
+        entry = {
+            "title": "Attention Is All You Need",
+            "author": "Vaswani, Ashish",
+            "booktitle": "Advances in Neural Information Processing Systems (NeurIPS)",
+            "year": "2017",
+        }
+        record = PublishedRecord(
+            doi="10.65215/2q58a426",
+            title="Attention Is All You Need",
+            authors=[{"given": "Ashish", "family": "Vaswani"}],
+            journal="",
+            year=2025,
+            structured_names=True,
+        )
+        comparisons = fact_checker._compare_all_fields(entry, record)
+        assert comparisons["year"].is_mismatch is False
+        status = fact_checker._determine_status(0.95, comparisons, ["crossref"])
+        assert status == FactCheckStatus.UNCONFIRMED
+
+    def test_reprint_in_different_venue_abstains_not_partial_match(self, fact_checker):
+        # Regression: 'GAN' (entry: NeurIPS 2014) matched the CACM 2020 reprint of
+        # the same work (title 'Nets'->'networks' near-miss, venue CACM, year 2020)
+        # -> old code: PARTIAL_MATCH. Same work, different edition -> abstain.
+        entry = {
+            "title": "Generative Adversarial Nets",
+            "author": "Goodfellow, Ian",
+            "booktitle": "Advances in Neural Information Processing Systems (NeurIPS)",
+            "year": "2014",
+        }
+        record = PublishedRecord(
+            doi="10.1145/3422622",
+            title="Generative adversarial networks",
+            authors=[{"given": "Ian", "family": "Goodfellow"}],
+            journal="Communications of the ACM",
+            year=2020,
+            structured_names=True,
+        )
+        comparisons = fact_checker._compare_all_fields(entry, record)
+        status = fact_checker._determine_status(0.90, comparisons, ["crossref"])
+        assert status == FactCheckStatus.UNCONFIRMED
+
+    def test_same_venue_large_year_gap_still_flags(self, fact_checker):
+        # Guard: when the venue DOES positively match, a large year gap is NOT a
+        # different-edition signature -> it remains a YEAR_MISMATCH (the entry's
+        # year claim is genuinely contradicted in the same venue).
+        entry = {"title": "T", "author": "Smith, John", "journal": "Nature", "year": "2008"}
+        record = PublishedRecord(
+            doi="10.1/x",
+            title="T",
+            authors=[{"given": "John", "family": "Smith"}],
+            journal="Nature",
+            year=2020,
+            structured_names=True,
+        )
+        comparisons = fact_checker._compare_all_fields(entry, record)
+        status = fact_checker._determine_status(0.95, comparisons, ["crossref"])
+        assert status == FactCheckStatus.YEAR_MISMATCH
+
+    def test_wrong_author_still_flags_despite_year_gap(self, fact_checker):
+        # Guard: the different-edition rule only neutralizes year/venue/near-miss
+        # title -- a genuinely wrong lead author is still positive evidence.
+        entry = {
+            "title": "Attention Is All You Need",
+            "author": "Imposter, Alice",
+            "booktitle": "NeurIPS",
+            "year": "2017",
+        }
+        record = PublishedRecord(
+            doi="10.65215/2q58a426",
+            title="Attention Is All You Need",
+            authors=[{"given": "Ashish", "family": "Vaswani"}],
+            journal="",
+            year=2025,
+            structured_names=True,
+        )
+        comparisons = fact_checker._compare_all_fields(entry, record)
+        status = fact_checker._determine_status(0.95, comparisons, ["crossref"])
+        assert status == FactCheckStatus.AUTHOR_MISMATCH
+
+
+class TestGivenNameSubstitutionRouting:
+    """End-to-end (via _compare_all_fields + _determine_status): a given-name
+    substitution on matching surnames, against an order-reliable structured
+    record, escalates to the distinct GIVEN_NAME_SUBSTITUTION status; an
+    initials-style correct citation is NOT flagged; an unstructured record never
+    escalates.
+    """
+
+    REAL_AUTHORS = [
+        {"given": "Durmus", "family": "Acar"},
+        {"given": "Yue", "family": "Zhao"},
+        {"given": "Ramon", "family": "Navarro"},
+        {"given": "Matthew", "family": "Mattina"},
+    ]
+    TITLE = "Federated Learning Based on Dynamic Regularization"
+
+    def _record(self, order_reliable=True, structured=True):
+        return PublishedRecord(
+            doi="10.1/x",
+            title=self.TITLE,
+            authors=self.REAL_AUTHORS,
+            year=2021,
+            order_reliable=order_reliable,
+            structured_names=structured,
+        )
+
+    def test_substitution_routes_to_given_name_substitution(self, fact_checker):
+        entry = {
+            "title": self.TITLE,
+            "author": "Durmus Acar and Yujing Zhao and Rafael Navarro and Matthew Mattina",
+            "year": "2021",  # no venue claim -> venue vacuously confirmed
+        }
+        comps = fact_checker._compare_all_fields(entry, self._record())
+        assert comps["author"].is_mismatch is True
+        findings = comps["author"].given_name_findings or []
+        assert any(f["variety"] == "given_name_substitution" for f in findings)
+        status = fact_checker._determine_status(0.95, comps, ["crossref"])
+        assert status == FactCheckStatus.GIVEN_NAME_SUBSTITUTION
+
+    def test_initials_style_correct_citation_verifies(self, fact_checker):
+        entry = {
+            "title": self.TITLE,
+            "author": "D. Acar and Y. Zhao and R. Navarro and M. Mattina",
+            "year": "2021",
+        }
+        comps = fact_checker._compare_all_fields(entry, self._record())
+        assert comps["author"].is_mismatch is False
+        assert fact_checker._determine_status(0.95, comps, ["crossref"]) == FactCheckStatus.VERIFIED
+
+    def test_unstructured_but_order_reliable_record_escalates(self, fact_checker):
+        # Loosened gate (d67418): a DBLP-style record (order-reliable, synthesized
+        # names) now drives escalation -- the substitution surfaces via this source.
+        entry = {
+            "title": self.TITLE,
+            "author": "Durmus Acar and Yujing Zhao and Rafael Navarro and Matthew Mattina",
+            "year": "2021",
+        }
+        comps = fact_checker._compare_all_fields(entry, self._record(structured=False))
+        assert comps["author"].is_mismatch is True
+        assert fact_checker._determine_status(0.95, comps, ["dblp"]) == FactCheckStatus.GIVEN_NAME_SUBSTITUTION
+
+    def test_not_order_reliable_record_does_not_escalate(self, fact_checker):
+        # Semantic Scholar (not order_reliable) stays excluded -> surname-level MATCH.
+        entry = {
+            "title": self.TITLE,
+            "author": "Durmus Acar and Yujing Zhao and Rafael Navarro and Matthew Mattina",
+            "year": "2021",
+        }
+        comps = fact_checker._compare_all_fields(entry, self._record(structured=False, order_reliable=False))
+        assert comps["author"].is_mismatch is False
+
+
+class TestDoiOrgRejection:
+    """doi.org's own rejection of a DOI: 404/410, or a 400 returned with no
+    redirect (a malformed / unregistered DOI like a fabricated '10.77771/...').
+    A 400 AFTER a redirect is a downstream publisher quirk, not doi.org's verdict.
+    """
+
+    def _resp(self, status, redirected=False):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(status_code=status, history=([object()] if redirected else []))
+
+    def test_404_and_410_are_rejected(self):
+        from bibtex_updater.fact_checker import _doiorg_rejects_doi
+
+        assert _doiorg_rejects_doi(self._resp(404)) is True
+        assert _doiorg_rejects_doi(self._resp(410)) is True
+
+    def test_doiorg_direct_400_is_rejected(self):
+        # Fabricated/malformed DOI: doi.org returns 400 directly (no redirect).
+        from bibtex_updater.fact_checker import _doiorg_rejects_doi
+
+        assert _doiorg_rejects_doi(self._resp(400, redirected=False)) is True
+
+    def test_post_redirect_400_is_not_rejected(self):
+        # A 400 after doi.org's 302 is a publisher quirk, not an invalid DOI.
+        from bibtex_updater.fact_checker import _doiorg_rejects_doi
+
+        assert _doiorg_rejects_doi(self._resp(400, redirected=True)) is False
+
+    def test_redirect_and_blocks_resolve(self):
+        from bibtex_updater.fact_checker import _doiorg_rejects_doi
+
+        for code in (200, 302, 403, 418, 429):
+            assert _doiorg_rejects_doi(self._resp(code, redirected=True)) is False, code
+
+
+class TestResolveWhatCanBeResolved:
+    """General principle: do not stop (short-circuit the cascade) while a claimed
+    field is still unconfirmed and a remaining source could confirm it; and among
+    equally-good title/author matches, prefer the candidate that confirms the
+    MOST claimed fields. A DOI-less conference paper (Attention/NeurIPS) matches a
+    preprint perfectly on title+author but the preprint cannot confirm the venue;
+    the proceedings record from DBLP/OpenReview can, so the cascade must reach it
+    and selection must prefer it -> VERIFIED, not could-not-verify.
+    """
+
+    def _entry(self):
+        return {
+            "title": "Attention Is All You Need",
+            "author": "Vaswani, Ashish",
+            "booktitle": "Advances in Neural Information Processing Systems (NeurIPS)",
+            "year": "2017",
+        }
+
+    def _preprint(self):
+        return PublishedRecord(
+            doi="10.48550/arxiv.1706.03762",
+            title="Attention Is All You Need",
+            authors=[{"given": "Ashish", "family": "Vaswani"}],
+            journal="arXiv (Cornell University)",
+            year=2017,
+            structured_names=True,
+        )
+
+    def _proceedings(self):
+        return PublishedRecord(
+            doi="",
+            title="Attention Is All You Need",
+            authors=[{"given": "Ashish", "family": "Vaswani"}],
+            journal="NeurIPS",
+            year=2017,
+            structured_names=True,
+        )
+
+    def test_preprint_alone_is_not_full_confirmation(self, fact_checker):
+        cands = [(1.0, self._preprint(), "crossref")]
+        assert fact_checker._has_full_confirmation(self._entry(), cands) is False
+
+    def test_proceedings_record_yields_full_confirmation(self, fact_checker):
+        cands = [(1.0, self._preprint(), "crossref"), (0.99, self._proceedings(), "dblp")]
+        assert fact_checker._has_full_confirmation(self._entry(), cands) is True
+
+    def test_selection_prefers_venue_confirming_record_over_preprint(self, fact_checker):
+        cands = [(1.0, self._preprint(), "crossref"), (0.99, self._proceedings(), "dblp")]
+        score, rec, src = fact_checker._select_best_candidate(self._entry(), cands)
+        assert src == "dblp"
+        comps = fact_checker._compare_all_fields(self._entry(), rec)
+        status = fact_checker._determine_status(score, comps, ["crossref", "dblp"])
+        assert status == FactCheckStatus.VERIFIED
+
+    def test_fake_venue_never_full_confirmation(self, fact_checker):
+        # Leak guard: a hallucinated published-venue claim whose only real record
+        # is a preprint never reaches full confirmation -> the cascade's early
+        # stop can never mint a VERIFIED for it.
+        entry = {"title": "Real Title", "author": "Real, Author", "booktitle": "NeurIPS", "year": "2020"}
+        preprint = PublishedRecord(
+            doi="10.48550/arxiv.2003.00001",
+            title="Real Title",
+            authors=[{"given": "Author", "family": "Real"}],
+            journal="arXiv (Cornell University)",
+            year=2020,
+            structured_names=True,
+        )
+        assert fact_checker._has_full_confirmation(entry, [(1.0, preprint, "crossref")]) is False
+
+    def test_selection_does_not_promote_low_score_paper(self, fact_checker):
+        # A clearly different (low title+author) record must NOT be promoted over
+        # the genuine top match just because it shares a field.
+        entry = self._entry()
+        good = self._proceedings()
+        unrelated = PublishedRecord(
+            doi="10.1/x",
+            title="A Completely Different Paper About Something Else",
+            authors=[{"given": "Ashish", "family": "Vaswani"}],
+            journal="NeurIPS",
+            year=2017,
+            structured_names=True,
+        )
+        cands = [(0.99, good, "dblp"), (0.40, unrelated, "s2")]
+        _score, rec, _src = fact_checker._select_best_candidate(entry, cands)
+        assert rec is good
+
+
+class TestOrderReliablePreferenceOverArxivOnly:
+    """Regression for the Least-to-Most (db9a596a4d3f) shape introduced by X2
+    (commit a7c95e9). ``_arxiv_id_from_entry`` now feeds the arXiv API record
+    into the candidate pool for arXiv-DataCite-DOI entries. That arXiv record
+    carries ``order_reliable=False`` (the arXiv public listing doesn't expose a
+    canonical author ordering for downstream comparison) and its preprint venue
+    routes to ``NON_COMPARABLE`` -- which means the confirmation-key tiebreak
+    awards it FEWER hard mismatches than a tied DBLP/OpenReview record whose
+    published venue contradicts an entry venue claim. The arXiv-only candidate
+    wins selection, the order-gated ``given_name_position_audit`` silently
+    abstains (it requires ``order_reliable=True``), and the entry's lead-author
+    substitution ('Shunyu Zhou' vs canonical 'Denny Zhou') disappears -- the
+    entry routes to UNCONFIRMED instead of GIVEN_NAME_SUBSTITUTION.
+
+    Fix: among candidates tied at the top of the title+author score (within the
+    narrow ``_ORDER_RELIABLE_PREFERENCE_BAND``), an ``order_reliable`` candidate
+    is preferred over an order-unreliable one regardless of the
+    confirmation-key tiebreak. The audit then runs against the right record.
+    """
+
+    def _entry(self) -> dict[str, str]:
+        # Mirrors the Least-to-Most defect shape: entry venue = ICLR, an arXiv
+        # API hit will route its own venue to NON_COMPARABLE so the
+        # confirmation tiebreak prefers it over a structured competitor.
+        return {
+            "title": "Least-to-Most Prompting Enables Complex Reasoning in Large Language Models",
+            "author": "Shunyu Zhou and Denny Zhou",
+            "booktitle": "ICLR",
+            "year": "2023",
+        }
+
+    def _structured_dblp(self) -> PublishedRecord:
+        # ICLR proceedings record from DBLP: order_reliable=True (DBLP author
+        # lists preserve publication order). structured_names=False mirrors
+        # DBLP's synthesized given/family split -- the given-name audit still
+        # fires because its gate is ``order_reliable``, not ``structured_names``.
+        return PublishedRecord(
+            doi="",
+            title="Least-to-Most Prompting Enables Complex Reasoning in Large Language Models",
+            authors=[{"given": "Denny", "family": "Zhou"}, {"given": "Other", "family": "Author"}],
+            journal="ICLR",
+            year=2023,
+            order_reliable=True,
+            structured_names=False,
+        )
+
+    def _arxiv_only(self) -> PublishedRecord:
+        # arXiv API record (the X2 candidate-pool addition): same title+author
+        # surnames, but order_reliable=False -- the arXiv listing's first author
+        # is not a trustworthy ordering signal for downstream audits.
+        return PublishedRecord(
+            doi="10.48550/arxiv.2205.10625",
+            title="Least-to-Most Prompting Enables Complex Reasoning in Large Language Models",
+            authors=[{"given": "Denny", "family": "Zhou"}],
+            journal="",
+            year=2023,
+            order_reliable=False,
+            structured_names=False,
+        )
+
+    def test_order_reliable_candidate_wins_over_arxiv_only_when_tied(self, fact_checker):
+        # Both score 1.0 on title+author. Without the order-reliable preference,
+        # the arXiv-only record wins the confirmation tiebreak (NON_COMPARABLE
+        # venue contributes no mismatch, while the DBLP record's ICLR venue
+        # matches and contributes a confirmation -- but with my chosen entry
+        # they tie on confirmations and the order-reliable preference settles
+        # it). Assert selection picks the order-reliable DBLP record.
+        cands = [(1.0, self._arxiv_only(), "arxiv"), (1.0, self._structured_dblp(), "dblp")]
+        _score, rec, src = fact_checker._select_best_candidate(self._entry(), cands)
+        assert src == "dblp"
+        assert rec.order_reliable is True
+
+    def test_given_name_audit_fires_after_order_reliable_selection(self, fact_checker):
+        # End-to-end: the selected record is the order-reliable DBLP one, so
+        # the given-name position audit runs and surfaces the lead-author
+        # substitution. With the arXiv-only record selected (no fix), the audit
+        # would have abstained (it requires order_reliable=True).
+        cands = [(1.0, self._arxiv_only(), "arxiv"), (1.0, self._structured_dblp(), "dblp")]
+        _score, rec, _src = fact_checker._select_best_candidate(self._entry(), cands)
+        comps = fact_checker._compare_all_fields(self._entry(), rec)
+        # The audit attaches its per-position findings to the author comparison
+        # at the lead-author substitution position. The mere presence of the
+        # finding is what the regression is about; the downstream status route
+        # to GIVEN_NAME_SUBSTITUTION is exercised by the production bib runs.
+        findings = comps["author"].given_name_findings or []
+        assert any(
+            f.get("position") == 0
+            and f.get("variety") == "given_name_substitution"
+            and f.get("entry_given") == "Shunyu"
+            and f.get("record_given") == "Denny"
+            for f in findings
+        ), f"expected lead-author given-name substitution finding, got {findings!r}"
+
+    def test_audit_abstains_when_only_arxiv_only_candidate_is_present(self, fact_checker):
+        # Pre-fix invariant: with only an order-unreliable candidate in the
+        # pool, the audit cannot fire -- this confirms the audit's gate, and
+        # documents why the X2 regression surfaced when the arXiv record began
+        # winning selection over a structurally-available DBLP/Crossref hit.
+        cands = [(1.0, self._arxiv_only(), "arxiv")]
+        _score, rec, _src = fact_checker._select_best_candidate(self._entry(), cands)
+        comps = fact_checker._compare_all_fields(self._entry(), rec)
+        assert rec.order_reliable is False
+        assert not (comps["author"].given_name_findings or [])
+
+    def test_arxiv_only_still_wins_when_clearly_better(self, fact_checker):
+        # X2 invariant: an arXiv-only candidate that is clearly better on
+        # title+author (outside the narrow order-reliable preference sub-band)
+        # still wins. The sub-band is 0.02; with a 0.05 gap, the arXiv record
+        # is the unambiguous best match and should be selected.
+        weak_structured = PublishedRecord(
+            doi="10.1/wrong",
+            title="A Completely Different Paper",
+            authors=[{"given": "Wrong", "family": "Author"}],
+            journal="ICML",
+            year=2023,
+            order_reliable=True,
+            structured_names=True,
+        )
+        cands = [(1.0, self._arxiv_only(), "arxiv"), (0.95, weak_structured, "crossref")]
+        _score, rec, src = fact_checker._select_best_candidate(self._entry(), cands)
+        assert src == "arxiv"
+        assert rec.order_reliable is False
+
+
+class TestCrossSourceAuthorFabrication:
+    """FIX A: cross-source extra-author / fabrication detection. The prefix-slice
+    ``symmetric_author_match`` waves through a 13-author entry that gets the
+    first 5 authors right but appends fabricated trailing authors (Leak A /
+    OSAKA). When two or more order-reliable candidate records agree that the
+    extra entry authors are absent from the real paper, the author check is
+    downgraded to MISMATCH and the status routes to AUTHOR_MISMATCH.
+    """
+
+    # Real OSAKA authors (arXiv:2003.05856 / NeurIPS 2020), 11 authors.
+    REAL_AUTHORS = [
+        {"given": "Massimo", "family": "Caccia"},
+        {"given": "Pau", "family": "Rodriguez"},
+        {"given": "Oleksiy", "family": "Ostapenko"},
+        {"given": "Fabrice", "family": "Normandin"},
+        {"given": "Min", "family": "Lin"},
+        {"given": "Lucas", "family": "Page-Caccia"},
+        {"given": "Issam Hadj", "family": "Laradji"},
+        {"given": "Irina", "family": "Rish"},
+        {"given": "Alexandre", "family": "Lacoste"},
+        {"given": "David", "family": "Vazquez"},
+        {"given": "Laurent", "family": "Charlin"},
+    ]
+    TITLE = "Online Fast Adaptation and Knowledge Accumulation: a New Approach to Continual Learning"
+
+    # Entry with the documented OSAKA defect: first 5 correct, two fabricated
+    # trailing surnames (Castrejon, Pineau) absent from the real paper.
+    OSAKA_ENTRY_AUTHORS = (
+        "Massimo Caccia and Pau Rodriguez and Oleksiy Ostapenko and "
+        "Fabrice Normandin and Min Lin and Alexandre Lacoste and Laurent "
+        "Charlin and Issam Laradji and Irina Rish and Alexande Lacoste and "
+        "David Vazquez and Lluis Castrejon and Joelle Pineau"
+    )
+
+    def _crossref(self):
+        return PublishedRecord(
+            doi="10.1/x",
+            title=self.TITLE,
+            authors=self.REAL_AUTHORS,
+            year=2020,
+            structured_names=True,
+            order_reliable=True,
+        )
+
+    def _dblp(self):
+        return PublishedRecord(
+            doi="10.1/x",
+            title=self.TITLE,
+            authors=self.REAL_AUTHORS,
+            year=2020,
+            structured_names=False,
+            order_reliable=True,
+        )
+
+    def test_osaka_shape_flags_when_two_sources_agree(self, fact_checker):
+        # Two order-reliable sources both lack Castrejon/Pineau -> MISMATCH.
+        entry = {"title": self.TITLE, "author": self.OSAKA_ENTRY_AUTHORS, "year": "2020"}
+        per_source = {"crossref": self._crossref(), "dblp": self._dblp()}
+        comps = fact_checker._compare_all_fields(entry, self._crossref(), per_source_records=per_source)
+        assert comps["author"].is_mismatch is True
+        status = fact_checker._determine_status(0.95, comps, ["crossref", "dblp"])
+        assert status == FactCheckStatus.AUTHOR_MISMATCH
+
+    def test_single_source_does_not_flag(self, fact_checker):
+        # Only one order-reliable source -> below the corroboration threshold,
+        # keep the prefix-slice MATCH (a single source's record might be a stub).
+        entry = {"title": self.TITLE, "author": self.OSAKA_ENTRY_AUTHORS, "year": "2020"}
+        per_source = {"crossref": self._crossref()}
+        comps = fact_checker._compare_all_fields(entry, self._crossref(), per_source_records=per_source)
+        # No flag for fabrication: the symmetric author match still returns MATCH
+        # because the prefix slice agrees and there is no cross-source signal.
+        assert comps["author"].note is None or "fabricated" not in (comps["author"].note or "")
+
+    def test_legitimate_full_match_not_flagged(self, fact_checker):
+        # An entry whose authors exactly match the real list MUST verify
+        # cleanly across two sources.
+        entry = {
+            "title": self.TITLE,
+            "author": (
+                "Massimo Caccia and Pau Rodriguez and Oleksiy Ostapenko and Fabrice Normandin and Min Lin "
+                "and Lucas Page-Caccia and Issam Hadj Laradji and Irina Rish and Alexandre Lacoste "
+                "and David Vazquez and Laurent Charlin"
+            ),
+            "year": "2020",
+        }
+        per_source = {"crossref": self._crossref(), "dblp": self._dblp()}
+        comps = fact_checker._compare_all_fields(entry, self._crossref(), per_source_records=per_source)
+        assert comps["author"].is_mismatch is False
+        assert comps["author"].is_confirmed is True
+
+    def test_entry_shorter_than_candidate_not_flagged(self, fact_checker):
+        # A shorter entry (e.g. only the first few authors) is consistent with
+        # the candidate -- not fabrication. symmetric_author_match returns
+        # PARTIAL (leading prefix), so FIX A's MATCH-gated check stays off.
+        entry = {
+            "title": self.TITLE,
+            "author": "Massimo Caccia and Pau Rodriguez and Oleksiy Ostapenko",
+            "year": "2020",
+        }
+        per_source = {"crossref": self._crossref(), "dblp": self._dblp()}
+        comps = fact_checker._compare_all_fields(entry, self._crossref(), per_source_records=per_source)
+        # Not a MISMATCH -- either MATCH (sentinel-aware leading head) or PARTIAL.
+        assert comps["author"].is_mismatch is False
+
+    def test_ordinalclip_shape_short_candidate_with_fabricated_trailing(self, fact_checker):
+        # Leak C / OrdinalCLIP shape: the candidate records are SHORTER than the
+        # entry (e.g. an API stub with only 3 of the real authors), and the
+        # entry's trailing surnames are fabricated. ``symmetric_author_match``
+        # returns PARTIAL (the candidate is a leading prefix of the entry), so
+        # the original code routed to UNCONFIRMED -- which buries a real
+        # fabrication signal. With two order-reliable sources agreeing on the
+        # short list, the trailing entry surnames are absent from BOTH unions,
+        # so FIX A escalates from PARTIAL to MISMATCH.
+        short_authors = [
+            {"given": "Shaoyuan", "family": "Li"},
+            {"given": "Hua", "family": "Liu"},
+            {"given": "Wei", "family": "Hu"},
+        ]
+        cr_rec = PublishedRecord(
+            doi="10.1/x",
+            title="OrdinalCLIP",
+            authors=short_authors,
+            year=2022,
+            structured_names=True,
+            order_reliable=True,
+        )
+        dblp_rec = PublishedRecord(
+            doi="10.1/x",
+            title="OrdinalCLIP",
+            authors=short_authors,
+            year=2022,
+            structured_names=False,
+            order_reliable=True,
+        )
+        entry = {
+            "title": "OrdinalCLIP",
+            "author": "Shaoyuan Li and Hua Liu and Wei Hu and Phantom One and Phantom Two and Phantom Three",
+            "year": "2022",
+        }
+        per_source = {"crossref": cr_rec, "dblp": dblp_rec}
+        comps = fact_checker._compare_all_fields(entry, cr_rec, per_source_records=per_source)
+        assert comps["author"].is_mismatch is True
+        status = fact_checker._determine_status(0.95, comps, ["crossref", "dblp"])
+        assert status == FactCheckStatus.AUTHOR_MISMATCH
+
+    def test_sentinel_entry_not_flagged(self, fact_checker):
+        # "and others" on the entry side suppresses the fabrication check: the
+        # citation is explicitly truncated, so a trailing surname's absence
+        # cannot be read as fabrication.
+        entry = {
+            "title": self.TITLE,
+            "author": (
+                "Massimo Caccia and Pau Rodriguez and Oleksiy Ostapenko and Fabrice Normandin "
+                "and Lluis Castrejon and Joelle Pineau and others"
+            ),
+            "year": "2020",
+        }
+        per_source = {"crossref": self._crossref(), "dblp": self._dblp()}
+        comps = fact_checker._compare_all_fields(entry, self._crossref(), per_source_records=per_source)
+        # No fabrication note: sentinel suppresses the check.
+        assert "fabricated" not in (comps["author"].note or "")
+
+
+class TestFirstAuthorGivenNameSubstitution:
+    """FIX B: the existing ``given_name_position_audit`` previously skipped the
+    first author when Crossref returned a ``literal`` (no given/family split)
+    for the lead author. Leak B (Least-to-Most: "Shunyu Zhou" cited where the
+    real lead is "Denny Zhou") slipped through because the synthesized-empty
+    family produced an empty surname key -- the audit's surname-key pairing
+    silently dropped position 0. The fix routes empty-family records through
+    ``last_name_from_person`` on the reconstructed name, symmetric with
+    ``PublishedRecord.surname_keys``.
+    """
+
+    TITLE = "Least-to-Most Prompting Enables Complex Reasoning"
+
+    def test_literal_lead_substitution_flags(self, fact_checker):
+        # Crossref literal-author record: ``given`` carries the full flat name,
+        # ``family`` is empty. The audit must still pair position 0 and detect
+        # SUBSTITUTION.
+        record = PublishedRecord(
+            doi="10.1/x",
+            title=self.TITLE,
+            authors=[
+                {"given": "Denny Zhou", "family": ""},
+                {"given": "Nathanael", "family": "Schaerli"},
+            ],
+            year=2023,
+            structured_names=True,
+            order_reliable=True,
+        )
+        entry = {"title": self.TITLE, "author": "Shunyu Zhou and Nathanael Schaerli", "year": "2023"}
+        comps = fact_checker._compare_all_fields(entry, record)
+        assert comps["author"].is_mismatch is True
+        status = fact_checker._determine_status(0.95, comps, ["crossref"])
+        assert status == FactCheckStatus.GIVEN_NAME_SUBSTITUTION
+
+    def test_literal_lead_correct_given_verifies(self, fact_checker):
+        # The same record/path with the CORRECT lead author must still verify
+        # (no false positive on the empty-family code path).
+        record = PublishedRecord(
+            doi="10.1/x",
+            title=self.TITLE,
+            authors=[
+                {"given": "Denny Zhou", "family": ""},
+                {"given": "Nathanael", "family": "Schaerli"},
+            ],
+            year=2023,
+            structured_names=True,
+            order_reliable=True,
+        )
+        entry = {"title": self.TITLE, "author": "Denny Zhou and Nathanael Schaerli", "year": "2023"}
+        comps = fact_checker._compare_all_fields(entry, record)
+        assert comps["author"].is_mismatch is False
+
+    def test_lead_substitution_when_entry_duplicates_surname(self, fact_checker):
+        # Refinement: the real Least-to-Most leak had the entry citing
+        # "Shunyu Zhou" as lead AND re-listing the canonical lead "Denny Zhou"
+        # at the tail. The OLD repeated-surname guard skipped the lead-position
+        # audit because the surname 'zhou' appeared TWICE in the entry, even
+        # though the record had it only ONCE (at position 0). The refined
+        # guard requires BOTH sides to repeat before declaring positional
+        # ambiguity, so the lead audit now fires for this shape.
+        record = PublishedRecord(
+            doi="10.1/x",
+            title=self.TITLE,
+            authors=[
+                {"given": "Denny", "family": "Zhou"},
+                {"given": "Nathanael", "family": "Schaerli"},
+            ],
+            year=2023,
+            structured_names=True,
+            order_reliable=True,
+        )
+        entry = {
+            "title": self.TITLE,
+            "author": "Shunyu Zhou and Nathanael Schaerli and Denny Zhou",
+            "year": "2023",
+        }
+        comps = fact_checker._compare_all_fields(entry, record)
+        assert comps["author"].is_mismatch is True
+        status = fact_checker._determine_status(0.95, comps, ["crossref"])
+        assert status == FactCheckStatus.GIVEN_NAME_SUBSTITUTION
+
+    def test_lead_both_sides_repeat_with_benign_given_match_abstains(self, fact_checker):
+        # When BOTH entry AND record have the lead surname repeated, there is
+        # genuine positional ambiguity. If the entry's lead given matches the
+        # record's position-0 same-surname given via a benign class (here:
+        # initial-compatible "Y." vs "Yang"), the audit abstains rather than
+        # escalating. Entry order matches record order, so the separate
+        # same-surname swap detector also stays quiet.
+        record = PublishedRecord(
+            doi="10.1/x",
+            title=self.TITLE,
+            authors=[
+                {"given": "Yang", "family": "Song"},
+                {"given": "Jiaming", "family": "Song"},
+            ],
+            year=2023,
+            structured_names=True,
+            order_reliable=True,
+        )
+        # Entry: lead "Y. Song" (initial-compatible with record's "Yang Song")
+        # then "Jiaming Song" -- order preserved.
+        entry = {
+            "title": self.TITLE,
+            "author": "Y. Song and Jiaming Song",
+            "year": "2023",
+        }
+        comps = fact_checker._compare_all_fields(entry, record)
+        # "Y." is an INITIAL_COMPATIBLE benign match for "Yang" -> not a mismatch.
+        assert comps["author"].is_mismatch is False
+
+    def test_lead_both_sides_repeat_with_no_benign_match_escalates(self, fact_checker):
+        # Same both-sides-repeat shape, but the entry's lead given matches
+        # NEITHER of the record's same-surname givens via any benign class
+        # (EXACT/INITIAL/ABBREVIATION/etc.). That is a real substitution
+        # whichever record author the entry meant -> escalate.
+        record = PublishedRecord(
+            doi="10.1/x",
+            title=self.TITLE,
+            authors=[
+                {"given": "Jiaming", "family": "Song"},
+                {"given": "Yang", "family": "Song"},
+            ],
+            year=2023,
+            structured_names=True,
+            order_reliable=True,
+        )
+        # Entry leads with "Phantom Song" -- not Jiaming, not Yang.
+        entry = {
+            "title": self.TITLE,
+            "author": "Phantom Song and Jiaming Song and Yang Song",
+            "year": "2023",
+        }
+        comps = fact_checker._compare_all_fields(entry, record)
+        assert comps["author"].is_mismatch is True

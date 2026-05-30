@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import collections
 import errno
+import html
 import json
 import os
 import random
@@ -28,6 +29,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
+from rapidfuzz.distance import Levenshtein
 
 # ------------- Constants & Regex -------------
 
@@ -138,9 +140,15 @@ _BRACES_RE = re.compile(r"[{}]")
 
 
 def latex_to_plain(text: str) -> str:
-    """Remove LaTeX commands, math, and braces from text."""
+    """Convert markup to plain text for matching/display.
+
+    Decodes HTML/XML entities first (e.g. ``d&apos;Amore`` -> ``d'Amore``,
+    ``A &amp; B`` -> ``A & B``) so DBLP/XML-scraped fields match clean records,
+    then removes LaTeX commands, math, and braces.
+    """
     if not text:
         return ""
+    text = html.unescape(text)
     t = _LATEX_MATH_RE.sub(" ", text)
     t = _LATEX_CMD_RE.sub(" ", t)
     t = _BRACES_RE.sub("", t)
@@ -237,6 +245,316 @@ def _normalize_surname_key(family: str) -> str:
     if tokens:
         return tokens[-1]
     return ""
+
+
+def _given_initial_from_full(name: str) -> str:
+    """First alphabetic initial of the GIVEN name in a flat person string.
+
+    Handles 'Family, Given' (given = after the comma) and 'Given ... Family'
+    (given = everything but the last token). Returns '' when no given name is
+    present (mononym / surname-only).
+    """
+    name = latex_to_plain(name or "").strip()
+    if not name:
+        return ""
+    if "," in name:
+        given = name.split(",", 1)[1].strip()
+    else:
+        toks = name.split()
+        given = " ".join(toks[:-1]) if len(toks) > 1 else ""
+    given = strip_diacritics(given).lower().strip()
+    for ch in given:
+        if ch.isalpha():
+            return ch
+    return ""
+
+
+def _given_initial(given: str) -> str:
+    """First alphabetic initial of an already-isolated given-name string."""
+    g = strip_diacritics(latex_to_plain(given or "")).lower().strip()
+    for ch in g:
+        if ch.isalpha():
+            return ch
+    return ""
+
+
+def same_surname_given_order_violation(entry_author_field: str, record: PublishedRecord) -> bool:
+    """Detect a swap/mismatch between two authors who share a surname.
+
+    Surname-only matching is blind to a swap of two co-authors with the SAME
+    surname (e.g. 'Yang Song' <-> 'Jiaming Song'): both reduce to 'song', so the
+    ordered surname lists look identical. When the matched record is from an
+    order-preserving source (``order_reliable``), compare the GIVEN-name initials
+    of each shared-surname run, in document order; a difference is a real
+    author-order/identity corruption the surname check cannot see.
+
+    Conservative by construction -- fires ONLY when, for a surname appearing >= 2
+    times, BOTH sides have the SAME count (aligned runs) AND every author in the
+    run has a usable given initial on both sides. A dropped/added same-surname
+    author (unequal counts) or any missing given name leaves this to the
+    surname-level logic instead.
+    """
+    if not getattr(record, "order_reliable", False) or not record.authors:
+        return False
+
+    entry_pairs = [
+        (last_name_from_person(n), _given_initial_from_full(n)) for n in split_authors_bibtex(entry_author_field)
+    ]
+    rec_pairs: list[tuple[str, str]] = []
+    for a in record.authors:
+        family = (a.get("family") or "").strip()
+        if record.structured_names and family:
+            surname = _normalize_surname_key(family)
+        else:
+            surname = last_name_from_person(f"{a.get('given', '') or ''} {family}".strip())
+        rec_pairs.append((surname, _given_initial(a.get("given", ""))))
+
+    from collections import Counter
+
+    entry_counts = Counter(sk for sk, _ in entry_pairs if sk)
+    rec_counts = Counter(sk for sk, _ in rec_pairs if sk)
+    for surname, n in entry_counts.items():
+        if n < 2 or rec_counts.get(surname, 0) != n:
+            continue  # not a shared-surname run aligned on both sides
+        entry_initials = [gi for sk, gi in entry_pairs if sk == surname]
+        rec_initials = [gi for sk, gi in rec_pairs if sk == surname]
+        if all(entry_initials) and all(rec_initials) and entry_initials != rec_initials:
+            return True
+    return False
+
+
+# Graded given-name comparison (runs only after surnames already align). Each
+# tier is a benign-convention equivalence except the last; only a full-vs-full
+# incompatible first given token escalates. Tier -> verdict class is in
+# GIVEN_VARIETY_CLASS below.
+class GivenNameVariety:
+    EXACT = "given_exact"
+    DIACRITIC_HYPHEN = "given_diacritic_hyphen_variant"
+    INITIAL_COMPATIBLE = "given_initial_form"
+    ABBREVIATION = "given_abbreviation_variant"
+    MIDDLE_NAME = "given_middle_name_delta"
+    TRANSLITERATION = "given_transliteration_variant"
+    NICKNAME = "given_nickname_variant"
+    INITIAL_CONFLICT = "given_initial_conflict"
+    SUBSTITUTION = "given_name_substitution"
+    NON_COMPARABLE = "given_non_comparable"
+
+
+#: Verdict class per variety. "confirmed" = benign, verdict unchanged (note only);
+#: "soften" = low-confidence, route to could-not-verify with a note (never a hard
+#: flag); "escalate" = genuine substitution -> PROBLEMATIC; "skip" = nothing to say.
+GIVEN_VARIETY_CLASS: dict[str, str] = {
+    GivenNameVariety.EXACT: "confirmed",
+    GivenNameVariety.DIACRITIC_HYPHEN: "confirmed",
+    GivenNameVariety.INITIAL_COMPATIBLE: "confirmed",
+    GivenNameVariety.ABBREVIATION: "confirmed",
+    GivenNameVariety.MIDDLE_NAME: "confirmed",
+    GivenNameVariety.TRANSLITERATION: "soften",
+    GivenNameVariety.NICKNAME: "soften",
+    GivenNameVariety.INITIAL_CONFLICT: "soften",
+    GivenNameVariety.SUBSTITUTION: "escalate",
+    GivenNameVariety.NON_COMPARABLE: "skip",
+}
+
+#: Close-spelling / romanization variants of a first given token within this edit
+#: distance are treated as a low-confidence TRANSLITERATION (softened, never
+#: escalated), so romanizations like "Sergey"/"Serguei" or "Aleksandr"/"Alexander"
+#: are not hard-flagged. A genuine different name (Yue/Yujing, Ramon/Rafael) is
+#: well beyond this. Tunable via the empirical FP check on the HALLMARK valid set.
+_GIVEN_SOFTEN_MAX_EDIT = 3
+
+#: Curated, finite hypocorism (nickname) groups; any two members are treated as a
+#: benign NICKNAME variant. Deliberately conservative.
+_NICKNAME_GROUPS: tuple[frozenset[str], ...] = (
+    frozenset({"william", "will", "bill", "billy"}),
+    frozenset({"robert", "rob", "bob", "bobby"}),
+    frozenset({"richard", "rich", "rick", "dick"}),
+    frozenset({"james", "jim", "jimmy"}),
+    frozenset({"john", "jack", "johnny"}),
+    frozenset({"joseph", "joe", "joey"}),
+    frozenset({"thomas", "tom", "tommy"}),
+    frozenset({"michael", "mike", "mikey"}),
+    frozenset({"charles", "charlie", "chuck"}),
+    frozenset({"christopher", "chris"}),
+    frozenset({"matthew", "matt"}),
+    frozenset({"anthony", "tony"}),
+    frozenset({"daniel", "dan", "danny"}),
+    frozenset({"david", "dave"}),
+    frozenset({"edward", "ed", "eddie", "ted"}),
+    frozenset({"alexander", "alex", "sasha", "aleksandr"}),
+    frozenset({"benjamin", "ben"}),
+    frozenset({"samuel", "sam"}),
+    frozenset({"nicholas", "nick"}),
+    frozenset({"andrew", "andy", "drew"}),
+    frozenset({"katherine", "kate", "katie", "kathy"}),
+    frozenset({"elizabeth", "liz", "beth", "betty"}),
+    frozenset({"margaret", "maggie", "meg", "peggy"}),
+)
+
+
+def _given_tokens(given: str) -> list[str]:
+    """Normalize a given-name string to comparison tokens: LaTeX-decoded,
+    diacritic-folded, lowercased, hyphens/dots split to spaces."""
+    g = strip_diacritics(latex_to_plain(given or "")).lower()
+    g = re.sub(r"[.\-]", " ", g)
+    g = re.sub(r"[^a-z0-9\s]", " ", g)
+    return [t for t in g.split() if t]
+
+
+def _is_initial_tokens(tokens: list[str]) -> bool:
+    return bool(tokens) and all(len(t) == 1 for t in tokens)
+
+
+def _nickname_equiv(a: str, b: str) -> bool:
+    return any(a in grp and b in grp for grp in _NICKNAME_GROUPS)
+
+
+def classify_given_pair(given_entry: str, given_record: str) -> str:
+    """Classify a single (entry, record) given-name pair into a GivenNameVariety.
+
+    First-hit-wins cascade. Only SUBSTITUTION (two FULL, non-initial first given
+    tokens that are neither a nickname pair nor within a small edit distance)
+    escalates; everything else is a benign convention or a low-confidence variant.
+    """
+    te, tr = _given_tokens(given_entry), _given_tokens(given_record)
+    if not te or not tr:
+        return GivenNameVariety.NON_COMPARABLE
+    if te == tr:
+        return GivenNameVariety.EXACT
+    # Separator/diacritic fold: "Jun-Yan" vs "Junyan", "Jun Yan" vs "Jun-Yan".
+    if "".join(te) == "".join(tr):
+        return GivenNameVariety.DIACRITIC_HYPHEN
+    # Initials on either side: an initials-only string is a benign abbreviation
+    # of the other ONLY if its letters are the leading initials in order.
+    if _is_initial_tokens(te) or _is_initial_tokens(tr):
+        short, long = (te, tr) if _is_initial_tokens(te) else (tr, te)
+        if len(short) <= len(long) and all(short[i] == long[i][0] for i in range(len(short))):
+            return GivenNameVariety.INITIAL_COMPATIBLE
+        return GivenNameVariety.INITIAL_CONFLICT
+    # Both sides carry a full (non-initial) given name from here.
+    if te[0] == tr[0]:
+        # Same first given token, differing middle/extra tokens -> middle-name
+        # presence/absence (benign): "Diederik P." vs "Diederik".
+        return GivenNameVariety.MIDDLE_NAME
+    # Abbreviation/diminutive: one full first token is a leading character prefix
+    # of the other ("Tim" of "Timothy", "Chris" of "Christopher", "Dan" of
+    # "Daniel") -- a shortened form, not a different person. Genuine substitutions
+    # (Yue/Yujing, Ramon/Rafael) are NOT prefixes of each other, so they still
+    # escalate. Both sides require >= 2 chars (bare initials are Tier 2 already).
+    if len(te[0]) >= 2 and len(tr[0]) >= 2 and (te[0].startswith(tr[0]) or tr[0].startswith(te[0])):
+        return GivenNameVariety.ABBREVIATION
+    if _nickname_equiv(te[0], tr[0]):
+        return GivenNameVariety.NICKNAME
+    if Levenshtein.distance(te[0], tr[0]) <= _GIVEN_SOFTEN_MAX_EDIT:
+        return GivenNameVariety.TRANSLITERATION
+    return GivenNameVariety.SUBSTITUTION
+
+
+def given_name_position_audit(entry_author_field: str, record: PublishedRecord) -> tuple[str, list[dict]]:
+    """Grade given names at every surname-confirmed position against an
+    order-preserving, structured record. Returns ``(worst_class, findings)`` where
+    worst_class is one of "escalate" / "soften" / "confirmed" / "skip" and findings
+    is a per-position list of ``{position, variety, entry_given, record_given}``.
+
+    Gated on ``order_reliable`` (Crossref/OpenAlex/DBLP/OpenReview). Note it does
+    NOT require ``structured_names``: a leaked hallucinated author is far worse
+    than a spurious flag, and a genuine substitution (e.g. d67418 'Yue'->'Yujing'
+    Zhao) often surfaces only via a DBLP/OpenAlex record whose given/family split
+    is synthesized. Several guards keep the synthesized split from causing false
+    positives: (1) a position is audited only where its surname is already
+    positionally confirmed AND (2) that surname is UNIQUE on both sides -- so a
+    repeated surname (two co-authors named "Liu") or a non-publication record
+    order (some sources alphabetize) can never cross-pair two different
+    same-surname authors; and (3) the given-name cascade folds initials,
+    diacritics, hyphenation and middle names before any escalation, so only a
+    full-vs-full incompatible leading given token escalates.
+    """
+    if not getattr(record, "order_reliable", False) or not record.authors:
+        return "skip", []
+
+    entry_names = split_authors_bibtex(entry_author_field)
+    entry_pairs = [(last_name_from_person(n), _entry_given_of(n)) for n in entry_names]
+    # Surname-key derivation mirrors ``PublishedRecord.surname_keys``: a trusted
+    # ``family`` is normalized verbatim; an empty family (Crossref ``literal``
+    # author with no given/family split) falls back to ``last_name_from_person``
+    # on the reconstructed full name so the audit still pairs position 0 against
+    # a record whose lead author arrived as a literal. Without this fallback the
+    # audit silently skipped a real lead-author given-name SUBSTITUTION (Leak B:
+    # "Shunyu Zhou" cited where the real lead is "Denny Zhou" and Crossref only
+    # had a ``literal`` for the lead).
+    rec_pairs: list[tuple[str, str]] = []
+    for a in record.authors:
+        family = (a.get("family") or "").strip()
+        given = (a.get("given") or "").strip()
+        if record.structured_names and family:
+            surname_key = _normalize_surname_key(family)
+        else:
+            surname_key = last_name_from_person(f"{given} {family}".strip())
+        rec_pairs.append((surname_key, given))
+
+    from collections import Counter
+
+    entry_sur_counts = Counter(s for s, _ in entry_pairs if s)
+    rec_sur_counts = Counter(s for s, _ in rec_pairs if s)
+
+    findings: list[dict] = []
+    rank = {"skip": 0, "confirmed": 1, "soften": 2, "escalate": 3}
+    worst = "skip"
+    for i in range(min(len(entry_pairs), len(rec_pairs))):
+        e_sur, e_giv = entry_pairs[i]
+        r_sur, r_giv = rec_pairs[i]
+        if not e_sur or not r_sur or e_sur != r_sur:
+            continue  # surname not positionally confirmed here -> not our job
+        # Repeated-surname ambiguity guard. The OLD rule -- skip if EITHER side
+        # had the surname repeated -- was over-conservative: a true cross-pairing
+        # risk only exists when BOTH sides have the surname multiple times (e.g.
+        # the canonical 'Yang Song' / 'Jiaming Song' co-authors that both appear
+        # in entry AND record, where the positional pairing could be flipped).
+        # When ONLY ONE side repeats the surname, the OTHER side's unique
+        # occurrence pins the pairing -- and at position 0 (LEAD AUTHOR) the
+        # natural pairing is unambiguous regardless. Specifically: the
+        # Least-to-Most leak ("Shunyu Zhou" at entry pos 0 vs canonical lead
+        # "Denny Zhou") was silently skipped because the entry had TWO 'zhou's
+        # (Shunyu at 0, Denny re-listed at the tail) while the record had ONE
+        # 'zhou' (Denny at 0). The OLD guard tripped on the entry-side repeat
+        # even though the record-side 'zhou' uniquely pinned the comparison.
+        both_repeat = entry_sur_counts[e_sur] > 1 and rec_sur_counts[r_sur] > 1
+        if both_repeat and i != 0:
+            continue
+        if both_repeat and i == 0:
+            # At the lead, both-side surname repetition is still genuine
+            # ambiguity (e.g. two real 'Song' lead-co-authors). Only audit if
+            # the entry's lead given matches NO record same-surname given via a
+            # benign classification; if any record author with that surname
+            # could explain the entry given as a benign variant, abstain.
+            same_surname_givens = [g for s, g in rec_pairs if s == r_sur]
+            best_class_rank = -1
+            for cand_g in same_surname_givens:
+                cls_cand = GIVEN_VARIETY_CLASS.get(classify_given_pair(e_giv, cand_g), "skip")
+                best_class_rank = max(best_class_rank, rank[cls_cand])
+            if best_class_rank < rank["escalate"]:
+                # Some record author with that surname is a benign match -> abstain.
+                continue
+        variety = classify_given_pair(e_giv, r_giv)
+        cls = GIVEN_VARIETY_CLASS.get(variety, "skip")
+        if cls == "skip":
+            continue
+        findings.append({"position": i, "variety": variety, "entry_given": e_giv, "record_given": r_giv})
+        if rank[cls] > rank[worst]:
+            worst = cls
+    return worst, findings
+
+
+def _entry_given_of(name: str) -> str:
+    """Best-effort given-name string for a flat entry author ('Given Family' or
+    'Family, Given'). Mirrors last_name_from_person's surname extraction."""
+    name = latex_to_plain(name or "").strip()
+    if not name:
+        return ""
+    if "," in name:
+        return name.split(",", 1)[1].strip()
+    toks = name.split()
+    return " ".join(toks[:-1]) if len(toks) > 1 else ""
 
 
 def authors_last_names(author_field: str, limit: int = 3) -> list[str]:
@@ -1214,8 +1532,9 @@ class HttpClient:
                     headers={"X-From-Cache": "1"},
                 )
         backoff = 1.0
+        attempts = 6
         limiter = self._get_limiter_for_service(service)
-        for _ in range(6):
+        for attempt in range(attempts):
             limiter.wait()
             try:
                 headers = {"Accept": accept} if accept else {}
@@ -1234,8 +1553,12 @@ class HttpClient:
                         pass
                 return resp
             except httpx.HTTPError:
-                time.sleep(backoff)
-                backoff = min(backoff * 2, 16.0)
+                # Don't sleep after the final attempt -- we're about to give up, so
+                # the backoff would just be a wasted stall (up to 16s) on a dead or
+                # rate-limited source.
+                if attempt < attempts - 1:
+                    time.sleep(backoff)
+                    backoff = min(backoff * 2, 16.0)
         raise RuntimeError(f"Network failure after retries for {url}")
 
 
@@ -1270,6 +1593,12 @@ class PublishedRecord:
     # synthesized one is unreliable for CJK/family-first names and is re-derived
     # from the full name via ``last_name_from_person``.
     structured_names: bool = False
+    # True when this source returns authors in PUBLICATION ORDER (Crossref,
+    # OpenAlex, DBLP, OpenReview -- verified empirically). The author matcher then
+    # treats a reordered author list as a real swapped-authors mismatch. Semantic
+    # Scholar (synthesized names, less reliable ordering) leaves this False so
+    # order is ignored.
+    order_reliable: bool = False
 
     def surname_keys(self, limit: int = 3) -> list[str]:
         """Canonical surname comparison keys derived from ``self.authors``.
@@ -1383,6 +1712,7 @@ def crossref_message_to_record(msg: dict[str, Any]) -> PublishedRecord | None:
         pages=msg.get("page"),
         type=typ,
         structured_names=has_structured_family,
+        order_reliable=True,
     )
 
 
@@ -1551,6 +1881,7 @@ def dblp_hit_to_candidate_record(hit: dict[str, Any]) -> PublishedRecord | None:
         number=info.get("number"),
         pages=info.get("pages"),
         type=record_type,
+        order_reliable=True,
     )
 
 

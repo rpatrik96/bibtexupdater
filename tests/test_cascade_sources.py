@@ -198,7 +198,18 @@ class TestQueryCascade:
         # authority (DBLP), and the ML-venue authority (OpenReview) before the
         # slow keyless-S2 specialist. OpenReview is lazily built from
         # ``crossref.http`` (a MagicMock here), so it is reached.
-        assert sources_queried == ["crossref", "openalex", "dblp", "openreview", "semanticscholar"]
+        # FIX X4: when every primary source returns nothing usable, the relaxed-
+        # author retrieval fallback runs (title-only retry on Crossref + OpenAlex).
+        # The fallback source names appear at the tail of the source list.
+        assert sources_queried == [
+            "crossref",
+            "openalex",
+            "dblp",
+            "openreview",
+            "semanticscholar",
+            "crossref-fallback",
+            "openalex-fallback",
+        ]
 
     def test_top_k_capped_at_max(self):
         fc, _ = self._build(config_override={"top_k": MAX_TOP_K + 100})
