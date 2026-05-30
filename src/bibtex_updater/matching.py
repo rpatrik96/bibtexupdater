@@ -247,6 +247,19 @@ def _is_leading_prefix(short: list[str], long: list[str]) -> bool:
     return len(short) <= len(long) and short == long[: len(short)]
 
 
+def _looks_alphabetized(names: list[str]) -> bool:
+    """True if surname keys are sorted A-Z over >=3 names.
+
+    A record whose authors are in alphabetical order has very likely *sorted*
+    its contributor list (Crossref NeurIPS/ICML proceedings deposits do this,
+    e.g. the 10.52202 prefix) rather than preserving title-page order, so its
+    author *order* cannot be trusted to detect a publication-order swap. Require
+    >=3 names: with one or two authors, alphabetical order coincides too often to
+    carry any signal.
+    """
+    return len(names) >= 3 and names == sorted(names)
+
+
 def symmetric_author_match(
     entry_names: list[str],
     api_names: list[str],
@@ -286,9 +299,11 @@ def symmetric_author_match(
     if not a or not b:
         return AuthorMatchResult(MatchOutcome.NON_COMPARABLE, 1.0)
 
-    # Hard first-author signal: an outright different lead author is a real
-    # mismatch. Both sides are already canonicalized surname keys.
-    if a[0] != b[0]:
+    # Hard first-author signal: a different lead author whose author multiset
+    # also DIFFERS is a real mismatch (a genuinely wrong/extra lead author).
+    # When the multisets are identical the lead difference is pure reordering --
+    # deferred to the same-multiset block below, which decides swap vs artifact.
+    if a[0] != b[0] and sorted(a) != sorted(b):
         return AuthorMatchResult(MatchOutcome.MISMATCH, 0.0)
 
     # Exact (sentinel-stripped) equality: full positive confirmation.
@@ -314,18 +329,20 @@ def symmetric_author_match(
     if _is_ordered_subsequence(a, b) or _is_ordered_subsequence(b, a):
         return AuthorMatchResult(MatchOutcome.PARTIAL, 1.0)
 
-    # Author ORDER mismatch: the lists share the lead author and contain the
-    # EXACT SAME author multiset but in a DIFFERENT order (a genuine reordering).
-    # Against an order-preserving source (Crossref/OpenAlex/DBLP/OpenReview) that
-    # is a real swapped-authors defect -> MISMATCH. Require full multiset equality
-    # (``sorted(a) == sorted(b)``) rather than mere overlap: a single differing
-    # author -- a record-side typo ('Ren' vs 'Rent') or a completeness difference
-    # -- is NOT a reordering and must fall through to the order-agnostic score
-    # below instead of being misread as a swap (this was a false-positive source
-    # on valid references whose matched record had one mangled/extra author).
-    # Semantic Scholar (order_reliable=False) is excluded.
-    if order_reliable and sorted(a) == sorted(b):
-        return AuthorMatchResult(MatchOutcome.MISMATCH, 0.0)
+    # Same author multiset, different order (a genuine reordering; requires full
+    # multiset equality, not mere overlap -- a single differing author such as a
+    # record-side typo 'Ren'/'Rent' is NOT a reordering and falls through to the
+    # order-agnostic score below). Against an order-preserving source this is a
+    # real swapped-authors defect -> MISMATCH. Two exclusions, where the order
+    # carries no signal so the shared author set is a positive confirmation:
+    #   * Semantic Scholar (order_reliable=False) -- flat, unordered names.
+    #   * An alphabetized API order (sorted A-Z) -- a record-side sort artifact
+    #     (e.g. Crossref NeurIPS/ICML proceedings deposits), not a publication
+    #     swap. This was a false-positive source on valid multi-author papers.
+    if sorted(a) == sorted(b):
+        if order_reliable and not _looks_alphabetized(b):
+            return AuthorMatchResult(MatchOutcome.MISMATCH, 0.0)
+        return AuthorMatchResult(MatchOutcome.MATCH, 1.0)
 
     # Symmetric slice + combined (Jaccard + LCS) score.
     n = min(len(a), len(b), prefix_n)
@@ -681,18 +698,32 @@ _SERIES_MARKERS: tuple[str, ...] = (
     "w&cp",
 )
 
+#: Hosting-*platform* markers. A record whose venue is only the platform name
+#: (OpenReview hosts ICLR, NeurIPS, TMLR, and many workshops) says nothing about
+#: the published venue, exactly like a preprint server -- so a venue comparison
+#: against it is non-comparable, not a mismatch. Not added as a venue *alias*
+#: (OpenReview is not a venue), only as a non-comparable platform string.
+_PLATFORM_MARKERS: tuple[str, ...] = (
+    "openreview",
+)
+
 
 def is_preprint_or_series_venue(venue: str) -> bool:
     """True if ``venue`` names a preprint server or non-specific publisher series.
 
     Such venues (arXiv/CoRR, bioRxiv, "Proceedings of Machine Learning Research",
-    PMLR/JMLR W&CP) cannot pin a single published venue, so a venue comparison
-    against them is *non-comparable* rather than a mismatch. The distinct journal
-    "Journal of Machine Learning Research" (JMLR) is deliberately NOT matched.
+    PMLR/JMLR W&CP, and hosting platforms like OpenReview) cannot pin a single
+    published venue, so a venue comparison against them is *non-comparable*
+    rather than a mismatch. The distinct journal "Journal of Machine Learning
+    Research" (JMLR) is deliberately NOT matched.
     """
     if not venue:
         return False
     raw = venue.lower().strip()
     if not raw:
         return False
-    return any(m in raw for m in _PREPRINT_SERVER_MARKERS) or any(m in raw for m in _SERIES_MARKERS)
+    return (
+        any(m in raw for m in _PREPRINT_SERVER_MARKERS)
+        or any(m in raw for m in _SERIES_MARKERS)
+        or any(m in raw for m in _PLATFORM_MARKERS)
+    )

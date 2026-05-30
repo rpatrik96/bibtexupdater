@@ -2889,6 +2889,14 @@ class FactChecker:
                 comparisons["author"].matches = False
                 comparisons["author"].note = "Given-name variant could not be confirmed (translit/nickname/initial)"
 
+        # The matched record's own publication metadata: detect a preprint/series/
+        # platform record up front (arXiv/bioRxiv DOI, or preprint/PMLR/OpenReview
+        # venue string), because such a record cannot authoritatively confirm OR
+        # refute the PUBLISHED year or venue the entry claims. Used by both the
+        # year and venue blocks below.
+        api_venue = record.journal or ""
+        record_is_preprint = _doi_is_preprint(record.doi) or is_preprint_or_series_venue(api_venue)
+
         # Year (three-valued, mirroring venue/author). An empty or unparseable
         # year on either side cannot confirm OR refute the claim -> NON_COMPARABLE,
         # not a mismatch (the old two-valued flag read a blank record year as a
@@ -2909,9 +2917,19 @@ class FactChecker:
         else:
             try:
                 year_diff = abs(int(entry_year) - int(api_year))
-                year_outcome = MatchOutcome.MATCH if year_diff <= cfg.year_tolerance else MatchOutcome.MISMATCH
-                year_score = 1.0 if year_outcome is MatchOutcome.MATCH else 0.0
-                year_note = f"Tolerance: ±{cfg.year_tolerance}"
+                if year_diff <= cfg.year_tolerance:
+                    year_outcome = MatchOutcome.MATCH
+                    year_note = f"Tolerance: ±{cfg.year_tolerance}"
+                elif record_is_preprint:
+                    # A preprint/series record is posted in an earlier year than the
+                    # proceedings/journal version, so its year cannot refute the
+                    # entry's claimed PUBLISHED year -> non-comparable, not a mismatch.
+                    year_outcome = MatchOutcome.NON_COMPARABLE
+                    year_note = "Year could not be confirmed (preprint/series record)"
+                else:
+                    year_outcome = MatchOutcome.MISMATCH
+                    year_note = f"Tolerance: ±{cfg.year_tolerance}"
+                year_score = 1.0 if year_outcome is not MatchOutcome.MISMATCH else 0.0
             except ValueError:
                 year_outcome = MatchOutcome.NON_COMPARABLE
                 year_score = 1.0
@@ -2926,16 +2944,11 @@ class FactChecker:
             outcome=year_outcome,
         )
 
-        # Venue (alias-aware matching, three-valued).
+        # Venue (alias-aware matching, three-valued). ``api_venue`` and
+        # ``record_is_preprint`` were computed above (a preprint/series/platform
+        # record returns a junk or repository venue that cannot confirm the
+        # published venue the entry claims -> NON_COMPARABLE, never a mismatch).
         entry_venue = entry.get("journal") or entry.get("booktitle") or ""
-        api_venue = record.journal or ""
-        # A matched record that is itself a PREPRINT cannot confirm the published
-        # venue the entry claims. Detect the preprint from the authoritative
-        # identifier (arXiv/bioRxiv DOI) as well as the venue string, because APIs
-        # sometimes return a junk repository name for a preprint's venue (e.g.
-        # 'UvA-DARE (University of Amsterdam)' for an arXiv DataCite DOI) that the
-        # string heuristic alone does not catch -> a false venue MISMATCH.
-        record_is_preprint = _doi_is_preprint(record.doi) or is_preprint_or_series_venue(api_venue)
         # Positive-confirmation gate distinguishes "no claim" from "claim we
         # could not confirm":
         #  - The entry makes NO venue claim (preprint @misc/@article with no

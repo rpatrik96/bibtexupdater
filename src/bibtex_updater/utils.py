@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import collections
 import errno
+import html
 import json
 import os
 import random
@@ -139,9 +140,15 @@ _BRACES_RE = re.compile(r"[{}]")
 
 
 def latex_to_plain(text: str) -> str:
-    """Remove LaTeX commands, math, and braces from text."""
+    """Convert markup to plain text for matching/display.
+
+    Decodes HTML/XML entities first (e.g. ``d&apos;Amore`` -> ``d'Amore``,
+    ``A &amp; B`` -> ``A & B``) so DBLP/XML-scraped fields match clean records,
+    then removes LaTeX commands, math, and braces.
+    """
     if not text:
         return ""
+    text = html.unescape(text)
     t = _LATEX_MATH_RE.sub(" ", text)
     t = _LATEX_CMD_RE.sub(" ", t)
     t = _BRACES_RE.sub("", t)

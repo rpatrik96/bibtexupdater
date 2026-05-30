@@ -366,6 +366,32 @@ class TestAuthorOrderSensitivity:
         api = ["caccia", "rodriguez", "ostapenko", "lin"]
         assert symmetric_author_match(entry, api, order_reliable=True).outcome is MatchOutcome.MISMATCH
 
+    def test_alphabetized_record_order_is_not_a_swap(self):
+        # Regression (df33d8b19854, c92305210097, ae74287cae13): some order-reliable
+        # records (Crossref NeurIPS/ICML proceedings deposits, prefix 10.52202) sort
+        # authors A-Z instead of preserving title-page order. The same author
+        # multiset in alphabetical order must NOT be read as a swapped-authors
+        # defect -- it is a record-side sort artifact -> MATCH, not MISMATCH.
+        entry = ["zhang", "pan", "li", "liu", "chen", "liu", "wang"]
+        api = sorted(entry)  # record alphabetized its contributors
+        assert symmetric_author_match(entry, api, order_reliable=True).outcome is MatchOutcome.MATCH
+
+    def test_alphabetized_lead_difference_is_not_a_mismatch(self):
+        # The alphabetized record also differs on the LEAD author; the same-multiset
+        # exclusion must cover the hard first-author guard too.
+        entry = ["nowak", "grooten", "mocanu", "tabor"]
+        api = sorted(entry)  # ["grooten", "mocanu", "nowak", "tabor"]
+        assert entry[0] != api[0]
+        assert symmetric_author_match(entry, api, order_reliable=True).outcome is MatchOutcome.MATCH
+
+    def test_non_alphabetized_genuine_swap_still_flags_after_alpha_guard(self):
+        # A real lead-author swap whose order is NOT alphabetical must still flag,
+        # so the alphabetization guard does not weaken genuine swap detection.
+        entry = ["smith", "jones", "adams"]
+        api = ["jones", "smith", "adams"]  # same set, swapped lead, not A-Z sorted
+        assert api != sorted(api)
+        assert symmetric_author_match(entry, api, order_reliable=True).outcome is MatchOutcome.MISMATCH
+
 
 # ------------- FIX E-venue: Preprint / series venue Tests -------------
 
@@ -392,6 +418,13 @@ class TestIsPreprintOrSeriesVenue:
     def test_jmlr_journal_not_treated_as_series(self):
         """JMLR is a distinct published journal, NOT the PMLR umbrella series."""
         assert is_preprint_or_series_venue("Journal of Machine Learning Research") is False
+
+    def test_openreview_platform_is_non_comparable(self):
+        # Regression (cc479d014ba7, a2b6f92163c9): OpenReview hosts many venues, so
+        # a record whose venue is just the platform name cannot confirm or refute a
+        # claimed conference -> non-comparable, not a venue mismatch.
+        for v in ("OpenReview", "OpenReview.net", "openreview.net"):
+            assert is_preprint_or_series_venue(v) is True, v
 
 
 # ------------- P2.5: Expanded Venue Aliases Tests -------------

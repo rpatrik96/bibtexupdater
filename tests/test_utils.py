@@ -172,6 +172,27 @@ class TestLastNameFromPerson:
         assert last_name_from_person("John M. Smith") == "smith"
         assert last_name_from_person("van den Oord, Aaron") == "oord"
 
+    def test_last_name_decodes_html_entity_apostrophe(self):
+        # DBLP/XML-scraped fields carry "&apos;"; without decoding, the entity
+        # letters survive punctuation-stripping ("d&apos;Amore" -> "daposamore")
+        # and spuriously fail to match the clean record ("damore").
+        assert last_name_from_person("Francesco d&apos;Amore") == "damore"
+        assert last_name_from_person("Shin-Fang Ch&apos;ng") == "chng"
+
+
+class TestHtmlEntityTitleDecoding:
+    """HTML/XML entities in titles must decode before fuzzy matching."""
+
+    def test_amp_entity_does_not_leak_amp_token(self):
+        result = normalize_title_for_match("Parameter Allocation &amp; Regularization")
+        assert "amp" not in result.split()
+        assert "allocation regularization" in result
+
+    def test_apos_entity_in_title(self):
+        result = normalize_title_for_match("An Extension of the D&apos;Hondt Method")
+        assert "apos" not in result
+        assert "hondt" in result
+
 
 class TestAuthorsLastNames:
     """Tests for authors_last_names function."""

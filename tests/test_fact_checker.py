@@ -241,6 +241,19 @@ class TestFactCheckerFieldComparison:
         comparisons = fact_checker._compare_all_fields(entry, record)
         assert comparisons["year"].matches is False
 
+    def test_compare_year_preprint_record_does_not_mismatch(self, fact_checker):
+        """Regression (ea48d1a613c3): a correct citation of a PUBLISHED version
+        whose matched record is the arXiv PREPRINT twin (posted years earlier)
+        must not read as a year_mismatch -- a preprint cannot refute a published
+        year -> NON_COMPARABLE."""
+        from bibtex_updater.matching import MatchOutcome
+
+        entry = {"title": "Test", "year": "2022", "author": "Author"}
+        record = PublishedRecord(doi="10.48550/arXiv.1910.03834", title="Test", year=2019)
+        comparisons = fact_checker._compare_all_fields(entry, record)
+        assert comparisons["year"].outcome is MatchOutcome.NON_COMPARABLE
+        assert comparisons["year"].matches is False
+
     def test_compare_no_venue_claim_is_vacuously_confirmed(self, fact_checker):
         """Entry makes NO venue claim -> nothing to confirm -> vacuous MATCH.
 
