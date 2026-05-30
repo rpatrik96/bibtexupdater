@@ -27,25 +27,25 @@ CNV = "#E69F00"  # orange (could-not-verify)
 PROBLEMATIC = "#D55E00"  # vermillion (FP on valid, catch on hallucinated)
 LEAK = "#882255"  # dark purple (the bad-on-hallucinated case)
 
-# Apples-to-apples numbers (post-correction gold)
-# dev: 502 VALID, 617 HALLUCINATED
-# test: 301 VALID, 530 HALLUCINATED
+# Apples-to-apples numbers (post-correction gold incl. batch1-4, 32 mislabels)
+# dev: 503 VALID, 616 HALLUCINATED
+# test: 302 VALID, 529 HALLUCINATED
 NUMBERS = {
     "dev": {
-        "n_valid": 502,
-        "n_hall": 617,
-        "valid_pre": {"verified": 453, "cnv": 36, "problematic": 13},
-        "valid_post": {"verified": 460, "cnv": 33, "problematic": 9},
-        "hall_pre": {"verified": 3, "cnv": 232, "problematic": 382},
-        "hall_post": {"verified": 4, "cnv": 243, "problematic": 370},  # Least-to-Most caught -> -1 leak
+        "n_valid": 503,
+        "n_hall": 616,
+        "valid_pre": {"verified": 453, "cnv": 37, "problematic": 13},
+        "valid_post": {"verified": 475, "cnv": 20, "problematic": 8},
+        "hall_pre": {"verified": 3, "cnv": 231, "problematic": 382},
+        "hall_post": {"verified": 4, "cnv": 240, "problematic": 372},
     },
     "test": {
-        "n_valid": 301,
-        "n_hall": 530,
-        "valid_pre": {"verified": 243, "cnv": 31, "problematic": 27},
-        "valid_post": {"verified": 251, "cnv": 32, "problematic": 18},
-        "hall_pre": {"verified": 2, "cnv": 230, "problematic": 298},
-        "hall_post": {"verified": 2, "cnv": 234, "problematic": 294},
+        "n_valid": 302,
+        "n_hall": 529,
+        "valid_pre": {"verified": 243, "cnv": 32, "problematic": 27},
+        "valid_post": {"verified": 271, "cnv": 24, "problematic": 7},
+        "hall_pre": {"verified": 2, "cnv": 229, "problematic": 298},
+        "hall_post": {"verified": 4, "cnv": 218, "problematic": 307},
     },
 }
 
