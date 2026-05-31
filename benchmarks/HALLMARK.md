@@ -43,19 +43,16 @@ per-version `abstained` flag) so the column is consistent across every split.
 |-------|---:|------:|-----:|----:|----:|----------:|---:|----:|---------:|
 | dev_public | 1119 | 513 | 606 | 86.5% | 9.2% | 91.8% | 0.890 | 0.771 | 82.2% |
 | test_public | 831 | 312 | 519 | 87.7% | 11.5% | 92.7% | 0.901 | 0.750 | 79.4% |
-| stress_test | 121 | 0 | 121 | _pending_ | n/a | _pending_ | _pending_ | n/a | _pending_ |
-| test_crossdomain | 500 | 200 | 300 | _pending_ | _pending_ | _pending_ | _pending_ | _pending_ | _pending_ |
+| stress_test | 121 | 0 | 121 | 64.5% | n/a | 100.0% | 0.784 | n/a | 62.8% |
+| test_crossdomain | 500 | 200 | 300 | 89.0% | 37.5% | 78.1% | 0.832 | 0.543 | 73.6% |
 
-The `dev_public` and `test_public` rows are final: they are re-scored offline from
+All four rows are final. `dev_public` / `test_public` are re-scored offline from
 the committed HALLMARK per-entry verdicts and reproduce the paper's co-designed
-`bibtexupdater` row exactly (see the cross-check below). The `stress_test` and
-`test_crossdomain` rows are produced by a live `bibtex-check` run against an
-isolated fact-checker cache; that run is long (Semantic-Scholar-rate-limited) and
-is still in progress at the time of this commit. Re-running
-`scripts/render_hallmark_report.py` over the four per-entry files fills these two
-rows — the script and the row counts (`stress_test`: 121 entries, all
-`HALLUCINATED` bar a single canary; `test_crossdomain`: 200 valid / 300
-hallucinated) are committed so the table can be completed deterministically.
+`bibtexupdater` row exactly (see the cross-check below). `stress_test` /
+`test_crossdomain` were produced by a live `bibtex-check` run (btu v1.2.0,
+Semantic-Scholar-rate-limited, isolated fact-checker cache) and rendered with the
+same `scripts/render_hallmark_report.py` over the four per-entry files, so the
+whole grid is reproducible deterministically.
 
 Splits: `dev_public` / `test_public` are the public ML-conference splits; `stress_test`
 is the hardest tier (near-miss titles, version mismatches, plausible fabrications,
@@ -69,6 +66,13 @@ Notes on the per-split numbers:
   read this split as a pure catch-rate (DR) stress test.
 * **`test_crossdomain`** carries genuine `VALID` negatives, so FPR and MCC are
   meaningful there and probe out-of-distribution generalization of the verdict gate.
+  The result is the sharpest caveat in this report: FPR rises to **37.5%** (vs
+  9–12% in-distribution), so `bibtex-check`'s low false-positive rate does **not**
+  transfer to non-ML references. It cannot locate many biomedical/other-domain
+  papers through its academic-database queries and flags the unfound ones — the
+  same conservative gate that is precise on ML-conference citations becomes a
+  liability out-of-distribution. Read the in-distribution FPR (~0.09) as a
+  property of the ML-citation regime, not a universal guarantee.
 
 ## Cross-check against the HALLMARK paper
 

@@ -10,7 +10,6 @@
     "strict_warn_preprint_year",
     "unconfirmed"
   ],
-  "note": "dev_public/test_public final (offline re-score of committed HALLMARK per-entry verdicts); stress_test/test_crossdomain pending live run. Regenerate all four with scripts/render_hallmark_report.py.",
   "splits": {
     "dev_public": {
       "n": 1119,
@@ -46,11 +45,35 @@
     },
     "stress_test": {
       "n": 121,
-      "status": "pending"
+      "n_hallucinated": 121,
+      "n_valid": 0,
+      "tp": 78,
+      "fp": 0,
+      "tn": 0,
+      "fn": 43,
+      "detection_rate": 0.6446,
+      "fpr": null,
+      "precision": 1.0,
+      "f1": 0.7839,
+      "mcc": null,
+      "abstained": 45,
+      "coverage": 0.6281
     },
     "test_crossdomain": {
       "n": 500,
-      "status": "pending"
+      "n_hallucinated": 300,
+      "n_valid": 200,
+      "tp": 267,
+      "fp": 75,
+      "tn": 125,
+      "fn": 33,
+      "detection_rate": 0.89,
+      "fpr": 0.375,
+      "precision": 0.7807,
+      "f1": 0.8318,
+      "mcc": 0.5427,
+      "abstained": 132,
+      "coverage": 0.736
     }
   }
 }
