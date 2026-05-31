@@ -142,6 +142,7 @@ python filter_bibliography.py paper.tex -b references.bib -o filtered.bib
 | [docs/ZOTERO_UPDATER.md](docs/ZOTERO_UPDATER.md) | Full Zotero updater documentation |
 | [docs/FILTER_BIBLIOGRAPHY.md](docs/FILTER_BIBLIOGRAPHY.md) | Full filter documentation |
 | [docs/LANDSCAPE.md](docs/LANDSCAPE.md) | Databases, competing tools, and ecosystem landscape |
+| [benchmarks/HALLMARK.md](benchmarks/HALLMARK.md) | `bibtex-check` v1.2.0 detection metrics on HALLMARK v1.1.1 (all splits) + reproduction |
 | [examples/](examples/) | Example workflows and configuration files |
 
 ## Overleaf Integration
@@ -220,6 +221,18 @@ For `filter_bibliography.py` only (no dependencies required):
 The "leak" headline is mostly benchmark noise: [HALLMARK PR #9](https://github.com/rpatrik96/hallmark/pull/9) corrects 30 entries — including **FlashAttention, DDPM, Imagen, SimCLR, Performers, ViT-vs-CNN, Chain-of-Thought (Wei), Zero-Shot Reasoner (Kojima), MERLOT** — that the v1.0 auto-labeller flagged as fabricated but are in fact real, correctly-cited papers (arXiv DOIs register with DataCite, not CrossRef, so the auto-labeller's "no resolve" check returned false). The corrected leak rate isolates genuine catch opportunities.
 
 ![bibtex-check v1.2.0 accuracy](assets/accuracy_v1_2_0.png)
+
+The full per-split detection grid (DR / FPR / Precision / F1 / MCC / Coverage on
+`dev_public`, `test_public`, `stress_test`, `test_crossdomain`) against the
+**corrected HALLMARK v1.1.1 gold** lives in
+[`benchmarks/HALLMARK.md`](benchmarks/HALLMARK.md), with a reproducible eval
+script ([`scripts/eval_hallmark.py`](scripts/eval_hallmark.py)):
+
+```bash
+# Score bibtex-check on a HALLMARK split and emit detection metrics
+export S2_API_KEY=...   # optional: lifts Semantic Scholar rate limits
+python scripts/eval_hallmark.py --split /path/to/hallmark/data/v1.0/test_public.jsonl --out test_public.json
+```
 
 - **Multi-source validation**: Crossref, OpenAlex, DBLP, OpenReview, Semantic Scholar
 - **Detailed mismatch detection**: Title, author, year, venue comparisons

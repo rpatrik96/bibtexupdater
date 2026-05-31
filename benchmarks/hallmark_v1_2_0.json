@@ -1,0 +1,56 @@
+{
+  "btu_version": "1.2.0",
+  "label_version": "v1.1.1",
+  "abstain_definition": [
+    "api_error",
+    "missing",
+    "not_found",
+    "skipped",
+    "strict_warn_cnv",
+    "strict_warn_preprint_year",
+    "unconfirmed"
+  ],
+  "note": "dev_public/test_public final (offline re-score of committed HALLMARK per-entry verdicts); stress_test/test_crossdomain pending live run. Regenerate all four with scripts/render_hallmark_report.py.",
+  "splits": {
+    "dev_public": {
+      "n": 1119,
+      "n_hallucinated": 606,
+      "n_valid": 513,
+      "tp": 524,
+      "fp": 47,
+      "tn": 466,
+      "fn": 82,
+      "detection_rate": 0.8647,
+      "fpr": 0.0916,
+      "precision": 0.9177,
+      "f1": 0.8904,
+      "mcc": 0.7706,
+      "abstained": 199,
+      "coverage": 0.8222
+    },
+    "test_public": {
+      "n": 831,
+      "n_hallucinated": 519,
+      "n_valid": 312,
+      "tp": 455,
+      "fp": 36,
+      "tn": 276,
+      "fn": 64,
+      "detection_rate": 0.8767,
+      "fpr": 0.1154,
+      "precision": 0.9267,
+      "f1": 0.901,
+      "mcc": 0.7498,
+      "abstained": 171,
+      "coverage": 0.7942
+    },
+    "stress_test": {
+      "n": 121,
+      "status": "pending"
+    },
+    "test_crossdomain": {
+      "n": 500,
+      "status": "pending"
+    }
+  }
+}
