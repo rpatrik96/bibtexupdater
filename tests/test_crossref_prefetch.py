@@ -420,3 +420,60 @@ class TestPrefetchFailureFallback:
         # IBRNet warmed normally -> mismatch verdict from per-entry path.
         checker.crossref.get_by_doi.side_effect = lambda doi: real_get(doi)
         assert checker.check_entry(_ibrnet_entry()).status == FactCheckStatus.DOI_MISMATCH
+
+
+class TestBackgroundPrewarm:
+    """The Crossref pre-warm runs in a background thread so the per-entry worker
+    pool starts immediately, instead of waiting out the serial, rate-limited
+    pre-warm prefix. Verdict-neutrality is covered by ``TestVerdictNeutral`` /
+    ``TestPrefetchWarmsCache`` (the warmed method itself is unchanged); these
+    tests pin the new orchestration contract: overlap + no leaked thread.
+    """
+
+    def test_prewarm_runs_concurrently_with_worker_pool(self, logger, tmp_path):
+        http, _ = _make_http({}, tmp_path)
+        checker = _checker(http, logger)
+        processor = FactCheckProcessor(checker, logger)
+        # Isolate the orchestration from the (separate) DOI pre-validation pool.
+        processor._batch_validate_dois = lambda entries: {}  # type: ignore[method-assign]
+
+        events: list[str] = []
+        lock = threading.Lock()
+        release = threading.Event()
+
+        def fake_warm(entries):
+            with lock:
+                events.append("warm_start")
+            # Block until a worker signals it is running, then finish.
+            release.wait(timeout=5)
+            with lock:
+                events.append("warm_end")
+            return 0
+
+        def fake_check_entry(entry, **kwargs):
+            with lock:
+                events.append("worker")
+            release.set()  # let the background warm complete
+            return object()  # jsonl_path=None -> result attributes never read
+
+        processor._batch_warm_crossref_records = fake_warm  # type: ignore[method-assign]
+        checker.check_entry = fake_check_entry  # type: ignore[method-assign]
+
+        results = processor.process_entries([_ibrnet_entry()], max_workers=2)
+
+        assert len(results) == 1
+        # A worker ran BEFORE the background warm finished -> they overlapped.
+        # Synchronous warming would record "warm_end" before "worker".
+        assert events.index("worker") < events.index("warm_end")
+
+    def test_prewarm_thread_is_joined_not_leaked(self, logger, tmp_path):
+        http, _ = _make_http({}, tmp_path)
+        checker = _checker(http, logger)
+        processor = FactCheckProcessor(checker, logger)
+        processor._batch_validate_dois = lambda entries: {}  # type: ignore[method-assign]
+        checker.check_entry = lambda entry, **kwargs: object()  # type: ignore[method-assign]
+
+        processor.process_entries([_ibrnet_entry()], max_workers=2)
+
+        # The background pre-warm must be joined before process_entries returns.
+        assert not any(t.name == "crossref-prewarm" and t.is_alive() for t in threading.enumerate())
