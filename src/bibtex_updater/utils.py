@@ -1018,9 +1018,10 @@ class AdaptiveRateLimiterRegistry(RateLimiterRegistry):
                     current_limit = self._limits.get(service, 30)
                     new_limit = max(current_limit // 2, self._min_limits.get(service, 5))
                     if new_limit != current_limit:
-                        self._limits[service] = new_limit
-                        # Recreate limiter with new limit
+                        # Recreate limiter under the lock that guards both
+                        # _limits and _limiters against concurrent get() readers.
                         with self._lock:
+                            self._limits[service] = new_limit
                             self._limiters[service] = RateLimiter(new_limit)
             except (ValueError, TypeError):
                 pass
@@ -1039,11 +1040,12 @@ class AdaptiveRateLimiterRegistry(RateLimiterRegistry):
                 # Default 60 second backoff
                 self._backoff_until[service] = time.time() + 60.0
 
-            # Also reduce the rate limit
+            # Also reduce the rate limit (under the registry lock; concurrent
+            # workers read _limits/_limiters in get()).
             current_limit = self._limits.get(service, 30)
             new_limit = max(current_limit // 2, self._min_limits.get(service, 5))
-            self._limits[service] = new_limit
             with self._lock:
+                self._limits[service] = new_limit
                 self._limiters[service] = RateLimiter(new_limit)
 
     def wait(self, service: str) -> None:
@@ -1501,6 +1503,43 @@ class HttpClient:
         else:
             return self._rate_limiter  # type: ignore[return-value]
 
+    def _adapt_rate_limit(self, service: str | None, response: httpx.Response) -> None:
+        """Let an adaptive registry react to a response (429 / rate headers).
+
+        No-op unless the rate limiter is an ``AdaptiveRateLimiterRegistry`` and a
+        concrete ``service`` is known (skipped for ``service is None`` so the
+        ``crossref`` default used for pacing is never polluted). Adapting only
+        reconfigures *future* pacing for the service; it never touches the
+        current response or the retry budget, so it cannot change which records
+        are fetched or any verdict.
+        """
+        if service and hasattr(self._rate_limiter, "adapt"):
+            try:
+                self._rate_limiter.adapt(service, response)  # type: ignore[union-attr]
+            except Exception:
+                pass
+
+    @staticmethod
+    def _retry_delay(exc: httpx.HTTPError, backoff: float) -> float:
+        """Backoff before the next retry: honor a 429 ``Retry-After`` if present.
+
+        A server that tells us exactly when to retry is both faster (when it
+        wants a short wait) and more polite (when it wants a long one) than the
+        blind exponential schedule. Retry-After (integer seconds) is capped at
+        60s so a hostile or mis-set header cannot stall a single entry for hours;
+        everything else (5xx, connection errors, read timeouts) keeps the
+        exponential ``backoff``.
+        """
+        response = getattr(exc, "response", None)
+        if response is not None and getattr(response, "status_code", None) == 429:
+            retry_after = response.headers.get("Retry-After")
+            if retry_after:
+                try:
+                    return min(float(int(retry_after)), 60.0)
+                except (ValueError, TypeError):
+                    pass
+        return backoff
+
     def _request(
         self,
         method: str,
@@ -1533,9 +1572,11 @@ class HttpClient:
                 )
         backoff = 1.0
         attempts = 6
-        limiter = self._get_limiter_for_service(service)
         for attempt in range(attempts):
-            limiter.wait()
+            # Re-fetch the per-service limiter each attempt so an adaptive rate
+            # reduction (triggered by a prior 429 via _adapt_rate_limit) is
+            # picked up immediately, by this thread and by sibling workers.
+            self._get_limiter_for_service(service).wait()
             try:
                 headers = {"Accept": accept} if accept else {}
                 if json_body is not None:
@@ -1544,6 +1585,11 @@ class HttpClient:
                 if service == "semanticscholar" and self.s2_api_key:
                     headers["x-api-key"] = self.s2_api_key
                 resp = self.client.request(method, url, params=params, headers=headers, json=json_body)
+                # Feed the response to an adaptive registry so a 429 (or a low
+                # X-RateLimit-Remaining) throttles this service for the rest of
+                # the run, instead of every worker re-hammering the same limit.
+                # Pacing only -- never changes the response content or a verdict.
+                self._adapt_rate_limit(service, resp)
                 if resp.status_code in self.RETRYABLE_STATUS:
                     raise httpx.HTTPStatusError("Retryable status", request=resp.request, response=resp)
                 if self.cache and cache_key and resp.headers.get("Content-Type", "").startswith("application/json"):
@@ -1552,12 +1598,12 @@ class HttpClient:
                     except Exception:
                         pass
                 return resp
-            except httpx.HTTPError:
+            except httpx.HTTPError as exc:
                 # Don't sleep after the final attempt -- we're about to give up, so
                 # the backoff would just be a wasted stall (up to 16s) on a dead or
                 # rate-limited source.
                 if attempt < attempts - 1:
-                    time.sleep(backoff)
+                    time.sleep(self._retry_delay(exc, backoff))
                     backoff = min(backoff * 2, 16.0)
         raise RuntimeError(f"Network failure after retries for {url}")
 

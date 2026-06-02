@@ -74,6 +74,7 @@ from bibtex_updater.utils import (
     CROSSREF_API,
     DBLP_API_SEARCH,
     S2_API,
+    AdaptiveRateLimiterRegistry,
     GivenNameVariety,
     # Text normalization
     HttpClient,
@@ -4013,14 +4014,24 @@ class FactCheckProcessor:
                 "DOI pre-validation complete: %d checked, %d failed", len(pre_validated_dois), failed_count
             )
 
-        # Latency: warm the Crossref /works response cache for all entry DOIs in
-        # parallel up front, so the per-entry DOI checks (consistency + structured
-        # author recheck) hit the cache instead of each making a serial,
-        # rate-limited round-trip. Verdict-neutral; failures fall back to the
-        # existing per-entry fetch. (Mirrors _batch_validate_dois.)
-        warmed = self._batch_warm_crossref_records(entries)
-        if warmed:
-            self.logger.info("Pre-fetched Crossref records for %d DOIs", warmed)
+        # Latency: warm the Crossref /works response cache for all entry DOIs so
+        # the per-entry DOI checks (consistency + structured author recheck) hit
+        # the cache instead of each making a serial, rate-limited round-trip.
+        # Run it in the BACKGROUND so the per-entry worker pool starts
+        # immediately rather than waiting out the serial pre-warm prefix (gated
+        # by the crossref 50/min limiter -- tens of seconds on large
+        # bibliographies). Verdict-neutral: warming only seeds the shared,
+        # thread-safe SqliteCache with the same records the per-entry path would
+        # fetch; a DOI not yet warmed when a worker reaches it falls back to an
+        # on-demand fetch of the identical record. The thread is joined in the
+        # finally block so it is never leaked. (Mirrors _batch_validate_dois.)
+        warm_thread = threading.Thread(
+            target=self._batch_warm_crossref_records,
+            args=(entries,),
+            name="crossref-prewarm",
+            daemon=True,
+        )
+        warm_thread.start()
 
         results: list[FactCheckResult | None] = [None] * len(entries)  # Pre-allocate to preserve order
 
@@ -4098,6 +4109,11 @@ class FactCheckProcessor:
         finally:
             if jsonl_file:
                 jsonl_file.close()
+            # Drain the background pre-warm before returning so the thread is
+            # never leaked (its per-DOI failures are already swallowed inside
+            # _batch_warm_crossref_records, so this join cannot raise). By now the
+            # worker pool has usually outlived it, making the join near-instant.
+            warm_thread.join()
 
         # Filter out None values (from failed entries)
         return [r for r in results if r is not None]
@@ -4446,6 +4462,36 @@ Examples:
     return p
 
 
+def build_rate_limits(rate_limit: float, s2_api_key: str | None) -> dict[str, int]:
+    """Per-service request/min limits scaled by the ``--rate-limit`` knob.
+
+    Every service in :data:`RateLimiterRegistry.DEFAULT_LIMITS` is scaled by
+    ``rate_limit / 45`` (45 is the default), so lowering ``--rate-limit`` to
+    escape 429s now throttles *every* source. Previously the inline dict scaled
+    only six services, leaving OpenAlex, arXiv, ACL Anthology, Europe PMC and
+    Scholar pinned at their hard-coded defaults — so a user who dialled the rate
+    down to dodge 429s kept hammering those services at full speed. This changes
+    pacing only: it never alters which records are fetched or how a verdict is
+    computed, and at the default ``--rate-limit=45`` (``rate_scale == 1``) every
+    value equals its default.
+
+    Semantic Scholar keeps its key-aware override (the authenticated pool is far
+    higher; the keyless pool must stay low to dodge bot-detection). The book
+    verifiers (``openlibrary`` / ``google_books``) are not in DEFAULT_LIMITS, so
+    they are added explicitly.
+    """
+    rate_scale = rate_limit / 45.0  # 45 is the default --rate-limit
+    limits = {
+        service: max(10, int(default * rate_scale)) for service, default in RateLimiterRegistry.DEFAULT_LIMITS.items()
+    }
+    # Book-verifier services (not in DEFAULT_LIMITS).
+    limits["openlibrary"] = max(10, int(30 * rate_scale))
+    limits["google_books"] = max(10, int(30 * rate_scale))
+    # Semantic Scholar: authenticated pool is much higher; keyless stays low.
+    limits["semanticscholar"] = 60 if s2_api_key else max(5, int(10 * rate_scale))
+    return limits
+
+
 def main() -> int:
     """Main entry point."""
     args = build_parser().parse_args()
@@ -4519,18 +4565,11 @@ def main() -> int:
         logger.info("Using Semantic Scholar API key (authenticated rate limits)")
 
     cache = SqliteCache(args.cache_file) if not args.no_cache else None
-    # Scale per-service limits proportionally to --rate-limit
-    rate_scale = args.rate_limit / 45.0  # 45 is the default
-    limiter = RateLimiterRegistry(
-        {
-            "crossref": max(10, int(50 * rate_scale)),
-            "semanticscholar": 60 if s2_api_key else max(5, int(10 * rate_scale)),
-            "dblp": max(10, int(30 * rate_scale)),
-            "openreview": max(10, int(30 * rate_scale)),
-            "openlibrary": max(10, int(30 * rate_scale)),
-            "google_books": max(10, int(30 * rate_scale)),
-        }
-    )
+    # Per-service limits scaled by --rate-limit (see build_rate_limits). The
+    # adaptive registry additionally halves a service's rate on a 429 and honors
+    # Retry-After, so a rate-limited batch backs off correctly instead of
+    # re-hammering the same limit through the retry loop.
+    limiter = AdaptiveRateLimiterRegistry(build_rate_limits(args.rate_limit, s2_api_key))
     http = HttpClient(
         timeout=20.0,
         user_agent="BibtexFactChecker/1.0 (mailto:factchecker@example.com)",
