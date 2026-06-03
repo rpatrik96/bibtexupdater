@@ -60,6 +60,7 @@ from bibtex_updater.sources import (
     DEFAULT_OPENALEX_MAILTO,
     DEFAULT_TOP_K,
     MAX_TOP_K,
+    OR_NOT_ACCEPTED,
     AuthorIntersectionResult,
     OpenAlexClient,
     OpenReviewClient,
@@ -89,6 +90,7 @@ from bibtex_updater.utils import (
     entry_surnames_against_structured,
     first_author_surname,
     given_name_position_audit,
+    is_preprint_venue,
     is_valid_arxiv_id,
     # Matching
     jaccard_similarity,
@@ -225,6 +227,7 @@ class FactCheckStatus(Enum):
 
     # Preprint-vs-published statuses
     PREPRINT_ONLY = "preprint_only"  # Paper found only as preprint, not at claimed venue
+    UNPUBLISHED_AT_CLAIMED_VENUE = "unpublished_at_claimed_venue"  # OpenReview: real but not accepted at cited venue
     PUBLISHED_VERSION_EXISTS = "published_version_exists"  # Informational: published version found
 
     # Web reference statuses
@@ -1862,6 +1865,24 @@ class FactChecker:
             return FactCheckStatus.PREPRINT_ONLY
         return None
 
+    def _check_or_unpublished(self, entry: dict[str, Any], best_match: PublishedRecord) -> FactCheckStatus | None:
+        """Flag a citation whose best match is a NOT-ACCEPTED OpenReview submission
+        (rejected / withdrawn / under-review) at the cited venue: the paper is real
+        but was not published there. Env-gated via ``BIBTEX_CHECK_OR_UNPUBLISHED_FLAG``
+        (default off) pending a HALLMARK FPR check. Only the OpenReview converter
+        stamps ``acceptance``, so this never fires for non-OpenReview matches.
+        """
+        import os
+
+        if os.environ.get("BIBTEX_CHECK_OR_UNPUBLISHED_FLAG", "").strip() not in {"1", "true", "yes", "on"}:
+            return None
+        if getattr(best_match, "acceptance", None) != OR_NOT_ACCEPTED:
+            return None
+        claimed_venue = (entry.get("booktitle") or entry.get("journal") or "").strip()
+        if not claimed_venue or is_preprint_venue(claimed_venue):
+            return None
+        return FactCheckStatus.UNPUBLISHED_AT_CLAIMED_VENUE
+
     def check_entry(self, entry: dict[str, Any], pre_validated_dois: dict[str, bool] | None = None) -> FactCheckResult:
         """Fact-check a single bibliographic entry.
 
@@ -2040,6 +2061,9 @@ class FactChecker:
             preprint_status = self._check_preprint_status(entry, best_match)
             if preprint_status is not None:
                 status = preprint_status
+            unpublished_status = self._check_or_unpublished(entry, best_match)
+            if unpublished_status is not None:
+                status = unpublished_status
 
         # --strict-warn-cnv: promote could-not-verify abstentions (NOT_FOUND /
         # UNCONFIRMED) to STRICT_WARN_CNV so opt-in users can fail CI on

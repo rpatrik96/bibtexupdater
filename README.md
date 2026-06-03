@@ -2,7 +2,7 @@
 
 Tools for managing BibTeX bibliographies: automatically update preprints to published versions, validate references against external databases, and filter to only cited references.
 
-![9-stage resolution pipeline](assets/pipeline.gif)
+![10-stage resolution pipeline](assets/pipeline.gif)
 
 ## Installation
 
@@ -169,13 +169,13 @@ For `filter_bibliography.py` only (no dependencies required):
 
 ![Preprint to published](assets/before-after.gif)
 
-- **Multi-source resolution**: arXiv, OpenAlex, Europe PMC, Crossref, DBLP, ACL Anthology, Semantic Scholar, Google Scholar
+- **Multi-source resolution**: arXiv, OpenAlex, Europe PMC, Crossref, DBLP, ACL Anthology, OpenReview, Semantic Scholar, Google Scholar
 - **High accuracy**: Title and author fuzzy matching with confidence thresholds
 - **ACL Anthology support**: Zero-overhead resolution for NLP papers (ACL, EMNLP, NAACL, etc.)
 - **Batch processing**: Multiple files with concurrent workers (default: 8)
 - **Deduplication**: Merge duplicates by DOI or normalized title+authors
 - **Smart caching**: On-disk cache + semantic resolution cache with TTL
-- **Per-service rate limiting**: Optimized rate limits per API (Crossref, S2, DBLP, ACL Anthology, arXiv, OpenAlex, Europe PMC)
+- **Per-service rate limiting**: Optimized rate limits per API (Crossref, S2, DBLP, ACL Anthology, arXiv, OpenAlex, Europe PMC, OpenReview)
 - **Batch API support**: Faster bulk lookups via arXiv/S2/Crossref batch endpoints
 - **Resolution tracking**: `--mark-resolved` tags updated entries to skip on re-runs
 

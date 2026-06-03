@@ -49,6 +49,14 @@ from typing import Any
 
 from rapidfuzz.fuzz import token_sort_ratio
 
+from bibtex_updater.sources import (
+    OR_ACCEPTED,
+    OpenReviewClient,
+    build_openreview_paperhash,
+    openreview_acceptance,
+    openreview_note_to_candidate_record,
+)
+
 # Shared utilities
 from bibtex_updater.utils import (
     ACL_ANTHOLOGY_URL,
@@ -57,6 +65,7 @@ from bibtex_updater.utils import (
     DBLP_API_SEARCH,
     EUROPEPMC_API,
     OPENALEX_API,
+    OPENREVIEW_API,
     PREPRINT_HOSTS,
     S2_API,
     AsyncHttpClient,
@@ -77,6 +86,7 @@ from bibtex_updater.utils import (
     extract_acl_anthology_id,
     extract_arxiv_id_from_text,
     first_author_surname,
+    is_preprint_venue,
     jaccard_similarity,
     last_name_from_person,
     latex_to_plain,
@@ -818,7 +828,7 @@ def _s2_record_is_still_preprint(msg: dict[str, Any], doi: str | None) -> bool:
 
     Returns ``True`` when the resolved record is fundamentally still the arXiv
     version and must be rejected so the resolution cascade falls through to a
-    source carrying the real published record (DBLP / OpenReview).
+    source carrying the real published record (DBLP).
 
     The preprint-DOI prefix check mirrors ``Detector.detect`` exactly: both
     ``10.48550/arxiv`` (arXiv) and ``10.1101`` (bioRxiv/medRxiv) count as
@@ -862,6 +872,8 @@ class Resolver:
         self.logger = logger
         self.scholarly_client = scholarly_client
         self.resolution_cache = resolution_cache
+        # OpenReview submission registry (stage 3c). No network until ``.search``.
+        self.openreview = OpenReviewClient(http=http)
 
     # --- arXiv ---
     def arxiv_candidate_doi(self, arxiv_id: str) -> str | None:
@@ -1059,7 +1071,9 @@ class Resolver:
         Returns:
             PublishedRecord if a published version is found, None otherwise
         """
-        url = f"{OPENALEX_API}/works/arxiv:{arxiv_id}"
+        # OpenAlex dropped the bare ``arxiv:<id>`` route (now 404); resolve the
+        # work by its arXiv DOI instead.
+        url = f"{OPENALEX_API}/works/doi:10.48550/arXiv.{arxiv_id}"
         try:
             resp = self.http._request("GET", url, accept="application/json", service="openalex")
             if resp.status_code != 200:
@@ -1493,7 +1507,7 @@ class Resolver:
             return False
         # Reject if venue looks like a preprint venue (ensures idempotency)
         j_lower = rec.journal.lower()
-        if any(host in j_lower for host in PREPRINT_HOSTS):
+        if is_preprint_venue(rec.journal):
             return False
         if not rec.year:
             return False
@@ -1674,6 +1688,7 @@ class Resolver:
         2. Crossref relations: is-preprint-of links
         3. DBLP bibliographic search
         3b. ACL Anthology lookup (DOI/URL-based)
+        3c. OpenReview submission registry (accepted ICLR/NeurIPS/TMLR)
         4. Semantic Scholar search
         5. Crossref bibliographic search
         6. Google Scholar fallback (opt-in)
@@ -1711,6 +1726,11 @@ class Resolver:
 
         # Stage 3b: ACL Anthology lookup (DOI/URL-based)
         result = self._stage3b_acl_anthology(entry, title_norm, candidate_doi)
+        if result:
+            return result
+
+        # Stage 3c: OpenReview submission registry (accepted ICLR/NeurIPS/TMLR)
+        result = self._stage3c_openreview(entry, title_norm)
         if result:
             return result
 
@@ -1982,6 +2002,60 @@ class Resolver:
                     return rec
 
         return None
+
+    def _stage3c_openreview(self, entry: dict[str, Any], title_norm: str) -> PublishedRecord | None:
+        """Stage 3c: OpenReview submission-registry search (ICLR/NeurIPS/TMLR).
+
+        OpenReview owns the authoritative submission record for most ML
+        conferences. Only ACCEPTED submissions resolve -- rejected / withdrawn /
+        under-review / CoRR notes are skipped (``openreview_acceptance``). Mirrors
+        the DBLP stage: an exact ``paperhash`` (title + first author) lookup, then
+        title/author scoring; a match becomes a credible ``proceedings-article``
+        upgrade via :meth:`_openreview_record_for_upgrade`. For these venues a
+        DOI-less venue + forum-URL record is the canonical published form.
+        """
+        if not title_norm:
+            return None
+        first_author = first_author_surname(entry)
+        if not first_author:
+            return None
+        notes = self.openreview.search("", limit=5, title=entry.get("title") or "", first_author=first_author)
+        if not notes:
+            return None
+
+        authors_ref = authors_last_names(entry.get("author", ""))
+        best: tuple[float, PublishedRecord] | None = None
+        for note in notes:
+            if openreview_acceptance(note) != OR_ACCEPTED:
+                continue
+            rec = openreview_note_to_candidate_record(note)
+            if not rec:
+                continue
+            rec = self._openreview_record_for_upgrade(rec, note)
+            if rec is None:
+                continue
+            combined = self._compute_match_score(title_norm, rec, authors_ref)
+            if combined >= self.MATCH_THRESHOLD and self._credible_journal_article(rec):
+                rec.method = "OpenReview(search)"
+                rec.confidence = combined
+                if self._is_better_candidate(combined, rec, best):
+                    best = (combined, rec)
+        if best:
+            self.logger.debug("Stage 3c: Found via OpenReview(search) with score %.2f", best[0])
+            return best[1]
+        return None
+
+    @staticmethod
+    def _openreview_record_for_upgrade(rec: PublishedRecord, note: dict[str, Any]) -> PublishedRecord | None:
+        """Attach the canonical forum URL + ``proceedings-article`` type so an
+        accepted OpenReview record (DOI-less by venue) clears the credibility
+        gate. Returns ``None`` when the note carries no ``forum``/``id``."""
+        forum = note.get("forum") or note.get("id")
+        if not forum:
+            return None
+        rec.url = f"https://openreview.net/forum?id={forum}"
+        rec.type = "proceedings-article"
+        return rec
 
     def _compute_match_score(self, title_norm: str, rec: PublishedRecord, authors_ref: list[str]) -> float:
         """Compute combined title and author match score.
@@ -2300,8 +2374,7 @@ class AsyncResolver:
             return False
         if not rec.journal:
             return False
-        j_lower = rec.journal.lower()
-        if any(host in j_lower for host in PREPRINT_HOSTS):
+        if is_preprint_venue(rec.journal):
             return False
         if not rec.year:
             return False
@@ -2556,7 +2629,9 @@ class AsyncResolver:
         Returns:
             PublishedRecord if a published version is found, None otherwise
         """
-        url = f"{OPENALEX_API}/works/arxiv:{arxiv_id}"
+        # OpenAlex dropped the bare ``arxiv:<id>`` route (now 404); resolve the
+        # work by its arXiv DOI instead.
+        url = f"{OPENALEX_API}/works/doi:10.48550/arXiv.{arxiv_id}"
         try:
             resp = await self.http.get(url, service="openalex", accept="application/json")
             if resp.status_code != 200:
@@ -2644,6 +2719,80 @@ class AsyncResolver:
         return False
 
     # --- Parallel search ---
+    @staticmethod
+    def _openreview_record_for_upgrade(rec: PublishedRecord, note: dict[str, Any]) -> PublishedRecord | None:
+        """Attach a forum URL + ``proceedings-article`` type (see
+        :meth:`Resolver._openreview_record_for_upgrade`)."""
+        forum = note.get("forum") or note.get("id")
+        if not forum:
+            return None
+        rec.url = f"https://openreview.net/forum?id={forum}"
+        rec.type = "proceedings-article"
+        return rec
+
+    async def _openreview_fetch(self, params: dict[str, Any]) -> list[dict[str, Any]]:
+        """Single async OpenReview ``/notes`` request; returns the note list or ``[]``."""
+        try:
+            resp = await self.http.get(
+                f"{OPENREVIEW_API}/notes",
+                service="openreview",
+                params=params,
+                accept="application/json",
+            )
+            if resp.status_code != 200:
+                return []
+            data = resp.json() or {}
+        except Exception as e:
+            self.logger.debug("OpenReview async fetch failed: %s", e)
+            return []
+        notes = data.get("notes") or []
+        return notes if isinstance(notes, list) else []
+
+    async def _openreview_search(self, entry: dict[str, Any], title_norm: str) -> PublishedRecord | None:
+        """Async OpenReview stage 3c: resolve ACCEPTED submissions only."""
+        if not title_norm:
+            return None
+        first_author = first_author_surname(entry)
+        if not first_author:
+            return None
+        raw_title = entry.get("title") or ""
+        paperhash = build_openreview_paperhash(raw_title, first_author)
+        notes: list[dict[str, Any]] = []
+        if paperhash:
+            notes = await self._openreview_fetch({"paperhash": paperhash, "limit": 5})
+        if not notes:
+            plain_title = latex_to_plain(raw_title).strip()
+            if plain_title:
+                notes = await self._openreview_fetch({"term": plain_title, "limit": 5})
+        if not notes:
+            return None
+
+        authors_ref = authors_last_names(entry.get("author", ""))
+        best: tuple[float, PublishedRecord] | None = None
+        for note in notes:
+            if openreview_acceptance(note) != OR_ACCEPTED:
+                continue
+            rec = openreview_note_to_candidate_record(note)
+            if not rec:
+                continue
+            rec = self._openreview_record_for_upgrade(rec, note)
+            if rec is None:
+                continue
+            tb = normalize_title_for_match(rec.title or "")
+            title_score = token_sort_ratio(title_norm, tb)
+            blns = rec.surname_keys(limit=3)
+            auth_score = jaccard_similarity(authors_ref[:3], blns)
+            combined = 0.7 * (title_score / 100.0) + 0.3 * auth_score
+            if combined >= self.MATCH_THRESHOLD and self._credible_journal_article(rec):
+                rec.method = "OpenReview(search,parallel)"
+                rec.confidence = combined
+                if best is None or combined > best[0]:
+                    best = (combined, rec)
+        if best:
+            self.logger.debug("OpenReview(async): match score %.2f", best[0])
+            return best[1]
+        return None
+
     async def parallel_bibliographic_search(
         self,
         title: str,
@@ -2906,6 +3055,11 @@ class AsyncResolver:
                     rec.method = "ACLAnthology(url)"
                     rec.confidence = 1.0
                     return rec
+
+        # OpenReview submission registry (accepted ICLR/NeurIPS/TMLR), before the fan-out
+        rec = await self._openreview_search(entry, normalize_title_for_match(entry.get("title") or ""))
+        if rec:
+            return rec
 
         # 3) Parallel bibliographic search (DBLP, S2, Crossref)
         title = entry.get("title") or ""
@@ -3881,7 +4035,7 @@ def setup_http_client(args: argparse.Namespace) -> HttpClient:
     user_agent = (
         getattr(args, "user_agent", None)
         or os.environ.get("BIBTEX_UPDATER_USER_AGENT")
-        or "bib-preprint-upgrader/1.1 (mailto:you@example.com)"
+        or "bibtex-updater (+https://github.com/rpatrik96/bibtexupdater)"
     )
     return HttpClient(
         timeout=args.timeout,
