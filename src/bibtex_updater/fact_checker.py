@@ -3735,7 +3735,20 @@ class FactChecker:
                 # gets its own status so the root cause is explicit.
                 if mismatches == ["author"]:
                     findings = comparisons["author"].given_name_findings or []
-                    if any(f.get("variety") == GivenNameVariety.SUBSTITUTION for f in findings):
+                    # Route to GIVEN_NAME_SUBSTITUTION only when the substitution
+                    # IS the mismatch -- i.e. the given-name audit escalated an
+                    # author set whose surnames all matched (its note marks that
+                    # path). The audit records findings unconditionally, so a
+                    # gross author-set mismatch can *contain* substitution
+                    # findings at coincidentally shared surnames (fabricated
+                    # lists collide on frequent family names: Zhang/Liu/...).
+                    # Routing those to this benign-sounding status buried a
+                    # 9-of-10-fabricated author list (refchecker2024 incident);
+                    # they must stay AUTHOR_MISMATCH.
+                    author_note = comparisons["author"].note or ""
+                    if author_note.startswith("Given-name substitution on matching surnames") and any(
+                        f.get("variety") == GivenNameVariety.SUBSTITUTION for f in findings
+                    ):
                         return FactCheckStatus.GIVEN_NAME_SUBSTITUTION
                     # --strict rule 5: silent author-list truncation. Tagged
                     # by ``_compare_all_fields`` so the gate routes it to its
@@ -4173,6 +4186,11 @@ class FactCheckProcessor:
             # --strict escalations (positive evidence under arXiv 2026 policy).
             FactCheckStatus.TITLE_NEAR_MISS.value,
             FactCheckStatus.AUTHOR_TRUNCATED.value,
+            # Escalated wrong-author evidence: surnames match but a co-author's
+            # given name names a different person. Calibration already classes
+            # it CLEARLY-PROBLEM (_PROB_SOFT); omitting it here let the verdict
+            # bypass the PROBLEMATIC bucket and the strict CI gate.
+            FactCheckStatus.GIVEN_NAME_SUBSTITUTION.value,
         ]
 
         # Calculate verified rate including new verified statuses

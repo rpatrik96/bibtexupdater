@@ -407,6 +407,71 @@ class TestFactCheckerStatusDetermination:
         status = fact_checker._determine_status(0.80, comparisons, ["crossref"])
         assert status == FactCheckStatus.AUTHOR_MISMATCH
 
+    def test_gross_author_mismatch_with_incidental_substitution_stays_author_mismatch(self, fact_checker):
+        """Regression: refchecker2024 incident (hallmark-paper, 2026-06).
+
+        A fabricated author list (1 of 10 real) collides with the canonical
+        roster on two frequent surnames, so the given-name audit records
+        SUBSTITUTION findings at those positions -- but the author note is NOT
+        the audit's matching-surnames escalation. The verdict must stay
+        AUTHOR_MISMATCH (problematic), not the benign-sounding
+        GIVEN_NAME_SUBSTITUTION that buried the fabrication.
+        """
+        author = FieldComparison(
+            "author",
+            "Hu, Xiangkun and Gao, Dongyu and Liu, Zhengying and Zhang, Michael R.",
+            "Xiangkun Hu and Dongyu Ru and Pengfei Liu and Yue Zhang",
+            0.16,
+            False,
+            given_name_findings=[
+                {"position": 0, "variety": "given_exact", "entry_given": "Xiangkun", "record_given": "Xiangkun"},
+                {
+                    "position": 2,
+                    "variety": "given_name_substitution",
+                    "entry_given": "Zhengying",
+                    "record_given": "Pengfei",
+                },
+                {
+                    "position": 3,
+                    "variety": "given_name_substitution",
+                    "entry_given": "Michael R.",
+                    "record_given": "Yue",
+                },
+            ],
+        )
+        comparisons = {
+            "title": FieldComparison("title", "RefChecker", "RefChecker", 1.0, True),
+            "author": author,
+            "year": FieldComparison("year", "2024", "2024", 1.0, True),
+            "venue": FieldComparison("venue", "NAACL", "NAACL", 1.0, True),
+        }
+        status = fact_checker._determine_status(0.80, comparisons, ["crossref"])
+        assert status == FactCheckStatus.AUTHOR_MISMATCH
+
+    def test_escalated_given_name_substitution_still_routes(self, fact_checker):
+        """The audit's matching-surnames escalation (its note marks the path)
+        keeps its dedicated root-cause status."""
+        author = FieldComparison(
+            "author",
+            "Zhao, Yue and Smith, John",
+            "Yujing Zhao and John Smith",
+            0.9,
+            False,
+            note="Given-name substitution on matching surnames (likely a wrong author)",
+            given_name_findings=[
+                {"position": 0, "variety": "given_name_substitution", "entry_given": "Yue", "record_given": "Yujing"},
+                {"position": 1, "variety": "given_exact", "entry_given": "John", "record_given": "John"},
+            ],
+        )
+        comparisons = {
+            "title": FieldComparison("title", "A", "A", 1.0, True),
+            "author": author,
+            "year": FieldComparison("year", "2021", "2021", 1.0, True),
+            "venue": FieldComparison("venue", "J", "J", 1.0, True),
+        }
+        status = fact_checker._determine_status(0.85, comparisons, ["crossref"])
+        assert status == FactCheckStatus.GIVEN_NAME_SUBSTITUTION
+
     def test_year_mismatch_only(self, fact_checker):
         comparisons = {
             "title": FieldComparison("title", "A", "A", 1.0, True),
@@ -891,6 +956,22 @@ class TestFactCheckProcessor:
         # problematic = partial_match (now included so buckets fully partition)
         assert summary["problematic_count"] == 1
         # All four entries are accounted for across the three buckets.
+        assert summary["verified_count"] + summary["abstained_count"] + summary["problematic_count"] == summary["total"]
+
+    def test_given_name_substitution_counts_as_problematic(self, processor):
+        """GIVEN_NAME_SUBSTITUTION is positive wrong-author evidence: it must
+        land in the PROBLEMATIC bucket (and so trip the strict CI gate), in
+        line with calibration's CLEARLY-PROBLEM class for the status."""
+
+        def _r(key, status):
+            return FactCheckResult(key, "article", status, 0.7, {}, None, ["crossref"], ["crossref"], [])
+
+        results = [
+            _r("v", FactCheckStatus.VERIFIED),
+            _r("g", FactCheckStatus.GIVEN_NAME_SUBSTITUTION),
+        ]
+        summary = processor.generate_summary(results)
+        assert summary["problematic_count"] == 1
         assert summary["verified_count"] + summary["abstained_count"] + summary["problematic_count"] == summary["total"]
 
     def test_generate_json_report(self, processor, sample_published_record):
