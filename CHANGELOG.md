@@ -7,9 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-06-11
+
 ### Added
 
 - **OpenReview resolution stage** (`bibtex-update`): the resolver now upgrades **accepted** OpenReview submissions (ICLR/NeurIPS/TMLR) to their published `@inproceedings` (venue + `openreview.net/forum?id=…` URL) as stage 3c — after ACL Anthology, before Semantic Scholar — a throttle-resilient fallback for when DBLP is rate-limited. Rejected, withdrawn, under-review, and CoRR notes are never resolved (`openreview_acceptance`). For these DOI-less ML venues the venue + forum-URL record is the canonical published form, so the stage is default-on. Wired into both the synchronous `Resolver` and the async `AsyncResolver`. (OpenReview was already a step in the `bibtex-check` verification cascade.)
+
+### Fixed
+
+- **Author-fabrication check no longer flags authors present in the best-matched record** (`bibtex-check`): "absent from every candidate" was computed over order-reliable sources only, excluding the best-matched record when its source is order-unreliable (arXiv, Semantic Scholar). A recent paper whose full author list lives on arXiv while Crossref/OpenAlex have indexed only a lead-author stub had its non-lead authors flagged "likely fabricated" even though the best match (similarity 1.0) confirmed them. Order-reliability gates author *order*, not *presence*; the best-matched record's surnames now veto the flag. OSAKA/OrdinalCLIP trailing-author leak detection is unchanged.
+- **`GIVEN_NAME_SUBSTITUTION` no longer swallows gross author-set mismatches** (`bibtex-check`): a lone author mismatch carrying an incidental substitution finding (frequent family names colliding with a fabricated roster) was routed to `GIVEN_NAME_SUBSTITUTION` and dropped from the PROBLEMATIC bucket, waving fabrications through when the entry lacked an arXiv-ID anchor. The route now requires the audit's matching-surnames escalation note.
 
 ## [1.2.0] - 2026-05-30
 
