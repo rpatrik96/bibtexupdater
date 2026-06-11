@@ -2566,6 +2566,55 @@ class TestCrossSourceAuthorFabrication:
         assert comps["author"].is_mismatch is False
         assert comps["author"].is_confirmed is True
 
+    def test_full_author_best_match_from_order_unreliable_source_not_flagged(self, fact_checker):
+        # Regression (joshi2026guardians, UAI 2026): the full-author record came
+        # from an order-UNRELIABLE source (arXiv), while the order-reliable
+        # sources (Crossref/OpenAlex) returned an incomplete stub for this very
+        # recent paper (only the first author indexed). Every entry author
+        # appears in the best-matched record, so none is fabricated -- the
+        # positive-presence veto must keep the author check a clean MATCH rather
+        # than flagging the five stub-absent surnames.
+        title = "Who Guards the Guardians? The Challenges of Evaluating Identifiability of Learned Representations"
+        full_authors = [
+            {"given": "Shruti", "family": "Joshi"},
+            {"given": "Théo", "family": "Saulus"},
+            {"given": "Wieland", "family": "Brendel"},
+            {"given": "Philippe", "family": "Brouillard"},
+            {"given": "Dhanya", "family": "Sridhar"},
+            {"given": "Patrik", "family": "Reizinger"},
+        ]
+        # Best match: full author list, but arXiv is order-unreliable.
+        arxiv_rec = PublishedRecord(
+            doi="",
+            title=title,
+            authors=full_authors,
+            year=2026,
+            structured_names=True,
+            order_reliable=False,
+        )
+        # Two order-reliable stubs: a brand-new paper with only the lead author
+        # indexed in Crossref/OpenAlex.
+        stub_authors = [{"given": "Shruti", "family": "Joshi"}]
+        crossref_stub = PublishedRecord(
+            doi="", title=title, authors=stub_authors, year=2026, structured_names=True, order_reliable=True
+        )
+        openalex_stub = PublishedRecord(
+            doi="", title=title, authors=stub_authors, year=2026, structured_names=True, order_reliable=True
+        )
+        entry = {
+            "title": title,
+            "author": (
+                "Joshi, Shruti and Saulus, Th{\\'e}o and Brendel, Wieland and "
+                "Brouillard, Philippe and Sridhar, Dhanya and Reizinger, Patrik"
+            ),
+            "year": "2026",
+        }
+        per_source = {"crossref": crossref_stub, "openalex": openalex_stub}
+        comps = fact_checker._compare_all_fields(entry, arxiv_rec, per_source_records=per_source)
+        assert comps["author"].is_mismatch is False
+        assert comps["author"].is_confirmed is True
+        assert "fabricated" not in (comps["author"].note or "")
+
     def test_entry_shorter_than_candidate_not_flagged(self, fact_checker):
         # A shorter entry (e.g. only the first few authors) is consistent with
         # the candidate -- not fabrication. symmetric_author_match returns

@@ -3230,10 +3230,21 @@ class FactChecker:
         entry_author_field: str,
         entry_surname_keys: list[str],
         per_source_records: dict[str, PublishedRecord | None] | None,
+        best_record: PublishedRecord | None = None,
     ) -> list[str] | None:
         """Return entry surnames absent from every order-reliable record.
 
         Gated to limit false positives:
+
+        * Fold the best-matched ``best_record``'s surnames into the comparison
+          union when supplied: a surname present in the top-scoring candidate is
+          demonstrably real and must never be flagged as fabricated, even when
+          that candidate's source is order-UNRELIABLE (arXiv / Semantic Scholar).
+          Order-reliability gates author-ORDER checks, not author PRESENCE.
+          Without this veto, a full-author arXiv match paired with incomplete
+          order-reliable stubs (a brand-new paper Crossref/OpenAlex have only
+          partially indexed) yields a spurious fabrication flag even though the
+          best candidate confirms every entry author.
 
         * Skip when the entry side carries an ``and others`` / ``et al``
           sentinel (the citation is explicitly truncated, so absence on the
@@ -3273,6 +3284,14 @@ class FactChecker:
         union, source_count = self._record_full_surname_union(per_source_records)
         if source_count < min_sources:
             return None
+        # Positive-presence veto: a surname in the best-matched candidate is real
+        # regardless of that source's order-reliability (presence != order). The
+        # corroboration gate (``source_count`` above) still rests on the order-
+        # reliable union; folding in the best record only PREVENTS false flags
+        # when the full-author record came from arXiv/S2 while the order-reliable
+        # sources returned an incomplete stub for a very recent paper.
+        if best_record is not None and best_record.authors:
+            union = union | set(best_record.surname_keys(limit=10_000))
         if not union:
             return None
 
@@ -3447,7 +3466,7 @@ class FactChecker:
         # artifact never trips it. Sentinel-truncated citations ("and others"/
         # "et al") are suppressed by the helper.
         if comparisons["author"].resolved_outcome in (MatchOutcome.MATCH, MatchOutcome.PARTIAL) and per_source_records:
-            absent = self._detect_author_fabrication(entry_authors, entry_names, per_source_records)
+            absent = self._detect_author_fabrication(entry_authors, entry_names, per_source_records, best_record=record)
             if absent:
                 comparisons["author"].outcome = MatchOutcome.MISMATCH
                 comparisons["author"].matches = False
