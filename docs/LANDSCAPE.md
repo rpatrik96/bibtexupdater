@@ -182,7 +182,7 @@ Google Scholar is opt-in (`--use-scholarly` flag) because it is unreliable and s
 
 | Tool | Approach | Databases | Strengths | Limitations |
 |------|----------|-----------|-----------|-------------|
-| **bibtexupdater** | Multi-stage pipeline | arXiv, OpenAlex, Europe PMC, Crossref, DBLP, ACL Anthology, S2, Scholar | Most comprehensive pipeline, CI/CD ready, async support | Requires API calls (cached) |
+| **bibtexupdater** | Multi-stage pipeline | arXiv, OpenAlex, Europe PMC, Crossref, DBLP, ACL Anthology, OpenReview, S2, Scholar | Most comprehensive pipeline, CI/CD ready, async support | Requires API calls (cached) |
 | **rebiber** | Pre-built conference data | Static ACL/NeurIPS/etc. data | Fast, no API calls for known venues | NLP-only, static data requires manual updates |
 | **reffix** | Single-source lookup | DBLP | Simple, lightweight | Single source = lower coverage outside CS |
 | **PreprintResolver** | 4-database search | Crossref, DBLP, S2, OpenAlex | Published academic paper documenting approach | 60.3% success rate (2023 data) |

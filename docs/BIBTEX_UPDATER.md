@@ -4,7 +4,7 @@ Automatically replace preprint BibTeX entries (arXiv, bioRxiv, medRxiv, etc.) wi
 
 ## Features
 
-- **Multi-source resolution**: Queries arXiv, Crossref, DBLP, ACL Anthology, Semantic Scholar, and optionally Google Scholar
+- **Multi-source resolution**: Queries arXiv, OpenAlex, Europe PMC, Crossref, DBLP, ACL Anthology, OpenReview, Semantic Scholar, and optionally Google Scholar
 - **High accuracy**: Uses title and author matching with configurable confidence thresholds
 - **Batch processing**: Process multiple .bib files with concurrent workers
 - **Deduplication**: Merge duplicate entries by DOI or normalized title+authors
@@ -96,9 +96,12 @@ usage: bibtex_updater.py [-h] [-o OUTPUT | --in-place] [--keep-preprint-note]
 The tool uses a multi-stage resolution pipeline to find published versions of preprints:
 
 1. **arXiv → Crossref**: For arXiv preprints, query the arXiv API for DOI, then look up in Crossref
+1b. **OpenAlex**: Preprint-to-published version tracking across 250M+ works (best-in-class preprint→published linking)
+1c. **Europe PMC**: Specialist bioRxiv/medRxiv lookup for life-sciences preprints (`10.1101/` DOIs)
 2. **Crossref Relations**: Check Crossref's `is-preprint-of` relation links
 3. **DBLP Search**: Search DBLP by title and author
 3b. **ACL Anthology**: For NLP papers with ACL DOI prefix (`10.18653/v1/`) or aclanthology.org URLs
+3c. **OpenReview**: Accepted ICLR/NeurIPS/TMLR submissions (rejected/withdrawn/under-review skipped); resolves DOI-less conference papers to their venue + `openreview.net/forum` URL. Throttle-resilient fallback when DBLP is rate-limited.
 4. **Semantic Scholar**: Query Semantic Scholar's paper database
 5. **Crossref Search**: Bibliographic search in Crossref by title/author
 6. **Google Scholar** (opt-in): Fallback search via scholarly package

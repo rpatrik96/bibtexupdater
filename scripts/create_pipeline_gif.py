@@ -1,4 +1,4 @@
-"""Create an animated GIF showing the 9-stage resolution pipeline."""
+"""Create an animated GIF showing the 10-stage resolution pipeline."""
 
 import matplotlib
 
@@ -24,12 +24,13 @@ STAGES = [
     ("2", "Crossref\nRelations", "#f59e0b"),
     ("3", "DBLP", "#3b82f6"),
     ("3b", "ACL\nAnthology", "#ec4899"),  # NEW
+    ("3c", "OpenReview", "#14b8a6"),  # NEW
     ("4", "Semantic\nScholar", "#06b6d4"),
     ("5", "Crossref\nSearch", "#f59e0b"),
     ("6", "Google\nScholar", "#ef4444"),
 ]
 
-NEW_STAGES = {"1b", "1c", "3b"}
+NEW_STAGES = {"1b", "1c", "3b", "3c"}
 
 
 def draw_frame(fig, ax, n_lit):
@@ -69,7 +70,7 @@ def draw_frame(fig, ax, n_lit):
     ax.text(
         5.5,
         5.25,
-        "9-stage preprint resolution pipeline",
+        "10-stage preprint resolution pipeline",
         fontsize=15,
         color=MUTED_COLOR,
         ha="center",
@@ -77,7 +78,7 @@ def draw_frame(fig, ax, n_lit):
         fontweight="normal",
     )
 
-    # Layout: two rows — top row 5 stages, bottom row 4 stages (right-to-left)
+    # Layout: two rows — top row 5 stages, bottom row 5 stages (right-to-left)
     box_w, box_h = 1.8, 1.1
     top_y = 3.4
     bot_y = 1.2
@@ -85,8 +86,8 @@ def draw_frame(fig, ax, n_lit):
 
     # Top row positions (left to right): stages 0-4
     top_xs = [0.5 + i * (box_w + gap) for i in range(5)]
-    # Bottom row positions (right to left): stages 5-8
-    bot_xs = [0.5 + (3 - i) * (box_w + gap) for i in range(4)]
+    # Bottom row positions (right to left): stages 5-9
+    bot_xs = [0.5 + (4 - i) * (box_w + gap) for i in range(5)]
     # Offset bottom row to align right edge
     offset = top_xs[4] + box_w - (bot_xs[0] + box_w)
     bot_xs = [x + offset for x in bot_xs]

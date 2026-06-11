@@ -60,6 +60,7 @@ from bibtex_updater.sources import (
     DEFAULT_OPENALEX_MAILTO,
     DEFAULT_TOP_K,
     MAX_TOP_K,
+    OR_NOT_ACCEPTED,
     AuthorIntersectionResult,
     OpenAlexClient,
     OpenReviewClient,
@@ -89,6 +90,7 @@ from bibtex_updater.utils import (
     entry_surnames_against_structured,
     first_author_surname,
     given_name_position_audit,
+    is_preprint_venue,
     is_valid_arxiv_id,
     # Matching
     jaccard_similarity,
@@ -225,6 +227,7 @@ class FactCheckStatus(Enum):
 
     # Preprint-vs-published statuses
     PREPRINT_ONLY = "preprint_only"  # Paper found only as preprint, not at claimed venue
+    UNPUBLISHED_AT_CLAIMED_VENUE = "unpublished_at_claimed_venue"  # OpenReview: real but not accepted at cited venue
     PUBLISHED_VERSION_EXISTS = "published_version_exists"  # Informational: published version found
 
     # Web reference statuses
@@ -1862,6 +1865,24 @@ class FactChecker:
             return FactCheckStatus.PREPRINT_ONLY
         return None
 
+    def _check_or_unpublished(self, entry: dict[str, Any], best_match: PublishedRecord) -> FactCheckStatus | None:
+        """Flag a citation whose best match is a NOT-ACCEPTED OpenReview submission
+        (rejected / withdrawn / under-review) at the cited venue: the paper is real
+        but was not published there. Env-gated via ``BIBTEX_CHECK_OR_UNPUBLISHED_FLAG``
+        (default off) pending a HALLMARK FPR check. Only the OpenReview converter
+        stamps ``acceptance``, so this never fires for non-OpenReview matches.
+        """
+        import os
+
+        if os.environ.get("BIBTEX_CHECK_OR_UNPUBLISHED_FLAG", "").strip() not in {"1", "true", "yes", "on"}:
+            return None
+        if getattr(best_match, "acceptance", None) != OR_NOT_ACCEPTED:
+            return None
+        claimed_venue = (entry.get("booktitle") or entry.get("journal") or "").strip()
+        if not claimed_venue or is_preprint_venue(claimed_venue):
+            return None
+        return FactCheckStatus.UNPUBLISHED_AT_CLAIMED_VENUE
+
     def check_entry(self, entry: dict[str, Any], pre_validated_dois: dict[str, bool] | None = None) -> FactCheckResult:
         """Fact-check a single bibliographic entry.
 
@@ -2040,6 +2061,9 @@ class FactChecker:
             preprint_status = self._check_preprint_status(entry, best_match)
             if preprint_status is not None:
                 status = preprint_status
+            unpublished_status = self._check_or_unpublished(entry, best_match)
+            if unpublished_status is not None:
+                status = unpublished_status
 
         # --strict-warn-cnv: promote could-not-verify abstentions (NOT_FOUND /
         # UNCONFIRMED) to STRICT_WARN_CNV so opt-in users can fail CI on
@@ -3206,10 +3230,21 @@ class FactChecker:
         entry_author_field: str,
         entry_surname_keys: list[str],
         per_source_records: dict[str, PublishedRecord | None] | None,
+        best_record: PublishedRecord | None = None,
     ) -> list[str] | None:
         """Return entry surnames absent from every order-reliable record.
 
         Gated to limit false positives:
+
+        * Fold the best-matched ``best_record``'s surnames into the comparison
+          union when supplied: a surname present in the top-scoring candidate is
+          demonstrably real and must never be flagged as fabricated, even when
+          that candidate's source is order-UNRELIABLE (arXiv / Semantic Scholar).
+          Order-reliability gates author-ORDER checks, not author PRESENCE.
+          Without this veto, a full-author arXiv match paired with incomplete
+          order-reliable stubs (a brand-new paper Crossref/OpenAlex have only
+          partially indexed) yields a spurious fabrication flag even though the
+          best candidate confirms every entry author.
 
         * Skip when the entry side carries an ``and others`` / ``et al``
           sentinel (the citation is explicitly truncated, so absence on the
@@ -3249,6 +3284,14 @@ class FactChecker:
         union, source_count = self._record_full_surname_union(per_source_records)
         if source_count < min_sources:
             return None
+        # Positive-presence veto: a surname in the best-matched candidate is real
+        # regardless of that source's order-reliability (presence != order). The
+        # corroboration gate (``source_count`` above) still rests on the order-
+        # reliable union; folding in the best record only PREVENTS false flags
+        # when the full-author record came from arXiv/S2 while the order-reliable
+        # sources returned an incomplete stub for a very recent paper.
+        if best_record is not None and best_record.authors:
+            union = union | set(best_record.surname_keys(limit=10_000))
         if not union:
             return None
 
@@ -3423,7 +3466,7 @@ class FactChecker:
         # artifact never trips it. Sentinel-truncated citations ("and others"/
         # "et al") are suppressed by the helper.
         if comparisons["author"].resolved_outcome in (MatchOutcome.MATCH, MatchOutcome.PARTIAL) and per_source_records:
-            absent = self._detect_author_fabrication(entry_authors, entry_names, per_source_records)
+            absent = self._detect_author_fabrication(entry_authors, entry_names, per_source_records, best_record=record)
             if absent:
                 comparisons["author"].outcome = MatchOutcome.MISMATCH
                 comparisons["author"].matches = False
@@ -3711,7 +3754,20 @@ class FactChecker:
                 # gets its own status so the root cause is explicit.
                 if mismatches == ["author"]:
                     findings = comparisons["author"].given_name_findings or []
-                    if any(f.get("variety") == GivenNameVariety.SUBSTITUTION for f in findings):
+                    # Route to GIVEN_NAME_SUBSTITUTION only when the substitution
+                    # IS the mismatch -- i.e. the given-name audit escalated an
+                    # author set whose surnames all matched (its note marks that
+                    # path). The audit records findings unconditionally, so a
+                    # gross author-set mismatch can *contain* substitution
+                    # findings at coincidentally shared surnames (fabricated
+                    # lists collide on frequent family names: Zhang/Liu/...).
+                    # Routing those to this benign-sounding status buried a
+                    # 9-of-10-fabricated author list (refchecker2024 incident);
+                    # they must stay AUTHOR_MISMATCH.
+                    author_note = comparisons["author"].note or ""
+                    if author_note.startswith("Given-name substitution on matching surnames") and any(
+                        f.get("variety") == GivenNameVariety.SUBSTITUTION for f in findings
+                    ):
                         return FactCheckStatus.GIVEN_NAME_SUBSTITUTION
                     # --strict rule 5: silent author-list truncation. Tagged
                     # by ``_compare_all_fields`` so the gate routes it to its
@@ -4149,6 +4205,11 @@ class FactCheckProcessor:
             # --strict escalations (positive evidence under arXiv 2026 policy).
             FactCheckStatus.TITLE_NEAR_MISS.value,
             FactCheckStatus.AUTHOR_TRUNCATED.value,
+            # Escalated wrong-author evidence: surnames match but a co-author's
+            # given name names a different person. Calibration already classes
+            # it CLEARLY-PROBLEM (_PROB_SOFT); omitting it here let the verdict
+            # bypass the PROBLEMATIC bucket and the strict CI gate.
+            FactCheckStatus.GIVEN_NAME_SUBSTITUTION.value,
         ]
 
         # Calculate verified rate including new verified statuses

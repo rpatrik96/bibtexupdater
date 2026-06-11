@@ -1,14 +1,20 @@
 """Cascading source clients and cross-source author cross-validation.
 
 This module consolidates calls to external bibliographic databases
-(CrossRef, Semantic Scholar, OpenAlex) for the fact-checker.
+(CrossRef, OpenAlex, DBLP, OpenReview, Semantic Scholar) for the fact-checker.
 
-The cascading order is intentional:
+The cascading order is intentional and throughput-aware:
 
 1. **CrossRef** -- broadest DOI-registered coverage, no API key, generous
    polite-pool rate limits.
-2. **Semantic Scholar** -- best preprint coverage (arXiv, bioRxiv, ...).
-3. **OpenAlex** -- aggregator that catches everything CrossRef and S2 miss.
+2. **OpenAlex** -- high-rate aggregator (polite pool) with broad coverage that
+   catches works CrossRef misses.
+3. **DBLP** -- authoritative CS/ML-conference index (token-AND title search).
+4. **OpenReview** -- authoritative ICLR/NeurIPS/TMLR submission registry; it
+   positively confirms ML-conference papers the DOI- and CS-index sources can
+   only leave unconfirmed.
+5. **Semantic Scholar** -- strong preprint coverage (arXiv, bioRxiv, ...) but the
+   slowest source without an API key, so it is queried last.
 
 The cascade short-circuits as soon as one source returns a candidate above the
 ``CASCADE_HIGH_CONFIDENCE`` threshold, which avoids wasted API calls.
@@ -31,6 +37,7 @@ from bibtex_updater.utils import (
     OPENALEX_API,
     OPENREVIEW_API,
     PublishedRecord,
+    is_preprint_venue,
     last_name_from_person,
     latex_to_plain,
     normalize_title_for_match,
@@ -42,6 +49,11 @@ __all__ = [
     "openalex_work_to_candidate_record",
     "OpenReviewClient",
     "openreview_note_to_candidate_record",
+    "openreview_acceptance",
+    "OR_ACCEPTED",
+    "OR_NOT_ACCEPTED",
+    "OR_PREPRINT",
+    "OR_UNKNOWN",
     "build_openreview_paperhash",
     "select_top_k_by_title_similarity",
     "cross_source_author_intersection",
@@ -406,6 +418,58 @@ def _family_from_tilde_id(authorid: str) -> str | None:
     return tokens[-1]
 
 
+# OpenReview acceptance-status classification. OpenReview hosts a submission
+# whatever its outcome, so presence alone is not publication: the venue/venueid
+# separate an accepted paper from a rejected/withdrawn/under-review one and from a
+# preprint mirror (CoRR). Gates resolution (ACCEPTED only) and powers the
+# verification existence + unpublished-at-claimed-venue signals.
+OR_ACCEPTED = "accepted"
+OR_NOT_ACCEPTED = "not_accepted"
+OR_PREPRINT = "preprint"
+OR_UNKNOWN = "unknown"
+
+_OR_NOT_ACCEPTED_RE = re.compile(r"withdrawn|rejected|desk[_-]?reject", re.IGNORECASE)
+_OR_DBLP_CONF_RE = re.compile(r"dblp\.org/conf/", re.IGNORECASE)
+_OR_NATIVE_CONF_RE = re.compile(r"\.cc/\d{4}/conference\b", re.IGNORECASE)
+_OR_YEAR_RE = re.compile(r"\b(?:19|20)\d{2}\b")
+
+
+def openreview_acceptance(note: dict[str, Any]) -> str:
+    """Classify an OpenReview note's acceptance status from ``venue``/``venueid``.
+
+    Returns one of :data:`OR_ACCEPTED`, :data:`OR_NOT_ACCEPTED`,
+    :data:`OR_PREPRINT`, or :data:`OR_UNKNOWN`. OpenReview hosts a submission
+    whatever its outcome, so presence is not publication: the venue strings
+    separate an accepted paper ("ICLR 2021", ``dblp.org/conf/ICLR/2021``) from a
+    rejected/withdrawn/under-review one (``…/Withdrawn_Submission``, ``…/Rejected``,
+    "Submitted to ICLR 2024") and from a preprint mirror (CoRR). ``UNKNOWN`` is
+    returned when the status cannot be determined; callers treat it conservatively
+    (never a resolution, never a problematic verdict).
+    """
+    content = note.get("content") or {}
+    if not isinstance(content, dict):
+        return OR_UNKNOWN
+    venue = _content_value(content, "venue")
+    venueid = _content_value(content, "venueid")
+    venue_s = str(venue or "")
+    venueid_l = str(venueid or "").lower()
+    venue_l = venue_s.lower()
+
+    # 1. Preprint mirror (CoRR / arXiv) -- not a publication.
+    if is_preprint_venue(venue) or "journals/corr" in venueid_l:
+        return OR_PREPRINT
+    # 2. Not accepted -- withdrawn / rejected / still under review.
+    if _OR_NOT_ACCEPTED_RE.search(venueid_l) or venue_l.startswith("submitted to"):
+        return OR_NOT_ACCEPTED
+    # 3. Accepted -- a DBLP conference import, a native ``…/Conference`` venueid,
+    #    or a clean venue string carrying a year and none of the markers above.
+    if _OR_DBLP_CONF_RE.search(venueid_l) or _OR_NATIVE_CONF_RE.search(venueid_l):
+        return OR_ACCEPTED
+    if venue_s and _OR_YEAR_RE.search(venue_s):
+        return OR_ACCEPTED
+    return OR_UNKNOWN
+
+
 def openreview_note_to_candidate_record(note: dict[str, Any]) -> PublishedRecord | None:
     """Convert an OpenReview note to a ``PublishedRecord`` for cascade scoring.
 
@@ -461,6 +525,11 @@ def openreview_note_to_candidate_record(note: dict[str, Any]) -> PublishedRecord
         all_structured = False
 
     venue = _content_value(content, "venue") or _content_value(content, "venueid")
+    # A preprint-labelled venue (e.g. a DBLP "CoRR" import surfaced on OpenReview)
+    # is not a published-venue confirmation; drop it so the verifier treats the
+    # venue as unconfirmable rather than matching against "CoRR".
+    if is_preprint_venue(venue):
+        venue = None
 
     year = None
     raw_year = _content_value(content, "year")
@@ -487,6 +556,7 @@ def openreview_note_to_candidate_record(note: dict[str, Any]) -> PublishedRecord
         type="conference",
         structured_names=all_structured,
         order_reliable=True,
+        acceptance=openreview_acceptance(note),
     )
 
 

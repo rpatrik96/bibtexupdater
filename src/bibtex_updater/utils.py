@@ -14,6 +14,7 @@ import collections
 import errno
 import html
 import json
+import logging
 import os
 import random
 import re
@@ -30,6 +31,22 @@ from typing import Any
 
 import httpx
 from rapidfuzz.distance import Levenshtein
+
+logger = logging.getLogger(__name__)
+
+
+class CircuitOpenError(Exception):
+    """Raised when a service's circuit breaker is open, to skip the request fast.
+
+    Source clients catch this via their broad ``except`` and return an empty
+    result, so a throttled service stops being hammered while the cascade falls
+    through to the next source.
+    """
+
+    def __init__(self, service: str) -> None:
+        super().__init__(f"circuit open for service {service!r}")
+        self.service = service
+
 
 # ------------- Constants & Regex -------------
 
@@ -50,6 +67,44 @@ ARXIV_ID_RE = re.compile(
 ARXIV_HOST_RE = re.compile(r"https?://(?:www\.)?arxiv\.org/(?:abs|pdf)/(?P<id>[^\s?#]+)", re.IGNORECASE)
 
 PREPRINT_HOSTS = ("arxiv", "biorxiv", "medrxiv")
+
+# DBLP labels arXiv mirrors "CoRR" (Computing Research Repository) -- a preprint
+# venue, not a real publication venue. Match it on a word boundary so real venues
+# that merely contain the letters (e.g. "Corrosion Science") are not rejected.
+_CORR_VENUE_RE = re.compile(r"\bcorr\b", re.IGNORECASE)
+
+
+def is_preprint_venue(venue: str | None) -> bool:
+    """True if ``venue`` names a preprint host (arXiv/bioRxiv/medRxiv) or CoRR.
+
+    Single source of truth for the "is this a real published venue?" check,
+    shared by the resolver credibility gate and the source converters so a
+    preprint-labelled record -- e.g. an OpenReview note whose venue is
+    "CoRR 2017" -- can never be mistaken for a published venue.
+    """
+    if not venue:
+        return False
+    v = venue.lower()
+    if any(host in v for host in PREPRINT_HOSTS):
+        return True
+    return bool(_CORR_VENUE_RE.search(v))
+
+
+def retry_after_seconds(exc: httpx.HTTPError, fallback: float, cap: float = 60.0) -> float:
+    """Retry sleep: honor a server ``Retry-After`` header when present (integer
+    seconds, capped at ``cap``), else the exponential ``fallback``. Lets the
+    client respect DBLP/Crossref 429/503 backoff requests instead of hammering;
+    the caller adds jitter."""
+    resp = getattr(exc, "response", None)
+    if resp is not None:
+        header = resp.headers.get("Retry-After")
+        if header:
+            try:
+                return min(float(int(header)), cap)
+            except (ValueError, TypeError):
+                pass
+    return fallback
+
 
 # API endpoints
 CROSSREF_API = "https://api.crossref.org/works"
@@ -1446,6 +1501,14 @@ class HttpClient:
 
     RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 
+    # Circuit breaker: after this many consecutive fully-failed requests to a
+    # service (sustained 429/5xx -- typically DBLP/Crossref IP-throttling), stop
+    # hammering it for CIRCUIT_COOLDOWN seconds so the throttle can clear instead
+    # of bursting into it. State is persisted to the cache for cross-run pacing.
+    CIRCUIT_FAIL_THRESHOLD = 4
+    CIRCUIT_COOLDOWN = 90.0
+    _CIRCUIT_CACHE_KEY = "__bibtex_updater_circuit_open_until__"
+
     def __init__(
         self,
         timeout: float,
@@ -1477,6 +1540,11 @@ class HttpClient:
         self.cache = cache
         self.verbose = verbose
         self.s2_api_key = s2_api_key
+        # Per-service circuit-breaker state (see CIRCUIT_* and _request).
+        self._circuit_fail_streak: dict[str, int] = {}
+        self._circuit_open_until: dict[str, float] = {}
+        self._tripped_services: set[str] = set()
+        self._load_circuit_state()
 
     @property
     def rate_limiter(self) -> RateLimiter | RateLimiterRegistry:
@@ -1500,6 +1568,64 @@ class HttpClient:
             return self._rate_limiter.get("crossref")  # type: ignore[union-attr]
         else:
             return self._rate_limiter  # type: ignore[return-value]
+
+    # --- Circuit breaker (per service) ---
+    @property
+    def tripped_services(self) -> set[str]:
+        """Services whose circuit opened this run (sustained throttling / 5xx)."""
+        return set(self._tripped_services)
+
+    def _load_circuit_state(self) -> None:
+        """Load any still-open per-service cooldowns persisted by an earlier run."""
+        if not self.cache:
+            return
+        try:
+            data = self.cache.get(self._CIRCUIT_CACHE_KEY)
+        except Exception:
+            return
+        if isinstance(data, dict):
+            now = time.time()
+            kept: dict[str, float] = {}
+            for svc, ts in data.items():
+                try:
+                    ts_f = float(ts)
+                except (ValueError, TypeError):
+                    continue
+                if ts_f > now:
+                    kept[svc] = ts_f
+            self._circuit_open_until = kept
+
+    def _persist_circuit_state(self) -> None:
+        if not self.cache:
+            return
+        try:
+            self.cache.set(self._CIRCUIT_CACHE_KEY, self._circuit_open_until)
+        except Exception:
+            pass
+
+    def _circuit_is_open(self, service: str | None) -> bool:
+        return bool(service) and time.time() < self._circuit_open_until.get(service, 0.0)
+
+    def _record_service_success(self, service: str | None) -> None:
+        if service:
+            self._circuit_fail_streak[service] = 0
+
+    def _record_service_failure(self, service: str | None) -> None:
+        if not service:
+            return
+        streak = self._circuit_fail_streak.get(service, 0) + 1
+        self._circuit_fail_streak[service] = streak
+        if streak >= self.CIRCUIT_FAIL_THRESHOLD and not self._circuit_is_open(service):
+            self._circuit_open_until[service] = time.time() + self.CIRCUIT_COOLDOWN
+            self._tripped_services.add(service)
+            self._persist_circuit_state()
+            logger.warning(
+                "Service %r is rate-limited/unavailable (sustained 429/5xx); pausing it for %ds. "
+                "Entries needing it may be left UNRESOLVED due to throttling, not absence -- "
+                "re-run after the cooldown to retry them.",
+                service,
+                int(self.CIRCUIT_COOLDOWN),
+            )
 
     def _request(
         self,
@@ -1531,6 +1657,8 @@ class HttpClient:
                     content=json.dumps(cached).encode("utf-8"),
                     headers={"X-From-Cache": "1"},
                 )
+        if self._circuit_is_open(service):
+            raise CircuitOpenError(service or "")
         backoff = 1.0
         attempts = 6
         limiter = self._get_limiter_for_service(service)
@@ -1551,14 +1679,17 @@ class HttpClient:
                         self.cache.set(cache_key, resp.json())
                     except Exception:
                         pass
+                self._record_service_success(service)
                 return resp
-            except httpx.HTTPError:
+            except httpx.HTTPError as exc:
                 # Don't sleep after the final attempt -- we're about to give up, so
-                # the backoff would just be a wasted stall (up to 16s) on a dead or
-                # rate-limited source.
+                # the backoff would just be a wasted stall on a dead or rate-limited
+                # source. Honor a server Retry-After (DBLP/Crossref 429/503) over the
+                # blind exponential backoff, with jitter to avoid synchronized retries.
                 if attempt < attempts - 1:
-                    time.sleep(backoff)
+                    time.sleep(retry_after_seconds(exc, backoff) + random.uniform(0, 0.5))
                     backoff = min(backoff * 2, 16.0)
+        self._record_service_failure(service)
         raise RuntimeError(f"Network failure after retries for {url}")
 
 
@@ -1599,6 +1730,10 @@ class PublishedRecord:
     # Scholar (synthesized names, less reliable ordering) leaves this False so
     # order is ignored.
     order_reliable: bool = False
+    # OpenReview acceptance status (accepted/not_accepted/preprint/unknown) stamped
+    # by the OpenReview converter; None for every other source. Lets the verifier
+    # act on a not-accepted match without re-fetching the note.
+    acceptance: str | None = None
 
     def surname_keys(self, limit: int = 3) -> list[str]:
         """Canonical surname comparison keys derived from ``self.authors``.
@@ -1767,7 +1902,7 @@ def dblp_hit_to_record(hit: dict[str, Any]) -> PublishedRecord | None:
 
     # Reject preprint venues (CoRR is arXiv's journal name in DBLP)
     venue_lower = safe_lower(venue) if venue else ""
-    if re.search(r"arxiv|biorxiv|medrxiv|^corr$", venue_lower):
+    if is_preprint_venue(venue):
         return None
     if not venue or not year:
         return None
@@ -2440,9 +2575,9 @@ class AsyncHttpClient:
                         pass  # Ignore cache errors
 
                 return resp
-            except httpx.HTTPError:
+            except httpx.HTTPError as exc:
                 if attempt < 5:
-                    await asyncio.sleep(backoff)
+                    await asyncio.sleep(retry_after_seconds(exc, backoff) + random.uniform(0, 0.5))
                     backoff = min(backoff * 2, 16.0)
 
         raise RuntimeError(f"Network failure after retries for {url}")

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **OpenReview resolution stage** (`bibtex-update`): the resolver now upgrades **accepted** OpenReview submissions (ICLR/NeurIPS/TMLR) to their published `@inproceedings` (venue + `openreview.net/forum?id=…` URL) as stage 3c — after ACL Anthology, before Semantic Scholar — a throttle-resilient fallback for when DBLP is rate-limited. Rejected, withdrawn, under-review, and CoRR notes are never resolved (`openreview_acceptance`). For these DOI-less ML venues the venue + forum-URL record is the canonical published form, so the stage is default-on. Wired into both the synchronous `Resolver` and the async `AsyncResolver`. (OpenReview was already a step in the `bibtex-check` verification cascade.)
+
 ## [1.2.0] - 2026-05-30
 
 Catch-rate release. Four new behavioral capabilities targeted at the `could-not-verify` HALLUCINATED bucket and one residual `wrong_venue` leak class. Converted ~110 abstentions to caught problematics across dev+test, caught the SCoRe wrong-venue leak (the v1.1.0 `cheap_fix` target), and kept the held-out FPR steady.
