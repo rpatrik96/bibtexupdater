@@ -110,6 +110,7 @@ def retry_after_seconds(exc: httpx.HTTPError, fallback: float, cap: float = 60.0
 CROSSREF_API = "https://api.crossref.org/works"
 ARXIV_API = "http://export.arxiv.org/api/query"
 DBLP_API_SEARCH = "https://dblp.org/search/publ/api"
+DBLP_API_VENUE_SEARCH = "https://dblp.org/search/venue/api"
 S2_API = "https://api.semanticscholar.org/graph/v1"
 ACL_ANTHOLOGY_URL = "https://aclanthology.org"
 ACL_DOI_PREFIX = "10.18653/v1/"
@@ -121,6 +122,12 @@ EUROPEPMC_API = "https://www.ebi.ac.uk/europepmc/webservices/rest"
 # endpoint does -- and that is the authoritative title+first-author lookup the
 # cascade relies on. Public read is keyless.
 OPENREVIEW_API = "https://api.openreview.net"
+# OpenReview API v2. Venues that migrated to v2 (ICLR 2024+, NeurIPS 2023+,
+# most 2024+ venues) are INVISIBLE on the legacy v1 host, so the client falls
+# back to ``GET /notes/search?term=<title>`` here when both v1 lookups miss.
+# v2 wraps every note content field as ``{"value": ...}`` (the converters
+# accept both shapes via ``_content_value``). Public read is keyless.
+OPENREVIEW_API_V2 = "https://api2.openreview.net"
 
 
 # ------------- Atomic File Replace -------------
@@ -333,6 +340,38 @@ def _given_initial(given: str) -> str:
     return ""
 
 
+def record_looks_alphabetized(record: PublishedRecord) -> bool:
+    """True if the record's author list looks SORTED rather than publication order.
+
+    Some order-reliable sources alphabetize their contributor lists instead of
+    preserving title-page order (Crossref NeurIPS/ICML proceedings deposits,
+    e.g. the 10.52202 prefix) -- sometimes by family name, sometimes by the
+    full given-first display string ("Anh Tuan Tran" < "Khoi Nguyen" < "Quang
+    Ho Nguyen" < "Truong Thanh Vu"). Such a record's author ORDER carries no
+    publication-order signal, so order-sensitive author checks (shared-surname
+    run comparison, positional given-name pairing across a repeated surname,
+    same-multiset swap detection) must not anchor on it. Mirrors
+    ``matching._looks_alphabetized`` (surname keys) and extends it with the
+    display-string sort that surname keys cannot see. Requires >= 3 usable
+    names: with fewer, sorted order coincides too often to carry any signal.
+    """
+    authors = record.authors or []
+    if len(authors) < 3:
+        return False
+    surnames = [k for k in record.surname_keys(limit=10_000) if k]
+    if len(surnames) >= 3 and surnames == sorted(surnames):
+        return True
+    display: list[str] = []
+    for a in authors:
+        name = f"{(a.get('given') or '').strip()} {(a.get('family') or '').strip()}".strip()
+        key = strip_diacritics(latex_to_plain(name)).lower()
+        key = re.sub(r"[^a-z0-9\s]", " ", key)
+        key = " ".join(key.split())
+        if key:
+            display.append(key)
+    return len(display) >= 3 and display == sorted(display)
+
+
 def same_surname_given_order_violation(entry_author_field: str, record: PublishedRecord) -> bool:
     """Detect a swap/mismatch between two authors who share a surname.
 
@@ -347,9 +386,15 @@ def same_surname_given_order_violation(entry_author_field: str, record: Publishe
     times, BOTH sides have the SAME count (aligned runs) AND every author in the
     run has a usable given initial on both sides. A dropped/added same-surname
     author (unequal counts) or any missing given name leaves this to the
-    surname-level logic instead.
+    surname-level logic instead. A record whose author list looks ALPHABETIZED
+    (``record_looks_alphabetized``) never anchors this check: alphabetization
+    re-orders shared-surname runs (the two 'Nguyen's of an A-Z-sorted Crossref
+    proceedings deposit need not follow publication order), so a run-order
+    difference against it is a record-side sort artifact, not a swap.
     """
     if not getattr(record, "order_reliable", False) or not record.authors:
+        return False
+    if record_looks_alphabetized(record):
         return False
 
     entry_pairs = [
@@ -486,6 +531,19 @@ def classify_given_pair(given_entry: str, given_record: str) -> str:
         if len(short) <= len(long) and all(short[i] == long[i][0] for i in range(len(short))):
             return GivenNameVariety.INITIAL_COMPATIBLE
         return GivenNameVariety.INITIAL_CONFLICT
+    # MIXED initial+name forms: a given like "J. Westerborn" is NOT all-initials
+    # (so the branch above does not catch it) but its FIRST token is still a
+    # bare initial. Comparing that single letter against a full first given
+    # token ("Johan") as if both were full names mis-graded the pair as a
+    # SUBSTITUTION (HALLMARK FP: "Johan Alenlov" vs a record's "J. Westerborn
+    # Alenlov"). A one-letter first token can only ever testify about the
+    # initial: same letter -> benign initial form; different letter -> the same
+    # low-confidence INITIAL_CONFLICT the all-initials branch yields. Never a
+    # full-name substitution.
+    if len(te[0]) == 1 or len(tr[0]) == 1:
+        if te[0][0] == tr[0][0]:
+            return GivenNameVariety.INITIAL_COMPATIBLE
+        return GivenNameVariety.INITIAL_CONFLICT
     # Both sides carry a full (non-initial) given name from here.
     if te[0] == tr[0]:
         # Same first given token, differing middle/extra tokens -> middle-name
@@ -555,6 +613,7 @@ def given_name_position_audit(entry_author_field: str, record: PublishedRecord) 
     findings: list[dict] = []
     rank = {"skip": 0, "confirmed": 1, "soften": 2, "escalate": 3}
     worst = "skip"
+    record_alphabetized = record_looks_alphabetized(record)
     for i in range(min(len(entry_pairs), len(rec_pairs))):
         e_sur, e_giv = entry_pairs[i]
         r_sur, r_giv = rec_pairs[i]
@@ -573,22 +632,27 @@ def given_name_position_audit(entry_author_field: str, record: PublishedRecord) 
         # (Shunyu at 0, Denny re-listed at the tail) while the record had ONE
         # 'zhou' (Denny at 0). The OLD guard tripped on the entry-side repeat
         # even though the record-side 'zhou' uniquely pinned the comparison.
-        both_repeat = entry_sur_counts[e_sur] > 1 and rec_sur_counts[r_sur] > 1
+        rec_repeats = rec_sur_counts[r_sur] > 1
+        both_repeat = entry_sur_counts[e_sur] > 1 and rec_repeats
         if both_repeat and i != 0:
             continue
-        if both_repeat and i == 0:
-            # At the lead, both-side surname repetition is still genuine
-            # ambiguity (e.g. two real 'Song' lead-co-authors). Only audit if
-            # the entry's lead given matches NO record same-surname given via a
-            # benign classification; if any record author with that surname
-            # could explain the entry given as a benign variant, abstain.
+        # Positional-ambiguity guard: when the RECORD carries the surname more
+        # than once AND the positional pairing cannot be trusted -- at the lead
+        # with both sides repeating (two real 'Song' lead-co-authors), or
+        # ANYWHERE against an ALPHABETIZED record (sorting re-orders a shared-
+        # surname run, so position i may hold the OTHER same-surname author,
+        # e.g. an A-Z Crossref deposit putting 'Khoi Nguyen' where the entry
+        # cites 'Quang Nguyen') -- grade the entry given against EVERY record
+        # author with that surname instead of the positional one. If ANY of
+        # them explains it benignly (or nothing is comparable), abstain; only
+        # when every comparable candidate grades as a substitution is the
+        # entry's author genuinely none of them -> escalate.
+        if (both_repeat and i == 0) or (rec_repeats and record_alphabetized):
             same_surname_givens = [g for s, g in rec_pairs if s == r_sur]
-            best_class_rank = -1
-            for cand_g in same_surname_givens:
-                cls_cand = GIVEN_VARIETY_CLASS.get(classify_given_pair(e_giv, cand_g), "skip")
-                best_class_rank = max(best_class_rank, rank[cls_cand])
-            if best_class_rank < rank["escalate"]:
-                # Some record author with that surname is a benign match -> abstain.
+            cand_classes = {GIVEN_VARIETY_CLASS.get(classify_given_pair(e_giv, g), "skip") for g in same_surname_givens}
+            if "escalate" not in cand_classes or "confirmed" in cand_classes or "soften" in cand_classes:
+                # Some record author with that surname is a benign/low-confidence
+                # match (or none is comparable) -> abstain.
                 continue
         variety = classify_given_pair(e_giv, r_giv)
         cls = GIVEN_VARIETY_CLASS.get(variety, "skip")
@@ -744,6 +808,30 @@ def normalize_doi_for_resolution(doi: str | None) -> str | None:
     if normalized.startswith(_ARXIV_DOI_PREFIX):
         normalized = re.sub(r"v\d+$", "", normalized)
     return normalized
+
+
+#: arXiv DataCite DOI shape: ``10.48550/arXiv.YYMM.NNNNN`` with an optional
+#: version suffix. Case-insensitive because the ``arXiv`` casing varies across
+#: sources. Single source of truth for "this DOI *is* an arXiv ID" -- reused by
+#: ``arxiv_id_from_datacite_doi`` and the fact-checker's entry-side extractor.
+_ARXIV_DATACITE_DOI_RE = re.compile(r"^10\.48550/arxiv\.(\d{4}\.\d{4,5})(v\d+)?$", re.IGNORECASE)
+
+
+def arxiv_id_from_datacite_doi(doi: str | None) -> str | None:
+    """Extract the bare arXiv ID from an arXiv DataCite DOI.
+
+    ``10.48550/arXiv.2301.00001`` (or ``...v2``) -> ``2301.00001``: the version
+    suffix is stripped and the ID is month-validated via ``is_valid_arxiv_id``.
+    Any other DOI shape (including legacy-scheme arXiv IDs, which DataCite does
+    not mint under this prefix in the wild) returns ``None``.
+    """
+    if not doi:
+        return None
+    m = _ARXIV_DATACITE_DOI_RE.match(doi.strip())
+    if not m:
+        return None
+    bare = m.group(1)
+    return bare if is_valid_arxiv_id(bare) else None
 
 
 def doi_url(doi: str) -> str:
@@ -983,14 +1071,18 @@ class RateLimiterRegistry:
     optimizing throughput while respecting each service's constraints.
     """
 
+    # Conservative *library* defaults for embedders that never tune limits.
+    # The fact-checker CLI overrides these with scaled-and-capped values much
+    # closer to the documented service ceilings (see
+    # ``fact_checker._cli_service_rate_limits``).
     DEFAULT_LIMITS = {
-        "crossref": 50,  # Crossref: 50/min polite pool
-        "semanticscholar": 100,  # S2: 100/min (1000 with API key)
+        "crossref": 50,  # Conservative default; Crossref's polite-pool ceiling is ~50 req/SECOND
+        "semanticscholar": 100,  # Keyless S2 is a SHARED global pool; keyed search allowance is ~1 req/s
         "dblp": 30,  # DBLP: 30/min (conservative)
-        "arxiv": 30,  # arXiv: 30/min
+        "arxiv": 20,  # arXiv asks for ~1 request per 3 seconds (politeness)
         "scholarly": 10,  # Scholar: very conservative
         "aclanthology": 30,  # ACL Anthology: 30/min (conservative)
-        "openalex": 100,  # OpenAlex: polite pool (~10 req/sec max)
+        "openalex": 100,  # Conservative default; OpenAlex polite pool allows ~10 req/sec
         "europepmc": 20,  # Europe PMC: conservative rate limit
         "openreview": 30,  # OpenReview: 30/min (conservative; keyless public read)
     }
@@ -1083,16 +1175,17 @@ class AdaptiveRateLimiterRegistry(RateLimiterRegistry):
         # Handle 429 Too Many Requests
         if hasattr(response, "status_code") and response.status_code == 429:
             retry_after = response.headers.get("Retry-After")
+            backoff_seconds = 60.0  # Default backoff when header absent/unparseable
             if retry_after:
                 try:
-                    retry_seconds = int(retry_after)
-                    self._backoff_until[service] = time.time() + retry_seconds
+                    backoff_seconds = float(int(retry_after))
                 except (ValueError, TypeError):
-                    # Default 60 second backoff
-                    self._backoff_until[service] = time.time() + 60.0
-            else:
-                # Default 60 second backoff
-                self._backoff_until[service] = time.time() + 60.0
+                    backoff_seconds = 60.0
+            # ``_backoff_until`` is read by ``wait`` on every worker thread, so
+            # the write must happen under the registry lock (it was previously
+            # unguarded; a torn read could miss/garble a fresh backoff).
+            with self._lock:
+                self._backoff_until[service] = time.time() + backoff_seconds
 
             # Also reduce the rate limit
             current_limit = self._limits.get(service, 30)
@@ -1107,8 +1200,9 @@ class AdaptiveRateLimiterRegistry(RateLimiterRegistry):
         Args:
             service: Name of the API service
         """
-        # Check for backoff period
-        backoff_end = self._backoff_until.get(service, 0)
+        # Check for backoff period (read under the lock; see ``adapt``).
+        with self._lock:
+            backoff_end = self._backoff_until.get(service, 0)
         now = time.time()
         if now < backoff_end:
             time.sleep(backoff_end - now)
@@ -1501,6 +1595,12 @@ class HttpClient:
 
     RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 
+    # Versioned envelope marker for cached NON-JSON text responses (e.g. arXiv
+    # Atom XML), stored as {"__btu_cache_v2__": true, "ct": <content-type>,
+    # "text": <body>}. JSON responses keep the legacy format (the raw decoded
+    # body), so existing cache files remain fully readable in both directions.
+    CACHE_ENVELOPE_KEY = "__btu_cache_v2__"
+
     # Circuit breaker: after this many consecutive fully-failed requests to a
     # service (sustained 429/5xx -- typically DBLP/Crossref IP-throttling), stop
     # hammering it for CIRCUIT_COOLDOWN seconds so the throttle can clear instead
@@ -1627,6 +1727,83 @@ class HttpClient:
                 int(self.CIRCUIT_COOLDOWN),
             )
 
+    @staticmethod
+    def _is_cacheable_text(content_type: str) -> bool:
+        """True for non-JSON *text* bodies worth caching (arXiv Atom XML, ...).
+
+        Conservative allow-list: ``text/*`` plus XML media types. Binary
+        responses are never cached (the JSON-valued SqliteCache cannot hold
+        them faithfully).
+        """
+        mime = content_type.split(";", 1)[0].strip().lower()
+        return mime.startswith("text/") or mime.endswith("+xml") or mime == "application/xml"
+
+    @staticmethod
+    def _cache_key(
+        method: str,
+        url: str,
+        params: dict[str, Any] | None,
+        accept: str | None,
+        json_body: dict[str, Any] | list[Any] | None,
+    ) -> str:
+        """Single source of truth for response-cache keys.
+
+        Shared by :meth:`_request` (read/write on real traffic) and
+        :meth:`prime_cache` (bulk pre-population) so the two can never drift:
+        a primed entry is guaranteed to be the exact key the equivalent
+        ``_request`` call would look up.
+        """
+        return json.dumps({"m": method, "u": url, "p": params, "a": accept, "j": json_body}, sort_keys=True)
+
+    def prime_cache(
+        self,
+        method: str,
+        url: str,
+        params: dict[str, Any] | None = None,
+        accept: str | None = None,
+        json_body: dict[str, Any] | list[Any] | None = None,
+        *,
+        value: Any,
+    ) -> None:
+        """Pre-populate the response cache for an equivalent ``_request`` call.
+
+        ``value`` is stored exactly as a 200 JSON response body would be (the
+        legacy raw-decoded-JSON format), so a later ``_request(method, url,
+        params=..., accept=..., json_body=...)`` is served from cache without
+        touching the network. Public sibling of ``_request`` used by bulk
+        prefetchers (e.g. the Semantic Scholar ``/paper/batch`` warm-up). A
+        cache-less client makes this a no-op; storage failures are swallowed
+        (priming is best-effort by definition).
+        """
+        if not self.cache:
+            return
+        try:
+            self.cache.set(self._cache_key(method, url, params, accept, json_body), value)
+        except Exception:
+            pass
+
+    def _adapt_rate_limiter(self, service: str | None, resp: httpx.Response) -> None:
+        """Feed a REAL (non-cache-hit) response to an adaptive rate limiter.
+
+        Called once per transport response -- including a retryable 429/5xx
+        before the retry exception is raised -- so a server ``Retry-After`` /
+        ``X-RateLimit-Remaining`` lands in the registry's backoff state.
+        Cache-hit synthetic responses never reach this (the cache
+        short-circuits before the request loop). No-op when the configured
+        limiter has no ``adapt`` attribute (plain RateLimiter / registry) or
+        no service was given.
+        """
+        if not service:
+            return
+        adapt = getattr(self._rate_limiter, "adapt", None)
+        if adapt is None:
+            return
+        try:
+            adapt(service, resp)
+        except Exception:
+            # Adaptation is advisory; it must never lose a fetched response.
+            logger.debug("rate-limiter adapt() failed for service %r", service, exc_info=True)
+
     def _request(
         self,
         method: str,
@@ -1649,9 +1826,23 @@ class HttpClient:
         """
         cache_key = None
         if self.cache:
-            cache_key = json.dumps({"m": method, "u": url, "p": params, "a": accept, "j": json_body}, sort_keys=True)
+            cache_key = self._cache_key(method, url, params, accept, json_body)
             cached = self.cache.get(cache_key)
             if cached is not None:
+                # v2 envelope: a cached non-JSON text response (arXiv Atom XML,
+                # ...). Reconstruct it with its original Content-Type so callers
+                # that inspect the header / use .text behave identically.
+                if isinstance(cached, dict) and cached.get(self.CACHE_ENVELOPE_KEY) is True:
+                    return httpx.Response(
+                        200,
+                        content=str(cached.get("text") or "").encode("utf-8"),
+                        headers={
+                            "Content-Type": str(cached.get("ct") or "text/plain"),
+                            "X-From-Cache": "1",
+                        },
+                    )
+                # Legacy format: the raw decoded JSON body (kept for backward
+                # compatibility with existing cache files).
                 return httpx.Response(
                     200,
                     content=json.dumps(cached).encode("utf-8"),
@@ -1672,13 +1863,30 @@ class HttpClient:
                 if service == "semanticscholar" and self.s2_api_key:
                     headers["x-api-key"] = self.s2_api_key
                 resp = self.client.request(method, url, params=params, headers=headers, json=json_body)
+                # Adaptive rate limiting feedback for every REAL response,
+                # including a retryable 429/5xx before it is raised below.
+                self._adapt_rate_limiter(service, resp)
                 if resp.status_code in self.RETRYABLE_STATUS:
                     raise httpx.HTTPStatusError("Retryable status", request=resp.request, response=resp)
-                if self.cache and cache_key and resp.headers.get("Content-Type", "").startswith("application/json"):
-                    try:
-                        self.cache.set(cache_key, resp.json())
-                    except Exception:
-                        pass
+                if self.cache and cache_key and resp.status_code == 200:
+                    content_type = resp.headers.get("Content-Type", "")
+                    if content_type.startswith("application/json"):
+                        # Legacy format: raw decoded JSON body (kept so old and
+                        # new cache files stay mutually compatible).
+                        try:
+                            self.cache.set(cache_key, resp.json())
+                        except Exception:
+                            pass
+                    elif self._is_cacheable_text(content_type):
+                        # Non-JSON text (arXiv Atom XML, ...): versioned envelope
+                        # preserving the Content-Type for faithful replay.
+                        try:
+                            self.cache.set(
+                                cache_key,
+                                {self.CACHE_ENVELOPE_KEY: True, "ct": content_type, "text": resp.text},
+                            )
+                        except Exception:
+                            pass
                 self._record_service_success(service)
                 return resp
             except httpx.HTTPError as exc:
@@ -1691,6 +1899,61 @@ class HttpClient:
                     backoff = min(backoff * 2, 16.0)
         self._record_service_failure(service)
         raise RuntimeError(f"Network failure after retries for {url}")
+
+
+# ------------- Venue-identity helpers -------------
+
+
+#: ISSN body after stripping the hyphen: 7 digits + a digit-or-X check char.
+_ISSN_BODY_RE = re.compile(r"^\d{7}[\dX]$")
+
+#: DBLP record-key prefixes that name a venue *stream* (``conf/icml/Smith23``
+#: -> stream ``conf/icml``). Other prefixes (``books``, ``phd``, ``homepages``)
+#: do not identify a recurring venue and are ignored.
+_DBLP_STREAM_TYPES = frozenset({"conf", "journals", "series"})
+
+
+def normalize_issn(value: Any) -> str | None:
+    """Normalize an ISSN to the standard hyphenated uppercase ``NNNN-NNNX`` form.
+
+    Accepts hyphenated/unhyphenated, any case (``1532-4435``, ``15324435``,
+    ``2167-647x``). Returns ``None`` for anything that is not 7 digits plus a
+    digit-or-X check character, so junk values never pollute identifier-based
+    venue grouping.
+    """
+    if not value:
+        return None
+    body = str(value).strip().upper().replace("-", "").replace(" ", "")
+    if not _ISSN_BODY_RE.match(body):
+        return None
+    return f"{body[:4]}-{body[4:]}"
+
+
+def dblp_stream_key(info: dict[str, Any]) -> str | None:
+    """Derive the DBLP venue *stream* key from a search-hit ``info`` dict.
+
+    DBLP record keys embed the venue stream as their first two segments:
+    ``conf/icml/Smith23`` -> ``conf/icml``; ``journals/corr/abs-2301-00001`` ->
+    ``journals/corr``. The same shape appears in the record URL after ``/rec/``
+    (``https://dblp.org/rec/conf/icml/Smith23``), which is consulted as a
+    fallback when ``key`` is absent. Parsing is defensive: anything that does
+    not look like ``<stream-type>/<stream>/<record-id>`` with a known stream
+    type yields ``None`` rather than a bogus venue identity.
+    """
+    if not isinstance(info, dict):
+        return None
+    candidates: list[str] = []
+    key = info.get("key")
+    if isinstance(key, str) and key.strip():
+        candidates.append(key.strip())
+    url = info.get("url")
+    if isinstance(url, str) and "/rec/" in url:
+        candidates.append(url.split("/rec/", 1)[1])
+    for cand in candidates:
+        parts = [p for p in cand.strip("/").split("/") if p]
+        if len(parts) >= 3 and parts[0].lower() in _DBLP_STREAM_TYPES:
+            return f"{parts[0].lower()}/{parts[1].lower()}"
+    return None
 
 
 # ------------- Data Classes -------------
@@ -1734,6 +1997,27 @@ class PublishedRecord:
     # by the OpenReview converter; None for every other source. Lets the verifier
     # act on a not-accepted match without re-fetching the note.
     acceptance: str | None = None
+    # ----- Venue-identity fields (cross-source venue consensus) -----
+    # All default-empty/None so every existing constructor call keeps working.
+    # Two records that share any of these identifiers refer to the SAME venue
+    # even when their venue *strings* differ and neither canonicalizes through
+    # the hand-curated alias map.
+    #: Venue ISSNs in the standard hyphenated uppercase ``NNNN-NNNX`` form
+    #: (``normalize_issn``). Crossref ``ISSN`` list / OpenAlex source ``issn``.
+    issn: tuple[str, ...] = ()
+    #: OpenAlex source id URL (e.g. ``https://openalex.org/S1983995261``).
+    venue_source_id: str | None = None
+    #: DBLP venue stream key (e.g. ``conf/icml``, ``journals/corr``); see
+    #: ``dblp_stream_key``. ``journals/corr`` marks the arXiv/CoRR preprint
+    #: stream and must never anchor a published-venue claim.
+    venue_key: str | None = None
+    #: Bare arXiv ID (version stripped) when the source ties this record to an
+    #: arXiv preprint: the arXiv Atom feed entry id, S2 ``externalIds.ArXiv``,
+    #: an OpenAlex arXiv landing page, or the record's own DataCite arXiv DOI.
+    #: Lets the preprint check pivot onto the MATCHED record's identity when
+    #: the entry itself carries no doi/eprint (HALLMARK preprint_as_published
+    #: entries strip identifiers; real-world offenders often cite none).
+    arxiv_id: str | None = None
 
     def surname_keys(self, limit: int = 3) -> list[str]:
         """Canonical surname comparison keys derived from ``self.authors``.
@@ -1795,6 +2079,18 @@ def crossref_message_to_record(msg: dict[str, Any]) -> PublishedRecord | None:
     title = titles[0] if titles else None
     if title:
         title = re.sub(r"<[^>]*>", "", title)  # strip HTML tags
+    # ACM/IEEE deposit colon-titles split across title/subtitle (the CACM NeRF
+    # record is title=["NeRF"], subtitle=["Representing scenes as ..."]).
+    # Dropping the subtitle left the record title as the bare head, so the
+    # DOI-consistency check compared the entry's FULL title against "NeRF"
+    # alone and flagged a CORRECT DOI as DOI_MISMATCH. Re-join them unless the
+    # subtitle is already contained in the title (some publishers repeat it).
+    subtitles = msg.get("subtitle") or []
+    subtitle = subtitles[0] if subtitles else None
+    if subtitle:
+        subtitle = re.sub(r"<[^>]*>", "", subtitle).strip()  # strip HTML tags
+    if title and subtitle and subtitle.lower() not in title.lower():
+        title = f"{title}: {subtitle}"
 
     # Authors - handle given/family and literal formats. Crossref returns
     # AUTHORITATIVE separate given/family fields, so a real ``family`` is
@@ -1822,9 +2118,11 @@ def crossref_message_to_record(msg: dict[str, Any]) -> PublishedRecord | None:
     container = msg.get("container-title", [])
     journal = container[0] if container else None
 
-    # Publication date - check multiple date fields
+    # Publication date - check multiple date fields. ``created`` is the DOI
+    # *deposit* date, which can be years off the publication date for
+    # backfilled archives, so it is consulted strictly LAST.
     pubyear = None
-    for dt_key in ("published-print", "published-online", "created", "issued", "published"):
+    for dt_key in ("published-print", "published-online", "issued", "published", "created"):
         if msg.get(dt_key, {}).get("date-parts"):
             y = msg[dt_key]["date-parts"][0][0]
             if y:
@@ -1833,6 +2131,17 @@ def crossref_message_to_record(msg: dict[str, Any]) -> PublishedRecord | None:
 
     # Issue can be in different locations
     issue = msg.get("issue") or msg.get("journal-issue", {}).get("issue")
+
+    # Venue identity: Crossref carries the container's ISSNs (print + online).
+    # Normalized + deduped; junk entries are dropped by ``normalize_issn``.
+    raw_issns = msg.get("ISSN") or []
+    if isinstance(raw_issns, str):
+        raw_issns = [raw_issns]
+    issns: list[str] = []
+    for raw_issn in raw_issns if isinstance(raw_issns, list) else []:
+        norm_issn = normalize_issn(raw_issn)
+        if norm_issn and norm_issn not in issns:
+            issns.append(norm_issn)
 
     return PublishedRecord(
         doi=doi,
@@ -1848,6 +2157,7 @@ def crossref_message_to_record(msg: dict[str, Any]) -> PublishedRecord | None:
         type=typ,
         structured_names=has_structured_family,
         order_reliable=True,
+        issn=tuple(issns),
     )
 
 
@@ -1929,6 +2239,7 @@ def dblp_hit_to_record(hit: dict[str, Any]) -> PublishedRecord | None:
         number=number,
         pages=pages,
         type=record_type,
+        venue_key=dblp_stream_key(info),
     )
 
 
@@ -2017,12 +2328,27 @@ def dblp_hit_to_candidate_record(hit: dict[str, Any]) -> PublishedRecord | None:
         pages=info.get("pages"),
         type=record_type,
         order_reliable=True,
+        venue_key=dblp_stream_key(info),
     )
 
 
 def s2_data_to_record(data: dict[str, Any]) -> PublishedRecord | None:
     """Convert Semantic Scholar data to a PublishedRecord."""
-    doi = doi_normalize(data.get("doi") or (data.get("externalIds") or {}).get("DOI"))
+    external_ids = data.get("externalIds") or {}
+    doi = doi_normalize(data.get("doi") or external_ids.get("DOI"))
+
+    # arXiv identity: S2 exposes the bare ID in ``externalIds.ArXiv`` (kept on
+    # published papers too, since S2 merges preprint + published versions).
+    # Fall back to a DataCite arXiv DOI. Version-stripped + month-validated so
+    # junk values never pollute the preprint-twin pivot downstream.
+    arxiv_id: str | None = None
+    raw_arxiv = external_ids.get("ArXiv")
+    if isinstance(raw_arxiv, str) and raw_arxiv.strip():
+        bare = re.sub(r"v\d+$", "", raw_arxiv.strip())
+        if is_valid_arxiv_id(bare):
+            arxiv_id = bare
+    if arxiv_id is None:
+        arxiv_id = arxiv_id_from_datacite_doi(doi)
 
     # Parse authors
     authors = []
@@ -2064,6 +2390,7 @@ def s2_data_to_record(data: dict[str, Any]) -> PublishedRecord | None:
         journal=venue,
         year=data.get("year"),
         type=record_type,
+        arxiv_id=arxiv_id,
     )
 
 
@@ -2128,6 +2455,11 @@ def arxiv_atom_to_record(xml: str) -> PublishedRecord | None:
     doi_el = entry.find("arxiv:doi", _ATOM_NS)
     doi = doi_normalize(doi_el.text) if doi_el is not None and doi_el.text else ""
 
+    # The Atom <id> is the abs URL (``http://arxiv.org/abs/2301.00001v2``);
+    # extract the bare, version-stripped arXiv ID so the record carries its own
+    # preprint identity even when the entry that matched it cites no identifier.
+    arxiv_id = extract_arxiv_id_from_text(entry_id) if entry_id else None
+
     return PublishedRecord(
         doi=doi or "",
         url=entry_id or None,
@@ -2137,6 +2469,7 @@ def arxiv_atom_to_record(xml: str) -> PublishedRecord | None:
         year=year,
         type="preprint",
         method="arXiv(id_list)",
+        arxiv_id=arxiv_id,
     )
 
 

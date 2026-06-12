@@ -36,10 +36,14 @@ from rapidfuzz.fuzz import token_sort_ratio
 from bibtex_updater.utils import (
     OPENALEX_API,
     OPENREVIEW_API,
+    OPENREVIEW_API_V2,
     PublishedRecord,
+    arxiv_id_from_datacite_doi,
+    extract_arxiv_id_from_text,
     is_preprint_venue,
     last_name_from_person,
     latex_to_plain,
+    normalize_issn,
     normalize_title_for_match,
     strip_diacritics,
 )
@@ -187,6 +191,46 @@ class OpenAlexClient:
             return []
         return results
 
+    def search_sources(self, query: str, limit: int = 10) -> list[dict[str, Any]] | None:
+        """Search the OpenAlex *sources* registry (journals / conference series).
+
+        Endpoint: ``GET /sources?search=<venue>&per-page=<limit>`` (polite-pool
+        ``mailto`` included). Used by the venue-existence check, so errors must
+        be distinguishable from zero hits: returns ``None`` on any non-200 /
+        parse / network failure (callers MUST treat that as "could not check",
+        never as "venue missing") and a possibly-empty source list only when
+        OpenAlex answered successfully.
+        """
+        if not query or not query.strip():
+            return []
+        per_page = max(1, min(int(limit), 25))
+        url = f"{OPENALEX_API}/sources"
+        params: dict[str, Any] = {"search": query.strip(), "per-page": per_page, "mailto": self.mailto}
+        try:
+            if self.http is not None and hasattr(self.http, "_request"):
+                resp = self.http._request(
+                    "GET",
+                    url,
+                    params=params,
+                    accept="application/json",
+                    service="openalex",
+                )
+                if resp.status_code != 200:
+                    return None
+                data = resp.json() or {}
+            else:
+                with httpx.Client(timeout=self.timeout) as client:
+                    resp = client.get(url, params=params)
+                    if resp.status_code != 200:
+                        return None
+                    data = resp.json() or {}
+        except Exception:
+            return None
+        results = data.get("results")
+        if results is None:
+            results = []
+        return results if isinstance(results, list) else None
+
 
 def openalex_work_to_candidate_record(work: dict[str, Any]) -> PublishedRecord | None:
     """Permissive OpenAlex -> ``PublishedRecord`` conversion for cascade search.
@@ -225,10 +269,52 @@ def openalex_work_to_candidate_record(work: dict[str, Any]) -> PublishedRecord |
             authors.append({"given": "", "family": parts[0]})
 
     primary_location = work.get("primary_location") or {}
+    if not isinstance(primary_location, dict):
+        primary_location = {}
     source = primary_location.get("source") or {}
+    if not isinstance(source, dict):
+        source = {}
     journal = source.get("display_name")
     year = work.get("publication_year")
     work_type = work.get("type")
+
+    # arXiv identity: OpenAlex has no first-class arXiv field on works; the ID
+    # is recoverable from a DataCite arXiv DOI (``10.48550/arXiv.<id>``) or
+    # from an arxiv.org landing/PDF URL on the primary location / locations
+    # list. Defensive throughout: any unexpected shape just leaves it None.
+    arxiv_id = arxiv_id_from_datacite_doi(doi)
+    if arxiv_id is None:
+        locations: list[Any] = [primary_location]
+        raw_locations = work.get("locations")
+        if isinstance(raw_locations, list):
+            locations.extend(raw_locations)
+        for loc in locations:
+            if not isinstance(loc, dict):
+                continue
+            for url_field in ("landing_page_url", "pdf_url"):
+                url_val = loc.get(url_field)
+                if isinstance(url_val, str) and "arxiv.org" in url_val.lower():
+                    arxiv_id = extract_arxiv_id_from_text(url_val)
+                    if arxiv_id:
+                        break
+            if arxiv_id:
+                break
+
+    # Venue identity: the OpenAlex source id is a stable venue identifier, and
+    # ``issn``/``issn_l`` carry the journal's ISSNs. Defensive: any unexpected
+    # shape yields empty identity fields rather than a parse error.
+    raw_source_id = source.get("id")
+    venue_source_id = raw_source_id if isinstance(raw_source_id, str) and raw_source_id.strip() else None
+    raw_issns = source.get("issn") or []
+    if isinstance(raw_issns, str):
+        raw_issns = [raw_issns]
+    issns: list[str] = []
+    issn_candidates = list(raw_issns) if isinstance(raw_issns, list) else []
+    issn_candidates.append(source.get("issn_l"))
+    for raw_issn in issn_candidates:
+        norm_issn = normalize_issn(raw_issn)
+        if norm_issn and norm_issn not in issns:
+            issns.append(norm_issn)
 
     return PublishedRecord(
         doi=doi,
@@ -238,6 +324,9 @@ def openalex_work_to_candidate_record(work: dict[str, Any]) -> PublishedRecord |
         year=year,
         type=work_type,
         order_reliable=True,
+        issn=tuple(issns),
+        venue_source_id=venue_source_id,
+        arxiv_id=arxiv_id,
     )
 
 
@@ -344,6 +433,13 @@ class OpenReviewClient:
         with the plain title so the cascade still gets a chance to confirm the
         venue. A fabricated paper still returns 0 notes under both queries:
         the index is closed-world over OpenReview-hosted submissions.
+
+        API v2 fallback: venues that migrated to ``api2.openreview.net`` (ICLR
+        2024+, NeurIPS 2023+, most 2024+ venues) are INVISIBLE on the legacy v1
+        host, so when BOTH v1 lookups miss we issue the same term search against
+        the v2 ``/notes/search`` endpoint. Same gating as the v1 term fallback
+        (requires ``first_author`` + a built paperhash); v2 notes wrap content
+        fields as ``{"value": ...}``, which the converters already accept.
         """
         per_page = max(1, min(int(limit), MAX_TOP_K))
         paperhash = build_openreview_paperhash(title or "", first_author or "")
@@ -364,15 +460,25 @@ class OpenReviewClient:
         if not plain_title:
             return []
         term_params = {"term": plain_title, "limit": per_page}
-        return self._fetch(term_params)
+        notes = self._fetch(term_params)
+        if notes:
+            return notes
+        # API v2 fallback: only reached when v1 paperhash AND v1 term both
+        # missed -- the note may live on the v2-only host. Defensive like every
+        # other path: any error / non-200 yields [].
+        return self._fetch(term_params, url=f"{OPENREVIEW_API_V2}/notes/search")
 
-    def _fetch(self, params: dict[str, Any]) -> list[dict[str, Any]]:
-        """Issue a single OpenReview ``/notes`` request, return the note list.
+    def _fetch(self, params: dict[str, Any], url: str | None = None) -> list[dict[str, Any]]:
+        """Issue a single OpenReview request, return the note list.
 
-        Preserves shared-HttpClient-vs-bare-httpx routing (rate limiting + caching
-        on the shared path). Returns ``[]`` on any non-200 status or exception.
+        ``url`` defaults to the legacy v1 ``/notes`` endpoint; the API v2
+        fallback passes the ``api2.openreview.net/notes/search`` URL instead
+        (both hosts answer ``{"notes": [...]}``). Preserves
+        shared-HttpClient-vs-bare-httpx routing (rate limiting + caching on the
+        shared path). Returns ``[]`` on any non-200 status or exception.
         """
-        url = f"{OPENREVIEW_API}/notes"
+        if url is None:
+            url = f"{OPENREVIEW_API}/notes"
         try:
             if self.http is not None and hasattr(self.http, "_request"):
                 resp = self.http._request(

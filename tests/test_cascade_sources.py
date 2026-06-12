@@ -690,3 +690,110 @@ class TestCascadePassesRawTitle(TestQueryCascade):
         # short-circuits at DBLP and never reaches Semantic Scholar.
         assert sources_queried == ["crossref", "openalex", "dblp"]
         assert any(src == "dblp" for _, _, src in cands)
+
+
+class TestLatexFreeRetrievalTitles(TestQueryCascade):
+    """FIX: LaTeX-laden titles (``{B}rain {S}urgeon`` braces, ``M\\"uller``
+    escapes) must be stripped from the title used for EVERY retrieval path --
+    Crossref ``query.title``, OpenAlex ``filter=title.search:``, the S2
+    free-text query, OpenReview, and the relaxed/structured-recheck retries --
+    not just DBLP (FIX B2). Retrieval only: scoring still normalizes the
+    original strings.
+    """
+
+    LATEX_TITLE = "The Combinatorial {B}rain {S}urgeon: Pruning Weights That Cancel One Another in Neural Networks"
+    PLAIN_TITLE = "The Combinatorial Brain Surgeon: Pruning Weights That Cancel One Another in Neural Networks"
+
+    def _entry(self):
+        return {
+            "ID": "yu2022brain",
+            "ENTRYTYPE": "inproceedings",
+            "title": self.LATEX_TITLE,
+            "author": "Yu, Xin and Serra, Thiago",
+            "booktitle": "ICML",
+            "year": "2022",
+        }
+
+    def _cascade_checker(self):
+        fc, oa = self._build(cr_items=[], s2_items=[], oa_items=[])
+        fc.openalex = oa
+        fc.dblp = MagicMock()
+        fc.dblp.search.return_value = []
+        fc.openreview = MagicMock()
+        fc.openreview.search.return_value = []
+        return fc, oa
+
+    def test_all_cascade_sources_receive_brace_free_title(self):
+        fc, oa = self._cascade_checker()
+        entry = self._entry()
+
+        fc._query_cascade(entry, "combinatorial brain surgeon yu", [], [], [])
+
+        # Crossref fielded query.title is brace-free (first, strict call).
+        cr_kwargs = fc.crossref.search.call_args_list[0].kwargs
+        assert cr_kwargs["title"] == self.PLAIN_TITLE
+        # OpenAlex fielded title.search is brace-free.
+        oa_kwargs = oa.search.call_args_list[0].kwargs
+        assert oa_kwargs["title"] == self.PLAIN_TITLE
+        # DBLP free-text query is brace-free (pre-existing FIX B2 behavior).
+        dblp_query = fc.dblp.search.call_args[0][0]
+        assert "{" not in dblp_query and self.PLAIN_TITLE in dblp_query
+        # OpenReview paperhash title is brace-free.
+        or_kwargs = fc.openreview.search.call_args.kwargs
+        assert or_kwargs["title"] == self.PLAIN_TITLE
+        # Semantic Scholar free-text query is brace-free.
+        s2_query = fc.s2.search.call_args[0][0]
+        assert "{" not in s2_query and self.PLAIN_TITLE in s2_query
+
+    def test_relaxed_author_fallback_receives_brace_free_title(self):
+        fc, oa = self._cascade_checker()
+        entry = self._entry()
+
+        # Zero usable candidates -> the title-only fallback retries fire.
+        fc._query_cascade(entry, "combinatorial brain surgeon yu", [], [], [])
+
+        assert len(fc.crossref.search.call_args_list) == 2
+        fallback_call = fc.crossref.search.call_args_list[1]
+        assert fallback_call.args[0] == self.PLAIN_TITLE
+        assert fallback_call.kwargs["title"] == self.PLAIN_TITLE
+
+        assert len(oa.search.call_args_list) == 2
+        oa_fallback = oa.search.call_args_list[1]
+        assert oa_fallback.args[0] == self.PLAIN_TITLE
+        assert oa_fallback.kwargs["title"] == self.PLAIN_TITLE
+
+    def test_structured_author_recheck_search_is_brace_free(self):
+        fc, _ = self._cascade_checker()
+        entry = self._entry()  # no DOI -> Path 2 (fielded Crossref search)
+        best_match = PublishedRecord(
+            doi=None,
+            title=self.PLAIN_TITLE,
+            authors=[{"given": "", "family": "Xin Yu"}],
+            structured_names=False,
+        )
+
+        fc._structured_author_recheck(entry, best_match)
+
+        recheck_call = fc.crossref.search.call_args
+        assert recheck_call.args[0] == self.PLAIN_TITLE
+        assert recheck_call.kwargs["title"] == self.PLAIN_TITLE
+
+    def test_scoring_still_uses_original_title_normalization(self):
+        """The brace-stripped retrieval title must not leak into scoring: an
+        exact (normalized) match still scores 1.0 on the title component."""
+        cr_item = {
+            "DOI": "10.5555/brain",
+            "title": [self.PLAIN_TITLE],
+            "author": [{"given": "Xin", "family": "Yu"}, {"given": "Thiago", "family": "Serra"}],
+            "container-title": ["ICML"],
+            "issued": {"date-parts": [[2022]]},
+            "type": "proceedings-article",
+        }
+        fc, oa = self._build(cr_items=[cr_item])
+        fc.openalex = oa
+        entry = self._entry()
+
+        candidates = fc._query_cascade(entry, "combinatorial brain surgeon yu", [], [], [])
+
+        cr_scores = [score for score, _rec, src in candidates if src == "crossref"]
+        assert cr_scores and max(cr_scores) == pytest.approx(1.0)
