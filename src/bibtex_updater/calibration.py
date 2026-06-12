@@ -21,8 +21,14 @@ __all__ = [
     "decompose_field_confidence",
     "status_aware_confidence",
     "calibrate_result",
+    "p_valid_from_result",
     "DEFAULT_FIELD_WEIGHTS",
     "STATUS_BASE_CONFIDENCE",
+    "P_VALID_VALID_STATUSES",
+    "P_VALID_PROBLEM_STATUSES",
+    "P_VALID_ABSTAIN_STATUSES",
+    "P_VALID_NOT_FOUND_CLEAN",
+    "P_VALID_NEUTRAL",
 ]
 
 # Status-specific base confidences (priors), grounded in the fact-checker's
@@ -410,3 +416,133 @@ def calibrate_result(
         return 0.7 * base_confidence + 0.3 * weighted_field_score
 
     return base_confidence
+
+
+# ------------- Explicit P(valid) output contract -------------
+#
+# ``overall_confidence`` (everything above) answers "how confident is the tool
+# that the ASSIGNED STATUS is the right call". Downstream consumers
+# (benchmarks, rankers, thresholding pipelines) instead need P(valid): the
+# probability that the entry AS CITED refers to a real publication with
+# correct metadata. The two differ in *direction*: a ``hallucinated`` verdict
+# at confidence 0.93 means the entry is almost certainly NOT valid
+# (P(valid) ~ 0.04), while a ``verified`` verdict at the same confidence means
+# it almost certainly IS (~ 0.96). :func:`p_valid_from_result` makes that
+# mapping explicit via the status-polarity map below, so consumers no longer
+# have to reverse-engineer the confidence semantics per status.
+#
+# The polarity map is a NEW, explicit layer ON TOP of the verdict confidences;
+# it deliberately does NOT change :data:`STATUS_BASE_CONFIDENCE` (which keeps
+# pricing "is the verdict the right call"). Notably ``preprint_only`` /
+# ``unpublished_at_claimed_venue`` sit in STATUS_BASE_CONFIDENCE's
+# CLEARLY-CORRECT tier (the tool is confident in the verdict: a real record
+# was found) but are PROBLEM-polarity here, because the claim AS CITED
+# ("published at venue X") is contradicted -- the entry as cited is not valid.
+
+#: VALID-polarity: the verdict asserts the entry as cited is fine.
+P_VALID_VALID_STATUSES = frozenset(
+    {
+        "verified",
+        "published_version_exists",
+        "url_verified",
+        "url_accessible",
+        "book_verified",
+        "working_paper_verified",
+    }
+)
+
+#: PROBLEM-polarity: the verdict asserts something is wrong with the entry AS
+#: CITED (fabricated, mis-attributed, mis-dated, mis-venued, or a preprint
+#: passed off as published).
+P_VALID_PROBLEM_STATUSES = frozenset(
+    {
+        "hallucinated",
+        "title_mismatch",
+        "author_mismatch",
+        "given_name_substitution",
+        "year_mismatch",
+        "venue_mismatch",
+        "partial_match",
+        "nonexistent_venue",
+        "future_date",
+        "invalid_year",
+        "doi_mismatch",
+        "arxiv_id_mismatch",
+        "doi_not_found",
+        "title_near_miss",
+        "author_truncated",
+        "preprint_only",
+        "unpublished_at_claimed_venue",
+        "url_content_mismatch",
+    }
+)
+
+#: ABSTENTION-polarity: the tool could not decide either way, so P(valid)
+#: stays neutral. ``not_found`` is deliberately NOT here -- it is special-cased
+#: in :func:`p_valid_from_result` (a clean exhaustive miss carries weak
+#: evidence of fabrication; a coverage-incomplete one does not).
+P_VALID_ABSTAIN_STATUSES = frozenset(
+    {
+        "unconfirmed",
+        "api_error",
+        "url_not_found",
+        "book_not_found",
+        "working_paper_not_found",
+        "strict_warn_preprint_year",
+        "strict_warn_cnv",
+        "skipped",
+    }
+)
+
+#: Neutral P(valid) for abstentions, coverage-incomplete misses, and unknown
+#: statuses. Starting point for offline calibration against labeled data.
+P_VALID_NEUTRAL = 0.5
+
+#: P(valid) for a CLEAN exhaustive ``not_found`` (no source errors during the
+#: lookup): in well-indexed domains, "no source knows this paper" is real --
+#: if weak -- evidence of fabrication, so it sits below neutral. Starting
+#: point for offline calibration against labeled data.
+P_VALID_NOT_FOUND_CLEAN = 0.35
+
+
+def p_valid_from_result(status: str, verdict_confidence: float, coverage_incomplete: bool = False) -> float:
+    """Probability that the ENTRY AS CITED refers to a real publication with
+    correct metadata (P(valid)).
+
+    This is the value downstream consumers should threshold/rank on;
+    ``verdict_confidence`` (the existing ``overall_confidence``) remains
+    "confidence that the assigned status is the right call".
+
+    Mapping (``conf`` = ``verdict_confidence`` clamped to [0, 1]):
+
+    * VALID-polarity statuses (:data:`P_VALID_VALID_STATUSES`)
+      -> ``0.5 + 0.5 * conf`` (confidence 0.88 -> 0.94; never below 0.5).
+    * PROBLEM-polarity statuses (:data:`P_VALID_PROBLEM_STATUSES`)
+      -> ``0.5 - 0.5 * conf`` (confidence 0.93 -> 0.035; never above 0.5).
+    * ``not_found``: a CLEAN exhaustive miss (``coverage_incomplete=False``)
+      -> :data:`P_VALID_NOT_FOUND_CLEAN`; with ``coverage_incomplete=True``
+      (sources errored / were throttled during the lookup, so the miss is not
+      exhaustive) -> :data:`P_VALID_NEUTRAL`.
+    * Other abstentions (:data:`P_VALID_ABSTAIN_STATUSES`) and unknown/future
+      statuses (defensive) -> :data:`P_VALID_NEUTRAL`.
+
+    Args:
+        status: ``FactCheckStatus`` value string (e.g. ``"verified"``).
+        verdict_confidence: 0-1 confidence that the assigned status is the
+            right call (``FactCheckResult.overall_confidence``).
+        coverage_incomplete: True when the verdict was produced while sources
+            were erroring or circuit-broken
+            (``FactCheckResult.coverage_incomplete``).
+
+    Returns:
+        P(valid) in [0, 1].
+    """
+    conf = max(0.0, min(1.0, verdict_confidence))
+    if status in P_VALID_VALID_STATUSES:
+        return 0.5 + 0.5 * conf
+    if status in P_VALID_PROBLEM_STATUSES:
+        return 0.5 - 0.5 * conf
+    if status == "not_found":
+        return P_VALID_NEUTRAL if coverage_incomplete else P_VALID_NOT_FOUND_CLEAN
+    # Known abstentions land here too; unknown statuses default neutral.
+    return P_VALID_NEUTRAL

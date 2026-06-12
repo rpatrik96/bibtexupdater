@@ -5,10 +5,16 @@ from __future__ import annotations
 import pytest
 
 from bibtex_updater.calibration import (
+    P_VALID_ABSTAIN_STATUSES,
+    P_VALID_NEUTRAL,
+    P_VALID_NOT_FOUND_CLEAN,
+    P_VALID_PROBLEM_STATUSES,
+    P_VALID_VALID_STATUSES,
     STATUS_BASE_CONFIDENCE,
     calibrate_result,
     compute_confidence_from_scores,
     decompose_field_confidence,
+    p_valid_from_result,
     status_aware_confidence,
 )
 
@@ -635,3 +641,96 @@ class TestBucketCoherence:
         for status in ALL_VERDICT_STATUSES + ("skipped",):
             conf = _end_to_end(status, found=True, match_score=0.8)
             assert 0.0 <= conf <= 1.0, f"{status} -> {conf}"
+
+
+# ------------- Test p_valid_from_result (explicit P(valid) layer) -------------
+
+
+class TestPValidFromResult:
+    """The explicit P(valid) output contract.
+
+    ``p_valid_from_result`` maps (status, verdict_confidence) onto the
+    probability that the ENTRY AS CITED is a real publication with correct
+    metadata. ``verdict_confidence`` keeps its existing meaning ("confidence
+    the assigned status is the right call"); the polarity map supplies the
+    direction consumers previously had to reverse-engineer.
+    """
+
+    def test_valid_polarity_spot_checks(self):
+        assert p_valid_from_result("verified", 0.88) == pytest.approx(0.94)
+        assert p_valid_from_result("published_version_exists", 0.88) == pytest.approx(0.94)
+        assert p_valid_from_result("book_verified", 0.6) == pytest.approx(0.8)
+        # Never below 0.5, even at zero confidence in the verdict.
+        for status in P_VALID_VALID_STATUSES:
+            assert p_valid_from_result(status, 0.0) == pytest.approx(0.5), status
+            assert p_valid_from_result(status, 0.3) > 0.5, status
+
+    def test_problem_polarity_spot_checks(self):
+        assert p_valid_from_result("hallucinated", 0.93) == pytest.approx(0.035)
+        assert p_valid_from_result("author_mismatch", 0.78) == pytest.approx(0.11)
+        assert p_valid_from_result("doi_mismatch", 0.93) == pytest.approx(0.035)
+        assert p_valid_from_result("nonexistent_venue", 0.78) == pytest.approx(0.11)
+        # Never above 0.5, even at zero confidence in the verdict.
+        for status in P_VALID_PROBLEM_STATUSES:
+            assert p_valid_from_result(status, 0.0) == pytest.approx(0.5), status
+            assert p_valid_from_result(status, 0.3) < 0.5, status
+
+    def test_preprint_only_is_problem_polarity_despite_correct_tier_prior(self):
+        """STATUS_BASE_CONFIDENCE prices preprint_only in the CLEARLY-CORRECT
+        tier (the tool is confident in the VERDICT: a real record was found);
+        for P(valid) the claim AS CITED (published at venue X) is contradicted,
+        so the polarity map deliberately diverges. Same for the OpenReview
+        not-accepted status."""
+        assert STATUS_BASE_CONFIDENCE["preprint_only"] >= 0.72
+        assert p_valid_from_result("preprint_only", 0.88) == pytest.approx(0.06)
+        assert p_valid_from_result("unpublished_at_claimed_venue", 0.88) == pytest.approx(0.06)
+
+    def test_abstention_polarity_is_neutral_regardless_of_confidence(self):
+        for status in P_VALID_ABSTAIN_STATUSES:
+            for conf in (0.0, 0.45, 1.0):
+                assert p_valid_from_result(status, conf) == pytest.approx(P_VALID_NEUTRAL), status
+
+    def test_not_found_clean_vs_coverage_incomplete(self):
+        """A clean exhaustive miss is weak evidence of fabrication; the same
+        miss with errored/throttled sources is no evidence at all."""
+        assert p_valid_from_result("not_found", 0.45) == pytest.approx(P_VALID_NOT_FOUND_CLEAN)
+        assert p_valid_from_result("not_found", 0.45, coverage_incomplete=False) == pytest.approx(
+            P_VALID_NOT_FOUND_CLEAN
+        )
+        assert p_valid_from_result("not_found", 0.45, coverage_incomplete=True) == pytest.approx(P_VALID_NEUTRAL)
+        # The confidence input does not move the not_found special case.
+        assert p_valid_from_result("not_found", 0.9) == pytest.approx(P_VALID_NOT_FOUND_CLEAN)
+
+    def test_ordering_invariants(self):
+        """The contract's headline ordering: confident-valid > abstention >
+        clean exhaustive miss > soft problem > strong problem."""
+        assert (
+            p_valid_from_result("verified", 0.88)
+            > p_valid_from_result("unconfirmed", 0.45)
+            > p_valid_from_result("not_found", 0.45)
+            > p_valid_from_result("author_mismatch", 0.78)
+            > p_valid_from_result("hallucinated", 0.93)
+        )
+
+    def test_clamping_at_confidence_bounds(self):
+        # Exact bounds.
+        assert p_valid_from_result("verified", 1.0) == pytest.approx(1.0)
+        assert p_valid_from_result("verified", 0.0) == pytest.approx(0.5)
+        assert p_valid_from_result("hallucinated", 1.0) == pytest.approx(0.0)
+        assert p_valid_from_result("hallucinated", 0.0) == pytest.approx(0.5)
+        # Out-of-range confidences clamp instead of leaving [0, 1].
+        assert p_valid_from_result("verified", 1.7) == pytest.approx(1.0)
+        assert p_valid_from_result("verified", -0.4) == pytest.approx(0.5)
+        assert p_valid_from_result("hallucinated", 1.7) == pytest.approx(0.0)
+        assert p_valid_from_result("hallucinated", -0.4) == pytest.approx(0.5)
+
+    def test_unknown_status_defaults_neutral(self):
+        assert p_valid_from_result("some_future_status", 0.93) == pytest.approx(P_VALID_NEUTRAL)
+
+    def test_unit_range_for_all_known_statuses(self):
+        all_statuses = P_VALID_VALID_STATUSES | P_VALID_PROBLEM_STATUSES | P_VALID_ABSTAIN_STATUSES | {"not_found"}
+        for status in all_statuses:
+            for conf in (0.0, 0.25, 0.5, 0.75, 1.0):
+                for incomplete in (False, True):
+                    p = p_valid_from_result(status, conf, incomplete)
+                    assert 0.0 <= p <= 1.0, (status, conf, incomplete)

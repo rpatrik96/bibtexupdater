@@ -45,7 +45,7 @@ import bibtexparser
 import httpx
 from rapidfuzz.fuzz import token_sort_ratio
 
-from bibtex_updater.calibration import calibrate_result
+from bibtex_updater.calibration import calibrate_result, p_valid_from_result
 from bibtex_updater.matching import (
     EXPANDED_VENUE_ALIASES,
     JOURNAL_CANONICAL_VENUES,
@@ -304,6 +304,33 @@ def _is_abstained_status(status: FactCheckStatus) -> bool:
     return status.value in ABSTAINED_STATUS_VALUES
 
 
+def _compute_coverage_incomplete(status: FactCheckStatus, errors: list[str]) -> bool:
+    """True when an abstention verdict may be due to source errors/throttling.
+
+    A NOT_FOUND/UNCONFIRMED produced while sources were erroring or
+    circuit-broken is indistinguishable from a clean exhaustive miss without
+    this flag, so downstream consumers were reading throttled lookups as
+    evidence of fabrication. ``errors`` is the per-entry error list -- it
+    captures per-source exceptions (including ``CircuitOpenError`` texts)
+    appended in ``_query_cascade`` and the pre-check helpers.
+
+    Rules:
+
+    * ``API_ERROR`` is definitionally incomplete coverage -> always True.
+    * Abstentions (:func:`_is_abstained_status`) and their opt-in strict
+      promotion ``STRICT_WARN_CNV`` (a re-labeled NOT_FOUND/UNCONFIRMED, so
+      the signal must survive the promotion) -> True iff any source errored
+      for this entry.
+    * VERIFIED / problem statuses -> always False, even with errors: a
+      positive verdict stands on its own evidence.
+    """
+    if status is FactCheckStatus.API_ERROR:
+        return True
+    if _is_abstained_status(status) or status is FactCheckStatus.STRICT_WARN_CNV:
+        return bool(errors)
+    return False
+
+
 @dataclass
 class FieldComparison:
     """Result of comparing a single field between entry and API record.
@@ -380,6 +407,29 @@ class FactCheckResult:
     # without racing on shared mutable state.
     author_intersection: AuthorIntersectionResult | None = None
     source_records: dict[str, PublishedRecord | None] = field(default_factory=dict)
+    # Output contract -- both fields are DERIVED, recomputed in __post_init__
+    # from (status, errors, overall_confidence) at EVERY construction site
+    # (check_entry's early returns, the cascade assembly, the verifier
+    # factories, the processor's exception fallback, ...), so they can never
+    # disagree with the verdict they describe. Values passed to the
+    # constructor are normalized to the derivation.
+    #
+    # ``coverage_incomplete``: the verdict is an abstention (or API_ERROR)
+    # reached while >= 1 source errored / was throttled / circuit-broken. A
+    # NOT_FOUND carrying this flag is NOT a clean exhaustive miss and must
+    # not be read as evidence of fabrication; re-run after a cooldown.
+    coverage_incomplete: bool = False
+    # ``p_valid``: probability that the entry AS CITED refers to a real
+    # publication with correct metadata -- the value downstream consumers
+    # should threshold/rank on. ``overall_confidence`` remains "confidence
+    # that the assigned status is the right call".
+    # See :func:`bibtex_updater.calibration.p_valid_from_result`.
+    p_valid: float = 0.5
+
+    def __post_init__(self) -> None:
+        """Derive the output-contract fields from the verdict itself."""
+        self.coverage_incomplete = _compute_coverage_incomplete(self.status, self.errors)
+        self.p_valid = p_valid_from_result(self.status.value, self.overall_confidence, self.coverage_incomplete)
 
 
 @dataclass
@@ -488,6 +538,11 @@ class VerificationResult:
     sources_confirmed: list[str]
     issues: list[str]
     matched_metadata: dict[str, str] | None = None
+    # Output contract, mirrored from the originating FactCheckResult (see the
+    # field docs there): P(entry as cited is valid) and the incomplete-source-
+    # coverage flag for abstentions.
+    p_valid: float = 0.5
+    coverage_incomplete: bool = False
 
 
 # ------------- Item 4: Numeric confidence (0-100) -------------
@@ -635,6 +690,8 @@ def build_verification_result(
         sources_confirmed=sources_confirmed,
         issues=issues,
         matched_metadata=matched,
+        p_valid=fc_result.p_valid,
+        coverage_incomplete=fc_result.coverage_incomplete,
     )
 
 
@@ -5289,7 +5346,15 @@ class FactCheckProcessor:
                                 # verify") are unambiguously identifiable and never
                                 # read as confirmed hallucinations downstream.
                                 "abstained": _is_abstained_status(result.status),
+                                # Output contract: an abstention reached while
+                                # sources errored/were throttled is NOT a clean
+                                # exhaustive miss (re-run after cooldown).
+                                "coverage_incomplete": result.coverage_incomplete,
                                 "confidence": result.overall_confidence,
+                                # Output contract: P(entry as cited is valid) --
+                                # threshold/rank on this; "confidence" remains
+                                # "confidence the assigned status is right".
+                                "p_valid": result.p_valid,
                                 # Additive: 0-100 numeric confidence (Item 4).
                                 "confidence_score": float(getattr(result, "confidence_score", 0.0)),
                                 "mismatched_fields": [n for n, c in result.field_comparisons.items() if not c.matches],
@@ -5397,6 +5462,9 @@ class FactCheckProcessor:
             "could_not_verify_rate": abstained_count / len(results) if results else 0,
             "abstained_count": abstained_count,
             "problematic_count": sum(counts.get(s, 0) for s in problematic_statuses),
+            # Abstentions/API errors reached while sources errored or were
+            # throttled: not clean exhaustive misses (re-run after cooldown).
+            "coverage_incomplete_count": sum(1 for r in results if r.coverage_incomplete),
         }
 
     def generate_json_report(self, results: list[FactCheckResult]) -> dict[str, Any]:
@@ -5409,6 +5477,11 @@ class FactCheckProcessor:
                 "category": r.category.value if r.category else None,
                 "status": r.status.value,
                 "confidence": r.overall_confidence,
+                # Output contract: P(entry as cited is valid) + incomplete-
+                # source-coverage flag (mirrors the JSONL record; see
+                # process_entries).
+                "p_valid": r.p_valid,
+                "coverage_incomplete": r.coverage_incomplete,
                 # Additive: 0-100 numeric confidence (Item 4).
                 "confidence_score": float(getattr(r, "confidence_score", 0.0)),
                 "field_comparisons": {
@@ -5474,7 +5547,11 @@ class FactCheckProcessor:
                         "status": r.status.value,
                         # Fix B: distinct abstention flag (see process_entries).
                         "abstained": _is_abstained_status(r.status),
+                        # Output contract (see process_entries).
+                        "coverage_incomplete": r.coverage_incomplete,
                         "confidence": r.overall_confidence,
+                        # Output contract: P(entry as cited is valid).
+                        "p_valid": r.p_valid,
                         # Additive: 0-100 numeric confidence (Item 4).
                         "confidence_score": float(getattr(r, "confidence_score", 0.0)),
                         "mismatched_fields": [n for n, c in r.field_comparisons.items() if not c.matches],
@@ -5980,6 +6057,16 @@ def main() -> int:
         abstained_n,
         summary["could_not_verify_rate"] * 100,
     )
+    # Output contract: a could-not-verify (or API-error) verdict reached while
+    # sources errored/were throttled is NOT a clean exhaustive miss. Surface
+    # the count next to the bucket so throttled runs are not misread.
+    coverage_incomplete_n = summary.get("coverage_incomplete_count", 0)
+    if coverage_incomplete_n > 0:
+        logger.info(
+            "      %d of the could-not-verify/API-error verdicts had source errors or throttling "
+            "(coverage_incomplete) -- re-run after a cooldown before treating them as misses",
+            coverage_incomplete_n,
+        )
     logger.info(
         "  (3) PROBLEMATIC:         %d  (%.1f%%)  -- positive evidence of a problem",
         problematic_n,
