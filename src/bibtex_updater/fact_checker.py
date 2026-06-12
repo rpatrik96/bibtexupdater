@@ -1533,6 +1533,25 @@ class SemanticScholarClient:
         except Exception:
             return []
 
+    def match_title(self, title: str) -> list[dict[str, Any]]:
+        """Single best title match via ``/paper/search/match``.
+
+        Returns the endpoint's ``data`` list (a single paper dict) on success.
+        HTTP 404 means "no match found" -- a NORMAL miss, not an error: the
+        shared HttpClient only retries 429/5xx, so a 404 passes straight
+        through as a non-200 and this returns ``[]`` without recording an
+        error. Any other non-200 / parse / network failure also yields ``[]``.
+        """
+        params = {"query": title, "fields": self.FIELDS}
+        url = f"{S2_API}/paper/search/match"
+        try:
+            resp = self.http._request("GET", url, params=params, accept="application/json", service="semanticscholar")
+            if resp.status_code != 200:
+                return []
+            return resp.json().get("data", []) or []
+        except Exception:
+            return []
+
     def get_paper(self, paper_id: str) -> dict[str, Any] | None:
         """Get paper details by S2 paper ID, DOI, or arXiv ID.
 
@@ -3046,7 +3065,8 @@ class FactChecker:
         sources_with_hits: list[str],
         errors: list[str],
     ) -> list[tuple[float, PublishedRecord, str]]:
-        """Source order: CrossRef -> OpenAlex -> DBLP -> OpenReview -> Semantic Scholar.
+        """Source order: CrossRef -> [S2 /match, key only] -> OpenAlex -> DBLP ->
+        OpenReview -> Semantic Scholar relevance search.
 
         Item 1 (CheckIfExist Algorithm 1, Abbonato 2026). Each step retrieves
         ``config.top_k`` candidates and re-ranks them by Levenshtein title
@@ -3068,7 +3088,11 @@ class FactChecker:
         (~30 req/min) is the CS-conference authority; OpenReview (~30 req/min) is
         the ICLR/NeurIPS/TMLR submission authority queried before the slow
         keyless Semantic Scholar (~10 req/min), which is queried last to keep it
-        off the hot path for the easy majority of entries.
+        off the hot path for the easy majority of entries. With an S2 API key
+        that premise inverts: a key-gated ``/paper/search/match`` step runs
+        right after Crossref (single best title match, one round-trip) and the
+        final S2 relevance search is skipped whenever the match step
+        contributed, keeping total S2 spend at one call per entry.
 
         Returns:
             List of ``(score, record, source_name)`` tuples, possibly from
@@ -3116,6 +3140,37 @@ class FactChecker:
         _ingest("crossref", cr_records)
         if self._has_full_confirmation(entry, all_candidates):
             return all_candidates
+
+        # ----- Step 1b: Semantic Scholar title match (API-key deployments) -----
+        # The "slowest w/o key" premise behind querying S2 last INVERTS when the
+        # shared HTTP client carries an API key: authenticated S2 is fast, and
+        # the ``/paper/search/match`` endpoint returns THE single best title
+        # match in one round-trip. Key present -> consult it right after
+        # Crossref; no key -> this step does not exist and the cascade is
+        # byte-for-byte the legacy order. A 404 from /match means "no match
+        # found" (a normal miss, never recorded as an error). When this step
+        # contributes >= 1 record, the final S2 relevance-search step is skipped
+        # so the per-entry S2 spend never doubles.
+        s2_match_contributed = False
+        s2_key = getattr(getattr(self.crossref, "http", None), "s2_api_key", None)
+        if isinstance(s2_key, str) and s2_key.strip():
+            sources_queried.append("semanticscholar")
+            try:
+                s2_match_data = self.s2.match_title(retrieval_title)
+            except Exception as exc:
+                s2_match_data = []
+                errors.append(f"Semantic Scholar (match): {exc}")
+            s2_match_records: list[PublishedRecord] = []
+            for item in s2_match_data or []:
+                rec = s2_data_to_record(item)
+                if rec:
+                    s2_match_records.append(rec)
+            if s2_match_records:
+                sources_with_hits.append("semanticscholar")
+                s2_match_contributed = True
+            _ingest("semanticscholar", s2_match_records)
+            if self._has_full_confirmation(entry, all_candidates):
+                return all_candidates
 
         # ----- Step 2: OpenAlex (high-rate aggregator, broad coverage) -----
         if self.openalex is None:
@@ -3210,22 +3265,29 @@ class FactChecker:
                 return all_candidates
 
         # ----- Step 5: Semantic Scholar (preprint coverage; slowest w/o key) -----
-        sources_queried.append("semanticscholar")
-        try:
-            # Title-led query keeps S2 relevance focused on the paper title.
-            s2_query = f"{retrieval_title} {first_author}".strip() or query
-            s2_data = self.s2.search(s2_query, limit=top_k)
-        except Exception as exc:
-            s2_data = []
-            errors.append(f"Semantic Scholar: {exc}")
-        s2_records: list[PublishedRecord] = []
-        for item in s2_data or []:
-            rec = s2_data_to_record(item)
-            if rec:
-                s2_records.append(rec)
-        if s2_records:
-            sources_with_hits.append("semanticscholar")
-        _ingest("semanticscholar", s2_records)
+        # Skipped when the key-gated match step (1b) already contributed a
+        # record: the /match endpoint returned S2's single best answer for this
+        # title, so a second S2 search would double the spend for no new
+        # information. When the match step missed (or there is no key), this
+        # step runs exactly as before.
+        if not s2_match_contributed:
+            if "semanticscholar" not in sources_queried:
+                sources_queried.append("semanticscholar")
+            try:
+                # Title-led query keeps S2 relevance focused on the paper title.
+                s2_query = f"{retrieval_title} {first_author}".strip() or query
+                s2_data = self.s2.search(s2_query, limit=top_k)
+            except Exception as exc:
+                s2_data = []
+                errors.append(f"Semantic Scholar: {exc}")
+            s2_records: list[PublishedRecord] = []
+            for item in s2_data or []:
+                rec = s2_data_to_record(item)
+                if rec:
+                    s2_records.append(rec)
+            if s2_records and "semanticscholar" not in sources_with_hits:
+                sources_with_hits.append("semanticscholar")
+            _ingest("semanticscholar", s2_records)
 
         # FIX X4: relaxed-author retrieval fallback. For DOI-less, title-and-
         # author-strict cascade queries that returned zero usable candidates,
