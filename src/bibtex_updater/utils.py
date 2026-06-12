@@ -804,6 +804,30 @@ def normalize_doi_for_resolution(doi: str | None) -> str | None:
     return normalized
 
 
+#: arXiv DataCite DOI shape: ``10.48550/arXiv.YYMM.NNNNN`` with an optional
+#: version suffix. Case-insensitive because the ``arXiv`` casing varies across
+#: sources. Single source of truth for "this DOI *is* an arXiv ID" -- reused by
+#: ``arxiv_id_from_datacite_doi`` and the fact-checker's entry-side extractor.
+_ARXIV_DATACITE_DOI_RE = re.compile(r"^10\.48550/arxiv\.(\d{4}\.\d{4,5})(v\d+)?$", re.IGNORECASE)
+
+
+def arxiv_id_from_datacite_doi(doi: str | None) -> str | None:
+    """Extract the bare arXiv ID from an arXiv DataCite DOI.
+
+    ``10.48550/arXiv.2301.00001`` (or ``...v2``) -> ``2301.00001``: the version
+    suffix is stripped and the ID is month-validated via ``is_valid_arxiv_id``.
+    Any other DOI shape (including legacy-scheme arXiv IDs, which DataCite does
+    not mint under this prefix in the wild) returns ``None``.
+    """
+    if not doi:
+        return None
+    m = _ARXIV_DATACITE_DOI_RE.match(doi.strip())
+    if not m:
+        return None
+    bare = m.group(1)
+    return bare if is_valid_arxiv_id(bare) else None
+
+
 def doi_url(doi: str) -> str:
     """Convert a DOI to a URL."""
     return f"https://doi.org/{doi}"
@@ -1906,6 +1930,13 @@ class PublishedRecord:
     #: ``dblp_stream_key``. ``journals/corr`` marks the arXiv/CoRR preprint
     #: stream and must never anchor a published-venue claim.
     venue_key: str | None = None
+    #: Bare arXiv ID (version stripped) when the source ties this record to an
+    #: arXiv preprint: the arXiv Atom feed entry id, S2 ``externalIds.ArXiv``,
+    #: an OpenAlex arXiv landing page, or the record's own DataCite arXiv DOI.
+    #: Lets the preprint check pivot onto the MATCHED record's identity when
+    #: the entry itself carries no doi/eprint (HALLMARK preprint_as_published
+    #: entries strip identifiers; real-world offenders often cite none).
+    arxiv_id: str | None = None
 
     def surname_keys(self, limit: int = 3) -> list[str]:
         """Canonical surname comparison keys derived from ``self.authors``.
@@ -2222,7 +2253,21 @@ def dblp_hit_to_candidate_record(hit: dict[str, Any]) -> PublishedRecord | None:
 
 def s2_data_to_record(data: dict[str, Any]) -> PublishedRecord | None:
     """Convert Semantic Scholar data to a PublishedRecord."""
-    doi = doi_normalize(data.get("doi") or (data.get("externalIds") or {}).get("DOI"))
+    external_ids = data.get("externalIds") or {}
+    doi = doi_normalize(data.get("doi") or external_ids.get("DOI"))
+
+    # arXiv identity: S2 exposes the bare ID in ``externalIds.ArXiv`` (kept on
+    # published papers too, since S2 merges preprint + published versions).
+    # Fall back to a DataCite arXiv DOI. Version-stripped + month-validated so
+    # junk values never pollute the preprint-twin pivot downstream.
+    arxiv_id: str | None = None
+    raw_arxiv = external_ids.get("ArXiv")
+    if isinstance(raw_arxiv, str) and raw_arxiv.strip():
+        bare = re.sub(r"v\d+$", "", raw_arxiv.strip())
+        if is_valid_arxiv_id(bare):
+            arxiv_id = bare
+    if arxiv_id is None:
+        arxiv_id = arxiv_id_from_datacite_doi(doi)
 
     # Parse authors
     authors = []
@@ -2264,6 +2309,7 @@ def s2_data_to_record(data: dict[str, Any]) -> PublishedRecord | None:
         journal=venue,
         year=data.get("year"),
         type=record_type,
+        arxiv_id=arxiv_id,
     )
 
 
@@ -2328,6 +2374,11 @@ def arxiv_atom_to_record(xml: str) -> PublishedRecord | None:
     doi_el = entry.find("arxiv:doi", _ATOM_NS)
     doi = doi_normalize(doi_el.text) if doi_el is not None and doi_el.text else ""
 
+    # The Atom <id> is the abs URL (``http://arxiv.org/abs/2301.00001v2``);
+    # extract the bare, version-stripped arXiv ID so the record carries its own
+    # preprint identity even when the entry that matched it cites no identifier.
+    arxiv_id = extract_arxiv_id_from_text(entry_id) if entry_id else None
+
     return PublishedRecord(
         doi=doi or "",
         url=entry_id or None,
@@ -2337,6 +2388,7 @@ def arxiv_atom_to_record(xml: str) -> PublishedRecord | None:
         year=year,
         type="preprint",
         method="arXiv(id_list)",
+        arxiv_id=arxiv_id,
     )
 
 

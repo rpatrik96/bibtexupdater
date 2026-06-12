@@ -89,6 +89,7 @@ from bibtex_updater.utils import (
     SqliteCache,
     # API converters
     arxiv_atom_to_record,
+    arxiv_id_from_datacite_doi,
     authors_last_names,
     crossref_message_to_record,
     dblp_hit_to_candidate_record,
@@ -2083,33 +2084,170 @@ class FactChecker:
             return FactCheckStatus.DOI_NOT_FOUND
         return None
 
-    def _check_preprint_status(self, entry: dict[str, Any], best_match: PublishedRecord) -> FactCheckStatus | None:
-        """Check if entry claims venue but paper is only a preprint."""
+    #: DBLP-CoRR-only signal: a DBLP candidate counts as "this paper" only at/
+    #: above this normalized title similarity. Deliberately stricter than
+    #: ``config.title_threshold``: the signal asserts DBLP's index knows the
+    #: paper ONLY as CoRR, so near-miss titles must not contribute.
+    _CORR_ONLY_TITLE_SIM: float = 0.95
+
+    def _check_preprint_status(
+        self,
+        entry: dict[str, Any],
+        best_match: PublishedRecord,
+        candidates: list[tuple[float, PublishedRecord, str]] | None = None,
+        errors: list[str] | None = None,
+        field_comparisons: dict[str, FieldComparison] | None = None,
+    ) -> FactCheckStatus | None:
+        """Check if entry claims venue but paper is only a preprint.
+
+        Three signals, in order:
+
+        1. Entry-identifier S2 lookup (legacy, semantics unchanged): the
+           entry's own DOI/eprint is asked of Semantic Scholar; an arXiv-only
+           answer (no DOI, no venue) is PREPRINT_ONLY.
+        2. Matched-record pivot (HALLMARK preprint_as_published): when the
+           entry carries NEITHER identifier (the common shape for offenders),
+           derive the arXiv ID from ``best_match`` -- but only when the best
+           match is genuinely the cited paper's preprint twin (title at/above
+           ``config.title_threshold``) -- and run the same S2 lookup.
+        3. DBLP-CoRR-only (:meth:`_dblp_corr_only_preprint`): works even when
+           S2 is unavailable; requires every strong-title DBLP candidate to be
+           the ``journals/corr`` stream and no source to confirm the claim.
+
+        The NEW signals (2+3) never run when some source positively confirmed
+        the claimed venue (``field_comparisons["venue"]`` is MATCH): a grounded
+        venue claim must not be second-guessed into PREPRINT_ONLY. They also
+        never run when S2 affirmatively shows a DOI/venue for the paper.
+        ``candidates``/``errors``/``field_comparisons`` default to None so
+        existing direct callers keep working.
+        """
         claimed_venue = entry.get("booktitle") or entry.get("journal") or ""
         if not claimed_venue:
             return None
         claimed_lower = claimed_venue.lower()
         if any(kw in claimed_lower for kw in ["arxiv", "biorxiv", "medrxiv", "preprint"]):
             return None
+        # A venue some record positively MATCHed is grounded; only the legacy
+        # entry-identifier path below may still inspect it (unchanged).
+        venue_cmp = (field_comparisons or {}).get("venue")
+        venue_confirmed = venue_cmp is not None and venue_cmp.resolved_outcome is MatchOutcome.MATCH
         paper_id = None
         if entry.get("doi"):
             paper_id = f"DOI:{entry['doi']}"
         elif entry.get("eprint"):
             paper_id = f"ARXIV:{entry['eprint']}"
-        if not paper_id:
+        if not paper_id and not venue_confirmed:
+            paper_id = self._twin_arxiv_paper_id(entry, best_match)
+        s2_affirms_published = False
+        if paper_id:
+            s2_data = self.s2.get_paper(paper_id)
+            if s2_data:
+                external_ids = s2_data.get("externalIds") or {}
+                venue = s2_data.get("venue") or ""
+                pub_venue = s2_data.get("publicationVenue")
+                has_doi = bool(external_ids.get("DOI"))
+                has_venue = bool(venue.strip()) or bool(pub_venue)
+                is_only_arxiv = external_ids.get("ArXiv") and not has_doi
+                if is_only_arxiv and not has_venue:
+                    return FactCheckStatus.PREPRINT_ONLY
+                s2_affirms_published = has_doi or has_venue
+        if venue_confirmed or s2_affirms_published:
             return None
-        s2_data = self.s2.get_paper(paper_id)
-        if not s2_data:
+        return self._dblp_corr_only_preprint(entry, claimed_venue, candidates, errors, field_comparisons)
+
+    def _twin_arxiv_paper_id(self, entry: dict[str, Any], best_match: PublishedRecord) -> str | None:
+        """S2 lookup id derived from the MATCHED record's arXiv identity.
+
+        For identifier-less entries the only handle on the paper is the best
+        match itself. Use its arXiv ID (converter-stamped ``arxiv_id`` or its
+        own DataCite arXiv DOI) ONLY when the record genuinely is the cited
+        paper's preprint twin: the entry-vs-record title similarity must reach
+        ``config.title_threshold``. The caller's status gate already implies a
+        decent match; this explicit guard keeps the check self-contained.
+        """
+        twin_id = best_match.arxiv_id or arxiv_id_from_datacite_doi(best_match.doi)
+        if not twin_id:
             return None
-        external_ids = s2_data.get("externalIds") or {}
-        venue = s2_data.get("venue") or ""
-        pub_venue = s2_data.get("publicationVenue")
-        has_doi = bool(external_ids.get("DOI"))
-        has_venue = bool(venue.strip()) or bool(pub_venue)
-        is_only_arxiv = external_ids.get("ArXiv") and not has_doi
-        if is_only_arxiv and not has_venue:
-            return FactCheckStatus.PREPRINT_ONLY
-        return None
+        entry_title_norm = normalize_title_for_match(entry.get("title", ""))
+        match_title_norm = normalize_title_for_match(best_match.title or "")
+        if not entry_title_norm or not match_title_norm:
+            return None
+        if token_sort_ratio(entry_title_norm, match_title_norm) / 100.0 < self.config.title_threshold:
+            return None
+        return f"ARXIV:{twin_id}"
+
+    def _dblp_corr_only_preprint(
+        self,
+        entry: dict[str, Any],
+        claimed_venue: str,
+        candidates: list[tuple[float, PublishedRecord, str]] | None,
+        errors: list[str] | None,
+        field_comparisons: dict[str, FieldComparison] | None,
+    ) -> FactCheckStatus | None:
+        """PREPRINT_ONLY from DBLP's CoRR stream alone (no S2 required).
+
+        DBLP indexes the covered CS conferences exhaustively, so "DBLP knows
+        this paper ONLY as ``journals/corr``" is positive evidence the claimed
+        proceedings appearance does not exist. ALL gates must pass (any doubt
+        -> ``None``, keep abstaining):
+
+        * the claimed venue canonicalizes to a known CS venue that is NOT a
+          journal (the DBLP proceedings index is only exhaustive for
+          conferences; journals like JMLR are exempt);
+        * the DBLP query did not error for this entry;
+        * entry year is at most last year (DBLP proceedings indexing lags;
+          never flag current-year claims this way);
+        * there is at least one DBLP candidate whose normalized title matches
+          the entry at/above ``_CORR_ONLY_TITLE_SIM``, and EVERY such strong
+          DBLP candidate is the ``journals/corr`` stream;
+        * NO candidate from ANY source carries a non-preprint venue that
+          ``venues_match``-MATCHes the claim.
+        """
+        if not candidates:
+            return None
+        # A failed DBLP query means its silence is meaningless.
+        if any(err.startswith("DBLP") for err in errors or []):
+            return None
+        canonical = get_canonical_venue(claimed_venue)
+        if canonical is None or canonical in JOURNAL_CANONICAL_VENUES:
+            return None
+        try:
+            entry_year = int(str(entry.get("year", "")).strip().strip("{}"))
+        except ValueError:
+            return None
+        if entry_year > datetime.datetime.now().year - 1:
+            return None
+        entry_title_norm = normalize_title_for_match(entry.get("title", ""))
+        if not entry_title_norm:
+            return None
+        corr_hits = 0
+        for _score, rec, source in candidates:
+            # Veto: some source DOES report a venue matching the claim.
+            rec_venue = rec.journal or ""
+            if (
+                rec_venue
+                and not is_preprint_or_series_venue(rec_venue)
+                and venues_match(claimed_venue, rec_venue, self.config.venue_threshold).outcome is MatchOutcome.MATCH
+            ):
+                return None
+            if source != "dblp":
+                continue
+            rec_title_norm = normalize_title_for_match(rec.title or "")
+            if not rec_title_norm:
+                continue
+            if token_sort_ratio(entry_title_norm, rec_title_norm) / 100.0 < self._CORR_ONLY_TITLE_SIM:
+                continue
+            if rec.venue_key != "journals/corr":
+                # DBLP knows a non-CoRR record for this title: not preprint-only.
+                return None
+            corr_hits += 1
+        if corr_hits == 0:
+            return None
+        note = f"DBLP indexes this paper only as CoRR (arXiv); claimed venue {claimed_venue!r} not found in any source"
+        self.logger.info("Entry %r: %s", entry.get("ID", "?"), note)
+        if field_comparisons is not None and "venue" in field_comparisons:
+            field_comparisons["venue"].note = note
+        return FactCheckStatus.PREPRINT_ONLY
 
     def _check_or_unpublished(self, entry: dict[str, Any], best_match: PublishedRecord) -> FactCheckStatus | None:
         """Flag a citation whose best match is a NOT-ACCEPTED OpenReview submission
@@ -2298,13 +2436,21 @@ class FactChecker:
         # Post-match: check preprint status. UNCONFIRMED is included because a
         # venue we could not confirm is exactly the case where an independent
         # preprint-only signal (arXiv-only, no DOI/venue) upgrades the verdict to
-        # the positive-evidence PREPRINT_ONLY.
+        # the positive-evidence PREPRINT_ONLY. The full candidate list + errors
+        # + comparisons feed the identifier-less signals (matched-record arXiv
+        # pivot, DBLP-CoRR-only), which never fire on a positively-MATCHed venue.
         if status in (
             FactCheckStatus.VERIFIED,
             FactCheckStatus.VENUE_MISMATCH,
             FactCheckStatus.UNCONFIRMED,
         ):
-            preprint_status = self._check_preprint_status(entry, best_match)
+            preprint_status = self._check_preprint_status(
+                entry,
+                best_match,
+                candidates=candidates,
+                errors=errors,
+                field_comparisons=field_comparisons,
+            )
             if preprint_status is not None:
                 status = preprint_status
             unpublished_status = self._check_or_unpublished(entry, best_match)
@@ -2432,17 +2578,10 @@ class FactChecker:
                 if is_valid_arxiv_id(bare):
                     return bare
 
-        # arXiv DataCite DOI: ``10.48550/arXiv.YYMM.NNNNN(vN)?``. Case-insensitive
-        # because BibTeX entries vary on the ``arXiv`` casing. The version suffix
-        # is stripped before validation, matching the rest of the helper.
-        doi = (entry.get("doi") or "").strip()
-        if doi:
-            m = re.match(r"^10\.48550/arxiv\.(\d{4}\.\d{4,5})(v\d+)?$", doi, flags=re.IGNORECASE)
-            if m:
-                bare = m.group(1)
-                if is_valid_arxiv_id(bare):
-                    return bare
-        return None
+        # arXiv DataCite DOI: ``10.48550/arXiv.YYMM.NNNNN(vN)?``. Shared helper
+        # (case-insensitive, version-stripped, month-validated) -- the same
+        # extraction the record converters use for ``PublishedRecord.arxiv_id``.
+        return arxiv_id_from_datacite_doi(entry.get("doi"))
 
     def _id_anchored_author_mismatch(
         self,

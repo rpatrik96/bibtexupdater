@@ -37,6 +37,8 @@ from bibtex_updater.utils import (
     OPENALEX_API,
     OPENREVIEW_API,
     PublishedRecord,
+    arxiv_id_from_datacite_doi,
+    extract_arxiv_id_from_text,
     is_preprint_venue,
     last_name_from_person,
     latex_to_plain,
@@ -266,12 +268,36 @@ def openalex_work_to_candidate_record(work: dict[str, Any]) -> PublishedRecord |
             authors.append({"given": "", "family": parts[0]})
 
     primary_location = work.get("primary_location") or {}
+    if not isinstance(primary_location, dict):
+        primary_location = {}
     source = primary_location.get("source") or {}
     if not isinstance(source, dict):
         source = {}
     journal = source.get("display_name")
     year = work.get("publication_year")
     work_type = work.get("type")
+
+    # arXiv identity: OpenAlex has no first-class arXiv field on works; the ID
+    # is recoverable from a DataCite arXiv DOI (``10.48550/arXiv.<id>``) or
+    # from an arxiv.org landing/PDF URL on the primary location / locations
+    # list. Defensive throughout: any unexpected shape just leaves it None.
+    arxiv_id = arxiv_id_from_datacite_doi(doi)
+    if arxiv_id is None:
+        locations: list[Any] = [primary_location]
+        raw_locations = work.get("locations")
+        if isinstance(raw_locations, list):
+            locations.extend(raw_locations)
+        for loc in locations:
+            if not isinstance(loc, dict):
+                continue
+            for url_field in ("landing_page_url", "pdf_url"):
+                url_val = loc.get(url_field)
+                if isinstance(url_val, str) and "arxiv.org" in url_val.lower():
+                    arxiv_id = extract_arxiv_id_from_text(url_val)
+                    if arxiv_id:
+                        break
+            if arxiv_id:
+                break
 
     # Venue identity: the OpenAlex source id is a stable venue identifier, and
     # ``issn``/``issn_l`` carry the journal's ISSNs. Defensive: any unexpected
@@ -299,6 +325,7 @@ def openalex_work_to_candidate_record(work: dict[str, Any]) -> PublishedRecord |
         order_reliable=True,
         issn=tuple(issns),
         venue_source_id=venue_source_id,
+        arxiv_id=arxiv_id,
     )
 
 
