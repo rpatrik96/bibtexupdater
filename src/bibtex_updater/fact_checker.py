@@ -3235,57 +3235,141 @@ class FactChecker:
         happens to be the entry's own preprint twin (NON_COMPARABLE -> no
         mismatch flag).
 
-        Fires only when (a) at least 2 order-reliable sources contributed a
-        published-venue candidate, (b) those venues canonicalize to the SAME
-        venue, (c) the entry's venue is itself canonicalizable AND (d)
-        canonicalizes to something different from the cross-source consensus.
-        Non-canonicalizable / preprint / blank entry venues abstain; a single
-        dissenting source can never outvote two agreeing sources because we
-        require a true consensus on the canonical mismatch.
+        Venue identity is established two ways (HALLMARK wrong_venue /
+        arxiv_version_mismatch FNs: the hand-curated alias map only covers ~45
+        ML/CS venues, so anything outside it used to abstain):
 
-        Returns the cross-source consensus canonical venue when ALL gates
-        pass; returns ``None`` otherwise (no flag).
+        * the existing alias-map route -- two records whose venues
+          canonicalize to the same key are the same venue;
+        * an identifier route -- two records that share an ISSN, an OpenAlex
+          ``venue_source_id``, or a DBLP ``venue_key`` are the same venue even
+          when their venue STRINGS differ and neither canonicalizes.
+
+        Records are merged into venue groups over those links (union-find). A
+        *consensus group* is a group contributed by at least
+        ``_MIN_ORDER_RELIABLE_SOURCES_FOR_FLAG`` order-reliable, non-preprint
+        sources (``journals/corr`` venue_key is a preprint marker, mirroring
+        the venue-string check).
+
+        Flag gates (conservative; when in doubt abstain):
+
+        * FPR guard: if ANY order-reliable source's venue agrees with the
+          entry (canonical-equal or fuzzy ``venues_match`` MATCH) -> no flag.
+        * Preprint/series/blank entry venues -> abstain (the published twin
+          legitimately coexists with a preprint claim).
+        * A CANONICALIZABLE entry venue that agrees with no member of the
+          single consensus group -> MISMATCH (it canonicalizes to something
+          different, or fuzzy-misses every member string).
+        * A NON-canonicalizable entry venue may flag ONLY when the consensus
+          group is *identifier-corroborated* (>= 2 sources linked by a shared
+          identifier, not merely equal canonicals) AND the entry string
+          fuzzy-misses every member name.
+        * Two or more disagreeing consensus groups -> ambiguity -> abstain.
+
+        Returns the consensus venue name (canonical key when available, else a
+        representative member venue string) when ALL gates pass; ``None``
+        otherwise (no flag).
         """
         if not entry_venue or not per_source_records:
             return None
-        entry_canonical = get_canonical_venue(entry_venue)
-        # An entry venue we cannot canonicalize is not a recognized published
-        # venue we can refute with cross-source consensus -- abstain.
-        if not entry_canonical:
+        # A preprint/series/platform venue claim cannot be refuted by a
+        # published-venue consensus: the published version coexisting with the
+        # cited preprint is normal, not a wrong-venue hallucination.
+        if is_preprint_or_series_venue(entry_venue):
             return None
+        entry_canonical = get_canonical_venue(entry_venue)
 
-        canonical_to_sources: dict[str, set[str]] = {}
+        # Gather order-reliable published-venue evidence (same gates as before:
+        # preprint / series records never anchor a published-venue claim).
+        evidence: list[tuple[str, PublishedRecord, str, str | None]] = []
         for src, rec in per_source_records.items():
             if rec is None or not rec.order_reliable:
                 continue
             rec_venue = rec.journal or ""
             if not rec_venue:
                 continue
-            # A preprint / series record cannot anchor a published venue claim
-            # -- per the venue trichotomy, it is NON_COMPARABLE, not evidence.
             if is_preprint_or_series_venue(rec_venue):
                 continue
-            rec_canonical = get_canonical_venue(rec_venue)
-            if not rec_canonical:
+            # Identifier-side preprint marker: DBLP's CoRR stream is arXiv,
+            # even when the venue string itself does not say so.
+            if (rec.venue_key or "").lower() == "journals/corr":
                 continue
-            canonical_to_sources.setdefault(rec_canonical, set()).add(src)
+            evidence.append((src, rec, rec_venue, get_canonical_venue(rec_venue)))
 
-        if not canonical_to_sources:
+        if len(evidence) < self._MIN_ORDER_RELIABLE_SOURCES_FOR_FLAG:
             return None
 
-        # Need at least 2 order-reliable sources agreeing on a canonical venue
-        # that differs from the entry's canonical venue. Sources agreeing with
-        # the entry never count as "consensus on a mismatch".
-        for canonical, sources in canonical_to_sources.items():
-            if canonical == entry_canonical:
-                continue
-            if len(sources) >= self._MIN_ORDER_RELIABLE_SOURCES_FOR_FLAG:
-                # FPR guard: refuse the flag if ANOTHER source agrees with the
-                # entry's canonical venue (genuine ambiguity, not consensus).
-                if entry_canonical in canonical_to_sources:
-                    return None
-                return canonical
-        return None
+        # FPR guard: any order-reliable source agreeing with the entry's venue
+        # (canonical equality or fuzzy MATCH) means there is no consensus
+        # AGAINST the entry -> abstain. Strictly stronger than the previous
+        # canonical-only guard.
+        for _src, _rec, rec_venue, _rec_canonical in evidence:
+            if venues_match(entry_venue, rec_venue, self.config.venue_threshold).outcome is MatchOutcome.MATCH:
+                return None
+
+        # Union-find merge of the evidence into venue-identity groups.
+        parent = list(range(len(evidence)))
+
+        def find(i: int) -> int:
+            while parent[i] != i:
+                parent[i] = parent[parent[i]]
+                i = parent[i]
+            return i
+
+        def union(i: int, j: int) -> None:
+            ri, rj = find(i), find(j)
+            if ri != rj:
+                parent[rj] = ri
+
+        identifier_pairs: list[tuple[int, int]] = []
+        for i in range(len(evidence)):
+            rec_i = evidence[i][1]
+            for j in range(i + 1, len(evidence)):
+                rec_j = evidence[j][1]
+                identifier_link = bool(
+                    (set(rec_i.issn) & set(rec_j.issn))
+                    or (rec_i.venue_source_id and rec_i.venue_source_id == rec_j.venue_source_id)
+                    or (rec_i.venue_key and rec_i.venue_key == rec_j.venue_key)
+                )
+                canonical_link = evidence[i][3] is not None and evidence[i][3] == evidence[j][3]
+                if identifier_link or canonical_link:
+                    union(i, j)
+                if identifier_link:
+                    identifier_pairs.append((i, j))
+
+        groups: dict[int, list[int]] = {}
+        for i in range(len(evidence)):
+            groups.setdefault(find(i), []).append(i)
+        consensus_groups = [
+            members for members in groups.values() if len(members) >= self._MIN_ORDER_RELIABLE_SOURCES_FOR_FLAG
+        ]
+        if len(consensus_groups) != 1:
+            # No consensus, or two consensus groups that contradict each other
+            # (the sources themselves disagree) -> genuine ambiguity, abstain.
+            return None
+        members = consensus_groups[0]
+        member_set = set(members)
+
+        # The FPR guard above already established that the entry venue agrees
+        # with NO contributing record (group members included). A
+        # non-canonicalizable entry venue additionally requires the group to be
+        # identifier-corroborated: equal canonicals alone are not enough to
+        # refute a venue string the alias map has never seen.
+        if entry_canonical is None:
+            identifier_corroborated = any(i in member_set and j in member_set for i, j in identifier_pairs)
+            if not identifier_corroborated:
+                return None
+
+        # Name the consensus venue for the note: prefer the (most common)
+        # canonical key, falling back to a representative member venue string.
+        canonical_counts: dict[str, int] = {}
+        for i in members:
+            member_canonical = evidence[i][3]
+            if member_canonical:
+                canonical_counts[member_canonical] = canonical_counts.get(member_canonical, 0) + 1
+        if canonical_counts:
+            return max(canonical_counts.items(), key=lambda kv: kv[1])[0]
+        return evidence[members[0]][2]
 
     def _detect_author_fabrication(
         self,

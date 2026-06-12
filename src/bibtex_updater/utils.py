@@ -110,6 +110,7 @@ def retry_after_seconds(exc: httpx.HTTPError, fallback: float, cap: float = 60.0
 CROSSREF_API = "https://api.crossref.org/works"
 ARXIV_API = "http://export.arxiv.org/api/query"
 DBLP_API_SEARCH = "https://dblp.org/search/publ/api"
+DBLP_API_VENUE_SEARCH = "https://dblp.org/search/venue/api"
 S2_API = "https://api.semanticscholar.org/graph/v1"
 ACL_ANTHOLOGY_URL = "https://aclanthology.org"
 ACL_DOI_PREFIX = "10.18653/v1/"
@@ -1795,6 +1796,61 @@ class HttpClient:
         raise RuntimeError(f"Network failure after retries for {url}")
 
 
+# ------------- Venue-identity helpers -------------
+
+
+#: ISSN body after stripping the hyphen: 7 digits + a digit-or-X check char.
+_ISSN_BODY_RE = re.compile(r"^\d{7}[\dX]$")
+
+#: DBLP record-key prefixes that name a venue *stream* (``conf/icml/Smith23``
+#: -> stream ``conf/icml``). Other prefixes (``books``, ``phd``, ``homepages``)
+#: do not identify a recurring venue and are ignored.
+_DBLP_STREAM_TYPES = frozenset({"conf", "journals", "series"})
+
+
+def normalize_issn(value: Any) -> str | None:
+    """Normalize an ISSN to the standard hyphenated uppercase ``NNNN-NNNX`` form.
+
+    Accepts hyphenated/unhyphenated, any case (``1532-4435``, ``15324435``,
+    ``2167-647x``). Returns ``None`` for anything that is not 7 digits plus a
+    digit-or-X check character, so junk values never pollute identifier-based
+    venue grouping.
+    """
+    if not value:
+        return None
+    body = str(value).strip().upper().replace("-", "").replace(" ", "")
+    if not _ISSN_BODY_RE.match(body):
+        return None
+    return f"{body[:4]}-{body[4:]}"
+
+
+def dblp_stream_key(info: dict[str, Any]) -> str | None:
+    """Derive the DBLP venue *stream* key from a search-hit ``info`` dict.
+
+    DBLP record keys embed the venue stream as their first two segments:
+    ``conf/icml/Smith23`` -> ``conf/icml``; ``journals/corr/abs-2301-00001`` ->
+    ``journals/corr``. The same shape appears in the record URL after ``/rec/``
+    (``https://dblp.org/rec/conf/icml/Smith23``), which is consulted as a
+    fallback when ``key`` is absent. Parsing is defensive: anything that does
+    not look like ``<stream-type>/<stream>/<record-id>`` with a known stream
+    type yields ``None`` rather than a bogus venue identity.
+    """
+    if not isinstance(info, dict):
+        return None
+    candidates: list[str] = []
+    key = info.get("key")
+    if isinstance(key, str) and key.strip():
+        candidates.append(key.strip())
+    url = info.get("url")
+    if isinstance(url, str) and "/rec/" in url:
+        candidates.append(url.split("/rec/", 1)[1])
+    for cand in candidates:
+        parts = [p for p in cand.strip("/").split("/") if p]
+        if len(parts) >= 3 and parts[0].lower() in _DBLP_STREAM_TYPES:
+            return f"{parts[0].lower()}/{parts[1].lower()}"
+    return None
+
+
 # ------------- Data Classes -------------
 
 
@@ -1836,6 +1892,20 @@ class PublishedRecord:
     # by the OpenReview converter; None for every other source. Lets the verifier
     # act on a not-accepted match without re-fetching the note.
     acceptance: str | None = None
+    # ----- Venue-identity fields (cross-source venue consensus) -----
+    # All default-empty/None so every existing constructor call keeps working.
+    # Two records that share any of these identifiers refer to the SAME venue
+    # even when their venue *strings* differ and neither canonicalizes through
+    # the hand-curated alias map.
+    #: Venue ISSNs in the standard hyphenated uppercase ``NNNN-NNNX`` form
+    #: (``normalize_issn``). Crossref ``ISSN`` list / OpenAlex source ``issn``.
+    issn: tuple[str, ...] = ()
+    #: OpenAlex source id URL (e.g. ``https://openalex.org/S1983995261``).
+    venue_source_id: str | None = None
+    #: DBLP venue stream key (e.g. ``conf/icml``, ``journals/corr``); see
+    #: ``dblp_stream_key``. ``journals/corr`` marks the arXiv/CoRR preprint
+    #: stream and must never anchor a published-venue claim.
+    venue_key: str | None = None
 
     def surname_keys(self, limit: int = 3) -> list[str]:
         """Canonical surname comparison keys derived from ``self.authors``.
@@ -1950,6 +2020,17 @@ def crossref_message_to_record(msg: dict[str, Any]) -> PublishedRecord | None:
     # Issue can be in different locations
     issue = msg.get("issue") or msg.get("journal-issue", {}).get("issue")
 
+    # Venue identity: Crossref carries the container's ISSNs (print + online).
+    # Normalized + deduped; junk entries are dropped by ``normalize_issn``.
+    raw_issns = msg.get("ISSN") or []
+    if isinstance(raw_issns, str):
+        raw_issns = [raw_issns]
+    issns: list[str] = []
+    for raw_issn in raw_issns if isinstance(raw_issns, list) else []:
+        norm_issn = normalize_issn(raw_issn)
+        if norm_issn and norm_issn not in issns:
+            issns.append(norm_issn)
+
     return PublishedRecord(
         doi=doi,
         url=url,
@@ -1964,6 +2045,7 @@ def crossref_message_to_record(msg: dict[str, Any]) -> PublishedRecord | None:
         type=typ,
         structured_names=has_structured_family,
         order_reliable=True,
+        issn=tuple(issns),
     )
 
 
@@ -2045,6 +2127,7 @@ def dblp_hit_to_record(hit: dict[str, Any]) -> PublishedRecord | None:
         number=number,
         pages=pages,
         type=record_type,
+        venue_key=dblp_stream_key(info),
     )
 
 
@@ -2133,6 +2216,7 @@ def dblp_hit_to_candidate_record(hit: dict[str, Any]) -> PublishedRecord | None:
         pages=info.get("pages"),
         type=record_type,
         order_reliable=True,
+        venue_key=dblp_stream_key(info),
     )
 
 

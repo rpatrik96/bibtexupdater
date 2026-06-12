@@ -40,6 +40,7 @@ from bibtex_updater.utils import (
     is_preprint_venue,
     last_name_from_person,
     latex_to_plain,
+    normalize_issn,
     normalize_title_for_match,
     strip_diacritics,
 )
@@ -226,9 +227,27 @@ def openalex_work_to_candidate_record(work: dict[str, Any]) -> PublishedRecord |
 
     primary_location = work.get("primary_location") or {}
     source = primary_location.get("source") or {}
+    if not isinstance(source, dict):
+        source = {}
     journal = source.get("display_name")
     year = work.get("publication_year")
     work_type = work.get("type")
+
+    # Venue identity: the OpenAlex source id is a stable venue identifier, and
+    # ``issn``/``issn_l`` carry the journal's ISSNs. Defensive: any unexpected
+    # shape yields empty identity fields rather than a parse error.
+    raw_source_id = source.get("id")
+    venue_source_id = raw_source_id if isinstance(raw_source_id, str) and raw_source_id.strip() else None
+    raw_issns = source.get("issn") or []
+    if isinstance(raw_issns, str):
+        raw_issns = [raw_issns]
+    issns: list[str] = []
+    issn_candidates = list(raw_issns) if isinstance(raw_issns, list) else []
+    issn_candidates.append(source.get("issn_l"))
+    for raw_issn in issn_candidates:
+        norm_issn = normalize_issn(raw_issn)
+        if norm_issn and norm_issn not in issns:
+            issns.append(norm_issn)
 
     return PublishedRecord(
         doi=doi,
@@ -238,6 +257,8 @@ def openalex_work_to_candidate_record(work: dict[str, Any]) -> PublishedRecord |
         year=year,
         type=work_type,
         order_reliable=True,
+        issn=tuple(issns),
+        venue_source_id=venue_source_id,
     )
 
 
