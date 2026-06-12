@@ -252,3 +252,74 @@ class TestMatchTitle404:
         assert errors == []
         assert "openalex" in sources_queried
         assert sources_queried[:2] == ["crossref", "semanticscholar"]
+
+
+# ------------- _has_full_confirmation memo (per-cascade-invocation) -------------
+
+
+class TestHasFullConfirmationMemo:
+    def _crossref_item(self):
+        # High title+author score (>= cascade_high_confidence) but the venue
+        # contradicts the entry's claim -> NOT a full confirmation, so the
+        # cascade keeps walking sources and re-evaluates the stop condition
+        # after every step. Without the memo the same record is re-compared at
+        # each step; with it, exactly once.
+        return {
+            "DOI": "10.1234/abc",
+            "title": ["Deep Learning"],
+            "author": [{"given": "John", "family": "Smith"}],
+            "container-title": ["NeurIPS"],
+            "issued": {"date-parts": [[2024]]},
+            "type": "proceedings-article",
+        }
+
+    def test_compare_all_fields_runs_once_per_record_in_cascade(self):
+        fc = _build_checker(None, cr_items=[self._crossref_item()])
+        entry = _entry(journal="ICML")
+
+        calls = {"n": 0}
+        real_compare = fc._compare_all_fields
+
+        def counting_compare(*args, **kwargs):
+            calls["n"] += 1
+            return real_compare(*args, **kwargs)
+
+        fc._compare_all_fields = counting_compare  # type: ignore[method-assign]
+        candidates = fc._query_cascade(entry, "deep learning smith", [], [], [])
+
+        # The lone high-confidence record was compared exactly ONCE despite
+        # the stop condition being evaluated after crossref/openalex/dblp/
+        # openreview (4 checks in the keyless cascade).
+        assert any(src == "crossref" for _, _, src in candidates)
+        assert calls["n"] == 1
+
+    def test_memoized_cascade_result_identical_to_unmemoized_check(self):
+        fc = _build_checker(None, cr_items=[self._crossref_item()])
+        entry = _entry(journal="ICML")
+        candidates = fc._query_cascade(entry, "deep learning smith", [], [], [])
+        # Direct (memo-less) call agrees: this record set has no full confirmation.
+        assert fc._has_full_confirmation(entry, candidates) is False
+
+    def test_memo_dict_caches_verdict_by_record_identity(self):
+        fc = _build_checker(None)
+        entry = _entry(journal="JML")
+        from bibtex_updater.utils import PublishedRecord
+
+        rec = PublishedRecord(
+            doi="10.1/x",
+            title="Deep Learning",
+            authors=[{"given": "John", "family": "Smith"}],
+            journal="JML",
+            year=2024,
+        )
+        memo: dict[int, bool] = {}
+        cands = [(1.0, rec, "crossref")]
+        assert fc._has_full_confirmation(entry, cands, memo=memo) is True
+        assert memo == {id(rec): True}
+
+        # Second evaluation is served from the memo: no compare call at all.
+        def boom(*args, **kwargs):  # pragma: no cover - must not run
+            raise AssertionError("memo not used")
+
+        fc._compare_all_fields = boom  # type: ignore[method-assign]
+        assert fc._has_full_confirmation(entry, cands, memo=memo) is True

@@ -3332,6 +3332,11 @@ class FactChecker:
         top_k = max(1, min(int(self.config.top_k), MAX_TOP_K))
 
         all_candidates: list[tuple[float, PublishedRecord, str]] = []
+        # Per-invocation memo for the _has_full_confirmation stop condition:
+        # the same candidate records are re-checked after every cascade step,
+        # and _compare_all_fields is the expensive part. Keyed by id(rec)
+        # (records stay alive inside all_candidates for the whole invocation).
+        confirmation_memo: dict[int, bool] = {}
 
         def _ingest(source_name: str, records: list[PublishedRecord]) -> float:
             """Score + add records under ``source_name``; return best score."""
@@ -3359,7 +3364,7 @@ class FactChecker:
         if cr_records:
             sources_with_hits.append("crossref")
         _ingest("crossref", cr_records)
-        if self._has_full_confirmation(entry, all_candidates):
+        if self._has_full_confirmation(entry, all_candidates, memo=confirmation_memo):
             return all_candidates
 
         # ----- Step 1b: Semantic Scholar title match (API-key deployments) -----
@@ -3390,7 +3395,7 @@ class FactChecker:
                 sources_with_hits.append("semanticscholar")
                 s2_match_contributed = True
             _ingest("semanticscholar", s2_match_records)
-            if self._has_full_confirmation(entry, all_candidates):
+            if self._has_full_confirmation(entry, all_candidates, memo=confirmation_memo):
                 return all_candidates
 
         # ----- Step 2: OpenAlex (high-rate aggregator, broad coverage) -----
@@ -3422,7 +3427,7 @@ class FactChecker:
             if oa_records:
                 sources_with_hits.append("openalex")
             _ingest("openalex", oa_records)
-            if self._has_full_confirmation(entry, all_candidates):
+            if self._has_full_confirmation(entry, all_candidates, memo=confirmation_memo):
                 return all_candidates
 
         # ----- Step 3: DBLP (authoritative ICML/ICLR/NeurIPS index) -----
@@ -3451,7 +3456,7 @@ class FactChecker:
             if dblp_records:
                 sources_with_hits.append("dblp")
             _ingest("dblp", dblp_records)
-            if self._has_full_confirmation(entry, all_candidates):
+            if self._has_full_confirmation(entry, all_candidates, memo=confirmation_memo):
                 return all_candidates
 
         # ----- Step 4: OpenReview (authoritative ICLR/NeurIPS/TMLR registry) -----
@@ -3482,7 +3487,7 @@ class FactChecker:
             if or_records:
                 sources_with_hits.append("openreview")
             _ingest("openreview", or_records)
-            if self._has_full_confirmation(entry, all_candidates):
+            if self._has_full_confirmation(entry, all_candidates, memo=confirmation_memo):
                 return all_candidates
 
         # ----- Step 5: Semantic Scholar (preprint coverage; slowest w/o key) -----
@@ -3604,7 +3609,10 @@ class FactChecker:
         return 0.7 * title_score + 0.3 * author_score
 
     def _has_full_confirmation(
-        self, entry: dict[str, Any], all_candidates: list[tuple[float, PublishedRecord, str]]
+        self,
+        entry: dict[str, Any],
+        all_candidates: list[tuple[float, PublishedRecord, str]],
+        memo: dict[int, bool] | None = None,
     ) -> bool:
         """True when some high-confidence candidate positively confirms EVERY
         claimed field (title, author, year, venue) -- i.e. it would verdict
@@ -3618,13 +3626,28 @@ class FactChecker:
         DBLP/OpenReview (which carry the proceedings venue) instead of returning a
         could-not-verify the preprint forced. If no source ever fully confirms,
         the cascade exhausts its sources and returns normally.
+
+        ``memo`` (optional) caches the all-confirmed verdict per candidate
+        record across the repeated stop-condition checks of a SINGLE
+        ``_query_cascade`` invocation: the entry is fixed for the invocation
+        and the records accumulate (each ``id(rec)`` stays alive inside
+        ``all_candidates``), so re-running ``_compare_all_fields`` for the
+        same record at every cascade step is pure CPU waste. Behavior is
+        identical with or without the memo.
         """
         threshold = self.config.cascade_high_confidence
         for score, rec, _src in all_candidates:
             if score < threshold:
                 continue
-            comparisons = self._compare_all_fields(entry, rec)
-            if all(c.is_confirmed for c in comparisons.values()):
+            key = id(rec)
+            if memo is not None and key in memo:
+                confirmed = memo[key]
+            else:
+                comparisons = self._compare_all_fields(entry, rec)
+                confirmed = all(c.is_confirmed for c in comparisons.values())
+                if memo is not None:
+                    memo[key] = confirmed
+            if confirmed:
                 return True
         return False
 
