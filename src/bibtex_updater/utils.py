@@ -333,6 +333,38 @@ def _given_initial(given: str) -> str:
     return ""
 
 
+def record_looks_alphabetized(record: PublishedRecord) -> bool:
+    """True if the record's author list looks SORTED rather than publication order.
+
+    Some order-reliable sources alphabetize their contributor lists instead of
+    preserving title-page order (Crossref NeurIPS/ICML proceedings deposits,
+    e.g. the 10.52202 prefix) -- sometimes by family name, sometimes by the
+    full given-first display string ("Anh Tuan Tran" < "Khoi Nguyen" < "Quang
+    Ho Nguyen" < "Truong Thanh Vu"). Such a record's author ORDER carries no
+    publication-order signal, so order-sensitive author checks (shared-surname
+    run comparison, positional given-name pairing across a repeated surname,
+    same-multiset swap detection) must not anchor on it. Mirrors
+    ``matching._looks_alphabetized`` (surname keys) and extends it with the
+    display-string sort that surname keys cannot see. Requires >= 3 usable
+    names: with fewer, sorted order coincides too often to carry any signal.
+    """
+    authors = record.authors or []
+    if len(authors) < 3:
+        return False
+    surnames = [k for k in record.surname_keys(limit=10_000) if k]
+    if len(surnames) >= 3 and surnames == sorted(surnames):
+        return True
+    display: list[str] = []
+    for a in authors:
+        name = f"{(a.get('given') or '').strip()} {(a.get('family') or '').strip()}".strip()
+        key = strip_diacritics(latex_to_plain(name)).lower()
+        key = re.sub(r"[^a-z0-9\s]", " ", key)
+        key = " ".join(key.split())
+        if key:
+            display.append(key)
+    return len(display) >= 3 and display == sorted(display)
+
+
 def same_surname_given_order_violation(entry_author_field: str, record: PublishedRecord) -> bool:
     """Detect a swap/mismatch between two authors who share a surname.
 
@@ -347,9 +379,15 @@ def same_surname_given_order_violation(entry_author_field: str, record: Publishe
     times, BOTH sides have the SAME count (aligned runs) AND every author in the
     run has a usable given initial on both sides. A dropped/added same-surname
     author (unequal counts) or any missing given name leaves this to the
-    surname-level logic instead.
+    surname-level logic instead. A record whose author list looks ALPHABETIZED
+    (``record_looks_alphabetized``) never anchors this check: alphabetization
+    re-orders shared-surname runs (the two 'Nguyen's of an A-Z-sorted Crossref
+    proceedings deposit need not follow publication order), so a run-order
+    difference against it is a record-side sort artifact, not a swap.
     """
     if not getattr(record, "order_reliable", False) or not record.authors:
+        return False
+    if record_looks_alphabetized(record):
         return False
 
     entry_pairs = [
@@ -486,6 +524,19 @@ def classify_given_pair(given_entry: str, given_record: str) -> str:
         if len(short) <= len(long) and all(short[i] == long[i][0] for i in range(len(short))):
             return GivenNameVariety.INITIAL_COMPATIBLE
         return GivenNameVariety.INITIAL_CONFLICT
+    # MIXED initial+name forms: a given like "J. Westerborn" is NOT all-initials
+    # (so the branch above does not catch it) but its FIRST token is still a
+    # bare initial. Comparing that single letter against a full first given
+    # token ("Johan") as if both were full names mis-graded the pair as a
+    # SUBSTITUTION (HALLMARK FP: "Johan Alenlov" vs a record's "J. Westerborn
+    # Alenlov"). A one-letter first token can only ever testify about the
+    # initial: same letter -> benign initial form; different letter -> the same
+    # low-confidence INITIAL_CONFLICT the all-initials branch yields. Never a
+    # full-name substitution.
+    if len(te[0]) == 1 or len(tr[0]) == 1:
+        if te[0][0] == tr[0][0]:
+            return GivenNameVariety.INITIAL_COMPATIBLE
+        return GivenNameVariety.INITIAL_CONFLICT
     # Both sides carry a full (non-initial) given name from here.
     if te[0] == tr[0]:
         # Same first given token, differing middle/extra tokens -> middle-name
@@ -555,6 +606,7 @@ def given_name_position_audit(entry_author_field: str, record: PublishedRecord) 
     findings: list[dict] = []
     rank = {"skip": 0, "confirmed": 1, "soften": 2, "escalate": 3}
     worst = "skip"
+    record_alphabetized = record_looks_alphabetized(record)
     for i in range(min(len(entry_pairs), len(rec_pairs))):
         e_sur, e_giv = entry_pairs[i]
         r_sur, r_giv = rec_pairs[i]
@@ -573,22 +625,27 @@ def given_name_position_audit(entry_author_field: str, record: PublishedRecord) 
         # (Shunyu at 0, Denny re-listed at the tail) while the record had ONE
         # 'zhou' (Denny at 0). The OLD guard tripped on the entry-side repeat
         # even though the record-side 'zhou' uniquely pinned the comparison.
-        both_repeat = entry_sur_counts[e_sur] > 1 and rec_sur_counts[r_sur] > 1
+        rec_repeats = rec_sur_counts[r_sur] > 1
+        both_repeat = entry_sur_counts[e_sur] > 1 and rec_repeats
         if both_repeat and i != 0:
             continue
-        if both_repeat and i == 0:
-            # At the lead, both-side surname repetition is still genuine
-            # ambiguity (e.g. two real 'Song' lead-co-authors). Only audit if
-            # the entry's lead given matches NO record same-surname given via a
-            # benign classification; if any record author with that surname
-            # could explain the entry given as a benign variant, abstain.
+        # Positional-ambiguity guard: when the RECORD carries the surname more
+        # than once AND the positional pairing cannot be trusted -- at the lead
+        # with both sides repeating (two real 'Song' lead-co-authors), or
+        # ANYWHERE against an ALPHABETIZED record (sorting re-orders a shared-
+        # surname run, so position i may hold the OTHER same-surname author,
+        # e.g. an A-Z Crossref deposit putting 'Khoi Nguyen' where the entry
+        # cites 'Quang Nguyen') -- grade the entry given against EVERY record
+        # author with that surname instead of the positional one. If ANY of
+        # them explains it benignly (or nothing is comparable), abstain; only
+        # when every comparable candidate grades as a substitution is the
+        # entry's author genuinely none of them -> escalate.
+        if (both_repeat and i == 0) or (rec_repeats and record_alphabetized):
             same_surname_givens = [g for s, g in rec_pairs if s == r_sur]
-            best_class_rank = -1
-            for cand_g in same_surname_givens:
-                cls_cand = GIVEN_VARIETY_CLASS.get(classify_given_pair(e_giv, cand_g), "skip")
-                best_class_rank = max(best_class_rank, rank[cls_cand])
-            if best_class_rank < rank["escalate"]:
-                # Some record author with that surname is a benign match -> abstain.
+            cand_classes = {GIVEN_VARIETY_CLASS.get(classify_given_pair(e_giv, g), "skip") for g in same_surname_givens}
+            if "escalate" not in cand_classes or "confirmed" in cand_classes or "soften" in cand_classes:
+                # Some record author with that surname is a benign/low-confidence
+                # match (or none is comparable) -> abstain.
                 continue
         variety = classify_given_pair(e_giv, r_giv)
         cls = GIVEN_VARIETY_CLASS.get(variety, "skip")

@@ -99,6 +99,7 @@ from bibtex_updater.utils import (
     latex_to_plain,
     normalize_doi_for_resolution,
     normalize_title_for_match,
+    record_looks_alphabetized,
     s2_data_to_record,
     same_surname_given_order_violation,
     strip_diacritics,
@@ -3512,6 +3513,30 @@ class FactChecker:
                         "2-author order swap not corroborated "
                         "(single source; possible record-side ordering artifact)"
                     )
+            # Same-multiset (>= 3 authors) reordering against a record whose
+            # author list is sorted by its full DISPLAY string. The matcher's
+            # alphabetization escape only sees SURNAME keys, so a Crossref
+            # proceedings deposit sorted by the given-first display name ("Anh
+            # Tuan Tran" < "Khoi Nguyen" < "Quang Ho Nguyen" < "Truong Thanh
+            # Vu" -- surname keys [tran, nguyen, nguyen, vu], NOT A-Z) still
+            # minted a MISMATCH for the valid Dataset-Diffusion entry. The
+            # record's order is a sort artifact carrying no publication-order
+            # signal, but unlike the matcher's surname-key escape we do not
+            # mint a positive MATCH from it -- soften to PARTIAL (abstain):
+            # never VERIFIED on an order claim no source can confirm, never a
+            # swap flag from an artifact. Strict mode is untouched (it does
+            # not honour alphabetization escapes at all).
+            elif (
+                len(entry_stripped) >= 3
+                and sorted(entry_stripped) == sorted(api_stripped)
+                and record_looks_alphabetized(record)
+            ):
+                comparisons["author"].outcome = MatchOutcome.PARTIAL
+                comparisons["author"].matches = False
+                comparisons["author"].note = (
+                    "Author order could not be verified "
+                    "(record's author list is alphabetized; record-side sort artifact)"
+                )
 
         # --strict rule 5: silent author-list truncation. A PARTIAL author
         # outcome where the ENTRY side is shorter (entry is a leading-prefix
