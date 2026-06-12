@@ -2735,10 +2735,13 @@ class TestCrossSourceAuthorFabrication:
         assert comps["author"].is_confirmed is True
         assert "fabricated" not in (comps["author"].note or "")
 
-    def test_entry_shorter_than_candidate_not_flagged(self, fact_checker):
+    def test_entry_shorter_than_candidate_not_flagged_as_fabrication(self, fact_checker):
         # A shorter entry (e.g. only the first few authors) is consistent with
-        # the candidate -- not fabrication. symmetric_author_match returns
-        # PARTIAL (leading prefix), so FIX A's MATCH-gated check stays off.
+        # the candidate -- not FABRICATION. symmetric_author_match returns
+        # PARTIAL (leading prefix), so FIX A's MATCH-gated check stays off. The
+        # default-mode silent-truncation rule now escalates this corroborated
+        # 3-of-11 silent prefix to AUTHOR_TRUNCATED instead -- the root cause
+        # (dropped co-authors, not invented ones) stays correctly attributed.
         entry = {
             "title": self.TITLE,
             "author": "Massimo Caccia and Pau Rodriguez and Oleksiy Ostapenko",
@@ -2746,8 +2749,11 @@ class TestCrossSourceAuthorFabrication:
         }
         per_source = {"crossref": self._crossref(), "dblp": self._dblp()}
         comps = fact_checker._compare_all_fields(entry, self._crossref(), per_source_records=per_source)
-        # Not a MISMATCH -- either MATCH (sentinel-aware leading head) or PARTIAL.
-        assert comps["author"].is_mismatch is False
+        # Never the fabrication flag (that is Leak A's inverse shape) ...
+        assert "fabricated" not in (comps["author"].note or "")
+        # ... but the corroborated silent truncation is flagged as such.
+        status = fact_checker._determine_status(0.95, comps, ["crossref", "dblp"])
+        assert status == FactCheckStatus.AUTHOR_TRUNCATED
 
     def test_ordinalclip_shape_short_candidate_with_fabricated_trailing(self, fact_checker):
         # Leak C / OrdinalCLIP shape: the candidate records are SHORTER than the

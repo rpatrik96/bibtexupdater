@@ -48,6 +48,7 @@ from bibtex_updater.calibration import calibrate_result
 from bibtex_updater.matching import (
     EXPANDED_VENUE_ALIASES,
     MatchOutcome,
+    _strip_author_sentinels,
     get_canonical_venue,
     has_explicit_truncation_indicator,
     is_near_miss_title,
@@ -3193,6 +3194,33 @@ class FactChecker:
                 source_count += 1
         return union, source_count
 
+    @staticmethod
+    def _count_fuller_author_sources(
+        per_source_records: dict[str, PublishedRecord | None] | None,
+        entry_author_count: int,
+    ) -> int:
+        """How many ORDER-RELIABLE sources list MORE authors than the entry cites.
+
+        Corroboration gate for the default-mode silent-truncation flag: a single
+        order-reliable record listing more authors than the entry could be the
+        artifact of a bad match, but >= 2 independent order-reliable sources each
+        carrying ``entry_author_count + 1`` or more authors is positive evidence
+        the citation silently dropped co-authors. Mirrors the iteration of
+        :meth:`_record_full_surname_union` (order-unreliable sources and empty
+        records are excluded); the best-matched record counts as one of the
+        sources when its source is present in ``per_source_records``.
+        """
+        if not per_source_records:
+            return 0
+        count = 0
+        for _src, rec in per_source_records.items():
+            if rec is None or not rec.authors or not rec.order_reliable:
+                continue
+            keys = _strip_author_sentinels(rec.surname_keys(limit=10_000))
+            if len(keys) >= entry_author_count + 1:
+                count += 1
+        return count
+
     def _detect_cross_source_venue_mismatch(
         self,
         entry_venue: str,
@@ -3457,17 +3485,18 @@ class FactChecker:
         # (_detect_author_fabrication) and routed through AUTHOR_MISMATCH; we
         # gate on ``len(entry_names) <= len(api_names)`` here so the two rules
         # don't fight over the same shape.
+        truncation_disclosed = has_explicit_truncation_indicator(
+            entry_authors,
+            entry.get("note"),
+            entry.get("howpublished"),
+            entry.get("title"),
+        )
         if (
             cfg.strict
             and comparisons["author"].resolved_outcome is MatchOutcome.PARTIAL
             and entry_names
             and len(entry_names) <= len(api_names)
-            and not has_explicit_truncation_indicator(
-                entry_authors,
-                entry.get("note"),
-                entry.get("howpublished"),
-                entry.get("title"),
-            )
+            and not truncation_disclosed
         ):
             comparisons["author"].outcome = MatchOutcome.MISMATCH
             comparisons["author"].matches = False
@@ -3480,6 +3509,60 @@ class FactChecker:
             comparisons["author"].given_name_findings = (comparisons["author"].given_name_findings or []) + [
                 {"variety": "strict_truncated"}
             ]
+
+        # DEFAULT-mode silent author-list truncation (HALLMARK partial_author_list,
+        # detected at only 16-22% before this gate). The benchmark's truncation
+        # corruption keeps the FIRST and LAST author and drops MIDDLE co-authors,
+        # so the entry side is an in-order SUBSEQUENCE (not a leading prefix) of
+        # the canonical list and the matcher correctly returns PARTIAL -- which
+        # used to abstain as UNCONFIRMED. Escalate to AUTHOR_TRUNCATED only under
+        # ALL of these FPR guards (strict mode keeps its looser rule 5 above):
+        #   a. PARTIAL with a non-empty, strictly SHORTER sentinel-stripped entry
+        #      list (sentinels stripped so an "and others" interior elision --
+        #      which the matcher keeps PARTIAL -- still counts as disclosed);
+        #   b. no disclosed truncation: neither a sibling-field indicator
+        #      ("...", "et al." in note/howpublished/title) nor an author-field
+        #      "and others"/"et al" sentinel;
+        #   c. the best record is order_reliable AND structured_names -- an
+        #      authoritative full author list, not a synthesized stub;
+        #   d. enough authors are dropped to be a deliberate truncation rather
+        #      than a transcription slip: >= 2 dropped, OR >= a third of a
+        #      >= 3-author canonical list (so 1-of-3 fires, 1-of-8 does not);
+        #   e. corroboration: >= 2 order-reliable sources independently list
+        #      MORE authors than the entry cites, so a single truncated record
+        #      stub can never mint the flag. Without ``per_source_records``
+        #      (or with fewer corroborating sources) we abstain as today.
+        if (
+            not cfg.strict
+            and comparisons["author"].resolved_outcome is MatchOutcome.PARTIAL
+            and record.order_reliable
+            and record.structured_names
+            and not truncation_disclosed
+        ):
+            entry_stripped = _strip_author_sentinels(entry_names)
+            api_stripped = _strip_author_sentinels(api_names)
+            dropped = len(api_stripped) - len(entry_stripped)
+            ratio_gate = dropped >= 2 or (len(api_stripped) >= 3 and dropped >= len(api_stripped) / 3.0)
+            if (
+                entry_stripped
+                and len(entry_stripped) == len(entry_names)  # no author-field sentinel
+                and len(entry_stripped) < len(api_stripped)
+                and ratio_gate
+            ):
+                corroborating = self._count_fuller_author_sources(per_source_records, len(entry_stripped))
+                if corroborating >= self._MIN_ORDER_RELIABLE_SOURCES_FOR_FLAG:
+                    comparisons["author"].outcome = MatchOutcome.MISMATCH
+                    comparisons["author"].matches = False
+                    comparisons["author"].note = (
+                        f"Silent author-list truncation (entry lists {len(entry_stripped)} of "
+                        f"{len(api_stripped)} authors without disclosure; corroborated by "
+                        f"{corroborating} sources)"
+                    )
+                    # Same routing tag as strict rule 5: _determine_status sends a
+                    # lone author MISMATCH so tagged to AUTHOR_TRUNCATED.
+                    comparisons["author"].given_name_findings = (comparisons["author"].given_name_findings or []) + [
+                        {"variety": "strict_truncated"}
+                    ]
 
         # FIX A: cross-source extra-author / fabrication detection. When the
         # author check has tentatively MATCHed (or returned PARTIAL because the
@@ -3534,7 +3617,11 @@ class FactChecker:
         # initials/diacritic/CJK citations are never hard-flagged.
         gn_class, gn_findings = given_name_position_audit(entry_authors, record)
         if gn_findings:
-            comparisons["author"].given_name_findings = gn_findings
+            # APPEND to any existing findings -- the truncation escalations above
+            # tag the comparison with a routing marker ("strict_truncated") that
+            # _determine_status needs; replacing the list would silently drop it
+            # whenever the audit also recorded benign per-position findings.
+            comparisons["author"].given_name_findings = (comparisons["author"].given_name_findings or []) + gn_findings
         if comparisons["author"].resolved_outcome in (MatchOutcome.MATCH, MatchOutcome.PARTIAL):
             if gn_class == "escalate":
                 comparisons["author"].outcome = MatchOutcome.MISMATCH

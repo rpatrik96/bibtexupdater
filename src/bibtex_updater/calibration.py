@@ -74,6 +74,7 @@ STATUS_BASE_CONFIDENCE = {
     "title_mismatch": _PROB_SOFT,
     "author_mismatch": _PROB_SOFT,
     "given_name_substitution": _PROB_SOFT,  # surnames match, a given name is a different person
+    "author_truncated": _PROB_SOFT,  # silent author-list truncation (one disagreeing field)
     "year_mismatch": _PROB_SOFT,
     "venue_mismatch": _PROB_SOFT,
     "partial_match": _PROB_SOFT,
