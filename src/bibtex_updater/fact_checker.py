@@ -31,6 +31,7 @@ import datetime
 import json
 import logging
 import re
+import ssl
 import sys
 import threading
 from abc import ABC, abstractmethod
@@ -966,21 +967,43 @@ class WebVerifier(BaseVerifier):
             api_sources_with_hits=["url_check"],
         )
 
-    def _check_url(self, url: str) -> URLCheckResult:
-        """Check if URL is accessible via HEAD request."""
-        import requests
+    @staticmethod
+    def _is_ssl_failure(exc: BaseException) -> bool:
+        """True when an httpx connection failure was caused by a TLS problem.
 
+        httpx surfaces TLS handshake/certificate failures as
+        ``httpx.ConnectError`` wrapping an ``ssl.SSLError`` cause; walk the
+        cause/context chain (bounded) so the error string stays informative.
+        """
+        cause: BaseException | None = exc
+        for _ in range(10):
+            if cause is None:
+                break
+            if isinstance(cause, ssl.SSLError):
+                return True
+            cause = cause.__cause__ or cause.__context__
+        text = str(exc).lower()
+        return "ssl" in text or "certificate" in text
+
+    def _check_url(self, url: str) -> URLCheckResult:
+        """Check if URL is accessible via HEAD request.
+
+        Uses the SHARED httpx client (``self.http.client``) so web-reference
+        checks ride the same connection pool as every other request instead of
+        opening a parallel ``requests`` pool.
+        """
         try:
             # Use HEAD request to minimize data transfer
-            resp = requests.head(
+            resp = self.http.client.request(
+                "HEAD",
                 url,
                 timeout=self.config.timeout,
-                allow_redirects=self.config.follow_redirects,
+                follow_redirects=self.config.follow_redirects,
                 headers={"User-Agent": "BibtexFactChecker/1.0"},
             )
 
             is_redirect = len(resp.history) > 0
-            final_url = resp.url if is_redirect else None
+            final_url = str(resp.url) if is_redirect else None
 
             return URLCheckResult(
                 url=url,
@@ -989,23 +1012,23 @@ class WebVerifier(BaseVerifier):
                 is_redirect=is_redirect,
                 final_url=final_url,
             )
-        except requests.exceptions.SSLError as e:
-            return URLCheckResult(url=url, accessible=False, error=f"SSL error: {e}")
-        except requests.exceptions.ConnectionError as e:
+        except httpx.ConnectError as e:
+            if self._is_ssl_failure(e):
+                return URLCheckResult(url=url, accessible=False, error=f"SSL error: {e}")
             return URLCheckResult(url=url, accessible=False, error=f"Connection error: {e}")
-        except requests.exceptions.Timeout:
+        except httpx.TimeoutException:
             return URLCheckResult(url=url, accessible=False, error="Request timed out")
         except Exception as e:
             return URLCheckResult(url=url, accessible=False, error=str(e))
 
     def _verify_content(self, url: str, entry: dict[str, Any]) -> float | None:
         """Verify that page content matches entry metadata."""
-        import requests
-
         try:
-            resp = requests.get(
+            # follow_redirects mirrors the old requests.get default.
+            resp = self.http.client.get(
                 url,
                 timeout=self.config.timeout,
+                follow_redirects=True,
                 headers={"User-Agent": "BibtexFactChecker/1.0"},
             )
             if resp.status_code != 200:
@@ -2549,10 +2572,12 @@ class FactChecker:
 
         # ----- Path 2: no usable DOI hit -> confident-title Crossref search. -----
         if structured is None and entry_title:
-            raw_title = entry.get("title", "") or ""
+            # Retrieval-only LaTeX strip (mirrors ``_query_cascade``); the title
+            # CONFIRMATION below still normalizes the original strings.
+            search_title = latex_to_plain(entry.get("title", "") or "")
             first_author = first_author_surname(entry)
             try:
-                items = self.crossref.search(raw_title, rows=5, title=raw_title, author=first_author)
+                items = self.crossref.search(search_title, rows=5, title=search_title, author=first_author)
             except Exception:
                 items = []
             best_struct: PublishedRecord | None = None
@@ -2668,6 +2693,12 @@ class FactChecker:
             multiple sources if intermediate matches were below threshold.
         """
         raw_title = entry.get("title", "") or ""
+        # LaTeX-laden titles ("{B}rain {S}urgeon", "M\\\"uller" escapes) degrade
+        # ranking on EVERY external index, not just DBLP (FIX B2). Strip the
+        # markup once and use this plain title for ALL retrieval parameters.
+        # RETRIEVAL only: scoring/comparison below keeps using the existing
+        # normalization on the original strings, so leak risk is zero.
+        retrieval_title = latex_to_plain(raw_title)
         title_norm = normalize_title_for_match(raw_title)
         first_author = first_author_surname(entry)
         authors_ref = authors_last_names(entry.get("author", ""), limit=3)
@@ -2689,7 +2720,7 @@ class FactChecker:
         # ----- Step 1: CrossRef (fielded query.title + query.author) -----
         sources_queried.append("crossref")
         try:
-            cr_items = self.crossref.search(query, rows=top_k, title=raw_title, author=first_author)
+            cr_items = self.crossref.search(query, rows=top_k, title=retrieval_title, author=first_author)
         except Exception as exc:
             cr_items = []
             errors.append(f"Crossref: {exc}")
@@ -2720,8 +2751,8 @@ class FactChecker:
         if self.openalex is not None:
             sources_queried.append("openalex")
             try:
-                # Fielded filter=title.search:<raw title>, free-text fallback.
-                oa_items = self.openalex.search(query, limit=top_k, title=raw_title)
+                # Fielded filter=title.search:<plain title>, free-text fallback.
+                oa_items = self.openalex.search(query, limit=top_k, title=retrieval_title)
             except Exception as exc:
                 oa_items = []
                 errors.append(f"OpenAlex: {exc}")
@@ -2747,9 +2778,8 @@ class FactChecker:
             # ``{B}rain {S}urgeon`` and ``Müller`` index correctly. This is a
             # RETRIEVAL change only -- the downstream matcher still applies
             # fuzzy logic to DBLP's response, so leak risk is zero.
-            dblp_title = latex_to_plain(raw_title or "")
             dblp_first_author = strip_diacritics(first_author or "")
-            dblp_query = f"{dblp_title} {dblp_first_author}".strip()
+            dblp_query = f"{retrieval_title} {dblp_first_author}".strip()
             try:
                 dblp_hits = self.dblp.search(dblp_query, max_hits=top_k)
             except Exception as exc:
@@ -2782,7 +2812,7 @@ class FactChecker:
         if self.openreview is not None:
             sources_queried.append("openreview")
             try:
-                or_notes = self.openreview.search(query, limit=top_k, title=raw_title, first_author=first_author)
+                or_notes = self.openreview.search(query, limit=top_k, title=retrieval_title, first_author=first_author)
             except Exception as exc:
                 or_notes = []
                 errors.append(f"OpenReview: {exc}")
@@ -2801,7 +2831,7 @@ class FactChecker:
         sources_queried.append("semanticscholar")
         try:
             # Title-led query keeps S2 relevance focused on the paper title.
-            s2_query = f"{raw_title} {first_author}".strip() or query
+            s2_query = f"{retrieval_title} {first_author}".strip() or query
             s2_data = self.s2.search(s2_query, limit=top_k)
         except Exception as exc:
             s2_data = []
@@ -2853,6 +2883,9 @@ class FactChecker:
         wrong-paper candidate that passes the title gate but fails the
         author gate routes to AUTHOR_MISMATCH, not VERIFIED.
         """
+        # Retrieval-only LaTeX strip (mirrors ``_query_cascade``); scoring below
+        # still normalizes the ORIGINAL title.
+        retrieval_title = latex_to_plain(raw_title or "")
         title_norm = normalize_title_for_match(raw_title)
         authors_ref = authors_last_names(entry.get("author", ""), limit=3)
 
@@ -2865,7 +2898,7 @@ class FactChecker:
         # ----- Crossref title-only retry -----
         sources_queried.append("crossref-fallback")
         try:
-            cr_items = self.crossref.search(raw_title, rows=top_k, title=raw_title)
+            cr_items = self.crossref.search(retrieval_title, rows=top_k, title=retrieval_title)
         except Exception as exc:
             cr_items = []
             errors.append(f"Crossref (fallback): {exc}")
@@ -2882,7 +2915,7 @@ class FactChecker:
         if self.openalex is not None:
             sources_queried.append("openalex-fallback")
             try:
-                oa_items = self.openalex.search(raw_title, limit=top_k, title=raw_title)
+                oa_items = self.openalex.search(retrieval_title, limit=top_k, title=retrieval_title)
             except Exception as exc:
                 oa_items = []
                 errors.append(f"OpenAlex (fallback): {exc}")
@@ -3826,9 +3859,22 @@ class AcademicVerifier(BaseVerifier):
     def supports(self, category: EntryCategory) -> bool:
         return category == EntryCategory.ACADEMIC
 
-    def verify(self, entry: dict[str, Any], classification: ClassificationResult) -> FactCheckResult:
-        """Verify an academic entry using the existing FactChecker logic."""
-        result = self.fact_checker.check_entry(entry)
+    def verify(
+        self,
+        entry: dict[str, Any],
+        classification: ClassificationResult,
+        pre_validated_dois: dict[str, bool] | None = None,
+    ) -> FactCheckResult:
+        """Verify an academic entry using the existing FactChecker logic.
+
+        Args:
+            entry: BibTeX entry to check.
+            classification: Category classification for the entry.
+            pre_validated_dois: Optional entry-ID -> DOI-resolves results from
+                the batch HEAD-sweep (``FactCheckProcessor._batch_validate_dois``),
+                forwarded so the per-entry check skips a duplicate doi.org HEAD.
+        """
+        result = self.fact_checker.check_entry(entry, pre_validated_dois=pre_validated_dois)
         # Add category to result
         return FactCheckResult(
             entry_key=result.entry_key,
@@ -3877,8 +3923,29 @@ class UnifiedFactChecker:
             ),
         }
 
-    def check_entry(self, entry: dict[str, Any]) -> FactCheckResult:
-        """Fact-check a single entry using the appropriate verifier."""
+    @property
+    def academic_fact_checker(self) -> FactChecker:
+        """The inner academic :class:`FactChecker`.
+
+        Public accessor for the batch-processing layer
+        (:class:`FactCheckProcessor`): the batch DOI HEAD-sweep and the Crossref
+        ``/works`` cache warm-up need the academic checker's shared clients
+        (httpx client, Crossref client + response cache) regardless of which
+        checker wrapper the CLI built.
+        """
+        verifier = self.verifiers[EntryCategory.ACADEMIC]
+        assert isinstance(verifier, AcademicVerifier)
+        return verifier.fact_checker
+
+    def check_entry(self, entry: dict[str, Any], pre_validated_dois: dict[str, bool] | None = None) -> FactCheckResult:
+        """Fact-check a single entry using the appropriate verifier.
+
+        Args:
+            entry: BibTeX entry to check.
+            pre_validated_dois: Optional entry-ID -> DOI-resolves results from
+                the batch HEAD-sweep, forwarded to the academic verifier (the
+                only verifier that validates DOIs; others ignore it).
+        """
         # Classify entry
         classification = self.classifier.classify(entry)
         self.logger.debug(
@@ -3919,7 +3986,10 @@ class UnifiedFactChecker:
                 category=classification.category,
             )
 
-        # Delegate to verifier
+        # Delegate to verifier. Only the academic verifier consumes the batch
+        # DOI pre-validation results.
+        if isinstance(verifier, AcademicVerifier):
+            return verifier.verify(entry, classification, pre_validated_dois=pre_validated_dois)
         return verifier.verify(entry, classification)
 
 
@@ -3932,6 +4002,20 @@ class FactCheckProcessor:
     def __init__(self, checker: FactChecker | UnifiedFactChecker, logger: logging.Logger):
         self.checker = checker
         self.logger = logger
+
+    def _academic_checker(self) -> FactChecker | None:
+        """Resolve the academic :class:`FactChecker` behind ``self.checker``.
+
+        The CLI always wraps it in a :class:`UnifiedFactChecker`; the batch
+        optimizations (DOI HEAD-sweep, Crossref ``/works`` cache warm-up) need
+        the inner checker's shared clients either way. Returns ``None`` for
+        duck-typed stand-ins (tests) that expose neither.
+        """
+        if isinstance(self.checker, FactChecker):
+            return self.checker
+        if isinstance(self.checker, UnifiedFactChecker):
+            return self.checker.academic_fact_checker
+        return None
 
     def _batch_validate_dois(self, entries: list[dict[str, Any]]) -> dict[str, bool]:
         """Pre-validate all DOIs via concurrent HEAD requests.
@@ -3961,11 +4045,14 @@ class FactCheckProcessor:
             return (entry_id, _doi_resolves(client, normalized) is not False)
 
         results: dict[str, bool] = {}
-        # Reuse shared httpx.Client if available (avoids TCP/TLS overhead)
-        if isinstance(self.checker, FactChecker):
-            client = self.checker.crossref.http.client
-        else:
-            client = httpx.Client(timeout=10.0, follow_redirects=True)
+        # Reuse the shared httpx.Client (avoids TCP/TLS overhead) of the
+        # academic checker -- reachable through either wrapper type, so the
+        # UnifiedFactChecker path no longer builds a throwaway client.
+        academic = self._academic_checker()
+        owns_client = academic is None
+        client = (
+            httpx.Client(timeout=10.0, follow_redirects=True) if academic is None else academic.crossref.http.client
+        )
         try:
             with concurrent.futures.ThreadPoolExecutor(max_workers=16) as executor:
                 futures = [executor.submit(_check_doi, eid, doi, client) for eid, doi in dois.items()]
@@ -3974,7 +4061,7 @@ class FactCheckProcessor:
                     results[entry_id] = is_valid
         finally:
             # Only close if we created the client ourselves
-            if not isinstance(self.checker, FactChecker):
+            if owns_client:
                 client.close()
 
         return results
@@ -4009,10 +4096,12 @@ class FactCheckProcessor:
         Returns:
             Number of distinct DOIs warmed (best-effort; for logging/tests).
         """
-        # Only FactChecker has a crossref client whose cache we can warm.
-        if not isinstance(self.checker, FactChecker):
+        # Resolve the crossref client whose cache we warm through either
+        # wrapper type (bare FactChecker or the CLI's UnifiedFactChecker).
+        academic = self._academic_checker()
+        if academic is None:
             return 0
-        crossref = self.checker.crossref
+        crossref = academic.crossref
         # No shared response cache -> warming would not be observed by the
         # per-entry calls, so skip (each call would re-fetch anyway).
         if getattr(crossref.http, "cache", None) is None:
@@ -4091,11 +4180,12 @@ class FactCheckProcessor:
                 """Process a single entry and write to JSONL if configured."""
                 self.logger.info("Checking %d/%d: %s", index + 1, len(entries), entry.get("ID", "?"))
                 try:
-                    # Pass pre-validated DOI results if checker is FactChecker
-                    if isinstance(self.checker, FactChecker):
+                    # Pass the batch DOI pre-validation results to both checker
+                    # types (UnifiedFactChecker forwards them to its academic
+                    # verifier). Duck-typed stand-ins keep the bare call.
+                    if isinstance(self.checker, FactChecker | UnifiedFactChecker):
                         result = self.checker.check_entry(entry, pre_validated_dois=pre_validated_dois)
                     else:
-                        # UnifiedFactChecker doesn't support pre_validated_dois yet
                         result = self.checker.check_entry(entry)
                 except Exception as exc:
                     self.logger.error("Exception checking entry %s: %s", entry.get("ID", "?"), exc)

@@ -1297,6 +1297,126 @@ class TestWebVerifier:
         assert result.status == FactCheckStatus.API_ERROR
         assert "No URL found" in result.errors[0]
 
+    # --- Shared-httpx-client URL checks (no separate `requests` pool) ---
+
+    def _verifier_with_transport(self, handler, logger, verify_content=False):
+        """WebVerifier whose shared client is a hermetic httpx.MockTransport."""
+        import httpx as _httpx
+
+        from bibtex_updater.fact_checker import WebVerifier, WebVerifierConfig
+
+        client = _httpx.Client(transport=_httpx.MockTransport(handler))
+        http = MagicMock()
+        http.client = client
+        return WebVerifier(http, WebVerifierConfig(verify_content=verify_content), logger)
+
+    def test_check_url_uses_shared_httpx_client_head(self, logger):
+        import httpx as _httpx
+
+        seen: list[_httpx.Request] = []
+
+        def handler(request: _httpx.Request) -> _httpx.Response:
+            seen.append(request)
+            return _httpx.Response(200)
+
+        verifier = self._verifier_with_transport(handler, logger)
+        result = verifier._check_url("https://example.com/post")
+
+        assert result.accessible is True
+        assert result.status_code == 200
+        assert result.is_redirect is False
+        assert result.final_url is None
+        assert len(seen) == 1
+        assert seen[0].method == "HEAD"
+        assert seen[0].headers["User-Agent"] == "BibtexFactChecker/1.0"
+
+    def test_check_url_records_redirect_history(self, logger):
+        import httpx as _httpx
+
+        def handler(request: _httpx.Request) -> _httpx.Response:
+            if request.url.path == "/old":
+                return _httpx.Response(301, headers={"Location": "https://example.com/new"})
+            return _httpx.Response(200)
+
+        verifier = self._verifier_with_transport(handler, logger)
+        result = verifier._check_url("https://example.com/old")
+
+        assert result.accessible is True
+        assert result.is_redirect is True
+        assert result.final_url == "https://example.com/new"
+
+    def test_check_url_404_not_accessible(self, logger):
+        import httpx as _httpx
+
+        verifier = self._verifier_with_transport(lambda request: _httpx.Response(404), logger)
+        result = verifier._check_url("https://example.com/missing")
+
+        assert result.accessible is False
+        assert result.status_code == 404
+
+    def test_check_url_connection_error(self, logger):
+        import httpx as _httpx
+
+        def handler(request: _httpx.Request) -> _httpx.Response:
+            raise _httpx.ConnectError("connection refused")
+
+        verifier = self._verifier_with_transport(handler, logger)
+        result = verifier._check_url("https://unreachable.example")
+
+        assert result.accessible is False
+        assert result.error is not None and "Connection error" in result.error
+
+    def test_check_url_ssl_error(self, logger):
+        import ssl as _ssl
+
+        import httpx as _httpx
+
+        def handler(request: _httpx.Request) -> _httpx.Response:
+            raise _httpx.ConnectError("handshake failed") from _ssl.SSLCertVerificationError(
+                "certificate verify failed"
+            )
+
+        verifier = self._verifier_with_transport(handler, logger)
+        result = verifier._check_url("https://badssl.example")
+
+        assert result.accessible is False
+        assert result.error is not None and "SSL error" in result.error
+
+    def test_check_url_timeout(self, logger):
+        import httpx as _httpx
+
+        def handler(request: _httpx.Request) -> _httpx.Response:
+            raise _httpx.ConnectTimeout("timed out")
+
+        verifier = self._verifier_with_transport(handler, logger)
+        result = verifier._check_url("https://slow.example")
+
+        assert result.accessible is False
+        assert result.error == "Request timed out"
+
+    def test_verify_content_uses_shared_httpx_client(self, logger):
+        import httpx as _httpx
+
+        seen: list[_httpx.Request] = []
+
+        def handler(request: _httpx.Request) -> _httpx.Response:
+            seen.append(request)
+            return _httpx.Response(200, text="<html>All about deep learning today</html>")
+
+        verifier = self._verifier_with_transport(handler, logger, verify_content=True)
+        score = verifier._verify_content("https://example.com/post", {"title": "Deep Learning"})
+
+        assert score == pytest.approx(1.0)
+        assert len(seen) == 1
+        assert seen[0].method == "GET"
+
+    def test_verify_content_non_200_returns_none(self, logger):
+        import httpx as _httpx
+
+        verifier = self._verifier_with_transport(lambda request: _httpx.Response(500), logger, verify_content=True)
+
+        assert verifier._verify_content("https://example.com/x", {"title": "T"}) is None
+
 
 class TestBookVerifier:
     """Tests for BookVerifier."""

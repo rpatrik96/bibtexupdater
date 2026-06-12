@@ -109,6 +109,111 @@ class TestCrossrefMessageToRecord:
         assert rec is not None
         assert rec.authors == []
 
+    def test_subtitle_joined_into_title(self):
+        """ACM/IEEE split colon-titles across title/subtitle; the converter must
+        re-join them (the CACM NeRF record: title=["NeRF"], subtitle=[...])."""
+        msg = {
+            "DOI": "10.1145/3503250",
+            "type": "journal-article",
+            "title": ["NeRF"],
+            "subtitle": ["Representing scenes as neural radiance fields for view synthesis"],
+        }
+        rec = crossref_message_to_record(msg)
+        assert rec is not None
+        assert rec.title == "NeRF: Representing scenes as neural radiance fields for view synthesis"
+
+    def test_subtitle_html_stripped_before_join(self):
+        msg = {
+            "DOI": "10.1234/test",
+            "title": ["<i>Head</i>"],
+            "subtitle": ["the <b>rest</b> of it"],
+        }
+        rec = crossref_message_to_record(msg)
+        assert rec is not None
+        assert rec.title == "Head: the rest of it"
+
+    def test_no_subtitle_leaves_title_alone(self):
+        msg = {
+            "DOI": "10.1234/test",
+            "title": ["Just a Title"],
+        }
+        rec = crossref_message_to_record(msg)
+        assert rec is not None
+        assert rec.title == "Just a Title"
+
+    def test_empty_subtitle_list_leaves_title_alone(self):
+        msg = {
+            "DOI": "10.1234/test",
+            "title": ["Just a Title"],
+            "subtitle": [],
+        }
+        rec = crossref_message_to_record(msg)
+        assert rec is not None
+        assert rec.title == "Just a Title"
+
+    def test_blank_subtitle_string_leaves_title_alone(self):
+        msg = {
+            "DOI": "10.1234/test",
+            "title": ["Just a Title"],
+            "subtitle": [""],
+        }
+        rec = crossref_message_to_record(msg)
+        assert rec is not None
+        assert rec.title == "Just a Title"
+
+    def test_subtitle_already_in_title_not_duplicated(self):
+        """Some publishers repeat the subtitle inside the full title; don't
+        append it twice (case-insensitive containment check)."""
+        msg = {
+            "DOI": "10.1234/test",
+            "title": ["NeRF: Representing Scenes as Neural Radiance Fields for View Synthesis"],
+            "subtitle": ["Representing scenes as neural radiance fields for view synthesis"],
+        }
+        rec = crossref_message_to_record(msg)
+        assert rec is not None
+        assert rec.title == "NeRF: Representing Scenes as Neural Radiance Fields for View Synthesis"
+
+    def test_subtitle_without_title_ignored(self):
+        msg = {
+            "DOI": "10.1234/test",
+            "subtitle": ["Orphan subtitle"],
+        }
+        rec = crossref_message_to_record(msg)
+        assert rec is not None
+        assert rec.title is None
+
+    def test_created_date_is_last_resort(self):
+        """``created`` is the DOI *deposit* date (years off for backfilled
+        archives) -- ``issued`` must win over it."""
+        msg = {
+            "DOI": "10.1234/test",
+            "issued": {"date-parts": [[1998]]},
+            "created": {"date-parts": [[2015, 4, 1]]},
+        }
+        rec = crossref_message_to_record(msg)
+        assert rec is not None
+        assert rec.year == 1998
+
+    def test_created_date_used_when_nothing_else(self):
+        msg = {
+            "DOI": "10.1234/test",
+            "created": {"date-parts": [[2015, 4, 1]]},
+        }
+        rec = crossref_message_to_record(msg)
+        assert rec is not None
+        assert rec.year == 2015
+
+    def test_published_print_still_wins_over_created(self):
+        msg = {
+            "DOI": "10.1234/test",
+            "published-print": {"date-parts": [[2003]]},
+            "created": {"date-parts": [[2011]]},
+            "issued": {"date-parts": [[2004]]},
+        }
+        rec = crossref_message_to_record(msg)
+        assert rec is not None
+        assert rec.year == 2003
+
 
 class TestDblpHitToRecord:
     """Tests for dblp_hit_to_record function."""

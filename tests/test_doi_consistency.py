@@ -150,6 +150,49 @@ class TestDoiConsistency:
         assert result.status != FactCheckStatus.DOI_MISMATCH
         assert result.status == FactCheckStatus.VERIFIED
 
+    def test_split_subtitle_record_not_flagged(self, dead_sources, logger):
+        """Regression: ACM/IEEE split colon-titles across Crossref title/subtitle
+        (CACM NeRF: title=["NeRF"], subtitle=["Representing scenes as ..."]).
+        Dropping the subtitle made the consistency check compare the entry's
+        full title against bare "NeRF" and flag the CORRECT DOI as
+        DOI_MISMATCH. The converter now re-joins them, so no flag."""
+        crossref, dblp, s2 = dead_sources
+        entry = {
+            "ID": "mildenhall2021nerf",
+            "ENTRYTYPE": "article",
+            "title": "NeRF: Representing Scenes as Neural Radiance Fields for View Synthesis",
+            "author": "Mildenhall, Ben and Srinivasan, Pratul P. and Tancik, Matthew",
+            "journal": "Communications of the ACM",
+            "doi": "10.1145/3503250",
+            "year": "2021",
+        }
+        split_message = {
+            "DOI": "10.1145/3503250",
+            "type": "journal-article",
+            "title": ["NeRF"],
+            "subtitle": ["Representing scenes as neural radiance fields for view synthesis"],
+            "author": [
+                {"given": "Ben", "family": "Mildenhall"},
+                {"given": "Pratul P.", "family": "Srinivasan"},
+                {"given": "Matthew", "family": "Tancik"},
+            ],
+            "container-title": ["Communications of the ACM"],
+            "issued": {"date-parts": [[2021]]},
+        }
+        crossref.get_by_doi = MagicMock(return_value=split_message)
+        checker = FactChecker(crossref, dblp, s2, FactCheckerConfig(), logger)
+
+        result = checker.check_entry(entry)
+
+        assert result.status != FactCheckStatus.DOI_MISMATCH
+        # The DOI is correct, so none of the ID-anchored mismatch flags may
+        # fire either (the record IS the cited paper).
+        assert result.status not in (
+            FactCheckStatus.AUTHOR_MISMATCH,
+            FactCheckStatus.VENUE_MISMATCH,
+            FactCheckStatus.YEAR_MISMATCH,
+        )
+
     def test_no_doi_entry_returns_none(self, dead_sources, logger):
         """An entry without a DOI is never flagged for DOI mismatch."""
         crossref, dblp, s2 = dead_sources

@@ -1501,6 +1501,12 @@ class HttpClient:
 
     RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 
+    # Versioned envelope marker for cached NON-JSON text responses (e.g. arXiv
+    # Atom XML), stored as {"__btu_cache_v2__": true, "ct": <content-type>,
+    # "text": <body>}. JSON responses keep the legacy format (the raw decoded
+    # body), so existing cache files remain fully readable in both directions.
+    CACHE_ENVELOPE_KEY = "__btu_cache_v2__"
+
     # Circuit breaker: after this many consecutive fully-failed requests to a
     # service (sustained 429/5xx -- typically DBLP/Crossref IP-throttling), stop
     # hammering it for CIRCUIT_COOLDOWN seconds so the throttle can clear instead
@@ -1627,6 +1633,17 @@ class HttpClient:
                 int(self.CIRCUIT_COOLDOWN),
             )
 
+    @staticmethod
+    def _is_cacheable_text(content_type: str) -> bool:
+        """True for non-JSON *text* bodies worth caching (arXiv Atom XML, ...).
+
+        Conservative allow-list: ``text/*`` plus XML media types. Binary
+        responses are never cached (the JSON-valued SqliteCache cannot hold
+        them faithfully).
+        """
+        mime = content_type.split(";", 1)[0].strip().lower()
+        return mime.startswith("text/") or mime.endswith("+xml") or mime == "application/xml"
+
     def _request(
         self,
         method: str,
@@ -1652,6 +1669,20 @@ class HttpClient:
             cache_key = json.dumps({"m": method, "u": url, "p": params, "a": accept, "j": json_body}, sort_keys=True)
             cached = self.cache.get(cache_key)
             if cached is not None:
+                # v2 envelope: a cached non-JSON text response (arXiv Atom XML,
+                # ...). Reconstruct it with its original Content-Type so callers
+                # that inspect the header / use .text behave identically.
+                if isinstance(cached, dict) and cached.get(self.CACHE_ENVELOPE_KEY) is True:
+                    return httpx.Response(
+                        200,
+                        content=str(cached.get("text") or "").encode("utf-8"),
+                        headers={
+                            "Content-Type": str(cached.get("ct") or "text/plain"),
+                            "X-From-Cache": "1",
+                        },
+                    )
+                # Legacy format: the raw decoded JSON body (kept for backward
+                # compatibility with existing cache files).
                 return httpx.Response(
                     200,
                     content=json.dumps(cached).encode("utf-8"),
@@ -1674,11 +1705,25 @@ class HttpClient:
                 resp = self.client.request(method, url, params=params, headers=headers, json=json_body)
                 if resp.status_code in self.RETRYABLE_STATUS:
                     raise httpx.HTTPStatusError("Retryable status", request=resp.request, response=resp)
-                if self.cache and cache_key and resp.headers.get("Content-Type", "").startswith("application/json"):
-                    try:
-                        self.cache.set(cache_key, resp.json())
-                    except Exception:
-                        pass
+                if self.cache and cache_key and resp.status_code == 200:
+                    content_type = resp.headers.get("Content-Type", "")
+                    if content_type.startswith("application/json"):
+                        # Legacy format: raw decoded JSON body (kept so old and
+                        # new cache files stay mutually compatible).
+                        try:
+                            self.cache.set(cache_key, resp.json())
+                        except Exception:
+                            pass
+                    elif self._is_cacheable_text(content_type):
+                        # Non-JSON text (arXiv Atom XML, ...): versioned envelope
+                        # preserving the Content-Type for faithful replay.
+                        try:
+                            self.cache.set(
+                                cache_key,
+                                {self.CACHE_ENVELOPE_KEY: True, "ct": content_type, "text": resp.text},
+                            )
+                        except Exception:
+                            pass
                 self._record_service_success(service)
                 return resp
             except httpx.HTTPError as exc:
@@ -1795,6 +1840,18 @@ def crossref_message_to_record(msg: dict[str, Any]) -> PublishedRecord | None:
     title = titles[0] if titles else None
     if title:
         title = re.sub(r"<[^>]*>", "", title)  # strip HTML tags
+    # ACM/IEEE deposit colon-titles split across title/subtitle (the CACM NeRF
+    # record is title=["NeRF"], subtitle=["Representing scenes as ..."]).
+    # Dropping the subtitle left the record title as the bare head, so the
+    # DOI-consistency check compared the entry's FULL title against "NeRF"
+    # alone and flagged a CORRECT DOI as DOI_MISMATCH. Re-join them unless the
+    # subtitle is already contained in the title (some publishers repeat it).
+    subtitles = msg.get("subtitle") or []
+    subtitle = subtitles[0] if subtitles else None
+    if subtitle:
+        subtitle = re.sub(r"<[^>]*>", "", subtitle).strip()  # strip HTML tags
+    if title and subtitle and subtitle.lower() not in title.lower():
+        title = f"{title}: {subtitle}"
 
     # Authors - handle given/family and literal formats. Crossref returns
     # AUTHORITATIVE separate given/family fields, so a real ``family`` is
@@ -1822,9 +1879,11 @@ def crossref_message_to_record(msg: dict[str, Any]) -> PublishedRecord | None:
     container = msg.get("container-title", [])
     journal = container[0] if container else None
 
-    # Publication date - check multiple date fields
+    # Publication date - check multiple date fields. ``created`` is the DOI
+    # *deposit* date, which can be years off the publication date for
+    # backfilled archives, so it is consulted strictly LAST.
     pubyear = None
-    for dt_key in ("published-print", "published-online", "created", "issued", "published"):
+    for dt_key in ("published-print", "published-online", "issued", "published", "created"):
         if msg.get(dt_key, {}).get("date-parts"):
             y = msg[dt_key]["date-parts"][0][0]
             if y:

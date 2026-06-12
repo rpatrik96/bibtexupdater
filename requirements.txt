@@ -1,5 +1,4 @@
 bibtexparser
-requests
 crossref-commons
 httpx
 rapidfuzz
