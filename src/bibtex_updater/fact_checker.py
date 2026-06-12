@@ -30,6 +30,7 @@ import concurrent.futures
 import datetime
 import json
 import logging
+import os
 import re
 import ssl
 import sys
@@ -80,12 +81,12 @@ from bibtex_updater.utils import (
     DBLP_API_SEARCH,
     DBLP_API_VENUE_SEARCH,
     S2_API,
+    AdaptiveRateLimiterRegistry,
     GivenNameVariety,
     # Text normalization
     HttpClient,
     # Data classes
     PublishedRecord,
-    RateLimiterRegistry,
     SqliteCache,
     # API converters
     arxiv_atom_to_record,
@@ -5142,6 +5143,89 @@ class FactCheckProcessor:
 # ------------- CLI -------------
 
 
+#: Placeholder polite-pool contact used when no real --mailto /
+#: BIBTEX_CHECK_MAILTO is configured (kept byte-identical to the historical
+#: default User-Agent so unconfigured runs keep their existing identity).
+DEFAULT_MAILTO_PLACEHOLDER = "factchecker@example.com"
+
+#: One-time guard for the missing-mailto warning (warn once per process, not
+#: once per call site).
+_mailto_warning_emitted = False
+
+
+def _cli_service_rate_limits(rate_limit: int, s2_api_key: str | None) -> dict[str, int]:
+    """Per-service requests-per-minute limits for the fact-checker CLI.
+
+    Scaled by ``--rate-limit`` (45, the historical default, is scale 1.0) and
+    capped well below each service's documented ceiling:
+
+    * Crossref's polite pool advertises ~50 req/SECOND; the old dict granted
+      50/min. Default 300/min, cap 600/min.
+    * OpenAlex's polite pool allows ~10 req/s; the old dict omitted the key
+      entirely so ``--rate-limit`` never scaled it. Default 150/min, cap
+      300/min.
+    * DBLP / OpenReview publish no ceiling: 30/min default, 60/min cap.
+    * arXiv asks for ~1 request per 3 s, so 20/min FLAT -- never scaled up
+      (the previous registry default of 30/min EXCEEDED the politeness ask).
+    * Semantic Scholar: 60/min with an API key (the documented authenticated
+      allowance for search endpoints is ~1 req/s); keyless traffic shares one
+      global pool across all users, so it stays at the historical trickle.
+    * openlibrary / google_books keep their historical scaling unchanged.
+    """
+    rate_scale = rate_limit / 45.0  # 45 is the --rate-limit default
+    return {
+        "crossref": min(600, max(10, int(300 * rate_scale))),
+        "openalex": min(300, max(10, int(150 * rate_scale))),
+        "dblp": min(60, max(10, int(30 * rate_scale))),
+        "openreview": min(60, max(10, int(30 * rate_scale))),
+        "arxiv": 20,
+        "semanticscholar": 60 if s2_api_key else max(5, int(10 * rate_scale)),
+        "openlibrary": max(10, int(30 * rate_scale)),
+        "google_books": max(10, int(30 * rate_scale)),
+    }
+
+
+def _resolve_polite_mailto(cli_mailto: str | None, logger: logging.Logger) -> str | None:
+    """Resolve the polite-pool contact email for this run.
+
+    The ``--mailto`` flag wins over the ``BIBTEX_CHECK_MAILTO`` env var. When
+    neither is set, return ``None`` and emit a ONE-TIME warning recommending a
+    real contact address: the Crossref and OpenAlex polite pools key on it,
+    and the placeholder default identifies nobody.
+    """
+    global _mailto_warning_emitted
+    mailto = (cli_mailto or "").strip() or os.environ.get("BIBTEX_CHECK_MAILTO", "").strip()
+    if mailto:
+        return mailto
+    if not _mailto_warning_emitted:
+        _mailto_warning_emitted = True
+        logger.warning(
+            "No contact email configured; using placeholder %r. The Crossref/"
+            "OpenAlex polite pools key on a real address -- set --mailto or "
+            "BIBTEX_CHECK_MAILTO to get polite-pool service levels.",
+            DEFAULT_MAILTO_PLACEHOLDER,
+        )
+    return None
+
+
+def _polite_user_agent(mailto: str | None) -> str:
+    """User-Agent for the shared HTTP client (mailto identifies the operator)."""
+    return f"BibtexFactChecker/1.0 (mailto:{mailto or DEFAULT_MAILTO_PLACEHOLDER})"
+
+
+def _effective_openalex_mailto(openalex_mailto: str, mailto: str | None) -> str:
+    """``--openalex-mailto`` value, defaulting to ``--mailto`` when not set.
+
+    "Not set" is detected by comparison with the packaged default: a user who
+    explicitly passes the default placeholder is indistinguishable from one
+    who omitted the flag, and substituting the real contact address is the
+    right outcome for both.
+    """
+    if mailto and openalex_mailto == DEFAULT_OPENALEX_MAILTO:
+        return mailto
+    return openalex_mailto
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the argument parser."""
     p = argparse.ArgumentParser(
@@ -5223,6 +5307,16 @@ Examples:
         "--s2-api-key",
         metavar="KEY",
         help="Semantic Scholar API key for higher rate limits (or set S2_API_KEY env var)",
+    )
+    api_opts.add_argument(
+        "--mailto",
+        metavar="EMAIL",
+        default=None,
+        help=(
+            "Contact email for polite-pool identification: used in the HTTP "
+            "User-Agent (Crossref polite pool) and as the default for "
+            "--openalex-mailto. Or set BIBTEX_CHECK_MAILTO (the flag wins)."
+        ),
     )
     api_opts.add_argument(
         "--no-cache",
@@ -5351,9 +5445,7 @@ def main() -> int:
     logger = logging.getLogger("fact_checker")
 
     # Item 6: non-generative-AI mode (CLI flag wins; env var also honored).
-    import os as _os
-
-    env_flag = _os.environ.get("BIBTEX_CHECK_NON_GENERATIVE", "").strip() in {"1", "true", "yes", "on"}
+    env_flag = os.environ.get("BIBTEX_CHECK_NON_GENERATIVE", "").strip() in {"1", "true", "yes", "on"}
     if args.non_generative or env_flag:
         set_non_generative_mode(True)
         sys.stderr.write(
@@ -5365,7 +5457,7 @@ def main() -> int:
     # --strict evaluation mode (arXiv 2026 hallucination policy). CLI flag
     # wins; env var also honored, mirroring --non-generative. --strict-warn-cnv
     # requires --strict.
-    strict_env = _os.environ.get("BIBTEX_CHECK_STRICT", "").strip() in {"1", "true", "yes", "on"}
+    strict_env = os.environ.get("BIBTEX_CHECK_STRICT", "").strip() in {"1", "true", "yes", "on"}
     strict_mode = bool(args.strict or strict_env)
     strict_warn_cnv = bool(getattr(args, "strict_warn_cnv", False))
     if strict_warn_cnv and not strict_mode:
@@ -5402,28 +5494,24 @@ def main() -> int:
     logger.info("Total entries to check: %d", len(entries))
 
     # Setup HTTP infrastructure
-    import os
-
     s2_api_key = args.s2_api_key or os.environ.get("S2_API_KEY")
     if s2_api_key:
         logger.info("Using Semantic Scholar API key (authenticated rate limits)")
 
+    # Polite-pool identity: --mailto flag wins over BIBTEX_CHECK_MAILTO; when
+    # set it lands in the User-Agent and becomes the --openalex-mailto default.
+    mailto = _resolve_polite_mailto(args.mailto, logger)
+    openalex_mailto = _effective_openalex_mailto(args.openalex_mailto, mailto)
+
     cache = SqliteCache(args.cache_file) if not args.no_cache else None
-    # Scale per-service limits proportionally to --rate-limit
-    rate_scale = args.rate_limit / 45.0  # 45 is the default
-    limiter = RateLimiterRegistry(
-        {
-            "crossref": max(10, int(50 * rate_scale)),
-            "semanticscholar": 60 if s2_api_key else max(5, int(10 * rate_scale)),
-            "dblp": max(10, int(30 * rate_scale)),
-            "openreview": max(10, int(30 * rate_scale)),
-            "openlibrary": max(10, int(30 * rate_scale)),
-            "google_books": max(10, int(30 * rate_scale)),
-        }
-    )
+    # Per-service limits scaled by --rate-limit and capped below each service's
+    # documented ceiling. The ADAPTIVE registry backs off on 429/Retry-After
+    # and rate-limit headers (HttpClient feeds it every real response), so the
+    # higher steady-state limits degrade gracefully instead of hammering.
+    limiter = AdaptiveRateLimiterRegistry(_cli_service_rate_limits(args.rate_limit, s2_api_key))
     http = HttpClient(
         timeout=20.0,
-        user_agent="BibtexFactChecker/1.0 (mailto:factchecker@example.com)",
+        user_agent=_polite_user_agent(mailto),
         rate_limiter=limiter,
         cache=cache,
         s2_api_key=s2_api_key,
@@ -5440,7 +5528,7 @@ def main() -> int:
         check_years=not args.no_check_years,
         check_venue_existence=not args.no_check_venue_existence,
         top_k=top_k,
-        openalex_mailto=args.openalex_mailto,
+        openalex_mailto=openalex_mailto,
         strict=strict_mode,
         strict_warn_cnv=strict_warn_cnv,
     )

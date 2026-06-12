@@ -1071,14 +1071,18 @@ class RateLimiterRegistry:
     optimizing throughput while respecting each service's constraints.
     """
 
+    # Conservative *library* defaults for embedders that never tune limits.
+    # The fact-checker CLI overrides these with scaled-and-capped values much
+    # closer to the documented service ceilings (see
+    # ``fact_checker._cli_service_rate_limits``).
     DEFAULT_LIMITS = {
-        "crossref": 50,  # Crossref: 50/min polite pool
-        "semanticscholar": 100,  # S2: 100/min (1000 with API key)
+        "crossref": 50,  # Conservative default; Crossref's polite-pool ceiling is ~50 req/SECOND
+        "semanticscholar": 100,  # Keyless S2 is a SHARED global pool; keyed search allowance is ~1 req/s
         "dblp": 30,  # DBLP: 30/min (conservative)
-        "arxiv": 30,  # arXiv: 30/min
+        "arxiv": 20,  # arXiv asks for ~1 request per 3 seconds (politeness)
         "scholarly": 10,  # Scholar: very conservative
         "aclanthology": 30,  # ACL Anthology: 30/min (conservative)
-        "openalex": 100,  # OpenAlex: polite pool (~10 req/sec max)
+        "openalex": 100,  # Conservative default; OpenAlex polite pool allows ~10 req/sec
         "europepmc": 20,  # Europe PMC: conservative rate limit
         "openreview": 30,  # OpenReview: 30/min (conservative; keyless public read)
     }
@@ -1171,16 +1175,17 @@ class AdaptiveRateLimiterRegistry(RateLimiterRegistry):
         # Handle 429 Too Many Requests
         if hasattr(response, "status_code") and response.status_code == 429:
             retry_after = response.headers.get("Retry-After")
+            backoff_seconds = 60.0  # Default backoff when header absent/unparseable
             if retry_after:
                 try:
-                    retry_seconds = int(retry_after)
-                    self._backoff_until[service] = time.time() + retry_seconds
+                    backoff_seconds = float(int(retry_after))
                 except (ValueError, TypeError):
-                    # Default 60 second backoff
-                    self._backoff_until[service] = time.time() + 60.0
-            else:
-                # Default 60 second backoff
-                self._backoff_until[service] = time.time() + 60.0
+                    backoff_seconds = 60.0
+            # ``_backoff_until`` is read by ``wait`` on every worker thread, so
+            # the write must happen under the registry lock (it was previously
+            # unguarded; a torn read could miss/garble a fresh backoff).
+            with self._lock:
+                self._backoff_until[service] = time.time() + backoff_seconds
 
             # Also reduce the rate limit
             current_limit = self._limits.get(service, 30)
@@ -1195,8 +1200,9 @@ class AdaptiveRateLimiterRegistry(RateLimiterRegistry):
         Args:
             service: Name of the API service
         """
-        # Check for backoff period
-        backoff_end = self._backoff_until.get(service, 0)
+        # Check for backoff period (read under the lock; see ``adapt``).
+        with self._lock:
+            backoff_end = self._backoff_until.get(service, 0)
         now = time.time()
         if now < backoff_end:
             time.sleep(backoff_end - now)
@@ -1732,6 +1738,28 @@ class HttpClient:
         mime = content_type.split(";", 1)[0].strip().lower()
         return mime.startswith("text/") or mime.endswith("+xml") or mime == "application/xml"
 
+    def _adapt_rate_limiter(self, service: str | None, resp: httpx.Response) -> None:
+        """Feed a REAL (non-cache-hit) response to an adaptive rate limiter.
+
+        Called once per transport response -- including a retryable 429/5xx
+        before the retry exception is raised -- so a server ``Retry-After`` /
+        ``X-RateLimit-Remaining`` lands in the registry's backoff state.
+        Cache-hit synthetic responses never reach this (the cache
+        short-circuits before the request loop). No-op when the configured
+        limiter has no ``adapt`` attribute (plain RateLimiter / registry) or
+        no service was given.
+        """
+        if not service:
+            return
+        adapt = getattr(self._rate_limiter, "adapt", None)
+        if adapt is None:
+            return
+        try:
+            adapt(service, resp)
+        except Exception:
+            # Adaptation is advisory; it must never lose a fetched response.
+            logger.debug("rate-limiter adapt() failed for service %r", service, exc_info=True)
+
     def _request(
         self,
         method: str,
@@ -1791,6 +1819,9 @@ class HttpClient:
                 if service == "semanticscholar" and self.s2_api_key:
                     headers["x-api-key"] = self.s2_api_key
                 resp = self.client.request(method, url, params=params, headers=headers, json=json_body)
+                # Adaptive rate limiting feedback for every REAL response,
+                # including a retryable 429/5xx before it is raised below.
+                self._adapt_rate_limiter(service, resp)
                 if resp.status_code in self.RETRYABLE_STATUS:
                     raise httpx.HTTPStatusError("Retryable status", request=resp.request, response=resp)
                 if self.cache and cache_key and resp.status_code == 200:
