@@ -47,6 +47,7 @@ from rapidfuzz.fuzz import token_sort_ratio
 from bibtex_updater.calibration import calibrate_result
 from bibtex_updater.matching import (
     EXPANDED_VENUE_ALIASES,
+    JOURNAL_CANONICAL_VENUES,
     MatchOutcome,
     _normalize_venue_for_matching,
     _strip_author_sentinels,
@@ -4090,6 +4091,55 @@ class FactChecker:
             year_note,
             outcome=year_outcome,
         )
+
+        # Conference exact-year rule (default mode; HALLMARK
+        # arxiv_version_mismatch -- despite the name: real paper, wrong venue
+        # OR year +-1). The default +-1 tolerance exists for preprint-vs-
+        # publication drift and journal online-first/issue drift; CONFERENCE
+        # proceedings years are exact. When the entry and the record BOTH
+        # canonicalize to the SAME conference (journal canonicals exempted),
+        # the +-1 drift has no innocent explanation -- escalate to MISMATCH,
+        # but only when >= 2 order-reliable, non-preprint per-source records
+        # independently agree on the record year, so a lone mis-dated deposit
+        # never mints the flag. Strict mode already runs tolerance 0 and is
+        # untouched; the preprint-twin guard stays upstream (a preprint best
+        # match never reaches this rule via ``record_is_preprint``), and the
+        # different-edition guard below is disjoint (it needs year_diff >= 4).
+        if (
+            not cfg.strict
+            and comparisons["year"].resolved_outcome is MatchOutcome.MATCH
+            and year_diff == 1
+            and not record_is_preprint
+            and per_source_records
+        ):
+            claimed_venue_for_year = entry.get("journal") or entry.get("booktitle") or ""
+            entry_year_canonical = get_canonical_venue(claimed_venue_for_year) if claimed_venue_for_year else None
+            record_year_canonical = get_canonical_venue(record.journal or "") if record.journal else None
+            if (
+                entry_year_canonical is not None
+                and entry_year_canonical == record_year_canonical
+                and entry_year_canonical not in JOURNAL_CANONICAL_VENUES
+            ):
+                try:
+                    record_year_int: int | None = int(api_year)
+                except ValueError:
+                    record_year_int = None
+                if record_year_int is not None:
+                    corroborating = 0
+                    for src_rec in per_source_records.values():
+                        if src_rec is None or not src_rec.order_reliable or src_rec.year != record_year_int:
+                            continue
+                        if _doi_is_preprint(src_rec.doi) or is_preprint_or_series_venue(src_rec.journal or ""):
+                            continue
+                        corroborating += 1
+                    if corroborating >= self._MIN_ORDER_RELIABLE_SOURCES_FOR_FLAG:
+                        comparisons["year"].outcome = MatchOutcome.MISMATCH
+                        comparisons["year"].matches = False
+                        comparisons["year"].note = (
+                            "Conference proceedings year is exact: "
+                            f"{corroborating} order-reliable sources agree the "
+                            f"{entry_year_canonical.upper()} year is {record_year_int}, not {entry_year}"
+                        )
 
         # Venue (alias-aware matching, three-valued). ``api_venue`` and
         # ``record_is_preprint`` were computed above (a preprint/series/platform

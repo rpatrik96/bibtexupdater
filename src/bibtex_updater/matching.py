@@ -659,6 +659,27 @@ EXPANDED_VENUE_ALIASES: dict[str, set[str]] = {
 GENERIC_SINGLE_WORD_VENUES: frozenset[str] = frozenset({"nature", "science", "pnas"})
 
 
+#: Canonical keys in :data:`EXPANDED_VENUE_ALIASES` that name a JOURNAL rather
+#: than a conference. Journal articles legitimately drift a year between
+#: online-first and issue publication, so the conference exact-year rule
+#: (same canonical venue on both sides => proceedings year must match exactly)
+#: exempts these.
+JOURNAL_CANONICAL_VENUES: frozenset[str] = frozenset(
+    {
+        "jmlr",
+        "tmlr",
+        "tpami",
+        "ijcv",
+        "tacl",
+        "nature",
+        "science",
+        "pnas",
+        "nature_mi",
+        "nature_comm",
+    }
+)
+
+
 #: OpenReview ``venueid`` shape: ``Acronym.cc/YYYY/<Track>``. Unique to
 #: OpenReview-hosted submissions (no real venue string uses ``.cc/YYYY/``), so a
 #: prefix-strip to the bare acronym is leak-safe: a hallucinated entry's venue
