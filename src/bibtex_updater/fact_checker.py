@@ -1531,6 +1531,12 @@ class SemanticScholarClient:
 
     FIELDS = "title,authors,venue,year,publicationTypes,externalIds,url"
 
+    #: Fields for the single-paper ``/paper/{id}`` endpoint (FIELDS plus
+    #: ``publicationVenue``). Class-level so the ``/paper/batch`` bulk
+    #: prefetch (FactCheckProcessor) requests the exact same field set and the
+    #: primed cache entries land on the exact key :meth:`get_paper` reads.
+    PAPER_FIELDS = "title,authors,venue,year,publicationTypes,externalIds,publicationVenue,url"
+
     def __init__(self, http: HttpClient):
         self.http = http
 
@@ -1570,9 +1576,8 @@ class SemanticScholarClient:
 
         paper_id can be: S2 ID, "DOI:10.1234/...", "ARXIV:2301.00001", "CorpusId:12345".
         """
-        fields = "title,authors,venue,year,publicationTypes,externalIds,publicationVenue,url"
         url = f"{S2_API}/paper/{paper_id}"
-        params = {"fields": fields}
+        params = {"fields": self.PAPER_FIELDS}
         try:
             resp = self.http._request("GET", url, params=params, accept="application/json", service="semanticscholar")
             if resp.status_code != 200:
@@ -5079,6 +5084,103 @@ class FactCheckProcessor:
 
         return len(dois)
 
+    #: Semantic Scholar's ``/paper/batch`` accepts at most 500 ids per call.
+    _S2_BATCH_CHUNK = 500
+
+    def _batch_prefetch_s2_records(self, entries: list[dict[str, Any]]) -> int:
+        """Bulk-prefetch Semantic Scholar records via ``POST /paper/batch``.
+
+        Cache-priming analogue of :meth:`_batch_warm_crossref_records` for the
+        per-entry ``SemanticScholarClient.get_paper`` lookups (the preprint
+        check's ``DOI:<doi>`` / ``ARXIV:<id>`` queries). One batch round-trip
+        replaces up to 500 sequential, rate-limited single-paper GETs.
+
+        Gated on the academic checker's shared HTTP client having BOTH an S2
+        API key (the primary deployment mode; keyless pools are too slow to
+        spend on speculative prefetch) AND a response cache to prime. Ids are
+        ``DOI:<doi>`` for entry DOIs -- skipping DataCite arXiv DOIs, which S2
+        indexes under the arXiv id -- and ``ARXIV:<id>`` via
+        ``FactChecker._arxiv_id_from_entry``; deduped, then POSTed in chunks
+        of <= 500 with the same fields string ``get_paper`` requests. Each
+        returned paper primes the exact cache entry ``get_paper(<id>)`` would
+        read (``HttpClient.prime_cache`` shares the key builder with
+        ``_request``, so the two cannot drift). ``null`` batch members (S2's
+        answer for unknown ids) are skipped, leaving the per-entry call to do
+        its own (cachedly-failing) fetch.
+
+        Purely best-effort: ANY error is logged at debug level and ignored --
+        every per-entry ``get_paper`` falls back to its own fetch, so verdicts
+        never depend on the prefetch.
+
+        Returns:
+            Number of cache entries primed (for logging/tests).
+        """
+        academic = self._academic_checker()
+        if academic is None:
+            return 0
+        http = getattr(academic.crossref, "http", None)
+        if http is None:
+            return 0
+        s2_key = getattr(http, "s2_api_key", None)
+        if not (isinstance(s2_key, str) and s2_key.strip()):
+            return 0
+        if getattr(http, "cache", None) is None:
+            return 0
+
+        ids: list[str] = []
+        seen: set[str] = set()
+        for entry in entries:
+            doi = (entry.get("doi", "") or "").strip()
+            # A DataCite arXiv DOI is indexed by S2 under the arXiv id, which
+            # _arxiv_id_from_entry extracts below; skip the DOI form.
+            if doi and arxiv_id_from_datacite_doi(doi) is None:
+                pid = f"DOI:{doi}"
+                if pid not in seen:
+                    seen.add(pid)
+                    ids.append(pid)
+            arxiv_id = FactChecker._arxiv_id_from_entry(entry)
+            if arxiv_id:
+                pid = f"ARXIV:{arxiv_id}"
+                if pid not in seen:
+                    seen.add(pid)
+                    ids.append(pid)
+        if not ids:
+            return 0
+
+        params = {"fields": SemanticScholarClient.PAPER_FIELDS}
+        primed = 0
+        try:
+            for start in range(0, len(ids), self._S2_BATCH_CHUNK):
+                chunk = ids[start : start + self._S2_BATCH_CHUNK]
+                resp = http._request(
+                    "POST",
+                    f"{S2_API}/paper/batch",
+                    params=params,
+                    accept="application/json",
+                    json_body={"ids": chunk},
+                    service="semanticscholar",
+                )
+                if resp.status_code != 200:
+                    continue
+                papers = resp.json()
+                if not isinstance(papers, list):
+                    continue
+                for pid, paper in zip(chunk, papers):
+                    if not isinstance(paper, dict) or not paper:
+                        continue  # null = unknown id; leave it to per-entry fetch
+                    http.prime_cache(
+                        "GET",
+                        f"{S2_API}/paper/{pid}",
+                        params=params,
+                        accept="application/json",
+                        json_body=None,
+                        value=paper,
+                    )
+                    primed += 1
+        except Exception as exc:
+            self.logger.debug("Semantic Scholar /paper/batch prefetch skipped (best-effort): %s", exc)
+        return primed
+
     def process_entries(
         self, entries: list[dict[str, Any]], jsonl_path: str | None = None, max_workers: int = 8
     ) -> list[FactCheckResult]:
@@ -5110,6 +5212,13 @@ class FactCheckProcessor:
         warmed = self._batch_warm_crossref_records(entries)
         if warmed:
             self.logger.info("Pre-fetched Crossref records for %d DOIs", warmed)
+
+        # Bulk S2 prefetch (API-key deployments): one /paper/batch POST primes
+        # the cache the per-entry get_paper lookups read. Best-effort -- any
+        # failure leaves the per-entry fetches to do their own work.
+        prefetched = self._batch_prefetch_s2_records(entries)
+        if prefetched:
+            self.logger.info("Pre-fetched %d Semantic Scholar records via /paper/batch", prefetched)
 
         results: list[FactCheckResult | None] = [None] * len(entries)  # Pre-allocate to preserve order
 

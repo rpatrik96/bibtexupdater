@@ -1738,6 +1738,50 @@ class HttpClient:
         mime = content_type.split(";", 1)[0].strip().lower()
         return mime.startswith("text/") or mime.endswith("+xml") or mime == "application/xml"
 
+    @staticmethod
+    def _cache_key(
+        method: str,
+        url: str,
+        params: dict[str, Any] | None,
+        accept: str | None,
+        json_body: dict[str, Any] | list[Any] | None,
+    ) -> str:
+        """Single source of truth for response-cache keys.
+
+        Shared by :meth:`_request` (read/write on real traffic) and
+        :meth:`prime_cache` (bulk pre-population) so the two can never drift:
+        a primed entry is guaranteed to be the exact key the equivalent
+        ``_request`` call would look up.
+        """
+        return json.dumps({"m": method, "u": url, "p": params, "a": accept, "j": json_body}, sort_keys=True)
+
+    def prime_cache(
+        self,
+        method: str,
+        url: str,
+        params: dict[str, Any] | None = None,
+        accept: str | None = None,
+        json_body: dict[str, Any] | list[Any] | None = None,
+        *,
+        value: Any,
+    ) -> None:
+        """Pre-populate the response cache for an equivalent ``_request`` call.
+
+        ``value`` is stored exactly as a 200 JSON response body would be (the
+        legacy raw-decoded-JSON format), so a later ``_request(method, url,
+        params=..., accept=..., json_body=...)`` is served from cache without
+        touching the network. Public sibling of ``_request`` used by bulk
+        prefetchers (e.g. the Semantic Scholar ``/paper/batch`` warm-up). A
+        cache-less client makes this a no-op; storage failures are swallowed
+        (priming is best-effort by definition).
+        """
+        if not self.cache:
+            return
+        try:
+            self.cache.set(self._cache_key(method, url, params, accept, json_body), value)
+        except Exception:
+            pass
+
     def _adapt_rate_limiter(self, service: str | None, resp: httpx.Response) -> None:
         """Feed a REAL (non-cache-hit) response to an adaptive rate limiter.
 
@@ -1782,7 +1826,7 @@ class HttpClient:
         """
         cache_key = None
         if self.cache:
-            cache_key = json.dumps({"m": method, "u": url, "p": params, "a": accept, "j": json_body}, sort_keys=True)
+            cache_key = self._cache_key(method, url, params, accept, json_body)
             cached = self.cache.get(cache_key)
             if cached is not None:
                 # v2 envelope: a cached non-JSON text response (arXiv Atom XML,
