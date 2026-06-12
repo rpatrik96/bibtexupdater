@@ -41,3 +41,7 @@ Thumbs.db
 CLAUDE.md
 .claude/
 uv.lock
+eval_runs/
+.omc/
+scripts/_run_eval_detached.py
+scripts/_watch_eval.py

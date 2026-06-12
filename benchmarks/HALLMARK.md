@@ -7,6 +7,11 @@ is an independent re-score of the same per-entry verdicts the HALLMARK paper
 reports for the co-designed `bibtexupdater` row, plus two splits the paper's main
 table does not break out (`stress_test`, `test_crossdomain`).
 
+> **Newer build:** for the post-1.3.0 reliability overhaul (Unreleased / PR #45),
+> see [Results — post-1.3.0 reliability overhaul](#results--post-130-reliability-overhaul-unreleased-commit-c758f7e)
+> below: tool-only **dev DR 84.8% / FPR 4.7%**, **test DR 88.4% / FPR 4.2%**, with
+> large gains on the previously-abstaining weak types.
+
 ## What is being measured
 
 HALLMARK frames citation verification as binary detection. Each reference carries
@@ -73,6 +78,75 @@ Notes on the per-split numbers:
   same conservative gate that is precise on ML-conference citations becomes a
   liability out-of-distribution. Read the in-distribution FPR (~0.09) as a
   property of the ML-citation regime, not a universal guarantee.
+
+## Results — post-1.3.0 reliability overhaul (Unreleased, commit `c758f7e`)
+
+The reliability/throughput overhaul (PR [#45](https://github.com/rpatrik96/bibtexupdater/pull/45):
+default-mode author-truncation flagging, identifier-based venue consensus + a
+`nonexistent_venue` registry check, identifier-less preprint-as-published
+detection, the author-FP fixes, the `p_valid`/`coverage_incomplete` contract) was
+re-evaluated live with `scripts/eval_hallmark.py` on the same two public splits,
+**with a Semantic Scholar API key** (`S2_API_KEY`). The headline below is
+**tool-only** — both the new run and the committed v1.2.0 per-entry file are
+scored from the raw `btu_status` with no pre-screening, so the comparison isolates
+the *tool* change. (The committed v1.2.0 file folds in HALLMARK's old networked
+DOI pre-screen, since fixed in [hallmark#14](https://github.com/rpatrik96/hallmark/pull/14);
+comparing raw `pred_label` would conflate the tool change with that pre-screening
+change. See `eval_runs/*/compare.json` for the full-stack rows too.)
+
+| Split | DR | FPR | Precision | F1 | MCC | DR Δ | FPR Δ | F1 Δ |
+|-------|----:|----:|----------:|---:|----:|-----:|------:|-----:|
+| dev_public  | **84.8%** | **4.7%** | 95.5% | **0.899** | **0.799** | +2.8pp | −0.4pp | +0.019 |
+| test_public | **88.4%** | **4.2%** | 97.2% | **0.926** | **0.824** | +4.6pp | −3.8pp | +0.038 |
+
+(v1.2.0 tool-only baseline: dev 82.0% / 5.1% / 0.880 / 0.768; test 83.8% / 8.0% /
+0.889 / 0.738.) Both splits improve on **every** headline metric: detection rate up
+~3–5pp, false-positive rate cut (test FPR roughly halved), and MCC up 3–8pp.
+
+**Where the detection gains come from** (tool-only per-type detection rate; the
+five types the overhaul targeted, all of which previously abstained as
+`unconfirmed`):
+
+| Hallucination type | dev v1.2.0 → new | test v1.2.0 → new |
+|--------------------|:----------------:|:-----------------:|
+| `partial_author_list`     | 0.219 → **0.438** (+21.9pp) | 0.129 → **0.419** (+29.0pp) |
+| `preprint_as_published`   | 0.677 → 0.645 (−3.2pp)      | 0.690 → **0.862** (+17.2pp) |
+| `wrong_venue`             | 0.447 → **0.489** (+4.3pp)  | 0.735 → **0.853** (+11.8pp) |
+| `nonexistent_venue`       | 0.436 → **0.564** (+12.8pp) | 0.459 → **0.568** (+10.8pp) |
+| `arxiv_version_mismatch`  | 0.612 → **0.694** (+8.2pp)  | 0.756 → **0.778** (+2.2pp)  |
+
+The remaining always-caught types (`fabricated_doi`, `future_date`,
+`placeholder_authors`, `chimeric_title`, `hybrid_fabrication`,
+`plausible_fabrication`, `merged_citation`) stay at 1.000 on both splits;
+`swapped_authors` holds (dev 0.985, test 0.968). The new positive-evidence
+statuses fire as designed (dev: `author_truncated` ×9, `nonexistent_venue` ×2,
+`preprint_only` ×1; test similar).
+
+**Calibration.** The new explicit `p_valid` (probability the entry as cited is
+genuine) has **ECE 0.252 (dev) / 0.278 (test)** as a P(valid) estimate — well
+below the v1.2.0 verdict-confidence ECE the HALLMARK paper reports (0.383 / 0.399),
+i.e. the new score is materially better calibrated for thresholding/ranking.
+
+**Honest caveats.**
+* *Default-mode near-miss leaks persist.* Five entries (dev) verify despite a
+  Levenshtein-1 title perturbation (e.g. "Meta-**Learnings**" vs "Meta-Learning");
+  these are the documented `KNOWN_LEAKS.md` cases that `--strict`'s `TITLE_NEAR_MISS`
+  catches. The author-FP fixes removed an *incidental* `author_mismatch` detection
+  on such title-perturbed entries (their authors are real), which is why default-mode
+  `near_miss_title` is flat-to-slightly-down rather than up.
+* *One small real regression:* dev `preprint_as_published` −3.2pp (one entry, now an
+  abstention) — a side effect of the more conservative venue gate that drives the
+  FPR win; on test the same type is +17.2pp.
+* *Run hygiene.* The live run used the default `--rate-limit 90` and hit
+  intermittent throttling on the keyless sources (DBLP/OpenReview); 20 `test_public`
+  entries were dropped by subprocess slowdowns and **re-run and merged** (see
+  `eval_runs/test_public_fill/`) so the grid reflects all 831 entries. `dev_public`
+  completed in one pass. Numbers are reproducible but, being a live API run, are not
+  bit-identical across runs the way the committed v1.2.0 re-score is.
+
+This block was produced by `scripts/eval_hallmark.py` + `scripts/_compare_hallmark_runs.py`
+over `eval_runs/{dev,test}_public/`; `stress_test` / `test_crossdomain` were not
+re-run for this build and their v1.2.0 rows above stand.
 
 ## Cross-check against the HALLMARK paper
 

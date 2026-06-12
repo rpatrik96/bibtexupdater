@@ -1,0 +1,217 @@
+{
+  "build": "unreleased (post-1.3.0, commit c758f7e)",
+  "dataset": "HALLMARK v1.1.1",
+  "eval": "scripts/eval_hallmark.py + _compare_hallmark_runs.py, live run with S2_API_KEY",
+  "framing": "tool-only (status->label, no pre-screening either side)",
+  "splits": {
+    "dev_public": {
+      "coverage": 0.8409,
+      "ece_p_valid": 0.2518,
+      "fn_status": {
+        "unconfirmed": 87,
+        "verified": 5
+      },
+      "fp_status": {
+        "arxiv_id_mismatch": 1,
+        "author_mismatch": 9,
+        "author_truncated": 1,
+        "doi_mismatch": 5,
+        "given_name_substitution": 3,
+        "not_found": 1,
+        "partial_match": 1,
+        "title_mismatch": 1,
+        "venue_mismatch": 2
+      },
+      "n": 1119,
+      "per_type_tool_only": {
+        "arxiv_version_mismatch": {
+          "n": 49,
+          "new": 0.6938775510204082,
+          "v120": 0.6122448979591837
+        },
+        "chimeric_title": {
+          "n": 47,
+          "new": 1.0,
+          "v120": 1.0
+        },
+        "fabricated_doi": {
+          "n": 39,
+          "new": 1.0,
+          "v120": 1.0
+        },
+        "future_date": {
+          "n": 30,
+          "new": 1.0,
+          "v120": 1.0
+        },
+        "hybrid_fabrication": {
+          "n": 26,
+          "new": 1.0,
+          "v120": 1.0
+        },
+        "merged_citation": {
+          "n": 30,
+          "new": 1.0,
+          "v120": 1.0
+        },
+        "near_miss_title": {
+          "n": 52,
+          "new": 0.8846153846153846,
+          "v120": 0.8846153846153846
+        },
+        "nonexistent_venue": {
+          "n": 39,
+          "new": 0.5641025641025641,
+          "v120": 0.4358974358974359
+        },
+        "partial_author_list": {
+          "n": 32,
+          "new": 0.4375,
+          "v120": 0.21875
+        },
+        "placeholder_authors": {
+          "n": 41,
+          "new": 1.0,
+          "v120": 1.0
+        },
+        "plausible_fabrication": {
+          "n": 76,
+          "new": 1.0,
+          "v120": 1.0
+        },
+        "preprint_as_published": {
+          "n": 31,
+          "new": 0.6451612903225806,
+          "v120": 0.6774193548387096
+        },
+        "swapped_authors": {
+          "n": 67,
+          "new": 0.9850746268656716,
+          "v120": 0.9850746268656716
+        },
+        "wrong_venue": {
+          "n": 47,
+          "new": 0.48936170212765956,
+          "v120": 0.44680851063829785
+        }
+      },
+      "tool_only_new": {
+        "dr": 0.8481848184818482,
+        "f1": 0.8986013986013986,
+        "fpr": 0.04678362573099415,
+        "mcc": 0.7992189543027273,
+        "precision": 0.9553903345724907
+      },
+      "tool_only_v120": {
+        "dr": 0.8646864686468647,
+        "f1": 0.8903993203058623,
+        "fpr": 0.09161793372319688,
+        "mcc": 0.7705568019491625,
+        "precision": 0.9176882661996497
+      }
+    },
+    "test_public": {
+      "coverage": 0.8339,
+      "ece_p_valid": 0.2776,
+      "fn_status": {
+        "unconfirmed": 55,
+        "verified": 5
+      },
+      "fp_status": {
+        "author_mismatch": 4,
+        "doi_mismatch": 1,
+        "not_found": 4,
+        "partial_match": 3,
+        "venue_mismatch": 1
+      },
+      "n": 831,
+      "note": "20 throttle-dropped entries re-run and merged",
+      "per_type_tool_only": {
+        "arxiv_version_mismatch": {
+          "n": 45,
+          "new": 0.7777777777777778,
+          "v120": 0.7555555555555555
+        },
+        "chimeric_title": {
+          "n": 23,
+          "new": 1.0,
+          "v120": 1.0
+        },
+        "fabricated_doi": {
+          "n": 29,
+          "new": 1.0,
+          "v120": 1.0
+        },
+        "future_date": {
+          "n": 29,
+          "new": 1.0,
+          "v120": 1.0
+        },
+        "hybrid_fabrication": {
+          "n": 29,
+          "new": 1.0,
+          "v120": 1.0
+        },
+        "merged_citation": {
+          "n": 29,
+          "new": 1.0,
+          "v120": 1.0
+        },
+        "near_miss_title": {
+          "n": 40,
+          "new": 0.875,
+          "v120": 0.875
+        },
+        "nonexistent_venue": {
+          "n": 37,
+          "new": 0.5675675675675675,
+          "v120": 0.4594594594594595
+        },
+        "partial_author_list": {
+          "n": 31,
+          "new": 0.41935483870967744,
+          "v120": 0.12903225806451613
+        },
+        "placeholder_authors": {
+          "n": 35,
+          "new": 1.0,
+          "v120": 1.0
+        },
+        "plausible_fabrication": {
+          "n": 66,
+          "new": 1.0,
+          "v120": 1.0
+        },
+        "preprint_as_published": {
+          "n": 29,
+          "new": 0.8620689655172413,
+          "v120": 0.6896551724137931
+        },
+        "swapped_authors": {
+          "n": 63,
+          "new": 0.9682539682539683,
+          "v120": 0.9523809523809523
+        },
+        "wrong_venue": {
+          "n": 34,
+          "new": 0.8529411764705882,
+          "v120": 0.7352941176470589
+        }
+      },
+      "tool_only_new": {
+        "dr": 0.884393063583815,
+        "f1": 0.9263370332996973,
+        "fpr": 0.041666666666666664,
+        "mcc": 0.8238143449154829,
+        "precision": 0.972457627118644
+      },
+      "tool_only_v120": {
+        "dr": 0.8766859344894027,
+        "f1": 0.900990099009901,
+        "fpr": 0.11538461538461539,
+        "mcc": 0.7497860459728523,
+        "precision": 0.9266802443991853
+      }
+    }
+  }
+}
