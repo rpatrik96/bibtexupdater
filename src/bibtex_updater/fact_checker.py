@@ -3472,6 +3472,47 @@ class FactChecker:
             outcome=author_outcome,
         )
 
+        # 2-author same-multiset swap needs corroboration (HALLMARK FP: valid
+        # NeurIPS 2023 entry "Zhicheng Sun and Yadong Mu" flagged author_mismatch
+        # because Crossref's 10.52202 proceedings deposit alphabetizes its
+        # contributors). ``_looks_alphabetized`` requires >= 3 names -- with TWO
+        # authors, alphabetical order coincides with publication order half the
+        # time, so a single record's ordering fundamentally cannot distinguish a
+        # real swap from a record-side sort artifact. The matcher stays pure (it
+        # has no cross-source view); here we demand a SECOND order-reliable
+        # source independently showing the same non-entry order before keeping
+        # the MISMATCH. Without corroboration (no second order-reliable source,
+        # or the second source shows the ENTRY's order) the comparison softens
+        # to PARTIAL -> UNCONFIRMED: abstention, never VERIFIED, never a
+        # positive flag on a single source's coin-flip ordering. Strict mode is
+        # untouched (its asymmetric-cost policy keeps the single-source flag).
+        if not cfg.strict and comparisons["author"].resolved_outcome is MatchOutcome.MISMATCH and record.order_reliable:
+            entry_stripped = _strip_author_sentinels(entry_names)
+            api_stripped = _strip_author_sentinels(api_names)
+            if (
+                len(entry_stripped) == 2
+                and len(api_stripped) == 2
+                and entry_stripped != api_stripped
+                and sorted(entry_stripped) == sorted(api_stripped)
+            ):
+                corroborated = False
+                for _src, rec in (per_source_records or {}).items():
+                    if rec is None or rec is record or not rec.order_reliable:
+                        continue
+                    rec_keys = _strip_author_sentinels(rec.surname_keys(limit=10_000))
+                    if rec_keys == api_stripped:
+                        # An independent order-reliable source shows the SAME
+                        # non-entry order -> a real swap, keep the MISMATCH.
+                        corroborated = True
+                        break
+                if not corroborated:
+                    comparisons["author"].outcome = MatchOutcome.PARTIAL
+                    comparisons["author"].matches = False
+                    comparisons["author"].note = (
+                        "2-author order swap not corroborated "
+                        "(single source; possible record-side ordering artifact)"
+                    )
+
         # --strict rule 5: silent author-list truncation. A PARTIAL author
         # outcome where the ENTRY side is shorter (entry is a leading-prefix
         # or in-order subsequence of the canonical list) without an explicit
