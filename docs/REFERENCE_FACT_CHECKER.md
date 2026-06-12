@@ -42,20 +42,21 @@ These run before the title/author search and fire only on *positive evidence*, s
 3. **DOI-target consistency** — fetches the Crossref record the entry's DOI actually resolves to. If that record's title clearly differs from the entry's title, the DOI points to a *different paper* → `doi_mismatch`. A copy-paste DOI that would otherwise be silently verified against the entry's real paper is caught here.
 4. **arXiv-ID consistency** — the same check for the entry's cited arXiv ID; a mismatch → `arxiv_id_mismatch`. arXiv DOIs are version-normalized (`…v2` stripped) so a versioned/unversioned mismatch is not falsely flagged.
 5. **ID-anchored author fabrication** — when a valid DOI/arXiv ID *does* resolve to the cited paper (title confirms) but the author list is swapped or contains placeholder names, the entry is flagged `author_mismatch`: the identifier is the entry's own, so a real author divergence on it is positive evidence of fabrication.
+6. **Identifier fast paths** — when the entry's own DOI/arXiv ID passed the consistency checks *and* the single authoritative record behind that identifier fully confirms every claimed field at the full thresholds, the multi-source cascade is skipped. The fast paths can only short-circuit a clean `verified` — anything less falls through to the normal cascade. Disable with `--no-fast-path`; automatically inert in `--strict` mode.
 
 ### Cascading source verification
 
 Title/author search runs a single cascade — there is no parallel "query every source" mode. Sources are queried in order and the cascade short-circuits as soon as one returns a candidate at or above the high-confidence threshold (`0.95`):
 
-| Step | Source | Role | Rate (keyless) |
+| Step | Source | Role | Rate (default) |
 |------|--------|------|------|
-| 1 | **CrossRef** | DOI-backed literature; fielded `query.title` + `query.author` | ~50/min |
-| 2 | **OpenAlex** | high-rate aggregator (polite pool), broad coverage; fielded `title.search` | ~100/min |
+| 1 | **CrossRef** | DOI-backed literature; fielded `query.title` + `query.author` | ~300/min |
+| 2 | **OpenAlex** | high-rate aggregator (polite pool), broad coverage; fielded `title.search` | ~150/min |
 | 3 | **DBLP** | authoritative CS/ML-conference index (token-AND search) | ~30/min |
-| 4 | **OpenReview** | authoritative ICLR/NeurIPS/TMLR submission registry | ~30/min |
-| 5 | **Semantic Scholar** | preprint coverage; slowest without a key | ~10/min |
+| 4 | **OpenReview** | authoritative ICLR/NeurIPS/TMLR submission registry (API v1 with an API v2 fallback for migrated venues, e.g. ICLR 2024+) | ~30/min |
+| 5 | **Semantic Scholar** | preprint coverage; slowest without a key | ~10/min keyless |
 
-The order is throughput-aware: fast, broad sources first so the slow keyless Semantic Scholar fallback is only reached on hard entries. OpenReview is consulted before Semantic Scholar because it owns the submission record for most ML conferences and can *positively confirm* ICLR/NeurIPS/TMLR papers that the DOI/CS-index sources can only leave unconfirmed. Set a Semantic Scholar API key (`--s2-api-key` or `S2_API_KEY`) to lift S2 from ~10 to ~60 req/min.
+The order is throughput-aware: fast, broad sources first so the slow keyless Semantic Scholar fallback is only reached on hard entries. OpenReview is consulted before Semantic Scholar because it owns the submission record for most ML conferences and can *positively confirm* ICLR/NeurIPS/TMLR papers that the DOI/CS-index sources can only leave unconfirmed. Set a Semantic Scholar API key (`--s2-api-key` or `S2_API_KEY`) to lift S2 to ~60 req/min — with a key, a single-best-title `/paper/search/match` step additionally runs right after CrossRef and the final S2 relevance-search step is skipped whenever it contributed, so per-entry S2 spend stays at one call.
 
 **Retrieval** uses fielded title search (CrossRef `query.title`, OpenAlex `title.search`) against the raw, author-free title rather than a free-text `title + surname` blob — the blob returned unrelated papers for DOI-less ML-conference titles. Each step retrieves `--top-k` candidates (default 3, max 10) and re-ranks them by title similarity.
 
@@ -77,8 +78,8 @@ Author handling: sources return authors in as-published order, so author-order d
 `VERIFIED` requires *every* claimed field to be **positively confirmed** against the matched record — not merely "not contradicted".
 
 - **Verified** (`verified`) — clean pass; all claimed fields confirmed.
-- **Could-not-verify** (`unconfirmed`, `not_found`) — **abstention**, *not* a clean pass. A record was found and nothing was contradicted, but at least one claimed field could not be positively confirmed (e.g. a published venue backed only by a preprint, or a consistent-but-incomplete author list), or no matching record was found at all. These entries warrant review.
-- **Problematic** — positive evidence of a defect: `title_mismatch`, `author_mismatch`, `year_mismatch`, `venue_mismatch`, `partial_match`, `doi_mismatch`, `arxiv_id_mismatch`, `hallucinated` (chimeric title, fabricated DOI, future/invalid year, ID misattribution).
+- **Could-not-verify** (`unconfirmed`, `not_found`) — **abstention**, *not* a clean pass. A record was found and nothing was contradicted, but at least one claimed field could not be positively confirmed (e.g. a published venue backed only by a preprint, or a consistent-but-incomplete author list), or no matching record was found at all. These entries warrant review. The per-entry `coverage_incomplete` flag distinguishes a *clean* exhaustive miss from an abstention reached while sources errored or were throttled (re-run the latter after a cooldown).
+- **Problematic** — positive evidence of a defect: `title_mismatch`, `author_mismatch`, `year_mismatch`, `venue_mismatch`, `nonexistent_venue`, `partial_match`, `doi_mismatch`, `arxiv_id_mismatch`, `author_truncated`, `hallucinated` (chimeric title, fabricated DOI, future/invalid year, ID misattribution).
 
 `hallucinated` is reserved for positive-evidence signals; a merely weak title-search match **abstains** as `not_found` rather than asserting fabrication.
 
@@ -92,8 +93,10 @@ Author handling: sources return authors in as-published order, so author-order d
 | `hallucinated` | problematic | Positive evidence of fabrication (chimeric/fabricated DOI/etc.) |
 | `title_mismatch` | problematic | Title differs significantly from best match |
 | `author_mismatch` | problematic | Author list differs (incl. ID-anchored fabrication) |
-| `year_mismatch` | problematic | Publication year differs beyond tolerance |
+| `year_mismatch` | problematic | Publication year differs beyond tolerance (exact-year for same-conference citations) |
 | `venue_mismatch` | problematic | Journal/venue differs |
+| `nonexistent_venue` | problematic | Claimed venue unknown to the DBLP/OpenAlex venue registries and reported by no source for this (otherwise real) paper |
+| `author_truncated` | problematic | Author list silently truncated (co-authors dropped without `et al.`/`and others`); corroborated by ≥ 2 sources |
 | `partial_match` | problematic | Multiple fields differ |
 | `doi_mismatch` | problematic | Cited DOI resolves to a different paper |
 | `arxiv_id_mismatch` | problematic | Cited arXiv ID resolves to a different paper |
@@ -115,12 +118,14 @@ The JSONL output carries an additive 0–100 `confidence_score` summarizing per-
 ## Command Line Options
 
 ```
-usage: bibtex-check [-h] [--report FILE] [--jsonl FILE] [--strict] [--verbose]
+usage: bibtex-check [-h] [--report FILE] [--jsonl FILE] [--strict]
+                    [--strict-warn-cnv] [--verbose]
                     [--title-threshold FLOAT] [--author-threshold FLOAT]
                     [--year-tolerance INT] [--venue-threshold FLOAT]
                     [--cache-file FILE] [--rate-limit INT] [--s2-api-key KEY]
-                    [--no-cache] [--no-check-dois] [--no-check-years]
-                    [--workers N] [--skip-web] [--skip-books]
+                    [--mailto EMAIL] [--no-cache] [--no-check-dois]
+                    [--no-check-years] [--no-check-venue-existence]
+                    [--no-fast-path] [--workers N] [--skip-web] [--skip-books]
                     [--skip-working-papers] [--academic-only]
                     [--verify-url-content] [--url-timeout FLOAT]
                     [--google-books-api-key KEY] [--no-google-books]
@@ -138,7 +143,7 @@ usage: bibtex-check [-h] [--report FILE] [--jsonl FILE] [--strict] [--verbose]
 
 **Thresholds:** `--title-threshold` (0.90), `--author-threshold` (0.80), `--year-tolerance` (1), `--venue-threshold` (0.70).
 
-**API options:** `--cache-file` (`.cache.fact_checker.json`), `--rate-limit` (45 req/min, scales per-service limits), `--s2-api-key KEY` (or `S2_API_KEY` env var), `--no-cache`, `--no-check-dois`, `--no-check-years`, `--workers N` (8).
+**API options:** `--cache-file` (`.cache.fact_checker.json`), `--rate-limit` (45 req/min, scales per-service limits), `--s2-api-key KEY` (or `S2_API_KEY` env var), `--mailto EMAIL` (or `BIBTEX_CHECK_MAILTO`; polite-pool contact for Crossref/OpenAlex, feeds the User-Agent and the `--openalex-mailto` default), `--no-cache`, `--no-check-dois`, `--no-check-years`, `--no-check-venue-existence` (disable the DBLP/OpenAlex venue-registry existence check behind `nonexistent_venue`), `--no-fast-path` (always run the full cascade; disables the DOI/arXiv identifier-anchored fast paths), `--workers N` (8).
 
 **Cascade (CheckIfExist):** `--top-k N` (3, max 10) candidates per source; `--openalex-mailto EMAIL` for the OpenAlex polite pool.
 
@@ -152,16 +157,28 @@ usage: bibtex-check [-h] [--report FILE] [--jsonl FILE] [--strict] [--verbose]
 
 ### JSON Report (`--report`)
 
-Full structured report: a `summary` block (totals, status counts, verified/problematic counts, timestamp) plus per-entry records with field comparisons, the best-matching record, and the sources consulted/confirmed.
+Full structured report: a `summary` block (totals, status counts, verified/abstained/problematic counts, `coverage_incomplete_count`, timestamp) plus per-entry records with field comparisons, the best-matching record, the sources consulted/confirmed, and the same `p_valid`/`coverage_incomplete` contract fields as the JSONL output.
 
 ### JSONL Report (`--jsonl`)
 
 One JSON object per line, streamed as entries complete — useful for large bibliographies and incremental processing:
 
 ```jsonl
-{"key": "smith2020", "status": "verified", "confidence_score": 96.0, "issues": [], "sources_confirmed": ["crossref"]}
-{"key": "fake2099", "status": "hallucinated", "confidence_score": 12.0, "issues": ["title_mismatch", "author_mismatch"], "sources_confirmed": []}
+{"key": "smith2020", "category": "academic", "status": "verified", "abstained": false, "coverage_incomplete": false, "confidence": 0.89, "p_valid": 0.945, "confidence_score": 96.0, "mismatched_fields": [], "api_sources": ["crossref", "dblp"], "errors": []}
+{"key": "fake2099", "category": "academic", "status": "hallucinated", "abstained": false, "coverage_incomplete": false, "confidence": 0.93, "p_valid": 0.035, "confidence_score": 12.0, "mismatched_fields": ["title", "author"], "api_sources": [], "errors": []}
 ```
+
+Per-line fields:
+
+| Field | Meaning |
+|-------|---------|
+| `key`, `category`, `status` | BibTeX key, entry category, and the status code (table above) |
+| `abstained` | `true` for could-not-verify verdicts — abstentions must never be read as confirmed hallucinations |
+| `coverage_incomplete` | `true` when an abstention (or `api_error`) was reached while ≥ 1 source errored / was throttled / circuit-broken. A `not_found` with this flag is **not** a clean exhaustive miss — re-run after a cooldown before treating it as evidence of fabrication |
+| `confidence` | 0–1 confidence that the **assigned status is the right call**. Direction-free: a confident `hallucinated` and a confident `verified` both carry high `confidence` |
+| `p_valid` | 0–1 probability that the entry **as cited** refers to a real publication with correct metadata — **threshold/rank on this**, not on `confidence`. Verified-polarity statuses map above 0.5, problem-polarity below 0.5, abstentions sit at 0.5, and a clean exhaustive `not_found` at 0.35. Note `preprint_only` is problem-polarity for `p_valid` (the claimed venue is contradicted) even though the verdict itself is confident |
+| `confidence_score` | additive 0–100 numeric confidence (next section) |
+| `mismatched_fields`, `api_sources`, `errors` | non-confirmed field names, sources with hits, and per-source error strings |
 
 ## Exit Codes
 
@@ -207,7 +224,7 @@ repos:
 
 API responses are cached to `.cache.fact_checker.json` by default (SQLite-backed, WAL mode, thread-safe). This speeds up repeated runs and reduces rate-limit pressure. Clear it by deleting the file or pointing `--cache-file` elsewhere; `--no-cache` disables caching entirely.
 
-Rate limits are enforced **per service** (Crossref, OpenAlex, DBLP, OpenReview, Semantic Scholar, …), scaled by `--rate-limit` (default 45 req/min). With `--workers` concurrent entries and the cascade short-circuiting on easy entries (~1.4 API calls/entry), most bibliographies finish quickly; a Semantic Scholar key further lifts the slowest source.
+Rate limits are enforced **per service** (Crossref, OpenAlex, DBLP, OpenReview, Semantic Scholar, …), scaled by `--rate-limit` (default 45 = scale 1.0) with per-service caps below each service's documented ceiling; arXiv stays flat at 20 req/min per its politeness ask. The limiter is **adaptive**: `Retry-After` and rate-limit response headers (including on retryable 429/5xx responses) drive automatic backoff. Set `--mailto` (or `BIBTEX_CHECK_MAILTO`) so Crossref/OpenAlex serve you from their polite pools. With `--workers` concurrent entries and the cascade short-circuiting on easy entries (~1.4 API calls/entry), most bibliographies finish quickly; a Semantic Scholar key further lifts the slowest source.
 
 ## Comparison with `bibtex-update`
 
