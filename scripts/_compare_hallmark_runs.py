@@ -98,8 +98,10 @@ def main() -> None:
     keys = [k for k in gold_by_key if k in new_rows]
     missing_new = [k for k in gold_by_key if k not in new_rows]
     only_old = [k for k in gold_by_key if k in old_rows and k not in new_rows]
-    print(f"# Comparison on {args.split.name}: {len(keys)} joined entries "
-          f"({len(missing_new)} missing from new run, {len(only_old)} of those in old)\n")
+    print(
+        f"# Comparison on {args.split.name}: {len(keys)} joined entries "
+        f"({len(missing_new)} missing from new run, {len(only_old)} of those in old)\n"
+    )
 
     new_pairs = [(gold_by_key[k], new_rows[k]["pred_label"]) for k in keys]
     old_keys = [k for k in keys if k in old_rows]
@@ -116,8 +118,10 @@ def main() -> None:
         d = h_new[m] - h_old[m] if (h_new[m] == h_new[m] and h_old[m] == h_old[m]) else float("nan")
         sign = "+" if d == d and d >= 0 else ""
         print(f"| {m.upper()} | {fmt(h_old[m])} | {fmt(h_new[m])} | {sign}{fmt(d)} |")
-    print(f"\ncounts new: TP {h_new['tp']} FP {h_new['fp']} TN {h_new['tn']} FN {h_new['fn']}  |  "
-          f"old: TP {h_old['tp']} FP {h_old['fp']} TN {h_old['tn']} FN {h_old['fn']}\n")
+    print(
+        f"\ncounts new: TP {h_new['tp']} FP {h_new['fp']} TN {h_new['tn']} FN {h_new['fn']}  |  "
+        f"old: TP {h_old['tp']} FP {h_old['fp']} TN {h_old['tn']} FN {h_old['fn']}\n"
+    )
 
     # Tool-only: re-derive BOTH sides' labels from btu_status (no pre-screening).
     tnew_pairs = [(gold_by_key[k], tool_label(new_rows[k])) for k in old_keys]
@@ -130,8 +134,10 @@ def main() -> None:
         d = t_new[m] - t_old[m] if (t_new[m] == t_new[m] and t_old[m] == t_old[m]) else float("nan")
         sign = "+" if d == d and d >= 0 else ""
         print(f"| {m.upper()} | {fmt(t_old[m])} | {fmt(t_new[m])} | {sign}{fmt(d)} |")
-    print(f"\ncounts new: TP {t_new['tp']} FP {t_new['fp']} TN {t_new['tn']} FN {t_new['fn']}  |  "
-          f"old: TP {t_old['tp']} FP {t_old['fp']} TN {t_old['tn']} FN {t_old['fn']}\n")
+    print(
+        f"\ncounts new: TP {t_new['tp']} FP {t_new['fp']} TN {t_new['tn']} FN {t_new['fn']}  |  "
+        f"old: TP {t_old['tp']} FP {t_old['fp']} TN {t_old['tn']} FN {t_old['fn']}\n"
+    )
 
     # Per-type detection rate (TOOL-ONLY, the apples-to-apples view).
     per_type: dict[str, dict[str, list[bool]]] = defaultdict(lambda: {"new": [], "old": []})
@@ -154,10 +160,16 @@ def main() -> None:
         print(f"| {t} | {len(nw)} | {fmt(dro)} | {fmt(drn)} | {sign}{fmt(d)} |")
 
     # FN/FP status distributions (new run).
-    fn_status = Counter(new_rows[k].get("btu_status") for k in keys
-                        if gold_by_key[k] == "HALLUCINATED" and new_rows[k]["pred_label"] == "VALID")
-    fp_status = Counter(new_rows[k].get("btu_status") for k in keys
-                        if gold_by_key[k] == "VALID" and new_rows[k]["pred_label"] == "HALLUCINATED")
+    fn_status = Counter(
+        new_rows[k].get("btu_status")
+        for k in keys
+        if gold_by_key[k] == "HALLUCINATED" and new_rows[k]["pred_label"] == "VALID"
+    )
+    fp_status = Counter(
+        new_rows[k].get("btu_status")
+        for k in keys
+        if gold_by_key[k] == "VALID" and new_rows[k]["pred_label"] == "HALLUCINATED"
+    )
     print("\n## New-run misses by tool status\n")
     print("FN (hallucinated -> VALID):", dict(fn_status.most_common()))
     print("FP (valid -> HALLUCINATED):", dict(fp_status.most_common()))
@@ -166,19 +178,23 @@ def main() -> None:
     print(f"\ncoverage_incomplete entries (new): {cov_inc}")
 
     # ECE of p_valid (gold VALID = 1).
-    scored = [(float(new_rows[k]["p_valid"]), 1.0 if gold_by_key[k] == "VALID" else 0.0)
-              for k in keys if new_rows[k].get("p_valid") is not None]
+    scored = [
+        (float(new_rows[k]["p_valid"]), 1.0 if gold_by_key[k] == "VALID" else 0.0)
+        for k in keys
+        if new_rows[k].get("p_valid") is not None
+    ]
     ece = float("nan")
     if scored:
         bins: list[list[tuple[float, float]]] = [[] for _ in range(10)]
         for p, y in scored:
             bins[min(int(p * 10), 9)].append((p, y))
-        ece = sum(
-            abs(sum(p for p, _ in b) / len(b) - sum(y for _, y in b) / len(b)) * len(b)
-            for b in bins if b
-        ) / len(scored)
-    print(f"ECE of p_valid as P(valid) (10 bins, n={len(scored)}): {fmt(ece)}  "
-          f"[v1.2.0 wrapper-confidence ECE reference: 0.383 dev / 0.399 test]")
+        ece = sum(abs(sum(p for p, _ in b) / len(b) - sum(y for _, y in b) / len(b)) * len(b) for b in bins if b) / len(
+            scored
+        )
+    print(
+        f"ECE of p_valid as P(valid) (10 bins, n={len(scored)}): {fmt(ece)}  "
+        f"[v1.2.0 wrapper-confidence ECE reference: 0.383 dev / 0.399 test]"
+    )
 
     if args.json_out:
         out = {
