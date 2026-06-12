@@ -425,6 +425,18 @@ class FactCheckerConfig:
     # of it, escalate to the positive NONEXISTENT_VENUE status. Lookup errors
     # always keep the abstention. Disable with --no-check-venue-existence.
     check_venue_existence: bool = True
+    # Identifier-anchored fast paths (speed). After the entry's own DOI/arXiv-ID
+    # consistency check found no mismatch, skip the multi-source cascade when
+    # the single authoritative record behind that identifier FULLY confirms
+    # every claimed field (full _compare_all_fields, full title threshold; the
+    # arXiv path additionally demands exact author-sequence equality and no
+    # venue/DOI claim). The fast paths can ONLY short-circuit a clean VERIFIED:
+    # any partial/non-comparable/mismatching field falls through to the normal
+    # cascade with no state carried over. Both are AUTOMATICALLY INERT in
+    # --strict mode (strict wants multi-source corroboration) and disabled
+    # together by --no-fast-path.
+    doi_fast_path: bool = True
+    arxiv_fast_path: bool = True
     # CheckIfExist additions (Item 1 + 2): cascading + top-K retrieval.
     # Verification uses the CrossRef -> OpenAlex -> DBLP -> Semantic Scholar
     # cascade, which short-circuits on a high-confidence match so the slow
@@ -2357,6 +2369,13 @@ class FactChecker:
             arxiv_status = self._check_arxiv_id_consistency(entry)
             if arxiv_status is not None:
                 return arxiv_status
+            # Speed: the consistency check found no mismatch and memoized the
+            # arXiv record. When that record fully confirms a venue-less,
+            # DOI-less preprint citation (exact author sequence), skip the
+            # cascade. Clean-VERIFIED only; inert in strict / --no-fast-path.
+            arxiv_fast = self._arxiv_fast_path_result(entry)
+            if arxiv_fast is not None:
+                return arxiv_fast
 
         # Pre-search consistency: the entry's own DOI must point to *this* paper.
         # A copy-paste DOI that resolves to a different work otherwise survives
@@ -2365,6 +2384,12 @@ class FactChecker:
             doi_consistency_status = self._check_doi_consistency(entry)
             if doi_consistency_status is not None:
                 return doi_consistency_status
+            # Speed: no mismatch and the DOI's cached Crossref record is at
+            # hand. When it fully confirms every claimed field, skip the
+            # cascade. Clean-VERIFIED only; inert in strict / --no-fast-path.
+            doi_fast = self._doi_fast_path_result(entry)
+            if doi_fast is not None:
+                return doi_fast
 
         query = f"{title_norm} {first_author}".strip()
         # Item 1: cascading source order (CrossRef -> OpenAlex -> DBLP -> S2).
@@ -2504,6 +2529,40 @@ class FactChecker:
         # STRICT_WARN_CNV is a fourth class users opt into.
         status = self._apply_strict_warn_cnv(status)
 
+        return self._assemble_match_result(
+            entry,
+            status=status,
+            best_score=best_score,
+            best_match=best_match,
+            field_comparisons=field_comparisons,
+            sources_queried=sources_queried,
+            sources_with_hits=sources_with_hits,
+            errors=errors,
+            intersection=intersection,
+            best_per_source=best_per_source,
+        )
+
+    def _assemble_match_result(
+        self,
+        entry: dict[str, Any],
+        *,
+        status: FactCheckStatus,
+        best_score: float,
+        best_match: PublishedRecord,
+        field_comparisons: dict[str, FieldComparison],
+        sources_queried: list[str],
+        sources_with_hits: list[str],
+        errors: list[str],
+        intersection: AuthorIntersectionResult,
+        best_per_source: dict[str, PublishedRecord | None],
+    ) -> FactCheckResult:
+        """Assemble the final result for a matched record.
+
+        Shared tail of :meth:`check_entry` and the identifier-anchored fast
+        paths: calibrated 0-1 confidence, the numeric (0-100)
+        ``confidence_score`` attribute stamp, and per-entry state carried on
+        the result (never on ``self`` -- check_entry runs concurrently).
+        """
         # P3.1+P3.2+P3.3: Use calibrated confidence instead of raw best_score
         field_comp_dict = {
             name: {"score": c.similarity_score, "matches": c.matches} for name, c in field_comparisons.items()
@@ -2547,8 +2606,8 @@ class FactChecker:
         )
 
         result = FactCheckResult(
-            entry_key=entry_key,
-            entry_type=entry_type,
+            entry_key=entry.get("ID", "unknown"),
+            entry_type=entry.get("ENTRYTYPE", "misc").lower(),
             status=status,
             overall_confidence=confidence,
             field_comparisons=field_comparisons,
@@ -2565,6 +2624,162 @@ class FactChecker:
         # not part of the JSONL schema so existing consumers keep working.
         result.confidence_score = numeric_conf  # type: ignore[attr-defined]
         return result
+
+    def _anchored_verified_result(
+        self,
+        entry: dict[str, Any],
+        rec: PublishedRecord,
+        comparisons: dict[str, FieldComparison],
+        source: str,
+    ) -> FactCheckResult:
+        """VERIFIED result for an identifier-anchored fast path.
+
+        Mirrors the normal assembly: same blended score formula, same
+        calibration, same numeric confidence. A single source contributes, so
+        there is no cross-source intersection -> no multi-source bonus and an
+        empty suspect list (``cross_source_author_intersection`` over one
+        record yields exactly that).
+        """
+        title_norm = normalize_title_for_match(entry.get("title", ""))
+        authors_ref = authors_last_names(entry.get("author", ""), limit=3)
+        best_score = self._score_candidate(title_norm, authors_ref, rec)
+        best_per_source: dict[str, PublishedRecord | None] = {source: rec}
+        intersection = cross_source_author_intersection(best_per_source, multi_source_bonus=MULTI_SOURCE_BONUS)
+        return self._assemble_match_result(
+            entry,
+            status=FactCheckStatus.VERIFIED,
+            best_score=best_score,
+            best_match=rec,
+            field_comparisons=comparisons,
+            sources_queried=[source],
+            sources_with_hits=[source],
+            errors=[],
+            intersection=intersection,
+            best_per_source=best_per_source,
+        )
+
+    def _doi_fast_path_result(self, entry: dict[str, Any]) -> FactCheckResult | None:
+        """DOI-anchored fast path: skip the cascade when the entry's own DOI
+        record fully confirms EVERY claimed field.
+
+        Runs immediately after ``_check_doi_consistency`` found no mismatch,
+        so hybrid fabrications (real DOI + fabricated title/authors) and the
+        ID-anchored author/venue/year mismatches were already caught upstream.
+        ``_structured_record_by_doi`` is served from the SqliteCache (the
+        consistency check / batch warm-up just fetched the same record), so
+        this adds no network round-trip.
+
+        Verdict-safe by construction -- it can ONLY short-circuit a clean
+        VERIFIED, never produce a negative/abstention verdict. Requirements
+        (strictly tighter than the consistency check):
+
+        * the record carries authoritative structured names AND reliable
+          author order;
+        * title matches at the FULL ``title_threshold`` (not the loose
+          ``doi_consistency_min_title``);
+        * the FULL ``_compare_all_fields`` confirms every claimed field. A
+          truncated author list (PARTIAL), a venue the record cannot confirm
+          (e.g. a preprint DOI record -> NON_COMPARABLE), or any mismatch
+          falls through to the normal cascade with NO state carried over.
+
+        Inert in --strict mode (strict wants multi-source corroboration) and
+        when disabled via --no-fast-path.
+        """
+        if self.config.strict or not self.config.doi_fast_path:
+            return None
+        raw_doi = (entry.get("doi", "") or "").strip()
+        if not raw_doi:
+            return None
+        rec = self._structured_record_by_doi(raw_doi)
+        if rec is None or not rec.title:
+            return None
+        if not (rec.structured_names and rec.order_reliable):
+            return None
+        entry_title = normalize_title_for_match(entry.get("title", ""))
+        if not entry_title:
+            return None
+        if token_sort_ratio(entry_title, normalize_title_for_match(rec.title)) / 100.0 < self.config.title_threshold:
+            return None
+        comparisons = self._compare_all_fields(entry, rec)
+        if not all(c.is_confirmed for c in comparisons.values()):
+            return None
+        self.logger.debug(
+            "DOI fast path: %s fully confirmed by its own DOI record (%s); cascade skipped",
+            entry.get("ID", "?"),
+            raw_doi,
+        )
+        return self._anchored_verified_result(entry, rec, comparisons, source="crossref")
+
+    def _arxiv_fast_path_result(self, entry: dict[str, Any]) -> FactCheckResult | None:
+        """arXiv-anchored fast path: skip the cascade for a venue-less,
+        DOI-less preprint citation whose own arXiv record confirms it exactly.
+
+        Runs immediately after ``_check_arxiv_id_consistency`` found no
+        mismatch; the record comes from the ``_arxiv_record`` memo (no extra
+        network). Only applies when the entry claims NO venue (no
+        journal/booktitle) and carries NO DOI -- an arXiv record can never
+        confirm a published-venue claim, so such entries always need the
+        cascade.
+
+        Deliberately STRICTER than the normal matcher on authors: arXiv
+        records are ``order_reliable=False``, so ``symmetric_author_match``
+        would wave a same-multiset swap through. Here the entry's surname-key
+        sequence must EQUAL the record's element-wise (same names, same order,
+        same length); a swapped-author preprint citation therefore falls
+        through to the cascade where order-reliable sources can catch it.
+        Title must clear the FULL ``title_threshold`` and the claimed year
+        must be within tolerance of the arXiv year; the full
+        ``_compare_all_fields`` must then confirm every claimed field.
+
+        Verdict-safe by construction (clean VERIFIED only); inert in --strict
+        mode and when disabled via --no-fast-path.
+        """
+        if self.config.strict or not self.config.arxiv_fast_path:
+            return None
+        if (entry.get("doi") or "").strip():
+            return None
+        if (entry.get("journal") or entry.get("booktitle") or "").strip():
+            return None
+        if self.arxiv is None:
+            return None
+        arxiv_id = self._arxiv_id_from_entry(entry)
+        if not arxiv_id:
+            return None
+        try:
+            rec = self._arxiv_record(arxiv_id)
+        except Exception:
+            return None
+        if rec is None or not rec.title:
+            return None
+        # Exact author-sequence equality (no multiset escape; see docstring).
+        entry_names = self._entry_surname_keys(entry, rec, limit=10_000)
+        api_names = rec.surname_keys(limit=10_000)
+        if not entry_names or not api_names or entry_names != api_names:
+            return None
+        entry_title = normalize_title_for_match(entry.get("title", ""))
+        if not entry_title:
+            return None
+        if token_sort_ratio(entry_title, normalize_title_for_match(rec.title)) / 100.0 < self.config.title_threshold:
+            return None
+        # Claimed year must sit within tolerance of the arXiv year.
+        entry_year = (entry.get("year") or "").strip()
+        if entry_year:
+            if rec.year is None:
+                return None
+            try:
+                if abs(int(entry_year) - int(rec.year)) > self.config.year_tolerance:
+                    return None
+            except ValueError:
+                return None
+        comparisons = self._compare_all_fields(entry, rec)
+        if not all(c.is_confirmed for c in comparisons.values()):
+            return None
+        self.logger.debug(
+            "arXiv fast path: %s fully confirmed by its own arXiv record (%s); cascade skipped",
+            entry.get("ID", "?"),
+            arxiv_id,
+        )
+        return self._anchored_verified_result(entry, rec, comparisons, source="arxiv")
 
     @staticmethod
     def _arxiv_id_from_entry(entry: dict[str, Any]) -> str | None:
@@ -5342,6 +5557,16 @@ Examples:
         ),
     )
     api_opts.add_argument(
+        "--no-fast-path",
+        action="store_true",
+        help=(
+            "Disable the DOI/arXiv identifier-anchored fast paths and always "
+            "run the full source cascade (the fast paths only ever "
+            "short-circuit a fully-confirmed VERIFIED; they are already "
+            "disabled in --strict mode)"
+        ),
+    )
+    api_opts.add_argument(
         "--workers",
         type=int,
         default=8,
@@ -5527,6 +5752,8 @@ def main() -> int:
         check_dois=not args.no_check_dois,
         check_years=not args.no_check_years,
         check_venue_existence=not args.no_check_venue_existence,
+        doi_fast_path=not args.no_fast_path,
+        arxiv_fast_path=not args.no_fast_path,
         top_k=top_k,
         openalex_mailto=openalex_mailto,
         strict=strict_mode,
