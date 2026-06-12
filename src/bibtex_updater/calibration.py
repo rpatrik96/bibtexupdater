@@ -77,6 +77,10 @@ STATUS_BASE_CONFIDENCE = {
     "author_truncated": _PROB_SOFT,  # silent author-list truncation (one disagreeing field)
     "year_mismatch": _PROB_SOFT,
     "venue_mismatch": _PROB_SOFT,
+    # Claimed venue unknown to the DBLP/OpenAlex venue registries while the
+    # paper itself is real: positive (registry-backed) evidence, but the
+    # registries are fuzzy-matched name lookups -> soft tier, not strong.
+    "nonexistent_venue": _PROB_SOFT,
     "partial_match": _PROB_SOFT,
     "url_content_mismatch": _PROB_SOFT,
     # --- DON'T-KNOW / abstention: could not adjudicate, near-neutral ---

@@ -48,6 +48,7 @@ from bibtex_updater.calibration import calibrate_result
 from bibtex_updater.matching import (
     EXPANDED_VENUE_ALIASES,
     MatchOutcome,
+    _normalize_venue_for_matching,
     _strip_author_sentinels,
     get_canonical_venue,
     has_explicit_truncation_indicator,
@@ -76,6 +77,7 @@ from bibtex_updater.utils import (
     ARXIV_API,
     CROSSREF_API,
     DBLP_API_SEARCH,
+    DBLP_API_VENUE_SEARCH,
     S2_API,
     GivenNameVariety,
     # Text normalization
@@ -217,6 +219,11 @@ class FactCheckStatus(Enum):
     GIVEN_NAME_SUBSTITUTION = "given_name_substitution"
     YEAR_MISMATCH = "year_mismatch"
     VENUE_MISMATCH = "venue_mismatch"
+    # The claimed venue is not known to any venue registry (DBLP venue search,
+    # OpenAlex /sources) AND no source reports it for this otherwise-real paper.
+    # Positive evidence of a fabricated venue -- a PROBLEM status, distinct from
+    # VENUE_MISMATCH (real-but-different venue) and NOT an abstention.
+    NONEXISTENT_VENUE = "nonexistent_venue"
     PARTIAL_MATCH = "partial_match"
     HALLUCINATED = "hallucinated"
     API_ERROR = "api_error"
@@ -408,6 +415,13 @@ class FactCheckerConfig:
     # treated as a *different* paper. Deliberately low (mirrors arXiv) so only
     # clear different-paper cases trip it.
     doi_consistency_min_title: float = 0.50
+    # Venue-existence check (HALLMARK nonexistent_venue). On the UNCONFIRMED
+    # abstention path only: when the entry claims a non-canonicalizable venue
+    # that NO source reports for this otherwise-real paper, probe the DBLP
+    # venue registry and OpenAlex /sources; if BOTH registries have never heard
+    # of it, escalate to the positive NONEXISTENT_VENUE status. Lookup errors
+    # always keep the abstention. Disable with --no-check-venue-existence.
+    check_venue_existence: bool = True
     # CheckIfExist additions (Item 1 + 2): cascading + top-K retrieval.
     # Verification uses the CrossRef -> OpenAlex -> DBLP -> Semantic Scholar
     # cascade, which short-circuits on a high-confidence match so the slow
@@ -1471,6 +1485,31 @@ class DBLPClient:
         except Exception:
             return []
 
+    def search_venues(self, query: str, max_hits: int = 10) -> list[dict[str, Any]] | None:
+        """Search the DBLP *venue* registry (``/search/venue/api``).
+
+        Unlike :meth:`search`, errors are distinguishable from zero hits:
+        returns ``None`` on any non-200 / parse / network failure (callers
+        MUST treat that as "could not check", never as "venue missing") and a
+        possibly-empty hit list only when DBLP answered successfully. Routed
+        through the shared HttpClient with ``service="dblp"`` so rate limiting
+        and caching apply.
+        """
+        params = {"q": query, "h": max_hits, "format": "json"}
+        try:
+            resp = self.http._request(
+                "GET", DBLP_API_VENUE_SEARCH, params=params, accept="application/json", service="dblp"
+            )
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+            hits = data.get("result", {}).get("hits", {}).get("hit", [])
+            if isinstance(hits, dict):
+                hits = [hits]
+            return hits if isinstance(hits, list) else None
+        except Exception:
+            return None
+
 
 class SemanticScholarClient:
     """Semantic Scholar API client."""
@@ -1792,6 +1831,17 @@ class FactChecker:
         # so a slow network call never serializes the other workers.
         self._arxiv_record_cache: dict[str, PublishedRecord | None] = {}
         self._arxiv_cache_lock = threading.Lock()
+        # Venue-existence memo (Task 2): keyed by the NORMALIZED claimed venue
+        # string, because bibliographies repeat the same venue across many
+        # entries and the registry probes (DBLP venue search + OpenAlex
+        # /sources) are two network calls each. Values: True (a registry knows
+        # the venue), False (both registries answered and neither does), None
+        # (a lookup failed -- "could not check" is cached too so a flaky
+        # registry is not hammered once per entry). Same double-checked-locking
+        # discipline as ``_arxiv_record_cache``: reads/inserts under the lock,
+        # network fetches outside it.
+        self._venue_existence_cache: dict[str, bool | None] = {}
+        self._venue_existence_lock = threading.Lock()
 
     def _arxiv_record(self, arxiv_id: str) -> PublishedRecord | None:
         """Fetch + parse the arXiv record for an ID, memoized per checker.
@@ -1816,6 +1866,176 @@ class FactChecker:
                 return self._arxiv_record_cache[arxiv_id]
             self._arxiv_record_cache[arxiv_id] = rec
         return rec
+
+    # ------------- Venue-existence check (Task 2: NONEXISTENT_VENUE) -------------
+
+    #: A registry hit whose normalized name token_sort-matches the normalized
+    #: claimed venue at/above this ratio counts as "the venue exists".
+    _VENUE_EXISTENCE_MATCH_THRESHOLD: float = 0.80
+
+    #: Minimum number of sources that must have returned a venue-bearing
+    #: candidate for THIS paper (none of which matches the claimed venue)
+    #: before the registries are consulted at all. "The paper is real and
+    #: known, but nobody has heard of the claimed venue for it."
+    _MIN_SOURCES_FOR_VENUE_EXISTENCE: int = 2
+
+    @staticmethod
+    def _venue_existence_query(claimed_venue: str) -> str:
+        """Normalize a claimed venue for registry lookup (and as the memo key).
+
+        LaTeX markup is stripped first, then ``_normalize_venue_for_matching``
+        removes the obvious noise (years, "Proceedings of the", track
+        decorations) so the registries are queried with the bare venue name.
+        """
+        return _normalize_venue_for_matching(latex_to_plain(claimed_venue or ""))
+
+    def _registry_name_matches(self, claimed_norm: str, candidate_name: str) -> bool:
+        """True when a registry hit's name plausibly IS the claimed venue."""
+        candidate_norm = _normalize_venue_for_matching(candidate_name or "")
+        if not claimed_norm or not candidate_norm:
+            return False
+        score = token_sort_ratio(claimed_norm, candidate_norm) / 100.0
+        return score >= self._VENUE_EXISTENCE_MATCH_THRESHOLD
+
+    def _venue_exists_in_registries(self, claimed_venue: str) -> bool | None:
+        """Probe the DBLP venue registry and OpenAlex ``/sources`` for a venue.
+
+        Returns:
+            True  -- some registry knows a venue whose name fuzzy-matches the
+                     claim (the venue exists; the entry stays UNCONFIRMED).
+            False -- BOTH registries answered successfully and neither has a
+                     plausible match: positive evidence the venue is fabricated.
+            None  -- either lookup failed (or a client is unavailable): could
+                     not check, so the caller must keep abstaining.
+
+        Memoized per checker on the normalized claim (thread-safe,
+        double-checked locking mirroring ``_arxiv_record_cache``) since the
+        same venue string repeats across a bibliography's entries.
+        """
+        key = self._venue_existence_query(claimed_venue)
+        if not key:
+            return None
+        with self._venue_existence_lock:
+            if key in self._venue_existence_cache:
+                return self._venue_existence_cache[key]
+        verdict = self._venue_exists_in_registries_uncached(key)
+        with self._venue_existence_lock:
+            # Another worker may have probed the same venue while we did; keep
+            # the first cached verdict so the memo stays stable.
+            if key in self._venue_existence_cache:
+                return self._venue_existence_cache[key]
+            self._venue_existence_cache[key] = verdict
+        return verdict
+
+    def _venue_exists_in_registries_uncached(self, claimed_norm: str) -> bool | None:
+        """Uncached registry probes; see :meth:`_venue_exists_in_registries`.
+
+        A nonexistence verdict (False) requires BOTH registries to answer
+        successfully with zero plausible matches; any failure on either side
+        returns None ("could not check") so a flaky registry can never mint a
+        positive flag.
+        """
+        # ----- DBLP venue registry -----
+        dblp_hits: Any = None
+        if self.dblp is not None and hasattr(self.dblp, "search_venues"):
+            try:
+                dblp_hits = self.dblp.search_venues(claimed_norm)
+            except Exception:
+                dblp_hits = None
+        if not isinstance(dblp_hits, list):
+            return None
+        for hit in dblp_hits:
+            if not isinstance(hit, dict):
+                continue
+            info = hit.get("info") or {}
+            if not isinstance(info, dict):
+                continue
+            for name_field in ("venue", "acronym"):
+                name = info.get(name_field)
+                if isinstance(name, str) and self._registry_name_matches(claimed_norm, name):
+                    return True
+        # ----- OpenAlex sources registry -----
+        oa_sources: Any = None
+        if self.openalex is not None and hasattr(self.openalex, "search_sources"):
+            try:
+                oa_sources = self.openalex.search_sources(claimed_norm)
+            except Exception:
+                oa_sources = None
+        if not isinstance(oa_sources, list):
+            return None
+        for src in oa_sources:
+            if not isinstance(src, dict):
+                continue
+            names: list[str] = []
+            for name_field in ("display_name", "abbreviated_title"):
+                value = src.get(name_field)
+                if isinstance(value, str):
+                    names.append(value)
+            alternates = src.get("alternate_titles")
+            if isinstance(alternates, list):
+                names.extend(alt for alt in alternates if isinstance(alt, str))
+            if any(self._registry_name_matches(claimed_norm, name) for name in names):
+                return True
+        return False
+
+    def _check_claimed_venue_exists(
+        self,
+        entry: dict[str, Any],
+        comparisons: dict[str, FieldComparison],
+        per_source_records: dict[str, PublishedRecord | None] | None,
+    ) -> FactCheckStatus | None:
+        """Positive nonexistent-venue check; runs ONLY on the UNCONFIRMED path.
+
+        A fabricated venue has no record to contradict it, so it abstains
+        forever under the comparison model (HALLMARK ``nonexistent_venue``
+        false negatives). This check supplies the missing positive evidence,
+        under ALL of these gates (any failure -> ``None``, keep abstaining):
+
+        * the entry claims a venue, and that venue is neither preprint-ish nor
+          canonicalizable via the alias map (a recognized real venue cited at
+          the wrong paper is the cross-source consensus path's job, never
+          "nonexistent");
+        * the venue comparison did not MATCH;
+        * the paper itself is real and known: >= 2 sources returned a
+          candidate that looks like THIS paper (title at/above the title
+          threshold) carrying a venue string, and NONE of those venue strings
+          ``venues_match`` the claim -- nobody has heard of the claimed venue
+          for this paper;
+        * the DBLP venue registry AND OpenAlex /sources both answer
+          successfully and neither knows a plausibly-matching venue name
+          (any lookup error keeps the abstention).
+        """
+        claimed = entry.get("journal") or entry.get("booktitle") or ""
+        if not claimed:
+            return None
+        if is_preprint_or_series_venue(claimed):
+            return None
+        if get_canonical_venue(claimed) is not None:
+            return None
+        venue_cmp = comparisons.get("venue")
+        if venue_cmp is not None and venue_cmp.resolved_outcome is MatchOutcome.MATCH:
+            return None
+        entry_title_norm = normalize_title_for_match(entry.get("title", ""))
+        if not entry_title_norm:
+            return None
+        reporting_sources = 0
+        for rec in (per_source_records or {}).values():
+            if rec is None or not (rec.journal or "").strip():
+                continue
+            rec_title_norm = normalize_title_for_match(rec.title or "")
+            if not rec_title_norm:
+                continue
+            if token_sort_ratio(entry_title_norm, rec_title_norm) / 100.0 < self.config.title_threshold:
+                continue
+            if venues_match(claimed, rec.journal or "", self.config.venue_threshold).outcome is MatchOutcome.MATCH:
+                # Some source DOES report the claimed venue for this paper.
+                return None
+            reporting_sources += 1
+        if reporting_sources < self._MIN_SOURCES_FOR_VENUE_EXISTENCE:
+            return None
+        if self._venue_exists_in_registries(claimed) is False:
+            return FactCheckStatus.NONEXISTENT_VENUE
+        return None
 
     def _validate_year(self, entry: dict[str, Any]) -> FactCheckStatus | None:
         """Pre-API year validation. Returns a status if year is invalid, None if OK."""
@@ -2089,6 +2309,26 @@ class FactChecker:
             unpublished_status = self._check_or_unpublished(entry, best_match)
             if unpublished_status is not None:
                 status = unpublished_status
+
+        # Venue-existence check (Task 2: HALLMARK nonexistent_venue). ONLY on
+        # the residual abstention path: a fabricated venue has no record to
+        # contradict it, so it lands in UNCONFIRMED forever unless the venue
+        # registries supply positive nonexistence evidence. All gates +
+        # registry probes live in _check_claimed_venue_exists; any doubt or
+        # lookup error keeps the abstention.
+        if status is FactCheckStatus.UNCONFIRMED and self.config.check_venue_existence:
+            nonexistent_status = self._check_claimed_venue_exists(entry, field_comparisons, best_per_source)
+            if nonexistent_status is not None:
+                status = nonexistent_status
+                if "venue" in field_comparisons:
+                    # The claim is now positively refuted, not merely
+                    # unconfirmable: surface the root cause on the comparison.
+                    field_comparisons["venue"].outcome = MatchOutcome.MISMATCH
+                    field_comparisons["venue"].matches = False
+                    field_comparisons["venue"].note = (
+                        "Claimed venue not found in DBLP/OpenAlex venue "
+                        "registries and no source reports it for this paper"
+                    )
 
         # --strict-warn-cnv: promote could-not-verify abstentions (NOT_FOUND /
         # UNCONFIRMED) to STRICT_WARN_CNV so opt-in users can fail CI on
@@ -4518,6 +4758,9 @@ class FactCheckProcessor:
             "author_mismatch",
             "year_mismatch",
             "venue_mismatch",
+            # Claimed venue unknown to the venue registries for a real paper:
+            # positive evidence of fabrication (Task 2), never an abstention.
+            FactCheckStatus.NONEXISTENT_VENUE.value,
             # Multiple confirmed mismatches -> positive evidence of a problem.
             # (Previously omitted, so PARTIAL_MATCH entries fell through all three
             # buckets and the bucket counts under-summed.)
@@ -4746,6 +4989,14 @@ Examples:
         help="Disable year validation (future dates, implausible years)",
     )
     api_opts.add_argument(
+        "--no-check-venue-existence",
+        action="store_true",
+        help=(
+            "Disable the venue-existence check (DBLP venue registry + OpenAlex "
+            "sources lookup for unconfirmable claimed venues)"
+        ),
+    )
+    api_opts.add_argument(
         "--workers",
         type=int,
         default=8,
@@ -4936,6 +5187,7 @@ def main() -> int:
         venue_threshold=args.venue_threshold,
         check_dois=not args.no_check_dois,
         check_years=not args.no_check_years,
+        check_venue_existence=not args.no_check_venue_existence,
         top_k=top_k,
         openalex_mailto=args.openalex_mailto,
         strict=strict_mode,

@@ -188,6 +188,46 @@ class OpenAlexClient:
             return []
         return results
 
+    def search_sources(self, query: str, limit: int = 10) -> list[dict[str, Any]] | None:
+        """Search the OpenAlex *sources* registry (journals / conference series).
+
+        Endpoint: ``GET /sources?search=<venue>&per-page=<limit>`` (polite-pool
+        ``mailto`` included). Used by the venue-existence check, so errors must
+        be distinguishable from zero hits: returns ``None`` on any non-200 /
+        parse / network failure (callers MUST treat that as "could not check",
+        never as "venue missing") and a possibly-empty source list only when
+        OpenAlex answered successfully.
+        """
+        if not query or not query.strip():
+            return []
+        per_page = max(1, min(int(limit), 25))
+        url = f"{OPENALEX_API}/sources"
+        params: dict[str, Any] = {"search": query.strip(), "per-page": per_page, "mailto": self.mailto}
+        try:
+            if self.http is not None and hasattr(self.http, "_request"):
+                resp = self.http._request(
+                    "GET",
+                    url,
+                    params=params,
+                    accept="application/json",
+                    service="openalex",
+                )
+                if resp.status_code != 200:
+                    return None
+                data = resp.json() or {}
+            else:
+                with httpx.Client(timeout=self.timeout) as client:
+                    resp = client.get(url, params=params)
+                    if resp.status_code != 200:
+                        return None
+                    data = resp.json() or {}
+        except Exception:
+            return None
+        results = data.get("results")
+        if results is None:
+            results = []
+        return results if isinstance(results, list) else None
+
 
 def openalex_work_to_candidate_record(work: dict[str, Any]) -> PublishedRecord | None:
     """Permissive OpenAlex -> ``PublishedRecord`` conversion for cascade search.
