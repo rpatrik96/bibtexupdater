@@ -122,6 +122,12 @@ EUROPEPMC_API = "https://www.ebi.ac.uk/europepmc/webservices/rest"
 # endpoint does -- and that is the authoritative title+first-author lookup the
 # cascade relies on. Public read is keyless.
 OPENREVIEW_API = "https://api.openreview.net"
+# OpenReview API v2. Venues that migrated to v2 (ICLR 2024+, NeurIPS 2023+,
+# most 2024+ venues) are INVISIBLE on the legacy v1 host, so the client falls
+# back to ``GET /notes/search?term=<title>`` here when both v1 lookups miss.
+# v2 wraps every note content field as ``{"value": ...}`` (the converters
+# accept both shapes via ``_content_value``). Public read is keyless.
+OPENREVIEW_API_V2 = "https://api2.openreview.net"
 
 
 # ------------- Atomic File Replace -------------

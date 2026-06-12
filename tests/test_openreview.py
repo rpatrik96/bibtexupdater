@@ -29,10 +29,11 @@ from bibtex_updater.fact_checker import (
 )
 from bibtex_updater.sources import (
     OpenReviewClient,
+    _content_value,
     build_openreview_paperhash,
     openreview_note_to_candidate_record,
 )
-from bibtex_updater.utils import RateLimiterRegistry
+from bibtex_updater.utils import OPENREVIEW_API, OPENREVIEW_API_V2, RateLimiterRegistry
 
 # ------------- Helpers -------------
 
@@ -179,6 +180,135 @@ class TestOpenReviewClientSearch:
         client = OpenReviewClient(http=http)
         client.search("b", limit=999, title="T", first_author="a")
         assert http._request.call_args.kwargs["params"]["limit"] <= 10
+
+
+# ------------- API v2 fallback -------------
+
+
+class TestOpenReviewV2Fallback:
+    """Venues that migrated to api2.openreview.net (ICLR 2024+, NeurIPS 2023+)
+    are invisible to the legacy v1 host; when v1 paperhash AND v1 term both
+    miss, the same term search runs against the v2 ``/notes/search`` endpoint.
+    """
+
+    def test_v1_paperhash_hit_skips_v2(self):
+        # (1) A v1 paperhash hit must short-circuit: exactly one request, to v1.
+        http = MagicMock()
+        http._request.return_value = _ok([_v1_note("Adam", ["D Kingma"], ["~Diederik_Kingma1"])])
+        client = OpenReviewClient(http=http)
+
+        out = client.search("blob", title="Adam", first_author="kingma")
+
+        assert out
+        assert http._request.call_count == 1
+        assert http._request.call_args.args[1] == f"{OPENREVIEW_API}/notes"
+
+    def test_v1_term_hit_skips_v2(self):
+        # v1 term fallback hit -> two requests, both v1, no v2 call.
+        http = MagicMock()
+        http._request.side_effect = [
+            _ok([]),
+            _ok([_v1_note("Adam", ["D Kingma"], ["~Diederik_Kingma1"])]),
+        ]
+        client = OpenReviewClient(http=http)
+
+        out = client.search("blob", title="Adam", first_author="kingma")
+
+        assert out
+        assert http._request.call_count == 2
+        for call in http._request.call_args_list:
+            assert call.args[1] == f"{OPENREVIEW_API}/notes"
+
+    def test_v1_double_miss_falls_back_to_v2(self):
+        # (2) v1 paperhash miss + v1 term miss -> v2 /notes/search is queried
+        # with the same LaTeX-stripped term, through the shared client with
+        # the openreview service tag; the v2-shaped note parses correctly.
+        v2_note = _v2_note(
+            "Sparse {A}ttention Revisited",
+            ["Grace Hopper", "Alan Turing"],
+            ["~Grace_Hopper1", "~Alan_Turing1"],
+            venue="ICLR 2024 poster",
+            venueid="ICLR.cc/2024/Conference",
+        )
+        http = MagicMock()
+        http._request.side_effect = [_ok([]), _ok([]), _ok([v2_note])]
+        client = OpenReviewClient(http=http)
+
+        out = client.search("blob", limit=3, title="Sparse {A}ttention Revisited", first_author="hopper")
+
+        assert out == [v2_note]
+        assert http._request.call_count == 3
+        v2_call = http._request.call_args_list[2]
+        assert v2_call.args[1] == f"{OPENREVIEW_API_V2}/notes/search"
+        assert v2_call.kwargs["service"] == "openreview"
+        # LaTeX-stripped term, same params shape as the v1 term fallback.
+        assert v2_call.kwargs["params"] == {"term": "Sparse Attention Revisited", "limit": 3}
+
+        rec = openreview_note_to_candidate_record(out[0])
+        assert rec is not None
+        assert rec.title == "Sparse {A}ttention Revisited"
+        assert rec.journal == "ICLR 2024 poster"
+        assert rec.year == 2024  # recovered from the venue string
+        assert rec.structured_names is True  # families from the tilde handles
+        assert rec.surname_keys() == ["hopper", "turing"]
+        assert rec.order_reliable is True  # same as the v1 converter
+
+    def test_v2_error_returns_empty(self):
+        # (3) Any v2 failure -> [] (never raises into the cascade).
+        http = MagicMock()
+        http._request.side_effect = [_ok([]), _ok([]), RuntimeError("v2 down")]
+        client = OpenReviewClient(http=http)
+        assert client.search("b", title="T U V", first_author="a") == []
+
+    def test_v2_non_200_returns_empty(self):
+        http = MagicMock()
+        resp_500 = MagicMock()
+        resp_500.status_code = 500
+        http._request.side_effect = [_ok([]), _ok([]), resp_500]
+        client = OpenReviewClient(http=http)
+        assert client.search("b", title="T U V", first_author="a") == []
+
+    def test_v2_malformed_notes_returns_empty(self):
+        bad = MagicMock()
+        bad.status_code = 200
+        bad.json.return_value = {"notes": "not-a-list"}
+        http = MagicMock()
+        http._request.side_effect = [_ok([]), _ok([]), bad]
+        client = OpenReviewClient(http=http)
+        assert client.search("b", title="T U V", first_author="a") == []
+
+    def test_no_v2_without_first_author(self):
+        # Same gating as the v1 term fallback: author-less searches never
+        # reach the term/v2 paths at all.
+        http = MagicMock()
+        http._request.return_value = _ok([])
+        client = OpenReviewClient(http=http)
+        assert client.search("blob", title="Adam", first_author=None) == []
+        http._request.assert_not_called()
+
+
+# ------------- _content_value (v1/v2 shapes) -------------
+
+
+class TestContentValue:
+    def test_v1_bare_value(self):
+        assert _content_value({"title": "Adam"}, "title") == "Adam"
+
+    def test_v2_wrapped_value(self):
+        assert _content_value({"title": {"value": "Adam"}}, "title") == "Adam"
+
+    def test_v2_wrapped_list(self):
+        assert _content_value({"authors": {"value": ["A", "B"]}}, "authors") == ["A", "B"]
+
+    def test_missing_key_is_none(self):
+        assert _content_value({}, "title") is None
+
+    def test_v2_wrapped_none(self):
+        assert _content_value({"title": {"value": None}}, "title") is None
+
+    def test_dict_without_value_key_passes_through(self):
+        raw = {"something": "else"}
+        assert _content_value({"title": raw}, "title") is raw
 
 
 # ------------- note -> PublishedRecord conversion -------------

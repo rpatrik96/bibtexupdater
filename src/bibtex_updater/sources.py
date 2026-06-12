@@ -36,6 +36,7 @@ from rapidfuzz.fuzz import token_sort_ratio
 from bibtex_updater.utils import (
     OPENALEX_API,
     OPENREVIEW_API,
+    OPENREVIEW_API_V2,
     PublishedRecord,
     arxiv_id_from_datacite_doi,
     extract_arxiv_id_from_text,
@@ -432,6 +433,13 @@ class OpenReviewClient:
         with the plain title so the cascade still gets a chance to confirm the
         venue. A fabricated paper still returns 0 notes under both queries:
         the index is closed-world over OpenReview-hosted submissions.
+
+        API v2 fallback: venues that migrated to ``api2.openreview.net`` (ICLR
+        2024+, NeurIPS 2023+, most 2024+ venues) are INVISIBLE on the legacy v1
+        host, so when BOTH v1 lookups miss we issue the same term search against
+        the v2 ``/notes/search`` endpoint. Same gating as the v1 term fallback
+        (requires ``first_author`` + a built paperhash); v2 notes wrap content
+        fields as ``{"value": ...}``, which the converters already accept.
         """
         per_page = max(1, min(int(limit), MAX_TOP_K))
         paperhash = build_openreview_paperhash(title or "", first_author or "")
@@ -452,15 +460,25 @@ class OpenReviewClient:
         if not plain_title:
             return []
         term_params = {"term": plain_title, "limit": per_page}
-        return self._fetch(term_params)
+        notes = self._fetch(term_params)
+        if notes:
+            return notes
+        # API v2 fallback: only reached when v1 paperhash AND v1 term both
+        # missed -- the note may live on the v2-only host. Defensive like every
+        # other path: any error / non-200 yields [].
+        return self._fetch(term_params, url=f"{OPENREVIEW_API_V2}/notes/search")
 
-    def _fetch(self, params: dict[str, Any]) -> list[dict[str, Any]]:
-        """Issue a single OpenReview ``/notes`` request, return the note list.
+    def _fetch(self, params: dict[str, Any], url: str | None = None) -> list[dict[str, Any]]:
+        """Issue a single OpenReview request, return the note list.
 
-        Preserves shared-HttpClient-vs-bare-httpx routing (rate limiting + caching
-        on the shared path). Returns ``[]`` on any non-200 status or exception.
+        ``url`` defaults to the legacy v1 ``/notes`` endpoint; the API v2
+        fallback passes the ``api2.openreview.net/notes/search`` URL instead
+        (both hosts answer ``{"notes": [...]}``). Preserves
+        shared-HttpClient-vs-bare-httpx routing (rate limiting + caching on the
+        shared path). Returns ``[]`` on any non-200 status or exception.
         """
-        url = f"{OPENREVIEW_API}/notes"
+        if url is None:
+            url = f"{OPENREVIEW_API}/notes"
         try:
             if self.http is not None and hasattr(self.http, "_request"):
                 resp = self.http._request(
