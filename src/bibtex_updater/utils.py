@@ -529,14 +529,40 @@ def _nickname_equiv(a: str, b: str) -> bool:
     return any(a in grp and b in grp for grp in _NICKNAME_GROUPS)
 
 
+def _deglue_initials(given: str) -> str:
+    """Expand a glued, separator-less all-caps initial run into spaced initials.
+
+    PubMed/biomedical sources write given names as concatenated initials with no
+    dots or spaces -- "ME" for *Maria Elisabetta*, "RMF" for *Robin Maria
+    Francisca*. Without this, ``_given_tokens("ME")`` yields the single 2-char
+    token ``["me"]``, which is not all-length-1 so it escapes the initials branch
+    of :func:`classify_given_pair` and is graded as a *full* given token -- "me"
+    vs "maria" then escalates to a spurious SUBSTITUTION (a false author flag).
+
+    Case is the disambiguator: only an all-uppercase 2-5 letter run with no
+    separator is treated as glued initials, so a real short given ("Bo", "Wei",
+    mixed-case) is left untouched. The conservative failure mode if a genuinely
+    all-caps short name ever slips through is INITIAL_CONFLICT (-> soften/abstain),
+    never a false flag. Returns ``given`` unchanged when it is not such a run.
+    """
+    s = strip_diacritics(latex_to_plain(given or "")).strip()
+    if re.fullmatch(r"[A-Z]{2,5}", s):
+        return " ".join(s)
+    return given
+
+
 def classify_given_pair(given_entry: str, given_record: str) -> str:
     """Classify a single (entry, record) given-name pair into a GivenNameVariety.
 
     First-hit-wins cascade. Only SUBSTITUTION (two FULL, non-initial first given
     tokens that are neither a nickname pair nor within a small edit distance)
     escalates; everything else is a benign convention or a low-confidence variant.
+
+    Glued separator-less initial runs ("ME", "RMF") are expanded to spaced
+    initials first (see :func:`_deglue_initials`) so the initials branch handles
+    them instead of mis-grading them as full given tokens.
     """
-    te, tr = _given_tokens(given_entry), _given_tokens(given_record)
+    te, tr = _given_tokens(_deglue_initials(given_entry)), _given_tokens(_deglue_initials(given_record))
     if not te or not tr:
         return GivenNameVariety.NON_COMPARABLE
     if te == tr:
