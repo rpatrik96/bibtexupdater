@@ -164,13 +164,18 @@ abstention `p_valid ≈ 0.5` rather than a meaningful calibration signal).
   bit-identical across runs the way the committed v1.2.0 re-score is.
 * *Where `test_crossdomain`'s residual 32% FPR comes from.* That split is deliberately
   out-of-ML-domain (PubMed/biomedical); its 64 false positives are dominated by
-  `venue_mismatch` (32) and **`given_name_substitution` (22)**. The latter is an
-  author-name-variant gap: compact PubMed initials with nobiliary particles — "Vito C
-  De" for *C. De Vito*, "Rosario I Del" for *I. Del Rosario*, "de Oca M Montes" for
-  *Montes de Oca* — misparse which token is the surname, which cascades into a wrong
-  given-name pairing and a spurious substitution flag. It does not appear at scale on
-  the ML splits (`test_public` FPR 4.2%); a parser fix for particle surnames is scoped
-  as a follow-up.
+  `venue_mismatch` (32) and **`given_name_substitution` (22)**. The latter is a
+  given-name-format gap, not a surname error (surnames match the authoritative Crossref
+  records): PubMed writes given names as **glued, separator-less initial runs** — "ME"
+  Baldassarre for *Maria Elisabetta*, "MK" McGuire for *Michael K.*, "RMF" Kenter for
+  *Robin Maria Francisca*. The given-name grader only recognizes initials when they are
+  space/period-separated, so a glued "ME" is read as one full token, compared against
+  "maria", found beyond edit distance, and escalated to a substitution. Across the 22
+  entries all 58 escalating positions are glued-initials runs whose letters are in fact
+  the record's leading initials — every flag is benign. It does not appear at scale on
+  the ML splits (`test_public` FPR 4.2%); the scoped follow-up is to recognize a glued
+  all-caps initial run and route it through the existing `INITIAL_COMPATIBLE` /
+  `INITIAL_CONFLICT` path (never a substitution).
 
 This block was produced by `scripts/eval_hallmark.py` + `scripts/_compare_hallmark_runs.py`
 over `eval_runs/{dev_public,test_public,stress_test,test_crossdomain}/` — all four splits
