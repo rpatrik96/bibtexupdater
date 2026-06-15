@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-06-15
+
 `bibtex-check` release branch: a clearer output contract for downstream consumers (`p_valid`, `coverage_incomplete`), new positive-evidence detectors for fabricated venues / silent author truncation / preprint-as-published / wrong-year citations, a batch of false-positive fixes for author checks and DOI-anchored verification, and substantial throughput work (identifier fast paths, key-gated Semantic Scholar steps, realistic adaptive rate limits).
 
 ### Added
@@ -39,6 +41,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`WebVerifier` uses the shared HTTP client** for URL HEAD/content checks (same pool, rate limiters, and error mapping as every other source); the unused `requests` runtime dependency is dropped.
 - **Given-name/author-swap false positives from alphabetized records and mixed-initial names**: shared-surname order conclusions are no longer anchored on alphabetized records (Crossref NeurIPS-proceedings deposits sort contributors); the given-name audit grades the entry against *every* same-surname record author and abstains when any candidate explains it benignly; a single-letter first given token ("J. Westerborn" vs "Johan") compares as an initial, never as a full-name substitution; and a same-multiset reorder against a display-alphabetized record softens to the `unconfirmed` abstention instead of a positive flag. True positives (given-name substitution, real swaps against publication-order records) keep firing.
 - **2-author same-multiset swaps require cross-source corroboration**: with two authors, alphabetical order coincides with publication order half the time, so a lone alphabetizing source cannot distinguish a swap from a sort artifact. The mismatch now stands only when a second order-reliable source independently shows the same non-entry order; otherwise the entry abstains (never `verified`). 3+-author swap detection and `--strict` behavior are unchanged.
+- **Generational suffixes are stripped from surname keys**: `last_name_from_person`/`_normalize_surname_key` dropped trailing 4-digit DBLP homonym suffixes and single-letter initials, but not generational suffixes — so "John Smith Jr." reduced to the surname key `jr` and spuriously mismatched the suffix-less "John Smith" of the same author. A shared `_reduce_trailing_to_surname` helper now drops `jr/sr/ii/iii/iv` on both the entry and the authoritative-record side (kept symmetric). (#47)
+- **Glued separator-less initials are no longer mis-graded as a given-name substitution**: PubMed/biomedical given names written as concatenated initial runs ("ME" for *Maria Elisabetta*, "RMF" for *Robin Maria Francisca*) were read as a full given token and escalated to a false `given_name_substitution` author flag. A glued all-caps initial run is now expanded to spaced initials before grading, routing it through the existing initials-compatible path (never a substitution); genuine substitutions and real short given names are unaffected. Removes a cluster of out-of-domain false positives (HALLMARK `test_crossdomain` FPR −11pp). (#48)
 
 ## [1.3.0] - 2026-06-11
 
