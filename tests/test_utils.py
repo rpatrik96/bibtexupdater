@@ -575,6 +575,23 @@ class TestClassifyGivenPair:
         assert self._class("Sergey", "Serguei") == "soften"  # close romanization
         assert self._class("Y.", "Jiaming") == "soften"  # initial conflict
 
+    def test_glued_pubmed_initials_are_confirmed_not_substitution(self):
+        # PubMed writes given names as glued separator-less initial runs ("ME"
+        # for Maria Elisabetta). Without deglueing these were read as a full
+        # token and mis-escalated to a substitution ("me" vs "maria").
+        assert self._class("ME", "Maria Elisabetta") == "confirmed"
+        assert self._class("MK", "Michael K.") == "confirmed"
+        assert self._class("RMF", "Robin Maria Francisca") == "confirmed"
+        assert self._class("AA", "Alexey A.") == "confirmed"
+        # A glued run whose letters do NOT lead the record name is a low-confidence
+        # initial conflict (soften/abstain), never a hard substitution flag.
+        assert self._class("XY", "Maria Elisabetta") == "soften"
+        # Real short given names are mixed-case, not glued initials -> untouched.
+        assert self._class("Bo", "Bo") == "confirmed"
+        assert self._class("Wei", "Wei Zhang") == "confirmed"
+        # Deglueing must NOT rescue a genuine full-name substitution.
+        assert self._class("Yujing", "Yue") == "escalate"
+
     def test_missing_given_is_non_comparable(self):
         assert self._class("", "Yue") == "skip"
         assert self._class("Yue", "") == "skip"
