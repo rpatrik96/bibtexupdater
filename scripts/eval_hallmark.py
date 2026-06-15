@@ -74,6 +74,8 @@ STATUS_TO_LABEL: dict[str, str] = {
     "doi_mismatch": "HALLUCINATED",
     "title_near_miss": "HALLUCINATED",
     "author_truncated": "HALLUCINATED",
+    "nonexistent_venue": "HALLUCINATED",
+    "unpublished_at_claimed_venue": "HALLUCINATED",
     "strict_warn_preprint_year": "VALID",
     "strict_warn_cnv": "VALID",
     # Pre-API validation
@@ -263,8 +265,8 @@ def run_bibtex_check(
     s2_api_key: str | None,
     timeout: float,
     academic_only: bool = True,
-) -> dict[str, tuple[str, bool]]:
-    """Run bibtex-check over entries; return {bibtex_key: (raw_status, abstained)}.
+) -> dict[str, tuple[str, bool, bool, float | None]]:
+    """Run bibtex-check; return {bibtex_key: (status, abstained, coverage_incomplete, p_valid)}.
 
     bibtex-check writes one JSON record per entry with ``key``, ``status`` and an
     explicit ``abstained`` boolean. The temp ``.bib``/JSONL live in a fresh temp
@@ -296,7 +298,7 @@ def run_bibtex_check(
     except subprocess.TimeoutExpired:
         print("[bibtex-check] timed out; parsing partial output", file=sys.stderr)
 
-    results: dict[str, tuple[str, bool]] = {}
+    results: dict[str, tuple[str, bool, bool, float | None]] = {}
     if jsonl_path.exists():
         for line in jsonl_path.read_text().splitlines():
             if not line.strip():
@@ -310,8 +312,13 @@ def run_bibtex_check(
             # so deriving abstention from ABSTAIN_STATUSES keeps Coverage identical
             # across tool versions and across all splits in the report.
             abstained = status in ABSTAIN_STATUSES
+            # >=1.3.0 output contract: ``coverage_incomplete`` marks abstentions
+            # reached under source errors/throttling; ``p_valid`` is the explicit
+            # P(entry-as-cited is genuine). Both absent on older builds.
+            coverage_incomplete = bool(rec.get("coverage_incomplete", False))
+            p_valid = rec.get("p_valid")
             if key is not None:
-                results[key] = (status, abstained)
+                results[key] = (status, abstained, coverage_incomplete, p_valid)
     return results
 
 
@@ -324,14 +331,22 @@ def verdict(
     abstained: bool,
     prescreen: bool,
     reference_year: int,
+    coverage_incomplete: bool = False,
 ) -> tuple[str, bool]:
     """Return (label, abstained) for one entry.
 
     Raw bibtex-check status drives the verdict; pre-screening can only upgrade a
     VALID verdict to HALLUCINATED (never the reverse), matching HALLMARK's merge.
     A pre-screening override resolves the abstention (the verdict is now decided).
+
+    Mirrors the HALLMARK wrapper for the >=1.3.0 contract: a ``not_found``
+    produced while sources were erroring/throttled (``coverage_incomplete``) is
+    an abstention, not evidence of fabrication -> conservative VALID.
     """
-    tool_label = STATUS_TO_LABEL.get(status, "VALID")
+    if status == "not_found" and coverage_incomplete:
+        tool_label = "VALID"
+    else:
+        tool_label = STATUS_TO_LABEL.get(status, "VALID")
     if prescreen and tool_label == "VALID":
         if prescreen_year(entry.fields, reference_year) or prescreen_authors(entry.fields):
             return "HALLUCINATED", False
@@ -420,15 +435,23 @@ def main() -> None:
     abstained = 0
     per_entry: list[dict] = []
     for e in entries:
-        status, raw_abstained = all_status.get(e.key, ("missing", True))
+        status, raw_abstained, cov_inc, p_valid = all_status.get(e.key, ("missing", True, False, None))
         if args.doi_prescreen and prescreen:
             status = _maybe_doi_prescreen(e, status)
-        pred, ab = verdict(e, status, raw_abstained, prescreen, args.reference_year)
+        pred, ab = verdict(e, status, raw_abstained, prescreen, args.reference_year, coverage_incomplete=cov_inc)
         if ab:
             abstained += 1
         pairs.append((e.label, pred))
         per_entry.append(
-            {"bibtex_key": e.key, "gold_label": e.label, "pred_label": pred, "btu_status": status, "abstained": ab}
+            {
+                "bibtex_key": e.key,
+                "gold_label": e.label,
+                "pred_label": pred,
+                "btu_status": status,
+                "abstained": ab,
+                "coverage_incomplete": cov_inc,
+                "p_valid": p_valid,
+            }
         )
 
     metrics = compute_metrics(pairs, abstained, len(entries))
@@ -445,21 +468,53 @@ def main() -> None:
         print(f"[wrote] {args.per_entry}", file=sys.stderr)
 
 
+_ARXIV_DATACITE_DOI = re.compile(r"^(10\.48550/arxiv\.\d{4}\.\d{4,5})(v\d+)?$", re.IGNORECASE)
+
+
+def _normalize_doi_for_resolution(doi: str) -> str | None:
+    """Mirror bibtex-updater's DOI normalization for the resolution check.
+
+    Strips a ``https://doi.org/`` / ``dx.doi.org`` prefix, then drops the trailing
+    ``vN`` version suffix from arXiv DataCite DOIs (``10.48550/arXiv.<id>vN``): the
+    versioned form 404s at doi.org while the unversioned one resolves. Matches the
+    HALLMARK pre-screening fix so ``--doi-prescreen`` no longer flags valid
+    versioned-arXiv preprints. Returns None if no DOI core is found.
+    """
+    s = doi.strip()
+    s = re.sub(r"^https?://(dx\.)?doi\.org/", "", s, flags=re.IGNORECASE).strip()
+    m = re.search(r"10\.\d+/[^\s]+", s)
+    if not m:
+        return None
+    core = m.group(0)
+    av = _ARXIV_DATACITE_DOI.match(core)
+    if av:
+        return av.group(1)
+    return core
+
+
 def _maybe_doi_prescreen(entry: Entry, status: str) -> str:
-    """Optionally upgrade VALID->HALLUCINATED via a networked DOI HEAD check."""
+    """Optionally upgrade VALID->HALLUCINATED via a networked DOI HEAD check.
+
+    Only a definitive 404/410 from doi.org flags; transient errors / bot-blocks /
+    redirect-target 404s do not (FPR-safe), mirroring the HALLMARK pre-screening
+    layer and bibtex-updater's own DOI handling.
+    """
     if STATUS_TO_LABEL.get(status, "VALID") != "VALID":
         return status
     doi = entry.fields.get("doi")
     if not doi:
         return status
-    m = re.search(r"10\.\d+/[^\s]+", doi)
-    if not m:
+    normalized = _normalize_doi_for_resolution(doi)
+    if not normalized:
         return status
     try:
         import httpx
 
-        resp = httpx.head(f"https://doi.org/{m.group(0)}", timeout=10.0, follow_redirects=True)
-        if resp.status_code == 404:
+        resp = httpx.head(f"https://doi.org/{normalized}", timeout=10.0, follow_redirects=True)
+        # Only doi.org's own definitive verdict (no successful redirect first) is
+        # evidence the DOI does not exist; a 404 from a publisher landing page
+        # reached after a redirect is not.
+        if resp.status_code in (404, 410) and not resp.history:
             return "doi_not_found"
     except Exception:
         return status
