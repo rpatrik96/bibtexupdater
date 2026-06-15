@@ -242,6 +242,34 @@ def split_authors_bibtex(author_field: str) -> list[str]:
     return parts
 
 
+#: Generational/lineage suffixes that trail a surname ("John Smith Jr.",
+#: "Forsyth III"). Like single-letter initials and 4-digit DBLP homonym
+#: suffixes, they are NOT the distinctive family token and must be dropped
+#: before taking the last token -- otherwise "John Smith Jr." reduces to "jr"
+#: and spuriously MISMATCHES the suffix-less "John Smith" of the same author.
+#: Multi-character only: a bare "V"/"I" generational numeral is already removed
+#: by the single-letter rule, and listing it here could eat a real initial.
+_GENERATIONAL_SUFFIXES: frozenset[str] = frozenset({"jr", "sr", "ii", "iii", "iv"})
+
+
+def _reduce_trailing_to_surname(tokens: list[str]) -> list[str]:
+    """Drop trailing non-surname tokens so the last token is the family name.
+
+    Strips, from the end: 4-digit DBLP homonym suffixes ("Sun 0020"), trailing
+    single-letter initials ("Mallikarjun B. R." -> the naive last token would be
+    "r"), and generational suffixes ("John Smith Jr." -> "jr"). Guarded by
+    ``len > 1`` so a name that is *only* an initial/number/suffix is never
+    emptied. Shared by :func:`last_name_from_person` and
+    :func:`_normalize_surname_key` so the entry side and the authoritative
+    record side reduce IDENTICALLY (the symmetry the whole comparison relies on).
+    """
+    while len(tokens) > 1 and (
+        re.fullmatch(r"\d{4}", tokens[-1]) or len(tokens[-1]) == 1 or tokens[-1] in _GENERATIONAL_SUFFIXES
+    ):
+        tokens.pop()
+    return tokens
+
+
 def last_name_from_person(name: str) -> str:
     """Extract a comparable surname key from a person name.
 
@@ -260,14 +288,7 @@ def last_name_from_person(name: str) -> str:
     last = strip_diacritics(last).lower()
     last = re.sub(r"[^a-z0-9\s-]", "", last).strip()
 
-    tokens = last.split()
-    # Drop trailing junk tokens so the key is the real surname:
-    #   - 4-digit DBLP homonym suffixes ("Sun 0020", "Li 0001")
-    #   - trailing single-letter initials ("Mallikarjun B. R." -> "mallikarjun",
-    #     where naive last-token would give "r")
-    # Guarded by len > 1 so a name that is only an initial/number is never emptied.
-    while len(tokens) > 1 and (re.fullmatch(r"\d{4}", tokens[-1]) or len(tokens[-1]) == 1):
-        tokens.pop()
+    tokens = _reduce_trailing_to_surname(last.split())
     if tokens:
         last = tokens[-1]
     return last
@@ -297,13 +318,12 @@ def _normalize_surname_key(family: str) -> str:
         family = family.split(",", 1)[0].strip()
     key = strip_diacritics(family).lower()
     key = re.sub(r"[^a-z0-9\s-]", "", key).strip()
-    tokens = key.split()
-    # Drop trailing junk (4-digit DBLP suffix / single-letter initial) then take
-    # the distinctive last family token -- identical reduction to
-    # ``last_name_from_person``, but applied to a family-only string so the lead
-    # given name of a CJK name can never masquerade as the surname.
-    while len(tokens) > 1 and (re.fullmatch(r"\d{4}", tokens[-1]) or len(tokens[-1]) == 1):
-        tokens.pop()
+    # Drop trailing junk (4-digit DBLP suffix / single-letter initial /
+    # generational suffix) then take the distinctive last family token --
+    # identical reduction to ``last_name_from_person`` (same shared helper),
+    # but applied to a family-only string so the lead given name of a CJK name
+    # can never masquerade as the surname.
+    tokens = _reduce_trailing_to_surname(key.split())
     if tokens:
         return tokens[-1]
     return ""

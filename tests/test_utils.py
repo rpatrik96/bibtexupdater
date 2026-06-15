@@ -162,6 +162,23 @@ class TestLastNameFromPerson:
         result = last_name_from_person("Smith, John Jr.")
         assert "smith" in result.lower()
 
+    def test_last_name_generational_suffix_after_surname(self):
+        # A generational suffix trailing the SURNAME must be dropped, or
+        # "John Smith Jr." reduces to "jr" and spuriously mismatches the
+        # suffix-less "John Smith" of the same author (and the comma form).
+        assert last_name_from_person("John Smith Jr.") == "smith"
+        assert last_name_from_person("Smith Jr., John") == "smith"
+        assert last_name_from_person("Forsyth III") == "forsyth"
+        assert last_name_from_person("Robert Downey IV") == "downey"
+
+    def test_normalize_surname_key_symmetric_with_suffix(self):
+        # The authoritative record side must reduce a suffixed family
+        # identically to the entry side, or the two never compare equal.
+        from bibtex_updater.utils import _normalize_surname_key
+
+        assert _normalize_surname_key("Smith Jr.") == last_name_from_person("John Smith Jr.")
+        assert _normalize_surname_key("Forsyth III") == "forsyth"
+
     def test_last_name_trailing_initials_skipped(self):
         # "Mallikarjun B. R." (surname first, then initials) -> "mallikarjun",
         # not the naive last token "r".
