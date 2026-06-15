@@ -173,9 +173,19 @@ abstention `p_valid ≈ 0.5` rather than a meaningful calibration signal).
   "maria", found beyond edit distance, and escalated to a substitution. Across the 22
   entries all 58 escalating positions are glued-initials runs whose letters are in fact
   the record's leading initials — every flag is benign. It does not appear at scale on
-  the ML splits (`test_public` FPR 4.2%); the scoped follow-up is to recognize a glued
-  all-caps initial run and route it through the existing `INITIAL_COMPATIBLE` /
-  `INITIAL_CONFLICT` path (never a substitution).
+  the ML splits (`test_public` FPR 4.2%).
+
+  *Fixed* (PR [#48](https://github.com/rpatrik96/bibtexupdater/pull/48)): a glued all-caps
+  initial run is now expanded to spaced initials before grading, routing it through the
+  existing `INITIAL_COMPATIBLE` / `INITIAL_CONFLICT` path so it can never escalate to a
+  substitution. On `test_crossdomain` this removes 22 of these FPs (**FPR 0.320 → 0.210,
+  MCC 0.658 → 0.736, F1 0.873 → 0.899**); dev/test detection is unchanged (their
+  given-name flags are real full-name differences, not glued initials, so the deglue
+  never fires). The fix unmasks three crossdomain entries whose true perturbation is in
+  the title/venue, not the authors — the author flag had been catching them incidentally:
+  two now abstain (`unconfirmed`) and one is a documented `near_miss_title` leak
+  (`KNOWN_LEAKS.md`, caught only by `--strict`), so DR moves 0.940 → 0.930. These are
+  pre-existing title/venue gaps exposed, not regressions introduced by the fix.
 
 This block was produced by `scripts/eval_hallmark.py` + `scripts/_compare_hallmark_runs.py`
 over `eval_runs/{dev_public,test_public,stress_test,test_crossdomain}/` — all four splits
