@@ -9,8 +9,10 @@ table does not break out (`stress_test`, `test_crossdomain`).
 
 > **Newer build:** for the post-1.3.0 reliability overhaul (Unreleased / PR #45),
 > see [Results — post-1.3.0 reliability overhaul](#results--post-130-reliability-overhaul-unreleased-commit-c758f7e)
-> below: tool-only **dev DR 84.8% / FPR 4.7%**, **test DR 88.4% / FPR 4.2%**, with
-> large gains on the previously-abstaining weak types.
+> below — now **all four splits re-run live and keyed**: tool-only **dev DR 84.8% /
+> FPR 4.7%**, **test DR 88.4% / FPR 4.2%**, **stress_test DR 79.3%** (+14.9pp),
+> **test_crossdomain DR 94.0% / FPR 32.0%** (MCC +11.5pp), with large gains on the
+> previously-abstaining weak types (`partial_author_list` up to +60.9pp).
 
 ## What is being measured
 
@@ -85,7 +87,7 @@ The reliability/throughput overhaul (PR [#45](https://github.com/rpatrik96/bibte
 default-mode author-truncation flagging, identifier-based venue consensus + a
 `nonexistent_venue` registry check, identifier-less preprint-as-published
 detection, the author-FP fixes, the `p_valid`/`coverage_incomplete` contract) was
-re-evaluated live with `scripts/eval_hallmark.py` on the same two public splits,
+re-evaluated live with `scripts/eval_hallmark.py` on all four HALLMARK splits,
 **with a Semantic Scholar API key** (`S2_API_KEY`). The headline below is
 **tool-only** — both the new run and the committed v1.2.0 per-entry file are
 scored from the raw `btu_status` with no pre-screening, so the comparison isolates
@@ -98,10 +100,15 @@ change. See `eval_runs/*/compare.json` for the full-stack rows too.)
 |-------|----:|----:|----------:|---:|----:|-----:|------:|-----:|
 | dev_public  | **84.8%** | **4.7%** | 95.5% | **0.899** | **0.799** | +2.8pp | −0.4pp | +0.019 |
 | test_public | **88.4%** | **4.2%** | 97.2% | **0.926** | **0.824** | +4.6pp | −3.8pp | +0.038 |
+| stress_test | **79.3%** | n/a | 100.0% | **0.885** | n/a | +14.9pp | n/a | +0.101 |
+| test_crossdomain | **94.0%** | **32.0%** | 81.5% | **0.873** | **0.658** | +5.0pp | −5.5pp | +0.041 |
 
 (v1.2.0 tool-only baseline: dev 82.0% / 5.1% / 0.880 / 0.768; test 83.8% / 8.0% /
-0.889 / 0.738.) Both splits improve on **every** headline metric: detection rate up
-~3–5pp, false-positive rate cut (test FPR roughly halved), and MCC up 3–8pp.
+0.889 / 0.738; stress 64.5% / — / 0.784 / —; crossdomain 89.0% / 37.5% / 0.832 /
+0.543.) All four splits improve on **every comparable** headline metric: detection
+rate up 3–15pp, false-positive rate down wherever it is defined (test FPR roughly
+halved; crossdomain −5.5pp), F1 up 0.02–0.10, and MCC up 3–12pp (crossdomain
++11.5pp). `stress_test` has no valid negatives, so its FPR and MCC are undefined.
 
 **Where the detection gains come from** (tool-only per-type detection rate; the
 five types the overhaul targeted, all of which previously abstained as
@@ -122,10 +129,22 @@ The remaining always-caught types (`fabricated_doi`, `future_date`,
 statuses fire as designed (dev: `author_truncated` ×9, `nonexistent_venue` ×2,
 `preprint_only` ×1; test similar).
 
+The two newly re-run splits show the same shape, again driven by author-truncation
+flagging: **`partial_author_list` jumps +46.2pp on `stress_test` (0.051 → 0.513) and
++60.9pp on `test_crossdomain` (0.261 → 0.870)**, every other type is flat-to-up
+(`preprint_as_published` +4.8pp on crossdomain), and the eight always-caught types
+(`fabricated_doi`, `future_date`, `placeholder_authors`, `chimeric_title`,
+`hybrid_fabrication`, `plausible_fabrication`, `merged_citation`, `swapped_authors`)
+stay at 1.000. `stress_test` overall DR climbs +14.9pp almost entirely from that one
+type (19 `author_truncated` flags fire); `test_crossdomain` DR +5.0pp with FPR −5.5pp.
+
 **Calibration.** The new explicit `p_valid` (probability the entry as cited is
 genuine) has **ECE 0.252 (dev) / 0.278 (test)** as a P(valid) estimate — well
 below the v1.2.0 verdict-confidence ECE the HALLMARK paper reports (0.383 / 0.399),
-i.e. the new score is materially better calibrated for thresholding/ranking.
+i.e. the new score is materially better calibrated for thresholding/ranking. On
+`test_crossdomain` (the split with genuine valid negatives) ECE is **0.211**, the best
+of the four; `stress_test`'s 0.415 is degenerate (~99% one class, so it mostly reflects
+abstention `p_valid ≈ 0.5` rather than a meaningful calibration signal).
 
 **Honest caveats.**
 * *Default-mode near-miss leaks persist.* Five entries (dev) verify despite a
@@ -143,10 +162,20 @@ i.e. the new score is materially better calibrated for thresholding/ranking.
   `eval_runs/test_public_fill/`) so the grid reflects all 831 entries. `dev_public`
   completed in one pass. Numbers are reproducible but, being a live API run, are not
   bit-identical across runs the way the committed v1.2.0 re-score is.
+* *Where `test_crossdomain`'s residual 32% FPR comes from.* That split is deliberately
+  out-of-ML-domain (PubMed/biomedical); its 64 false positives are dominated by
+  `venue_mismatch` (32) and **`given_name_substitution` (22)**. The latter is an
+  author-name-variant gap: compact PubMed initials with nobiliary particles — "Vito C
+  De" for *C. De Vito*, "Rosario I Del" for *I. Del Rosario*, "de Oca M Montes" for
+  *Montes de Oca* — misparse which token is the surname, which cascades into a wrong
+  given-name pairing and a spurious substitution flag. It does not appear at scale on
+  the ML splits (`test_public` FPR 4.2%); a parser fix for particle surnames is scoped
+  as a follow-up.
 
 This block was produced by `scripts/eval_hallmark.py` + `scripts/_compare_hallmark_runs.py`
-over `eval_runs/{dev,test}_public/`; `stress_test` / `test_crossdomain` were not
-re-run for this build and their v1.2.0 rows above stand.
+over `eval_runs/{dev_public,test_public,stress_test,test_crossdomain}/` — all four splits
+re-run live and keyed (`S2_API_KEY`) for this build. `stress_test` and `test_crossdomain`
+each completed in a single pass with `coverage_incomplete = 0` (no throttle drops).
 
 ## Cross-check against the HALLMARK paper
 
