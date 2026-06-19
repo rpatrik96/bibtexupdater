@@ -3075,20 +3075,21 @@ class AsyncResolver:
 
 # ------------- Updater -------------
 class Updater:
-    PREPRINT_ONLY_FIELDS = {
-        "eprint",
-        "archiveprefix",
-        "archivePrefix",
-        "primaryClass",
-        "primaryclass",
-        "eprinttype",
-        "eprintclass",
-    }
-
-    def __init__(self, keep_preprint_note: bool = False, rekey: bool = False, mark_resolved: bool = False) -> None:
+    def __init__(
+        self,
+        keep_preprint_note: bool = False,
+        rekey: bool = False,
+        mark_resolved: bool = False,
+        preserve_fields: tuple[str, ...] = (),
+    ) -> None:
         self.keep_preprint_note = keep_preprint_note
         self.rekey = rekey
         self.mark_resolved = mark_resolved
+        # User-owned fields (e.g. ``file``, ``keywords``, ``annote``) to carry over
+        # from the original entry. Empty by default: an upgrade rebuilds the entry
+        # atomically from the resolved record, keeping only the citekey, so no stale
+        # preprint metadata can survive. Opt specific fields back in via this list.
+        self.preserve_fields = tuple(preserve_fields)
 
     @staticmethod
     def _author_bibtex_from_record(rec: PublishedRecord) -> str:
@@ -3114,21 +3115,25 @@ class Updater:
         return key or (entry.get("ID") or "key")
 
     def update_entry(self, entry: dict[str, Any], rec: PublishedRecord, detection: PreprintDetection) -> dict[str, Any]:
-        new_entry = dict(entry)
-        # Set entry type based on publication type (conference → inproceedings, else article)
+        # Build the upgraded entry atomically from the resolved record rather than
+        # overlaying record fields onto a copy of the original. Overlaying leaves
+        # stale preprint metadata behind whenever the record omits a field (an
+        # ``arXiv preprint`` journal or an arXiv ``url`` would survive), producing an
+        # internally inconsistent entry. Constructing from the record guarantees the
+        # result corresponds to a single real publication; only the citekey (and the
+        # opt-in ``preserve_fields`` / deliberate provenance below) carries over, so
+        # existing ``\cite`` commands keep resolving.
         is_conference = rec.type == "proceedings-article"
-        new_entry["ENTRYTYPE"] = "inproceedings" if is_conference else "article"
+        new_entry: dict[str, Any] = {
+            "ENTRYTYPE": "inproceedings" if is_conference else "article",
+            "ID": self._generate_key(entry, rec) if self.rekey else entry.get("ID"),
+        }
         if rec.title:
             new_entry["title"] = rec.title
         if rec.authors:
             new_entry["author"] = self._author_bibtex_from_record(rec)
         if rec.journal:
-            if is_conference:
-                new_entry["booktitle"] = rec.journal
-                new_entry.pop("journal", None)  # Remove journal field for inproceedings
-            else:
-                new_entry["journal"] = rec.journal
-                new_entry.pop("booktitle", None)  # Remove booktitle field for articles
+            new_entry["booktitle" if is_conference else "journal"] = rec.journal
         if rec.publisher:
             new_entry["publisher"] = rec.publisher
         if rec.year:
@@ -3145,24 +3150,22 @@ class Updater:
         elif rec.url:
             new_entry["url"] = rec.url
 
-        for f in list(self.PREPRINT_ONLY_FIELDS):
-            if f in new_entry:
-                new_entry.pop(f, None)
+        # Carry over explicitly opted-in user-owned fields (none by default).
+        for f in self.preserve_fields:
+            value = entry.get(f)
+            if value:
+                new_entry[f] = value
 
         if self.keep_preprint_note:
+            note = entry.get("note", "")
             arx = detection.arxiv_id or extract_arxiv_id_from_text(entry.get("url", "") or entry.get("note", "") or "")
-            if arx:
-                note = new_entry.get("note", "")
+            if arx and "also available as arxiv:" not in safe_lower(note):
                 msg = f"Also available as arXiv:{arx}"
-                if "also available as arxiv:" not in safe_lower(note):
-                    new_entry["note"] = (note + (" " if note else "") + msg).strip()
+                note = (note + (" " if note else "") + msg).strip()
+            if note:
+                new_entry["note"] = note
 
-        if self.rekey:
-            new_entry["ID"] = self._generate_key(entry, rec)
-        else:
-            new_entry["ID"] = entry.get("ID")
-
-        # Add marker for resolved entries to skip in future runs
+        # Add marker for resolved entries to skip in future runs.
         if self.mark_resolved:
             if detection.arxiv_id:
                 new_entry["_resolved_from"] = f"arXiv:{detection.arxiv_id}"
@@ -3619,6 +3622,26 @@ def build_arg_parser() -> argparse.ArgumentParser:
     out.add_argument("--in-place", action="store_true", help="Edit files in place")
     p.add_argument("--keep-preprint-note", action="store_true", help="Keep a note pointing to arXiv id")
     p.add_argument("--rekey", action="store_true", help="Regenerate BibTeX keys as authorYearTitle")
+    p.add_argument(
+        "--preserve-fields",
+        default="",
+        metavar="f1,f2,...",
+        help=(
+            "Comma-separated original fields to carry over when upgrading an entry "
+            "(e.g. 'file,keywords,annote'). By default an upgrade rebuilds the entry "
+            "atomically from the resolved record, keeping only the citekey."
+        ),
+    )
+    p.add_argument(
+        "--then-check",
+        action="store_true",
+        help=(
+            "After upgrading, fact-check the entries that were NOT upgraded "
+            "(upgraded entries are already clean database records). Shares one "
+            "cache/HTTP client with the checker. Writes the cleaned bib (-o/--in-place) "
+            "plus a verification summary."
+        ),
+    )
     p.add_argument(
         "--mark-resolved",
         action="store_true",
@@ -4543,7 +4566,9 @@ def process_to_output_mode(
     return 0
 
 
-def build_main_components(args: argparse.Namespace, logger: logging.Logger) -> MainComponents:
+def build_main_components(
+    args: argparse.Namespace, logger: logging.Logger, http: HttpClient | None = None
+) -> MainComponents:
     """Build all main function components from parsed arguments.
 
     Args:
@@ -4553,8 +4578,9 @@ def build_main_components(args: argparse.Namespace, logger: logging.Logger) -> M
     Returns:
         MainComponents containing all initialized components.
     """
-    # Build HTTP client
-    http = setup_http_client(args)
+    # Build HTTP client (or reuse a shared one, e.g. when chaining with the checker)
+    if http is None:
+        http = setup_http_client(args)
 
     # Handle --clear-cache: remove existing cache files
     if getattr(args, "clear_cache", False):
@@ -4596,6 +4622,7 @@ def build_main_components(args: argparse.Namespace, logger: logging.Logger) -> M
             keep_preprint_note=args.keep_preprint_note,
             rekey=args.rekey,
             mark_resolved=getattr(args, "mark_resolved", False),
+            preserve_fields=tuple(f.strip() for f in getattr(args, "preserve_fields", "").split(",") if f.strip()),
         ),
         loader=BibLoader(),
         writer=BibWriter(),
@@ -4681,6 +4708,12 @@ def main(argv: list[str] | None = None) -> int:
     if validation_error:
         logger.error(validation_error)
         return 1
+
+    # Chain into the fact-checker: upgrade, then verify only the non-upgraded entries.
+    if getattr(args, "then_check", False):
+        from .chain import run_update_then_check
+
+        return run_update_then_check(args, logger)
 
     # Build all components
     components = build_main_components(args, logger)
