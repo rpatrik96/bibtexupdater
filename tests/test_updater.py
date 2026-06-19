@@ -11,6 +11,7 @@ from bibtex_updater import (
     normalize_title_for_match,
     split_authors_bibtex,
 )
+from bibtex_updater.updater import Updater, build_arg_parser
 
 
 class TestUpdaterBasic:
@@ -356,8 +357,12 @@ class TestUpdaterEdgeCases:
         assert updated["title"] == record.title
         assert "volume" not in updated or updated.get("volume") == entry.get("volume")
 
-    def test_update_preserves_extra_fields(self, updater, make_entry, arxiv_detection):
-        """Extra fields in original entry should be preserved."""
+    def test_update_drops_extra_fields_by_default(self, updater, make_entry, arxiv_detection):
+        """Extra original fields are dropped by default (atomic rebuild from record).
+
+        The upgraded entry is constructed from the resolved record so no stale
+        original field can survive; ``preserve_fields`` opts specific fields back in.
+        """
         entry = make_entry(
             keywords="machine learning, deep learning",
             abstract="This is an abstract.",
@@ -372,5 +377,106 @@ class TestUpdaterEdgeCases:
         )
         updated = updater.update_entry(entry, record, arxiv_detection)
 
-        assert updated.get("keywords") == "machine learning, deep learning"
-        assert updated.get("abstract") == "This is an abstract."
+        assert "keywords" not in updated
+        assert "abstract" not in updated
+
+
+class TestUpdaterAtomicIntegrity:
+    """Upgraded entries are built atomically from the resolved record.
+
+    Only the citekey (and deliberate provenance: ``keep_preprint_note`` /
+    ``mark_resolved``) carries over from the original entry, so no stale preprint
+    field can survive the upgrade. Field preservation is opt-in via ``preserve_fields``.
+    """
+
+    @staticmethod
+    def _record() -> PublishedRecord:
+        return PublishedRecord(
+            doi="10.1000/real",
+            title="Real Published Title",
+            authors=[{"given": "Jane", "family": "Doe"}],
+            journal="Journal of Real Results",
+            year=2021,
+            volume="7",
+            number="2",
+            pages="10-20",
+            type="journal-article",
+            method="test",
+            confidence=1.0,
+        )
+
+    def test_drops_stale_non_record_fields(self, updater, make_entry, arxiv_detection):
+        """Original fields the record does not supply must not survive the upgrade."""
+        entry = make_entry(note="To appear", month="jan", abstract="Old abstract.")
+        entry["mendeley-tags"] = "personal"
+        updated = updater.update_entry(entry, self._record(), arxiv_detection)
+        for stale in ("note", "month", "abstract", "mendeley-tags"):
+            assert stale not in updated
+
+    def test_drops_preprint_url_when_record_lacks_doi_and_url(self, updater, make_entry, arxiv_detection):
+        """A published entry must never keep pointing at the preprint URL."""
+        entry = make_entry(url="https://arxiv.org/abs/2001.01234")
+        rec = PublishedRecord(
+            doi="",
+            url="",
+            title="Real Published Title",
+            authors=[{"given": "Jane", "family": "Doe"}],
+            journal="Journal of Real Results",
+            year=2021,
+            type="journal-article",
+            method="test",
+            confidence=1.0,
+        )
+        updated = updater.update_entry(entry, rec, arxiv_detection)
+        assert updated.get("url", "") != "https://arxiv.org/abs/2001.01234"
+
+    def test_keyset_limited_to_record_fields_and_citekey(self, updater, make_entry, arxiv_detection):
+        """The upgraded entry contains only record-derived fields plus the citekey."""
+        entry = make_entry(note="x", month="jan", keywords="a, b")
+        updated = updater.update_entry(entry, self._record(), arxiv_detection)
+        allowed = {
+            "ID",
+            "ENTRYTYPE",
+            "title",
+            "author",
+            "journal",
+            "booktitle",
+            "publisher",
+            "year",
+            "volume",
+            "number",
+            "pages",
+            "doi",
+            "url",
+        }
+        assert set(updated) <= allowed
+
+    def test_citekey_carries_over(self, updater, make_entry, arxiv_detection):
+        """The original citekey is preserved so existing ``\\cite`` commands keep working."""
+        entry = make_entry(ID="reizinger2021", note="drop me")
+        updated = updater.update_entry(entry, self._record(), arxiv_detection)
+        assert updated["ID"] == "reizinger2021"
+
+    def test_preserve_fields_opt_in_keeps_only_listed(self, make_entry, arxiv_detection):
+        """preserve_fields carries over exactly the named user fields, nothing else."""
+        upd = Updater(keep_preprint_note=False, rekey=False, preserve_fields=("file", "keywords"))
+        entry = make_entry(file="/local/p.pdf", keywords="ml, nlp", note="drop me")
+        updated = upd.update_entry(entry, self._record(), arxiv_detection)
+        assert updated["file"] == "/local/p.pdf"
+        assert updated["keywords"] == "ml, nlp"
+        assert "note" not in updated
+
+    def test_cli_preserve_fields_flag_parses_to_list(self, make_entry, arxiv_detection):
+        """The --preserve-fields CLI flag wires a comma list into Updater.preserve_fields."""
+        args = build_arg_parser().parse_args(["in.bib", "--preserve-fields", "file, keywords"])
+        preserve = tuple(f.strip() for f in args.preserve_fields.split(",") if f.strip())
+        assert preserve == ("file", "keywords")
+        upd = Updater(preserve_fields=preserve)
+        updated = upd.update_entry(make_entry(file="/p.pdf", keywords="x"), self._record(), arxiv_detection)
+        assert updated["file"] == "/p.pdf"
+        assert updated["keywords"] == "x"
+
+    def test_cli_preserve_fields_defaults_empty(self):
+        """Without the flag, no original fields are preserved (atomic default)."""
+        args = build_arg_parser().parse_args(["in.bib"])
+        assert args.preserve_fields == ""
