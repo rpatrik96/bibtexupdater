@@ -3633,6 +3633,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
+        "--then-check",
+        action="store_true",
+        help=(
+            "After upgrading, fact-check the entries that were NOT upgraded "
+            "(upgraded entries are already clean database records). Shares one "
+            "cache/HTTP client with the checker. Writes the cleaned bib (-o/--in-place) "
+            "plus a verification summary."
+        ),
+    )
+    p.add_argument(
         "--mark-resolved",
         action="store_true",
         help="Add '_resolved_from' field to updated entries to skip them in future runs",
@@ -4556,7 +4566,9 @@ def process_to_output_mode(
     return 0
 
 
-def build_main_components(args: argparse.Namespace, logger: logging.Logger) -> MainComponents:
+def build_main_components(
+    args: argparse.Namespace, logger: logging.Logger, http: HttpClient | None = None
+) -> MainComponents:
     """Build all main function components from parsed arguments.
 
     Args:
@@ -4566,8 +4578,9 @@ def build_main_components(args: argparse.Namespace, logger: logging.Logger) -> M
     Returns:
         MainComponents containing all initialized components.
     """
-    # Build HTTP client
-    http = setup_http_client(args)
+    # Build HTTP client (or reuse a shared one, e.g. when chaining with the checker)
+    if http is None:
+        http = setup_http_client(args)
 
     # Handle --clear-cache: remove existing cache files
     if getattr(args, "clear_cache", False):
@@ -4695,6 +4708,12 @@ def main(argv: list[str] | None = None) -> int:
     if validation_error:
         logger.error(validation_error)
         return 1
+
+    # Chain into the fact-checker: upgrade, then verify only the non-upgraded entries.
+    if getattr(args, "then_check", False):
+        from .chain import run_update_then_check
+
+        return run_update_then_check(args, logger)
 
     # Build all components
     components = build_main_components(args, logger)

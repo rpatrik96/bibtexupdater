@@ -5667,6 +5667,21 @@ Examples:
     p.add_argument("--report", "-r", metavar="FILE", help="Write JSON report to FILE")
     p.add_argument("--jsonl", metavar="FILE", help="Write JSONL report to FILE")
     p.add_argument(
+        "--resolve-first",
+        action="store_true",
+        help=(
+            "Run the preprint resolver first, then fact-check only the entries it did "
+            "NOT upgrade (upgraded entries are clean database records). Shares one "
+            "cache/HTTP client with the resolver and always writes the cleaned bib "
+            "(see --resolved-out)."
+        ),
+    )
+    p.add_argument(
+        "--resolved-out",
+        metavar="FILE",
+        help=("Where to write the cleaned bib when using --resolve-first " "(default: <input>.resolved.bib)."),
+    )
+    p.add_argument(
         "--strict",
         action="store_true",
         help=(
@@ -5864,69 +5879,21 @@ Examples:
     return p
 
 
-def main() -> int:
-    """Main entry point."""
-    args = build_parser().parse_args()
+def build_checker_processor(
+    args: argparse.Namespace,
+    logger: logging.Logger,
+    *,
+    strict_mode: bool = False,
+    strict_warn_cnv: bool = False,
+    http: HttpClient | None = None,
+) -> tuple[FactCheckProcessor, HttpClient]:
+    """Build the fact-check processor (and its HttpClient) from parsed CLI args.
 
-    # Setup logging
-    level = logging.DEBUG if args.verbose else logging.INFO
-    logging.basicConfig(level=level, format="%(levelname)s: %(message)s")
-    # Quiet the noisy per-request HTTP client logs (one INFO line per API call)
-    # unless --verbose: they bury the tool's own progress and the final summary.
-    if not args.verbose:
-        for noisy in ("httpx", "httpcore", "urllib3"):
-            logging.getLogger(noisy).setLevel(logging.WARNING)
-    logger = logging.getLogger("fact_checker")
-
-    # Item 6: non-generative-AI mode (CLI flag wins; env var also honored).
-    env_flag = os.environ.get("BIBTEX_CHECK_NON_GENERATIVE", "").strip() in {"1", "true", "yes", "on"}
-    if args.non_generative or env_flag:
-        set_non_generative_mode(True)
-        sys.stderr.write(
-            "bibtex-check running in non-generative mode (no LLM calls). "
-            "Compliant with ICML 2026 / ACL ARR LLM-in-review policies.\n"
-        )
-        logger.info("non-generative-AI mode active")
-
-    # --strict evaluation mode (arXiv 2026 hallucination policy). CLI flag
-    # wins; env var also honored, mirroring --non-generative. --strict-warn-cnv
-    # requires --strict.
-    strict_env = os.environ.get("BIBTEX_CHECK_STRICT", "").strip() in {"1", "true", "yes", "on"}
-    strict_mode = bool(args.strict or strict_env)
-    strict_warn_cnv = bool(getattr(args, "strict_warn_cnv", False))
-    if strict_warn_cnv and not strict_mode:
-        logger.error("--strict-warn-cnv requires --strict")
-        return 2
-    if strict_mode:
-        logger.info(
-            "strict evaluation mode active (arXiv 2026 policy): "
-            "title Lev-1 near-miss, year tolerance 0, single-source author-fab, "
-            "no alphabetization escape, silent author-truncation flagged"
-        )
-    if strict_warn_cnv:
-        logger.info("strict-warn-cnv active: NOT_FOUND/UNCONFIRMED promoted to STRICT_WARN_CNV")
-
-    # Load entries from all BibTeX files
-    entries = []
-    for path in args.bibfiles:
-        try:
-            with open(path, encoding="utf-8") as f:
-                db = bibtexparser.load(f)
-                entries.extend(db.entries)
-                logger.info("Loaded %d entries from %s", len(db.entries), path)
-        except FileNotFoundError:
-            logger.error("File not found: %s", path)
-            return 1
-        except Exception as e:
-            logger.error("Failed to parse %s: %s", path, e)
-            return 1
-
-    if not entries:
-        logger.error("No entries found in input files")
-        return 1
-
-    logger.info("Total entries to check: %d", len(entries))
-
+    Extracted from ``main`` so the resolve->check chain can construct a checker on
+    shared infrastructure and run it over a subset of entries. When ``http`` is
+    supplied it is reused (sharing one cache/limiter across the chain); otherwise
+    one is built from ``args``.
+    """
     # Setup HTTP infrastructure
     s2_api_key = args.s2_api_key or os.environ.get("S2_API_KEY")
     if s2_api_key:
@@ -5937,19 +5904,20 @@ def main() -> int:
     mailto = _resolve_polite_mailto(args.mailto, logger)
     openalex_mailto = _effective_openalex_mailto(args.openalex_mailto, mailto)
 
-    cache = SqliteCache(args.cache_file) if not args.no_cache else None
-    # Per-service limits scaled by --rate-limit and capped below each service's
-    # documented ceiling. The ADAPTIVE registry backs off on 429/Retry-After
-    # and rate-limit headers (HttpClient feeds it every real response), so the
-    # higher steady-state limits degrade gracefully instead of hammering.
-    limiter = AdaptiveRateLimiterRegistry(_cli_service_rate_limits(args.rate_limit, s2_api_key))
-    http = HttpClient(
-        timeout=20.0,
-        user_agent=_polite_user_agent(mailto),
-        rate_limiter=limiter,
-        cache=cache,
-        s2_api_key=s2_api_key,
-    )
+    if http is None:
+        cache = SqliteCache(args.cache_file) if not args.no_cache else None
+        # Per-service limits scaled by --rate-limit and capped below each service's
+        # documented ceiling. The ADAPTIVE registry backs off on 429/Retry-After
+        # and rate-limit headers (HttpClient feeds it every real response), so the
+        # higher steady-state limits degrade gracefully instead of hammering.
+        limiter = AdaptiveRateLimiterRegistry(_cli_service_rate_limits(args.rate_limit, s2_api_key))
+        http = HttpClient(
+            timeout=20.0,
+            user_agent=_polite_user_agent(mailto),
+            rate_limiter=limiter,
+            cache=cache,
+            s2_api_key=s2_api_key,
+        )
 
     # Setup fact checker
     top_k = max(1, min(int(args.top_k), MAX_TOP_K))
@@ -6016,7 +5984,80 @@ def main() -> int:
         skip_categories=skip_categories,
     )
 
-    processor = FactCheckProcessor(checker, logger)
+    return FactCheckProcessor(checker, logger), http
+
+
+def main() -> int:
+    """Main entry point."""
+    args = build_parser().parse_args()
+
+    # Setup logging
+    level = logging.DEBUG if args.verbose else logging.INFO
+    logging.basicConfig(level=level, format="%(levelname)s: %(message)s")
+    # Quiet the noisy per-request HTTP client logs (one INFO line per API call)
+    # unless --verbose: they bury the tool's own progress and the final summary.
+    if not args.verbose:
+        for noisy in ("httpx", "httpcore", "urllib3"):
+            logging.getLogger(noisy).setLevel(logging.WARNING)
+    logger = logging.getLogger("fact_checker")
+
+    # Item 6: non-generative-AI mode (CLI flag wins; env var also honored).
+    env_flag = os.environ.get("BIBTEX_CHECK_NON_GENERATIVE", "").strip() in {"1", "true", "yes", "on"}
+    if args.non_generative or env_flag:
+        set_non_generative_mode(True)
+        sys.stderr.write(
+            "bibtex-check running in non-generative mode (no LLM calls). "
+            "Compliant with ICML 2026 / ACL ARR LLM-in-review policies.\n"
+        )
+        logger.info("non-generative-AI mode active")
+
+    # --strict evaluation mode (arXiv 2026 hallucination policy). CLI flag
+    # wins; env var also honored, mirroring --non-generative. --strict-warn-cnv
+    # requires --strict.
+    strict_env = os.environ.get("BIBTEX_CHECK_STRICT", "").strip() in {"1", "true", "yes", "on"}
+    strict_mode = bool(args.strict or strict_env)
+    strict_warn_cnv = bool(getattr(args, "strict_warn_cnv", False))
+    if strict_warn_cnv and not strict_mode:
+        logger.error("--strict-warn-cnv requires --strict")
+        return 2
+    if strict_mode:
+        logger.info(
+            "strict evaluation mode active (arXiv 2026 policy): "
+            "title Lev-1 near-miss, year tolerance 0, single-source author-fab, "
+            "no alphabetization escape, silent author-truncation flagged"
+        )
+    if strict_warn_cnv:
+        logger.info("strict-warn-cnv active: NOT_FOUND/UNCONFIRMED promoted to STRICT_WARN_CNV")
+
+    # Chain with the resolver: upgrade preprints first, then verify only the
+    # entries the resolver did not upgrade, and persist the cleaned bib.
+    if getattr(args, "resolve_first", False):
+        from .chain import run_check_resolve_first
+
+        return run_check_resolve_first(args, logger)
+
+    # Load entries from all BibTeX files
+    entries = []
+    for path in args.bibfiles:
+        try:
+            with open(path, encoding="utf-8") as f:
+                db = bibtexparser.load(f)
+                entries.extend(db.entries)
+                logger.info("Loaded %d entries from %s", len(db.entries), path)
+        except FileNotFoundError:
+            logger.error("File not found: %s", path)
+            return 1
+        except Exception as e:
+            logger.error("Failed to parse %s: %s", path, e)
+            return 1
+
+    if not entries:
+        logger.error("No entries found in input files")
+        return 1
+
+    logger.info("Total entries to check: %d", len(entries))
+
+    processor, _ = build_checker_processor(args, logger, strict_mode=strict_mode, strict_warn_cnv=strict_warn_cnv)
 
     # Process entries (stream JSONL if path provided)
     results = processor.process_entries(entries, jsonl_path=args.jsonl, max_workers=args.workers)

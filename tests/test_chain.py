@@ -1,0 +1,126 @@
+"""Tests for the resolve->check chaining (``chain.py``).
+
+The chain runs the resolver first, then fact-checks only the entries the resolver
+did NOT actively upgrade -- an upgraded entry is a clean record pulled straight
+from a bibliographic database, so re-verifying it is redundant ("clean bib, fast").
+"""
+
+from __future__ import annotations
+
+import logging
+from types import SimpleNamespace
+
+from bibtex_updater.chain import build_chain_report, select_entries_to_check
+from bibtex_updater.updater import ProcessResult
+
+
+def _result(key: str, action: str, **overrides) -> ProcessResult:
+    entry = {"ID": key, "ENTRYTYPE": "article", "title": f"title-{key}"}
+    return ProcessResult(
+        original=dict(entry),
+        updated=dict(entry, **overrides),
+        changed=action == "upgraded",
+        action=action,
+    )
+
+
+class TestChainPartition:
+    """Only entries the resolver did not vouch for go to the checker."""
+
+    def test_upgraded_entries_are_not_checked(self):
+        results = [
+            _result("a", "upgraded"),
+            _result("b", "unchanged"),
+            _result("c", "failed"),
+            _result("d", "upgraded"),
+        ]
+        to_check = select_entries_to_check(results)
+        assert {e["ID"] for e in to_check} == {"b", "c"}
+
+    def test_previously_resolved_entries_are_not_rechecked(self):
+        """``skipped_resolved`` (a prior run's upgrade) is also trusted, not rechecked."""
+        results = [_result("a", "skipped_resolved"), _result("b", "unchanged")]
+        to_check = select_entries_to_check(results)
+        assert {e["ID"] for e in to_check} == {"b"}
+
+    def test_to_check_carries_the_updated_entry(self):
+        """The checker sees the cleaned/updated entry, not the original."""
+        results = [_result("b", "unchanged", journal="Real Journal")]
+        to_check = select_entries_to_check(results)
+        assert to_check[0]["journal"] == "Real Journal"
+
+
+class TestChainReport:
+    """The merged report distinguishes resolved-skip from actually-checked."""
+
+    def test_upgraded_marked_skipped_and_checked_carry_status(self):
+        results = [_result("a", "upgraded"), _result("b", "unchanged")]
+        check_results = [SimpleNamespace(entry_key="b", status="VERIFIED")]
+        report = build_chain_report(results, check_results)
+
+        by_key = {e["key"]: e for e in report["entries"]}
+        assert by_key["a"]["check"] == "skipped_resolved"
+        assert by_key["b"]["check"] == "VERIFIED"
+        assert report["summary"]["resolved_skipped"] == 1
+        assert report["summary"]["checked"] == 1
+
+    def test_enum_status_is_normalized_to_value(self):
+        """A FactCheckStatus enum is reported by its ``.value``, not its repr."""
+        results = [_result("b", "unchanged")]
+        check_results = [SimpleNamespace(entry_key="b", status=SimpleNamespace(value="hallucinated"))]
+        report = build_chain_report(results, check_results)
+        assert report["entries"][0]["check"] == "hallucinated"
+
+
+class TestCheckerFactory:
+    """The extracted checker factory builds a working processor on shared infra."""
+
+    def test_build_checker_processor_returns_processor_and_http(self):
+        from bibtex_updater.fact_checker import build_checker_processor, build_parser
+
+        args = build_parser().parse_args(["x.bib", "--no-cache"])
+        processor, http = build_checker_processor(args, logging.getLogger("t"))
+        assert processor is not None
+        assert http is not None
+
+    def test_factory_reuses_a_supplied_http(self):
+        """When given an http client, the factory shares it instead of building one."""
+        from bibtex_updater.fact_checker import build_checker_processor, build_parser
+
+        args = build_parser().parse_args(["x.bib", "--no-cache"])
+        processor1, http = build_checker_processor(args, logging.getLogger("t"))
+        processor2, http2 = build_checker_processor(args, logging.getLogger("t"), http=http)
+        assert http2 is http
+
+
+class TestArgBridging:
+    """Each flag lives on one CLI; the chain synthesizes the other arg namespace."""
+
+    def test_update_then_check_flag_and_bridge(self):
+        from bibtex_updater.chain import _bridge_check_args
+        from bibtex_updater.updater import build_arg_parser
+
+        update_args = build_arg_parser().parse_args(
+            ["refs.bib", "--then-check", "--cache", "/tmp/c.sqlite", "--rate-limit", "30", "--max-workers", "6"]
+        )
+        assert update_args.then_check is True
+
+        check_args = _bridge_check_args(update_args)
+        assert check_args.cache_file == "/tmp/c.sqlite"
+        assert check_args.rate_limit == 30
+        assert check_args.workers == 6
+
+    def test_check_resolve_first_flag_and_bridge(self):
+        from bibtex_updater.chain import _bridge_resolve_args, _default_resolved_out
+        from bibtex_updater.fact_checker import build_parser
+
+        check_args = build_parser().parse_args(
+            ["refs.bib", "--resolve-first", "--cache-file", "/tmp/c.sqlite", "--rate-limit", "25", "--workers", "5"]
+        )
+        assert check_args.resolve_first is True
+
+        resolve_args = _bridge_resolve_args(check_args)
+        assert resolve_args.cache == "/tmp/c.sqlite"
+        assert resolve_args.rate_limit == 25
+        assert resolve_args.max_workers == 5
+        assert _default_resolved_out(["refs.bib"]) == "refs.resolved.bib"
