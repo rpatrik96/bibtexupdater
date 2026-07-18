@@ -25,6 +25,7 @@ references" (2026), Algorithm 1.
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass, field
 from typing import Any
@@ -98,7 +99,10 @@ class OpenAlexClient:
 
     OpenAlex returns 25 works per page by default; we cap to ``per_page`` to
     keep responses small. Including ``mailto`` opts into the polite pool, which
-    bumps rate limits without requiring an API key.
+    bumps rate limits without requiring an API key. Since Feb 2026 keyless
+    traffic is additionally metered against a shared daily credit budget that
+    429s for the rest of the day once exhausted; a premium ``api_key`` (or the
+    ``OPENALEX_API_KEY`` env var) lifts requests out of that pool.
     """
 
     def __init__(
@@ -106,10 +110,12 @@ class OpenAlexClient:
         http: Any | None = None,
         mailto: str = DEFAULT_OPENALEX_MAILTO,
         timeout: float = 20.0,
+        api_key: str | None = None,
     ) -> None:
         self.http = http
         self.mailto = mailto
         self.timeout = timeout
+        self.api_key = api_key or os.environ.get("OPENALEX_API_KEY") or None
 
     def search(
         self,
@@ -166,6 +172,8 @@ class OpenAlexClient:
         otherwise). Returns ``[]`` on any non-200 status or exception.
         """
         url = f"{OPENALEX_API}/works"
+        if self.api_key:
+            params.setdefault("api_key", self.api_key)
         try:
             if self.http is not None and hasattr(self.http, "_request"):
                 resp = self.http._request(
@@ -206,6 +214,8 @@ class OpenAlexClient:
         per_page = max(1, min(int(limit), 25))
         url = f"{OPENALEX_API}/sources"
         params: dict[str, Any] = {"search": query.strip(), "per-page": per_page, "mailto": self.mailto}
+        if self.api_key:
+            params.setdefault("api_key", self.api_key)
         try:
             if self.http is not None and hasattr(self.http, "_request"):
                 resp = self.http._request(
