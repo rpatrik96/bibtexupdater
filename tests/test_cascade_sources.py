@@ -615,6 +615,56 @@ class TestOpenAlexFieldedTitleSearch:
         assert "filter" not in params
 
 
+class TestOpenAlexApiKey:
+    """OpenAlex premium ``api_key`` (explicit arg or ``OPENALEX_API_KEY`` env)
+    must ride along on every /works and /sources request; keyless clients must
+    not send the parameter at all.
+    """
+
+    def test_explicit_api_key_lands_in_works_params(self, monkeypatch):
+        monkeypatch.delenv("OPENALEX_API_KEY", raising=False)
+        http = MagicMock()
+        http._request.return_value = _ok([{"title": "X"}])
+        client = OpenAlexClient(http=http, api_key="premium-key")
+        client.search("x surname", title="X")
+        params = http._request.call_args.kwargs["params"]
+        assert params["api_key"] == "premium-key"
+
+    def test_env_api_key_used_as_fallback(self, monkeypatch):
+        monkeypatch.setenv("OPENALEX_API_KEY", "env-key")
+        http = MagicMock()
+        http._request.return_value = _ok([{"title": "X"}])
+        client = OpenAlexClient(http=http)
+        client.search("x surname", title="X")
+        params = http._request.call_args.kwargs["params"]
+        assert params["api_key"] == "env-key"
+
+    def test_explicit_key_wins_over_env(self, monkeypatch):
+        monkeypatch.setenv("OPENALEX_API_KEY", "env-key")
+        http = MagicMock()
+        http._request.return_value = _ok([{"title": "X"}])
+        client = OpenAlexClient(http=http, api_key="explicit-key")
+        client.search("x surname", title="X")
+        assert http._request.call_args.kwargs["params"]["api_key"] == "explicit-key"
+
+    def test_keyless_client_sends_no_api_key_param(self, monkeypatch):
+        monkeypatch.delenv("OPENALEX_API_KEY", raising=False)
+        http = MagicMock()
+        http._request.return_value = _ok([{"title": "X"}])
+        client = OpenAlexClient(http=http)
+        client.search("x surname", title="X")
+        assert "api_key" not in http._request.call_args.kwargs["params"]
+
+    def test_search_sources_includes_api_key(self, monkeypatch):
+        monkeypatch.delenv("OPENALEX_API_KEY", raising=False)
+        http = MagicMock()
+        http._request.return_value = _ok([{"display_name": "Some Journal"}])
+        client = OpenAlexClient(http=http, api_key="premium-key")
+        client.search_sources("some journal")
+        params = http._request.call_args.kwargs["params"]
+        assert params["api_key"] == "premium-key"
+
+
 class TestCrossrefFieldedTitleSearch:
     """FIX A.2: Crossref must use fielded ``query.title`` (+ ``query.author``)
     with the raw title instead of the generic ``query.bibliographic`` blob.

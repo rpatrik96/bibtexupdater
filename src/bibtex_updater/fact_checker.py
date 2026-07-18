@@ -495,6 +495,9 @@ class FactCheckerConfig:
     cascade_low_confidence: float = CASCADE_LOW_CONFIDENCE
     cascade_high_confidence: float = CASCADE_HIGH_CONFIDENCE
     openalex_mailto: str = DEFAULT_OPENALEX_MAILTO
+    # OpenAlex premium key: lifts requests out of the shared keyless daily
+    # credit budget (which 429s for the rest of the day once exhausted).
+    openalex_api_key: str | None = None
     # --strict mode (arXiv 2026 hallucination policy). When True, the
     # checker raises its bar in a few asymmetric-cost places where a leaked
     # hallucinated reference is far worse than a false positive: Levenshtein-1
@@ -3467,6 +3470,7 @@ class FactChecker:
                 self.openalex = OpenAlexClient(
                     http=shared_http,
                     mailto=self.config.openalex_mailto,
+                    api_key=self.config.openalex_api_key,
                 )
         if self.openalex is not None:
             sources_queried.append("openalex")
@@ -5748,6 +5752,11 @@ Examples:
         help="Semantic Scholar API key for higher rate limits (or set S2_API_KEY env var)",
     )
     api_opts.add_argument(
+        "--openalex-api-key",
+        metavar="KEY",
+        help="OpenAlex premium API key, bypasses the keyless daily credit budget (or set OPENALEX_API_KEY env var)",
+    )
+    api_opts.add_argument(
         "--mailto",
         metavar="EMAIL",
         default=None,
@@ -5898,6 +5907,9 @@ def build_checker_processor(
     s2_api_key = args.s2_api_key or os.environ.get("S2_API_KEY")
     if s2_api_key:
         logger.info("Using Semantic Scholar API key (authenticated rate limits)")
+    openalex_api_key = getattr(args, "openalex_api_key", None) or os.environ.get("OPENALEX_API_KEY")
+    if openalex_api_key:
+        logger.info("Using OpenAlex API key (premium pool, bypasses keyless daily credit budget)")
 
     # Polite-pool identity: --mailto flag wins over BIBTEX_CHECK_MAILTO; when
     # set it lands in the User-Agent and becomes the --openalex-mailto default.
@@ -5933,6 +5945,7 @@ def build_checker_processor(
         arxiv_fast_path=not args.no_fast_path,
         top_k=top_k,
         openalex_mailto=openalex_mailto,
+        openalex_api_key=openalex_api_key,
         strict=strict_mode,
         strict_warn_cnv=strict_warn_cnv,
     )
