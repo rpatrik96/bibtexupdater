@@ -1207,13 +1207,14 @@ class AdaptiveRateLimiterRegistry(RateLimiterRegistry):
             try:
                 remaining_int = int(remaining)
                 if remaining_int < 10:
-                    # Getting close to limit, slow down
-                    current_limit = self._limits.get(service, 30)
-                    new_limit = max(current_limit // 2, self._min_limits.get(service, 5))
-                    if new_limit != current_limit:
-                        self._limits[service] = new_limit
-                        # Recreate limiter with new limit
-                        with self._lock:
+                    # Getting close to limit, slow down. The read-modify-write
+                    # on ``_limits`` must share the lock with the paired
+                    # ``_limiters`` swap, or a concurrent adapt can tear them.
+                    with self._lock:
+                        current_limit = self._limits.get(service, 30)
+                        new_limit = max(current_limit // 2, self._min_limits.get(service, 5))
+                        if new_limit != current_limit:
+                            self._limits[service] = new_limit
                             self._limiters[service] = RateLimiter(new_limit)
             except (ValueError, TypeError):
                 pass
@@ -1233,11 +1234,11 @@ class AdaptiveRateLimiterRegistry(RateLimiterRegistry):
             with self._lock:
                 self._backoff_until[service] = time.time() + backoff_seconds
 
-            # Also reduce the rate limit
-            current_limit = self._limits.get(service, 30)
-            new_limit = max(current_limit // 2, self._min_limits.get(service, 5))
-            self._limits[service] = new_limit
+            # Also reduce the rate limit (same locking rationale as above).
             with self._lock:
+                current_limit = self._limits.get(service, 30)
+                new_limit = max(current_limit // 2, self._min_limits.get(service, 5))
+                self._limits[service] = new_limit
                 self._limiters[service] = RateLimiter(new_limit)
 
     def wait(self, service: str) -> None:
@@ -1263,8 +1264,8 @@ class AdaptiveRateLimiterRegistry(RateLimiterRegistry):
             service: Name of the API service
         """
         default = self.DEFAULT_LIMITS.get(service, 30)
-        self._limits[service] = default
         with self._lock:
+            self._limits[service] = default
             if service in self._limiters:
                 self._limiters[service] = RateLimiter(default)
 
