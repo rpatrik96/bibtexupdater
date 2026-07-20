@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-07-20
+
+Resolve→check chaining with a non-compensatory trust gate, OpenAlex premium API-key support, and a thread-safety fix in the adaptive rate limiter.
+
+### Added
+
+- **Chained resolve→check** (`bibtex-check --resolve-first`, #49): runs the preprint resolver first and fact-checks only the entries it did **not** upgrade — upgraded entries are clean database records by construction, so re-checking them is wasted spend. Shares one cache/HTTP client across both stages and always writes the cleaned bib (`--resolved-out`, default `<input>.resolved.bib`). Entries the resolver already upgraded in a previous run are skipped on re-entry.
+- **Non-compensatory trust gate on upgrades** (#49): a resolver upgrade must clear every trust criterion individually (no averaging away a failed one); risky upgrades are flagged and reverted atomically, and upgraded entries are rebuilt from the resolved record rather than field-patched, so a partial upgrade can no longer leave a hybrid entry.
+- **OpenAlex premium API key** (`--openalex-api-key` / `OPENALEX_API_KEY`, #50): authenticated OpenAlex requests for deployments with a premium key — required at practical throughput since OpenAlex began enforcing keys (Feb 2026).
+
+### Fixed
+
+- **Adaptive-limiter lock race** (#51): `AdaptiveRateLimiterRegistry` mutated `_limits` outside the lock guarding the paired `_limiters` swap in three places (header-driven slowdown, 429 backoff, `reset_limit`); concurrent `adapt` calls could tear the limit/limiter pair. The read-modify-write now runs under the lock. Extracted from #43, whose broader rate-limit policy work was superseded by the v1.4.0 circuit breaker and per-service limits.
+
+### Docs
+
+- arXiv-scale deployment bottleneck analysis (what dominates cost/latency when checking bibliographies at archive scale).
+
 ## [1.4.0] - 2026-06-15
 
 `bibtex-check` release branch: a clearer output contract for downstream consumers (`p_valid`, `coverage_incomplete`), new positive-evidence detectors for fabricated venues / silent author truncation / preprint-as-published / wrong-year citations, a batch of false-positive fixes for author checks and DOI-anchored verification, and substantial throughput work (identifier fast paths, key-gated Semantic Scholar steps, realistic adaptive rate limits).
