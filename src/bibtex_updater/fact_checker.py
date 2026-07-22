@@ -6047,6 +6047,10 @@ def main() -> int:
     if getattr(args, "resolve_first", False):
         from .chain import run_check_resolve_first
 
+        # The chain reads strictness off ``check_args``, so fold the env-var form in
+        # here -- otherwise BIBTEX_CHECK_STRICT=1 would be honored by the plain path
+        # but silently ignored when chaining.
+        args.strict = strict_mode
         return run_check_resolve_first(args, logger)
 
     # Load entries from all BibTeX files

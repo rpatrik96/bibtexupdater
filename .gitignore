@@ -22,6 +22,7 @@ htmlcov/
 
 # Cache files
 .cache.replace_preprints.json
+.cache.resolution.json
 *.cache
 .cache.*.db
 .smoke-cache.json
