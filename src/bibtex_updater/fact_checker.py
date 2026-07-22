@@ -3164,7 +3164,12 @@ class FactChecker:
         if not raw_doi:
             return None
 
-        entry_title = normalize_title_for_match(entry.get("title", ""))
+        # A volume-level entry (@proceedings) is titled after its conference, so
+        # its title must be normalized as a venue name here too -- this check has
+        # its own title comparison and would otherwise ignore the volume rule.
+        is_volume = is_volume_entry_type(entry.get("ENTRYTYPE", ""))
+        normalize = normalize_volume_title if is_volume else normalize_title_for_match
+        entry_title = normalize(entry.get("title", ""))
         if not entry_title:
             return None
 
@@ -3173,8 +3178,16 @@ class FactChecker:
         if rec is None or not rec.title:
             return None
 
-        doi_title = normalize_title_for_match(rec.title)
+        doi_title = normalize(rec.title)
         title_score = token_sort_ratio(entry_title, doi_title) / 100.0
+        # Publishers store a volume's full descriptive title ("... ECCV 2016:
+        # 14th European Conference, Amsterdam, ..., Proceedings, Part I") while
+        # the entry cites the short form. The DOI is the entry's OWN identifier,
+        # so the short title being contained in the record's is confirmation,
+        # not evidence of a different work -- and the length gap alone drives the
+        # fuzzy score well below the threshold.
+        if is_volume and entry_title in doi_title:
+            title_score = max(title_score, self.config.doi_consistency_min_title)
         if title_score >= self.config.doi_consistency_min_title:
             # Title confirms this IS the cited paper. The DOI is the entry's OWN
             # identifier, so a genuine author mismatch here is positive evidence

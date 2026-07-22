@@ -979,8 +979,11 @@ def normalize_volume_title(title: str) -> str:
     normalized = _VOLUME_ACRONYM_YEAR_RE.sub(lambda m: f"({m.group(1)}{m.group(2)})".replace("()", ""), title)
     normalized = _VOLUME_ORDINAL_RE.sub(" ", normalized)
     # Reuse the venue normalizer: it already drops "Proceedings of the", bare
-    # years and track decorations, which is exactly this boilerplate.
-    return _normalize_venue_for_matching(normalized)
+    # years and track decorations, which is exactly this boilerplate. Finish
+    # with the title normalizer so LaTeX braces, diacritics and punctuation go
+    # too -- "Computer Vision -- {ECCV}" and "Computer Vision - ECCV" must
+    # reduce to the same tokens for the containment test to see them.
+    return normalize_title_for_match(_normalize_venue_for_matching(normalized))
 
 
 #: Generic venue-name scaffolding. Present in most conference names and

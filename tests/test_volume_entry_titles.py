@@ -66,3 +66,99 @@ class TestNormalizeVolumeTitle:
 
     def test_empty_title(self):
         assert normalize_volume_title("") == ""
+
+    def test_record_subtitle_does_not_make_it_a_different_volume(self):
+        """Publishers store the volume's full descriptive title.
+
+        The entry cites "Computer Vision -- ECCV 2016"; Crossref's record for the
+        same DOI is "Computer Vision - ECCV 2016: 14th European Conference,
+        Amsterdam, The Netherlands, October 11-14, 2016, Proceedings, Part I".
+        Same volume, and the DOI is the entry's own identifier.
+        """
+        entry = normalize_volume_title("Computer Vision -- {ECCV} 2016")
+        api = normalize_volume_title(
+            "Computer Vision - ECCV 2016: 14th European Conference, Amsterdam, "
+            "The Netherlands, October 11-14, 2016, Proceedings, Part I"
+        )
+        assert entry and api
+        assert entry in api
+
+
+class TestDoiConsistencyForVolumes:
+    """The DOI-consistency check must use volume normalization too.
+
+    It has its OWN title comparison, so a volume-title fix applied only in
+    ``_compare_all_fields`` leaves this path flagging DOI_MISMATCH on a
+    correctly-cited proceedings volume.
+    """
+
+    def _checker(self):
+        import logging
+        from unittest.mock import MagicMock
+
+        from bibtex_updater.fact_checker import (
+            CrossrefClient,
+            DBLPClient,
+            FactChecker,
+            FactCheckerConfig,
+            SemanticScholarClient,
+        )
+
+        http = MagicMock()
+        http._request.return_value = MagicMock(status_code=404, json=lambda: {})
+        return FactChecker(
+            CrossrefClient(http),
+            DBLPClient(http),
+            SemanticScholarClient(http),
+            FactCheckerConfig(),
+            logging.getLogger("volume-doi-test"),
+        )
+
+    def test_proceedings_doi_with_fuller_record_title_is_not_a_mismatch(self):
+        from bibtex_updater.fact_checker import PublishedRecord
+
+        checker = self._checker()
+        record = PublishedRecord(
+            doi="10.1007/978-3-319-46448-0",
+            url=None,
+            title=(
+                "Computer Vision - ECCV 2016: 14th European Conference, Amsterdam, "
+                "The Netherlands, October 11-14, 2016, Proceedings, Part I"
+            ),
+            authors=[],
+            journal="Lecture Notes in Computer Science",
+            year=2016,
+        )
+        checker._structured_record_by_doi = lambda _doi: record
+        entry = {
+            "ID": "g3_eccv2016proceedings",
+            "ENTRYTYPE": "proceedings",
+            "editor": "Bastian Leibe and Jiri Matas and Nicu Sebe and Max Welling",
+            "title": "Computer Vision -- {ECCV} 2016",
+            "year": "2016",
+            "doi": "10.1007/978-3-319-46448-0",
+        }
+        assert checker._check_doi_consistency(entry) is None
+
+    def test_a_genuinely_wrong_doi_on_a_volume_still_flags(self):
+        from bibtex_updater.fact_checker import FactCheckStatus, PublishedRecord
+
+        checker = self._checker()
+        record = PublishedRecord(
+            doi="10.1007/978-3-319-46448-0",
+            url=None,
+            title="Advances in Cryptology - CRYPTO 2019",
+            authors=[],
+            journal="Lecture Notes in Computer Science",
+            year=2019,
+        )
+        checker._structured_record_by_doi = lambda _doi: record
+        entry = {
+            "ID": "x",
+            "ENTRYTYPE": "proceedings",
+            "title": "Computer Vision -- {ECCV} 2016",
+            "year": "2016",
+            "doi": "10.1007/978-3-319-46448-0",
+        }
+        result = checker._check_doi_consistency(entry)
+        assert result is not None and result.status is FactCheckStatus.DOI_MISMATCH
