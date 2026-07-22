@@ -874,7 +874,228 @@ _SERIES_MARKERS: tuple[str, ...] = (
     "pmlr",
     "jmlr workshop and conference proceedings",
     "w&cp",
+    # Springer/IFIP book series. Crossref and OpenAlex return the SERIES as the
+    # container-title for proceedings published in them, so an entry citing the
+    # actual conference ("International Conference on Entertainment Computing")
+    # was compared against "Lecture Notes in Computer Science" and reported as a
+    # venue MISMATCH -- on entries whose title matched the record exactly. Each
+    # of these spans many distinct conferences, so it cannot pin one venue.
+    # "lecture notes" covers LNCS/LNNS/LNEE/LNBIP/LNICST and the spelled-out
+    # "Lecture Notes of the Institute for Computer Sciences..."; no single real
+    # venue is named "Lecture Notes ...".
+    "lecture notes",
+    "studies in computational intelligence",
+    "communications in computer and information science",
+    "advances in intelligent systems and computing",
+    "smart innovation, systems and technologies",
+    "ifip international federation for information processing",
+    "ifip advances in information and communication technology",
+    "springerbriefs",
+    "springer proceedings in",
 )
+
+#: Tokens naming a SEPARATE co-located event with its own proceedings. When one
+#: venue name carries such a token and the other does not, they are different
+#: venues (a workshop is not its parent conference), so neither subsumption nor
+#: a high fuzzy score may merge them.
+#:
+#: Deliberately excludes presentation-format words -- ``poster``, ``oral``,
+#: ``spotlight``, ``demo``, ``abstract``. Those name a TRACK within one venue,
+#: not a venue, and :func:`_strip_track_decorations` already removes them so
+#: ``ICML 2023 poster`` still confirms a claimed ``ICML 2023``.
+#: Tokens naming a SEPARATE VOLUME of the same event (the companion/adjunct
+#: proceedings). These never name a venue on their own, so their presence on one
+#: side alone always means two different publications.
+_DISTINCT_VOLUME_TOKENS: frozenset[str] = frozenset({"companion", "adjunct", "supplement"})
+
+#: Tokens naming a satellite EVENT. Unlike the volume markers above, a workshop
+#: or tutorial is a venue in its own right and is routinely cited as one, so
+#: these need the added-topic test in :func:`adds_satellite_marker` rather than
+#: an unconditional block.
+_SATELLITE_EVENT_TOKENS: frozenset[str] = frozenset(
+    {
+        "workshop",
+        "workshops",
+        "tutorial",
+        "tutorials",
+        "doctoral",
+        "consortium",
+        "satellite",
+        "colocated",
+    }
+)
+
+_SUBSUMPTION_BLOCKING_TOKENS: frozenset[str] = _DISTINCT_VOLUME_TOKENS | _SATELLITE_EVENT_TOKENS
+
+#: Fewer tokens than this cannot establish venue identity on their own
+#: ("Automation" must not subsume "International Conference on Robotics and
+#: Automation").
+_MIN_SUBSUMPTION_TOKENS = 3
+
+
+#: Entry types whose ``title`` names a whole volume rather than a paper. Their
+#: title IS the conference name, so it carries venue boilerplate and must be
+#: normalized as a venue -- not compared verbatim like a paper title.
+_VOLUME_ENTRY_TYPES: frozenset[str] = frozenset({"proceedings"})
+
+#: A trailing acronym parenthetical, with or without the repeated year:
+#: ``(CNSM 2024)`` and ``(CNSM)`` must reduce to the same thing.
+_VOLUME_ACRONYM_YEAR_RE = re.compile(r"\(([^)]*?)\s*\b(?:19|20)\d{2}\b\s*([^)]*?)\)")
+
+#: Ordinal edition markers ("18th", "20th", "8th") -- boilerplate in a
+#: conference name, and the commonest source of a spurious near-miss.
+_VOLUME_ORDINAL_RE = re.compile(r"\b\d+(?:st|nd|rd|th)\b")
+
+
+#: Entry types that the paper databases in the cascade (Crossref, OpenAlex,
+#: DBLP, Semantic Scholar) do not index. Dissertations are deposited in
+#: institutional and national repositories instead, so a cascade miss carries no
+#: information about whether the thesis exists.
+_THESIS_ENTRY_TYPES: frozenset[str] = frozenset({"phdthesis", "mastersthesis"})
+
+
+def is_volume_entry_type(entry_type: str) -> bool:
+    """True for entry types whose title names a volume, not a paper."""
+    return (entry_type or "").strip().lower() in _VOLUME_ENTRY_TYPES
+
+
+def is_thesis_entry_type(entry_type: str) -> bool:
+    """True for thesis types, which paper databases do not index."""
+    return (entry_type or "").strip().lower() in _THESIS_ENTRY_TYPES
+
+
+def normalize_volume_title(title: str) -> str:
+    """Normalize a volume title the way a venue name is normalized.
+
+    ``@proceedings`` titles differ from their indexed form only by conference
+    boilerplate -- a ``Proceedings of the`` prefix, a leading year, an ordinal,
+    and a trailing ``(ACRONYM YEAR)`` whose year the index drops. Comparing them
+    verbatim produced TITLE_MISMATCH at similarities as high as 0.97.
+    """
+    if not title:
+        return ""
+    # Collapse "(CNSM 2024)" -> "(CNSM)" before the generic year strip so the
+    # parenthetical survives as an acronym rather than an empty pair of parens.
+    normalized = _VOLUME_ACRONYM_YEAR_RE.sub(lambda m: f"({m.group(1)}{m.group(2)})".replace("()", ""), title)
+    normalized = _VOLUME_ORDINAL_RE.sub(" ", normalized)
+    # Reuse the venue normalizer: it already drops "Proceedings of the", bare
+    # years and track decorations, which is exactly this boilerplate. Finish
+    # with the title normalizer so LaTeX braces, diacritics and punctuation go
+    # too -- "Computer Vision -- {ECCV}" and "Computer Vision - ECCV" must
+    # reduce to the same tokens for the containment test to see them.
+    return normalize_title_for_match(_normalize_venue_for_matching(normalized))
+
+
+#: Generic venue-name scaffolding. Present in most conference names and
+#: therefore carrying no topical information -- what remains after removing
+#: these is what actually distinguishes one event from another.
+_VENUE_BOILERPLATE_TOKENS: frozenset[str] = frozenset(
+    {
+        "international",
+        "national",
+        "annual",
+        "joint",
+        "ieee",
+        "acm",
+        "ifip",
+        "usenix",
+        "european",
+        "asian",
+        "conference",
+        "symposium",
+        "congress",
+        "meeting",
+        "proceedings",
+        "on",
+        "the",
+        "of",
+        "in",
+        "and",
+        "for",
+        "at",
+        "st",
+        "nd",
+        "rd",
+        "th",
+    }
+)
+
+
+def volume_title_subsumed(entry_title: str, record_title: str) -> bool:
+    """True when a volume's cited title is the record's title minus a suffix.
+
+    Indexes store a proceedings volume under its full descriptive title -- the
+    meeting's place and dates ("..., ACL 2020, Online, July 5-10, 2020") or its
+    part number ("..., Proceedings, Part I") -- while bibliographies cite the
+    short form. They are the same volume, and the length gap alone drops the
+    fuzzy score below the title threshold.
+
+    Containment is only meaningful because the entry side is a VOLUME title:
+    for a paper title, a record title that merely *contains* it would be a
+    different (longer-titled) work.
+    """
+    cited = normalize_volume_title(entry_title)
+    indexed = normalize_volume_title(record_title)
+    if not cited or not indexed:
+        return False
+    return cited in indexed
+
+
+def adds_satellite_marker(venue_a: str, venue_b: str) -> bool:
+    """True when one side is a SATELLITE of the other, not merely longer.
+
+    A workshop shares almost every token with its parent conference, so fuzzy
+    similarity alone rates them a match ("ICML Workshop on Foundation Models" vs
+    "ICML"). But a workshop is also a venue in its own right, and indexes
+    routinely shorten ITS name too ("International Workshop on IP Operations and
+    Management" stored as "IP Operations and Management") -- treating that as a
+    different venue is the same false positive in reverse.
+
+    The discriminator is whether the longer side adds substantive TOPIC words
+    beyond the marker and generic scaffolding. "Foundation Models" is a distinct
+    event; "International ... on" is boilerplate around the same one. When both
+    sides carry the marker it says nothing either way.
+    """
+    tokens_a, tokens_b = set(venue_a.split()), set(venue_b.split())
+    # A companion/adjunct volume is a different publication of the same event,
+    # whatever else the names share -- no topic test applies.
+    if bool(tokens_a & _DISTINCT_VOLUME_TOKENS) != bool(tokens_b & _DISTINCT_VOLUME_TOKENS):
+        return True
+    marked_a = bool(tokens_a & _SATELLITE_EVENT_TOKENS)
+    marked_b = bool(tokens_b & _SATELLITE_EVENT_TOKENS)
+    if marked_a == marked_b:
+        return False
+    longer, shorter = (tokens_a, tokens_b) if marked_a else (tokens_b, tokens_a)
+    added_topic = (longer - shorter) - _SUBSUMPTION_BLOCKING_TOKENS - _VENUE_BOILERPLATE_TOKENS
+    return bool(added_topic)
+
+
+def venue_name_subsumes(venue_a: str, venue_b: str) -> bool:
+    """True when one venue name contains the other, i.e. they name one venue.
+
+    Indexes routinely store a shortened container name: the organizer prefix and
+    trailing acronym dropped ("2021 IFIP/IEEE International Symposium on
+    Integrated Network Management (IM)" indexed as "Integrated Network
+    Management"), or the subtitle omitted. Treating that as a venue MISMATCH is
+    a false positive; treating it as identity is not, PROVIDED the extra words
+    are boilerplate rather than a satellite-event marker.
+    """
+    tokens_a = venue_a.split()
+    tokens_b = venue_b.split()
+    if not tokens_a or not tokens_b:
+        return False
+    shorter, longer = (tokens_a, tokens_b) if len(tokens_a) <= len(tokens_b) else (tokens_b, tokens_a)
+    # Equal length means neither adds anything: that is a plain comparison, not
+    # subsumption, and must stay with the fuzzy verdict.
+    if len(shorter) < _MIN_SUBSUMPTION_TOKENS or len(shorter) == len(longer):
+        return False
+    if " ".join(shorter) not in " ".join(longer):
+        return False
+    # Same discriminator as :func:`adds_satellite_marker`: only a longer name
+    # that adds real TOPIC words names a different (satellite) event. Extra
+    # boilerplate around the marker is index truncation of the SAME venue.
+    return not adds_satellite_marker(" ".join(longer), " ".join(shorter))
+
 
 #: Hosting-*platform* markers. A record whose venue is only the platform name
 #: (OpenReview hosts ICLR, NeurIPS, TMLR, and many workshops) says nothing about
