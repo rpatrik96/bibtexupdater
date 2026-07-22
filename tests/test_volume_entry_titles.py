@@ -13,7 +13,7 @@ normalized, and to switch off the near-miss rule -- a year or ordinal delta in a
 conference name is boilerplate, not fabrication.
 """
 
-from bibtex_updater.matching import is_volume_entry_type, normalize_volume_title
+from bibtex_updater.matching import is_volume_entry_type, normalize_volume_title, volume_title_subsumed
 
 
 class TestVolumeEntryTypes:
@@ -82,6 +82,92 @@ class TestNormalizeVolumeTitle:
         )
         assert entry and api
         assert entry in api
+
+
+class TestVolumeTitleSubsumption:
+    """A volume's cited title is the record's title minus a descriptive suffix.
+
+    Indexes append the meeting's place and dates to a proceedings title
+    ("... Computational Linguistics, ACL 2020, Online, July 5-10, 2020"). The
+    cited short form is the same volume, and the length gap alone is what sinks
+    the fuzzy score below the title threshold.
+    """
+
+    def test_acl_proceedings_with_place_and_date_suffix(self):
+        assert volume_title_subsumed(
+            "Proceedings of the 58th Annual Meeting of the Association for Computational Linguistics",
+            "Proceedings of the 58th Annual Meeting of the Association for Computational Linguistics, "
+            "ACL 2020, Online, July 5-10, 2020",
+        )
+
+    def test_eccv_proceedings_with_part_suffix(self):
+        assert volume_title_subsumed(
+            "Computer Vision -- {ECCV} 2016",
+            "Computer Vision - ECCV 2016: 14th European Conference, Amsterdam, "
+            "The Netherlands, October 11-14, 2016, Proceedings, Part I",
+        )
+
+    def test_a_different_conference_is_not_subsumed(self):
+        assert not volume_title_subsumed(
+            "Proceedings of the 58th Annual Meeting of the Association for Computational Linguistics",
+            "Advances in Cryptology - CRYPTO 2019, 39th Annual International Cryptology Conference",
+        )
+
+    def test_empty_sides_are_not_subsumed(self):
+        assert not volume_title_subsumed("", "Anything At All Here")
+        assert not volume_title_subsumed("Anything At All Here", "")
+
+
+class TestVolumeComparisonEndToEnd:
+    """``_compare_all_fields`` must apply the subsumption rule, not just the DOI path."""
+
+    def test_acl_volume_title_confirms_against_suffixed_record(self):
+        import logging
+        from unittest.mock import MagicMock
+
+        from bibtex_updater.fact_checker import (
+            CrossrefClient,
+            DBLPClient,
+            FactChecker,
+            FactCheckerConfig,
+            PublishedRecord,
+            SemanticScholarClient,
+        )
+
+        http = MagicMock()
+        http._request.return_value = MagicMock(status_code=404, json=lambda: {})
+        checker = FactChecker(
+            CrossrefClient(http),
+            DBLPClient(http),
+            SemanticScholarClient(http),
+            FactCheckerConfig(),
+            logging.getLogger("volume-cmp-test"),
+        )
+        entry = {
+            "ID": "g3_acl2020proceedings",
+            "ENTRYTYPE": "proceedings",
+            "editor": "Dan Jurafsky and Joyce Chai and Natalie Schluter and Joel Tetreault",
+            "title": "Proceedings of the 58th Annual Meeting of the Association for Computational Linguistics",
+            "year": "2020",
+        }
+        record = PublishedRecord(
+            doi="10.18653/v1/2020.acl-main",
+            url=None,
+            title=(
+                "Proceedings of the 58th Annual Meeting of the Association for Computational "
+                "Linguistics, ACL 2020, Online, July 5-10, 2020"
+            ),
+            authors=[
+                {"given": "Dan", "family": "Jurafsky"},
+                {"given": "Joyce", "family": "Chai"},
+                {"given": "Natalie", "family": "Schluter"},
+                {"given": "Joel R.", "family": "Tetreault"},
+            ],
+            journal="ACL",
+            year=2020,
+        )
+        comparisons = checker._compare_all_fields(entry, record)
+        assert comparisons["title"].is_confirmed, comparisons["title"].similarity_score
 
 
 class TestDoiConsistencyForVolumes:

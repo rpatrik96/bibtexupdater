@@ -63,6 +63,7 @@ from bibtex_updater.matching import (
     symmetric_author_match,
     title_edit_distance,
     venue_name_subsumes,
+    volume_title_subsumed,
 )
 from bibtex_updater.sources import (
     CASCADE_HIGH_CONFIDENCE,
@@ -3186,7 +3187,7 @@ class FactChecker:
         # so the short title being contained in the record's is confirmation,
         # not evidence of a different work -- and the length gap alone drives the
         # fuzzy score well below the threshold.
-        if is_volume and entry_title in doi_title:
+        if is_volume and volume_title_subsumed(entry.get("title", ""), rec.title):
             title_score = max(title_score, self.config.doi_consistency_min_title)
         if title_score >= self.config.doi_consistency_min_title:
             # Title confirms this IS the cited paper. The DOI is the entry's OWN
@@ -4274,6 +4275,12 @@ class FactChecker:
             title_score = (
                 token_sort_ratio(normalize_volume_title(entry_title), normalize_volume_title(api_title)) / 100.0
             )
+            # Indexes append the meeting's place/dates or a part number to a
+            # volume title ("..., ACL 2020, Online, July 5-10, 2020"). The cited
+            # short form being CONTAINED in the indexed one is the same volume;
+            # only the length gap pushed the fuzzy score under the threshold.
+            if volume_title_subsumed(entry_title, api_title):
+                title_score = max(title_score, cfg.title_threshold)
         else:
             title_score = (
                 token_sort_ratio(normalize_title_for_match(entry_title), normalize_title_for_match(api_title)) / 100.0

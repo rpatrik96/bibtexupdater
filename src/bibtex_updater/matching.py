@@ -1021,6 +1021,26 @@ _VENUE_BOILERPLATE_TOKENS: frozenset[str] = frozenset(
 )
 
 
+def volume_title_subsumed(entry_title: str, record_title: str) -> bool:
+    """True when a volume's cited title is the record's title minus a suffix.
+
+    Indexes store a proceedings volume under its full descriptive title -- the
+    meeting's place and dates ("..., ACL 2020, Online, July 5-10, 2020") or its
+    part number ("..., Proceedings, Part I") -- while bibliographies cite the
+    short form. They are the same volume, and the length gap alone drops the
+    fuzzy score below the title threshold.
+
+    Containment is only meaningful because the entry side is a VOLUME title:
+    for a paper title, a record title that merely *contains* it would be a
+    different (longer-titled) work.
+    """
+    cited = normalize_volume_title(entry_title)
+    indexed = normalize_volume_title(record_title)
+    if not cited or not indexed:
+        return False
+    return cited in indexed
+
+
 def adds_satellite_marker(venue_a: str, venue_b: str) -> bool:
     """True when one side is a SATELLITE of the other, not merely longer.
 
