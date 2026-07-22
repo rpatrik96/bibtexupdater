@@ -25,7 +25,7 @@ import threading
 import time
 import unicodedata
 import xml.etree.ElementTree as ET
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -200,22 +200,173 @@ _LATEX_CMD_RE = re.compile(r"\\[a-zA-Z]+(\s*\[[^\]]*\])?(\s*\{[^}]*\})?")
 _LATEX_MATH_RE = re.compile(r"\$[^$]*\$")
 _BRACES_RE = re.compile(r"[{}]")
 
+# LaTeX accent macros -> the Unicode COMBINING mark they apply to the next
+# character. Decoded before ``_LATEX_CMD_RE`` runs: that regex replaces a
+# command with a SPACE, and a letter-named accent macro is separated from its
+# base character by whitespace (``{\H u}``), so stripping it blindly split the
+# word -- "Heged{\H u}s" became "Heged us", whose surname key is "us". The same
+# defect made Erd{\H o}s reduce to "os" and Ak{\c c}ay to "cay", so authors with
+# Hungarian, Polish, Turkish/Romanian or Scandinavian names could never match
+# their own records in Crossref/DBLP. Punctuation-named macros (``\'``, ``\"``)
+# escaped the bug only because ``'``/``"`` are not in ``[a-zA-Z]``.
+_LATEX_ACCENTS: dict[str, str] = {
+    "`": "̀",  # grave
+    "'": "́",  # acute
+    "^": "̂",  # circumflex
+    "~": "̃",  # tilde
+    '"': "̈",  # diaeresis
+    "=": "̄",  # macron
+    ".": "̇",  # dot above
+    "u": "̆",  # breve
+    "r": "̊",  # ring above
+    "H": "̋",  # double acute (Hungarian o"/u")
+    "v": "̌",  # caron
+    "d": "̣",  # dot below
+    "c": "̧",  # cedilla
+    "k": "̨",  # ogonek
+    "b": "̱",  # macron below
+}
+
+#: LaTeX macros naming a whole glyph rather than an accent. ``strip_diacritics``
+#: already folds the resulting characters to ASCII via ``_NONDECOMPOSING_FOLD``,
+#: so decoding to real Unicode keeps one folding table instead of two.
+_LATEX_GLYPHS: dict[str, str] = {
+    "ss": "ß",
+    "aa": "å",
+    "AA": "Å",
+    "ae": "æ",
+    "AE": "Æ",
+    "oe": "œ",
+    "OE": "Œ",
+    "dh": "ð",
+    "DH": "Ð",
+    "th": "þ",
+    "TH": "Þ",
+    "dj": "đ",
+    "DJ": "Đ",
+    "l": "ł",
+    "L": "Ł",
+    "o": "ø",
+    "O": "Ø",
+    "i": "ı",
+    "j": "ȷ",
+}
+
+# Longest-first so "\ae" wins over "\a"-prefixes and "\dh" over "\d".
+_LATEX_GLYPH_RE = re.compile(
+    r"\\(" + "|".join(sorted((re.escape(k) for k in _LATEX_GLYPHS), key=len, reverse=True)) + r")(?![A-Za-z])"
+)
+
+# The accented base is any single LETTER, not just ASCII: glyph macros are
+# decoded first, so "{\'\i}" (the standard BibTeX spelling of í) reaches this
+# pass as "{\'ı}" -- an ASCII-only class silently left it undecoded.
+_ACCENT_BASE = r"[^\W\d_]"
+
+# Punctuation-named accents: the base character may follow immediately ("\'a"),
+# so no lookahead is possible or needed.
+_LATEX_PUNCT_ACCENT_RE = re.compile(
+    r"\\([" + re.escape("`'^~\"=.") + r"])\s*(?:\{\s*(" + _ACCENT_BASE + r")\s*\}|(" + _ACCENT_BASE + r"))",
+)
+
+# Letter-named accents: require a non-letter after the macro name so "\Huge" is
+# not read as "\H" + "uge". The base character may be braced ("\H{u}"), space
+# separated ("\H u") or inside a group ("{\H u}").
+_LATEX_LETTER_ACCENT_RE = re.compile(
+    r"\\(["
+    + "".join(c for c in _LATEX_ACCENTS if c.isalpha())
+    + r"])(?![A-Za-z])\s*(?:\{\s*("
+    + _ACCENT_BASE
+    + r")\s*\}|("
+    + _ACCENT_BASE
+    + r"))",
+)
+
+
+def _apply_latex_accent(match: re.Match[str]) -> str:
+    """Compose ``base + combining mark`` into a single precomposed character."""
+    combining = _LATEX_ACCENTS[match.group(1)]
+    base = match.group(2) or match.group(3) or ""
+    # Dotless i/j exist only to carry an accent ("\'{\i}" -> í); the dot returns
+    # with the accent, and only the dotted forms compose under NFC.
+    base = {"ı": "i", "ȷ": "j"}.get(base, base)
+    return unicodedata.normalize("NFC", base + combining)
+
+
+def decode_latex_accents(text: str) -> str:
+    """Decode LaTeX accent and glyph macros to precomposed Unicode.
+
+    ``Heged{\\H u}s`` -> ``Hegedűs``, ``Ak{\\c c}ay`` -> ``Akçay``,
+    ``Wa{\\l}{\\k e}sa`` -> ``Wałęsa``. Glyph macros are decoded first so a
+    dotless-i base (``\\'{\\i}``) is already a character when the accent applies.
+    """
+    if "\\" not in text:
+        return text
+    t = _LATEX_GLYPH_RE.sub(lambda m: _LATEX_GLYPHS[m.group(1)], text)
+    t = _LATEX_PUNCT_ACCENT_RE.sub(_apply_latex_accent, t)
+    return _LATEX_LETTER_ACCENT_RE.sub(_apply_latex_accent, t)
+
 
 def latex_to_plain(text: str) -> str:
     """Convert markup to plain text for matching/display.
 
     Decodes HTML/XML entities first (e.g. ``d&apos;Amore`` -> ``d'Amore``,
     ``A &amp; B`` -> ``A & B``) so DBLP/XML-scraped fields match clean records,
-    then removes LaTeX commands, math, and braces.
+    then decodes LaTeX accent macros to real Unicode, and finally removes the
+    remaining LaTeX commands, math, and braces.
     """
     if not text:
         return ""
     text = html.unescape(text)
     t = _LATEX_MATH_RE.sub(" ", text)
+    t = decode_latex_accents(t)
     t = _LATEX_CMD_RE.sub(" ", t)
     t = _BRACES_RE.sub("", t)
     t = re.sub(r"\s+", " ", t)
     return t.strip()
+
+
+#: A ``howpublished`` matching any of these is a web reference or a citation-style
+#: marker, not a venue name. Promoting one to a venue claim would invent a claim
+#: the entry never made -- and a claim the checker can then "mismatch" against.
+_NON_VENUE_HOWPUBLISHED_RE = re.compile(
+    r"^\s*(?:\\url\b|\\href\b|https?://|www\.|ftp://|\[online\]|available\b|retrieved\b|accessed\b)",
+    re.IGNORECASE,
+)
+
+
+def entry_venue(entry: Mapping[str, Any]) -> str:
+    """The venue an entry claims, in descending order of authority.
+
+    ``journal``/``booktitle`` first, then ``howpublished`` -- where ``@misc``
+    front matter (editorials, magazine columns) names its journal -- then
+    ``series``. Without the ``howpublished`` arm, 24 entries of the Varga
+    bibliography reported "No venue claimed", so the venue field matched
+    vacuously and the journal name never constrained retrieval.
+
+    A URL-valued ``howpublished`` is a web reference and is NOT a venue claim.
+    """
+    for field_name in ("journal", "booktitle"):
+        value = (entry.get(field_name) or "").strip()
+        if value:
+            return value
+    howpublished = (entry.get("howpublished") or "").strip()
+    if howpublished and not _NON_VENUE_HOWPUBLISHED_RE.match(howpublished):
+        return howpublished
+    return (entry.get("series") or "").strip()
+
+
+def entry_authors(entry: Mapping[str, Any]) -> str:
+    """The people an entry credits, falling back to ``editor``.
+
+    ``@proceedings`` and ``@book`` name editors rather than authors, so reading
+    ``author`` alone produced an EMPTY author list for every volume-level entry
+    -- which both starves the search query and makes the author comparison
+    non-comparable.
+    """
+    author = (entry.get("author") or "").strip()
+    if author:
+        return author
+    return (entry.get("editor") or "").strip()
 
 
 def normalize_title_for_match(title: str) -> str:

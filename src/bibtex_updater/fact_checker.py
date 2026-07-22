@@ -52,12 +52,17 @@ from bibtex_updater.matching import (
     MatchOutcome,
     _normalize_venue_for_matching,
     _strip_author_sentinels,
+    adds_satellite_marker,
     get_canonical_venue,
     has_explicit_truncation_indicator,
     is_near_miss_title,
     is_preprint_or_series_venue,
+    is_thesis_entry_type,
+    is_volume_entry_type,
+    normalize_volume_title,
     symmetric_author_match,
     title_edit_distance,
+    venue_name_subsumes,
 )
 from bibtex_updater.sources import (
     CASCADE_HIGH_CONFIDENCE,
@@ -94,7 +99,9 @@ from bibtex_updater.utils import (
     authors_last_names,
     crossref_message_to_record,
     dblp_hit_to_candidate_record,
+    entry_authors,
     entry_surnames_against_structured,
+    entry_venue,
     first_author_surname,
     given_name_position_audit,
     is_preprint_venue,
@@ -1161,7 +1168,7 @@ class BookVerifier(BaseVerifier):
     def verify(self, entry: dict[str, Any], classification: ClassificationResult) -> FactCheckResult:
         """Verify a book entry using book APIs."""
         title = entry.get("title", "")
-        author = entry.get("author", "")
+        author = entry_authors(entry)
         isbn = classification.extracted_isbn or self.classifier._extract_isbn(entry)
 
         if not title:
@@ -1349,9 +1356,9 @@ class BookVerifier(BaseVerifier):
         title_score = token_sort_ratio(title_entry, title_book) / 100.0
 
         # Author matching
-        entry_authors = authors_last_names(entry.get("author", ""), limit=3)
+        entry_author_keys = authors_last_names(entry_authors(entry), limit=3)
         book_authors = [strip_diacritics(a.split()[-1]).lower() for a in book.authors[:3] if a]
-        author_score = jaccard_similarity(entry_authors, book_authors)
+        author_score = jaccard_similarity(entry_author_keys, book_authors)
 
         # Year matching (bonus if matches)
         year_bonus = 0.0
@@ -1461,7 +1468,7 @@ class WorkingPaperVerifier(BaseVerifier):
         title_rec = normalize_title_for_match(rec.title or "")
         title_score = token_sort_ratio(title_entry, title_rec) / 100.0
 
-        authors_entry = authors_last_names(entry.get("author", ""), limit=3)
+        authors_entry = authors_last_names(entry_authors(entry), limit=3)
         authors_rec = rec.surname_keys(limit=3)
         author_score = jaccard_similarity(authors_entry, authors_rec)
 
@@ -1791,6 +1798,14 @@ def venues_match(venue_a: str, venue_b: str, threshold: float = 0.70) -> VenueMa
     norm_a = normalize_venue(venue_a)
     norm_b = normalize_venue(venue_b)
 
+    # A satellite event on exactly one side means two different venues, whatever
+    # the names canonicalize to. ``_strip_track_decorations`` deliberately leaves
+    # "workshop" in place for this reason, but alias lookup still resolved
+    # "ICML Workshop on X" to ICML because the parent name is a substring of it
+    # -- so the distinction has to be enforced here, before canonicalization.
+    if adds_satellite_marker(normalize_title_for_match(norm_a), normalize_title_for_match(norm_b)):
+        return VenueMatchResult(MatchOutcome.MISMATCH, 0.0)
+
     # P2.5: Use expanded venue aliases from matching.py
     canonical_a = get_canonical_venue(norm_a, EXPANDED_VENUE_ALIASES)
     canonical_b = get_canonical_venue(norm_b, EXPANDED_VENUE_ALIASES)
@@ -1800,9 +1815,20 @@ def venues_match(venue_a: str, venue_b: str, threshold: float = 0.70) -> VenueMa
         return VenueMatchResult(MatchOutcome.MISMATCH, 0.0)  # Known different venues
 
     # Fall back to fuzzy matching
-    score = token_sort_ratio(normalize_title_for_match(norm_a), normalize_title_for_match(norm_b)) / 100.0
+    match_a = normalize_title_for_match(norm_a)
+    match_b = normalize_title_for_match(norm_b)
+    score = token_sort_ratio(match_a, match_b) / 100.0
     if score >= threshold:
-        return VenueMatchResult(MatchOutcome.MATCH, score)
+        # Guard the fuzzy MATCH: a satellite event scores high against its
+        # parent conference on shared tokens alone ("ICML Workshop on X" vs
+        # "ICML") but is a different venue.
+        if venue_name_subsumes(match_a, match_b) or not adds_satellite_marker(match_a, match_b):
+            return VenueMatchResult(MatchOutcome.MATCH, score)
+        return VenueMatchResult(MatchOutcome.MISMATCH, score)
+    # One name containing the other is a shortened index entry, not a different
+    # venue -- the fuzzy score is low only because the lengths differ.
+    if venue_name_subsumes(match_a, match_b):
+        return VenueMatchResult(MatchOutcome.MATCH, max(score, threshold))
     return VenueMatchResult(MatchOutcome.MISMATCH, score)
 
 
@@ -2104,7 +2130,7 @@ class FactChecker:
           successfully and neither knows a plausibly-matching venue name
           (any lookup error keeps the abstention).
         """
-        claimed = entry.get("journal") or entry.get("booktitle") or ""
+        claimed = entry_venue(entry)
         if not claimed:
             return None
         if is_preprint_or_series_venue(claimed):
@@ -2524,7 +2550,7 @@ class FactChecker:
         intersection = cross_source_author_intersection(best_per_source, multi_source_bonus=MULTI_SOURCE_BONUS)
 
         field_comparisons = self._compare_all_fields(entry, best_match, per_source_records=best_per_source)
-        status = self._determine_status(best_score, field_comparisons, sources_with_hits)
+        status = self._determine_status(best_score, field_comparisons, sources_with_hits, entry_type=entry_type)
 
         # FPR guard (Task 2b): an AUTHOR_MISMATCH driven by a candidate from a
         # source WITHOUT authoritative given/family names (S2 flat names, a DBLP
@@ -2541,7 +2567,7 @@ class FactChecker:
             if structured_rec is not None:
                 best_match = structured_rec
                 field_comparisons = self._compare_all_fields(entry, best_match, per_source_records=best_per_source)
-                status = self._determine_status(best_score, field_comparisons, sources_with_hits)
+                status = self._determine_status(best_score, field_comparisons, sources_with_hits, entry_type=entry_type)
 
         # Post-match: check preprint status. UNCONFIRMED is included because a
         # venue we could not confirm is exactly the case where an independent
@@ -2706,7 +2732,7 @@ class FactChecker:
         record yields exactly that).
         """
         title_norm = normalize_title_for_match(entry.get("title", ""))
-        authors_ref = authors_last_names(entry.get("author", ""), limit=3)
+        authors_ref = authors_last_names(entry_authors(entry), limit=3)
         best_score = self._score_candidate(title_norm, authors_ref, rec)
         best_per_source: dict[str, PublishedRecord | None] = {source: rec}
         intersection = cross_source_author_intersection(best_per_source, multi_source_bonus=MULTI_SOURCE_BONUS)
@@ -2803,7 +2829,7 @@ class FactChecker:
             return None
         if (entry.get("doi") or "").strip():
             return None
-        if (entry.get("journal") or entry.get("booktitle") or "").strip():
+        if (entry_venue(entry)).strip():
             return None
         if self.arxiv is None:
             return None
@@ -2927,7 +2953,7 @@ class FactChecker:
             id_kind,
             identifier,
             entry.get("ID", "?"),
-            entry.get("author", ""),
+            entry_authors(entry),
             source,
             api_names,
         )
@@ -2979,10 +3005,10 @@ class FactChecker:
         confirm -- is the only call site.
         """
         # ----- Venue check (hard MISMATCH only) -----
-        entry_venue = entry.get("journal") or entry.get("booktitle") or ""
+        claimed_venue = entry_venue(entry)
         rec_venue = rec.journal or ""
-        if entry_venue and rec_venue and not is_preprint_or_series_venue(rec_venue):
-            venue_result = venues_match(entry_venue, rec_venue, self.config.venue_threshold)
+        if claimed_venue and rec_venue and not is_preprint_or_series_venue(rec_venue):
+            venue_result = venues_match(claimed_venue, rec_venue, self.config.venue_threshold)
             if venue_result.is_mismatch:
                 self.logger.warning(
                     "%s %s for entry %r resolves to the cited paper but with mismatched "
@@ -2990,7 +3016,7 @@ class FactChecker:
                     id_kind,
                     identifier,
                     entry.get("ID", "?"),
-                    entry_venue,
+                    claimed_venue,
                     source,
                     rec_venue,
                 )
@@ -3005,7 +3031,7 @@ class FactChecker:
                     api_sources_with_hits=[source],
                     errors=[
                         f"{id_kind} {identifier} resolves to the cited paper "
-                        f"{rec.title!r}, but the entry's venue {entry_venue!r} "
+                        f"{rec.title!r}, but the entry's venue {claimed_venue!r} "
                         f"does not match the record's venue {rec_venue!r}"
                     ],
                 )
@@ -3239,7 +3265,7 @@ class FactChecker:
         or the match threshold.
         """
         entry_title = normalize_title_for_match(entry.get("title", ""))
-        if not authors_last_names(entry.get("author", ""), limit=10_000):
+        if not authors_last_names(entry_authors(entry), limit=10_000):
             return None
 
         # ----- Path 1: DOI present -> authoritative Crossref record. -----
@@ -3334,7 +3360,7 @@ class FactChecker:
 
         sources_with_hits.append("arxiv")
         title_norm = normalize_title_for_match(entry.get("title", ""))
-        authors_ref = authors_last_names(entry.get("author", ""), limit=3)
+        authors_ref = authors_last_names(entry_authors(entry), limit=3)
         score = self._score_candidate(title_norm, authors_ref, rec)
         return [(score, rec, "arxiv")]
 
@@ -3388,7 +3414,7 @@ class FactChecker:
         retrieval_title = latex_to_plain(raw_title)
         title_norm = normalize_title_for_match(raw_title)
         first_author = first_author_surname(entry)
-        authors_ref = authors_last_names(entry.get("author", ""), limit=3)
+        authors_ref = authors_last_names(entry_authors(entry), limit=3)
         top_k = max(1, min(int(self.config.top_k), MAX_TOP_K))
 
         all_candidates: list[tuple[float, PublishedRecord, str]] = []
@@ -3618,7 +3644,7 @@ class FactChecker:
         # still normalizes the ORIGINAL title.
         retrieval_title = latex_to_plain(raw_title or "")
         title_norm = normalize_title_for_match(raw_title)
-        authors_ref = authors_last_names(entry.get("author", ""), limit=3)
+        authors_ref = authors_last_names(entry_authors(entry), limit=3)
 
         def _ingest_fallback(source_name: str, records: list[PublishedRecord]) -> None:
             ranked = select_top_k_by_title_similarity(raw_title, records, k=top_k)
@@ -3889,8 +3915,8 @@ class FactChecker:
         if record.structured_names:
             family_keys = set(record.surname_keys(limit=limit))
             if family_keys:
-                return entry_surnames_against_structured(entry.get("author", ""), family_keys, limit=limit)
-        return authors_last_names(entry.get("author", ""), limit=limit)
+                return entry_surnames_against_structured(entry_authors(entry), family_keys, limit=limit)
+        return authors_last_names(entry_authors(entry), limit=limit)
 
     #: FIX A (cross-source extra-author / fabrication detection).
     #: ``symmetric_author_match`` uses a first-N prefix slice (``prefix_n=5``) for
@@ -4225,12 +4251,25 @@ class FactChecker:
         # Title (P2.2: Near-miss detection)
         entry_title = entry.get("title", "")
         api_title = record.title or ""
-        title_score = (
-            token_sort_ratio(normalize_title_for_match(entry_title), normalize_title_for_match(api_title)) / 100.0
-        )
-        # Detect near-miss: high fuzzy score but character-level differences
+        # A volume-level entry (@proceedings) titles itself after the conference,
+        # so its title carries venue boilerplate -- a leading year, an ordinal, a
+        # "Proceedings of the" prefix, a trailing "(ACRONYM YEAR)". Normalize it
+        # as a venue name; comparing it verbatim reported TITLE_MISMATCH at
+        # similarities as high as 0.97.
+        is_volume = is_volume_entry_type(entry.get("ENTRYTYPE", ""))
+        if is_volume:
+            title_score = (
+                token_sort_ratio(normalize_volume_title(entry_title), normalize_volume_title(api_title)) / 100.0
+            )
+        else:
+            title_score = (
+                token_sort_ratio(normalize_title_for_match(entry_title), normalize_title_for_match(api_title)) / 100.0
+            )
+        # Detect near-miss: high fuzzy score but character-level differences.
+        # Suppressed for volume titles, where a year/ordinal delta is boilerplate
+        # rather than the deliberate tampering the near-miss rule looks for.
         edit_dist = title_edit_distance(entry_title, api_title)
-        near_miss = is_near_miss_title(entry_title, api_title, title_score, cfg.title_threshold)
+        near_miss = not is_volume and is_near_miss_title(entry_title, api_title, title_score, cfg.title_threshold)
         # Strict mode (arXiv 2026): also flag a Levenshtein <= 1 normalized-title
         # difference as a near-miss ("Subspace Differential Privacys" vs "...
         # Privacy", "Chain of-Thought" vs "Chain-of-Thought"). The existing
@@ -4263,7 +4302,7 @@ class FactChecker:
         # code sliced the entry side to 10 but left the API side at 10_000, so a
         # correctly cited paper that lists fewer authors (or "and others") scored
         # below threshold purely from the length asymmetry.
-        entry_authors = entry.get("author", "")
+        entry_author_field = entry_authors(entry)
         entry_names = self._entry_surname_keys(entry, record, limit=10_000)
         api_names = record.surname_keys(limit=10_000)
         author_result = symmetric_author_match(
@@ -4294,7 +4333,7 @@ class FactChecker:
                 author_note = None
         comparisons["author"] = FieldComparison(
             "author",
-            entry_authors,
+            entry_author_field,
             api_authors_str,
             author_result.score,
             # ``matches`` is positive-confirmation only: a PARTIAL/NON_COMPARABLE
@@ -4383,7 +4422,7 @@ class FactChecker:
         # gate on ``len(entry_names) <= len(api_names)`` here so the two rules
         # don't fight over the same shape.
         truncation_disclosed = has_explicit_truncation_indicator(
-            entry_authors,
+            entry_author_field,
             entry.get("note"),
             entry.get("howpublished"),
             entry.get("title"),
@@ -4479,7 +4518,9 @@ class FactChecker:
         # artifact never trips it. Sentinel-truncated citations ("and others"/
         # "et al") are suppressed by the helper.
         if comparisons["author"].resolved_outcome in (MatchOutcome.MATCH, MatchOutcome.PARTIAL) and per_source_records:
-            absent = self._detect_author_fabrication(entry_authors, entry_names, per_source_records, best_record=record)
+            absent = self._detect_author_fabrication(
+                entry_author_field, entry_names, per_source_records, best_record=record
+            )
             if absent:
                 comparisons["author"].outcome = MatchOutcome.MISMATCH
                 comparisons["author"].matches = False
@@ -4496,7 +4537,7 @@ class FactChecker:
         if comparisons["author"].resolved_outcome in (
             MatchOutcome.MATCH,
             MatchOutcome.PARTIAL,
-        ) and same_surname_given_order_violation(entry_authors, record):
+        ) and same_surname_given_order_violation(entry_author_field, record):
             comparisons["author"].outcome = MatchOutcome.MISMATCH
             comparisons["author"].matches = False
             comparisons["author"].note = "Same-surname co-authors in a different given-name order (swapped authors)"
@@ -4512,7 +4553,7 @@ class FactChecker:
         # wrong author is far worse than a spurious flag -- but escalation is gated
         # to full-vs-full substitutions on authoritative records, so correct
         # initials/diacritic/CJK citations are never hard-flagged.
-        gn_class, gn_findings = given_name_position_audit(entry_authors, record)
+        gn_class, gn_findings = given_name_position_audit(entry_author_field, record)
         if gn_findings:
             # APPEND to any existing findings -- the truncation escalations above
             # tag the comparison with a routing marker ("strict_truncated") that
@@ -4618,7 +4659,7 @@ class FactChecker:
             and not record_is_preprint
             and per_source_records
         ):
-            claimed_venue_for_year = entry.get("journal") or entry.get("booktitle") or ""
+            claimed_venue_for_year = entry_venue(entry)
             entry_year_canonical = get_canonical_venue(claimed_venue_for_year) if claimed_venue_for_year else None
             record_year_canonical = get_canonical_venue(record.journal or "") if record.journal else None
             if (
@@ -4651,7 +4692,7 @@ class FactChecker:
         # ``record_is_preprint`` were computed above (a preprint/series/platform
         # record returns a junk or repository venue that cannot confirm the
         # published venue the entry claims -> NON_COMPARABLE, never a mismatch).
-        entry_venue = entry.get("journal") or entry.get("booktitle") or ""
+        claimed_venue = entry_venue(entry)
         # Positive-confirmation gate distinguishes "no claim" from "claim we
         # could not confirm":
         #  - The entry makes NO venue claim (preprint @misc/@article with no
@@ -4660,7 +4701,7 @@ class FactChecker:
         #  - The entry CLAIMS a published venue but the matched record is a
         #    preprint or blank -> the claim cannot be confirmed -> NON_COMPARABLE,
         #    which routes the verdict to UNCONFIRMED (could not verify).
-        if not entry_venue:
+        if not claimed_venue:
             venue_outcome = MatchOutcome.MATCH
             venue_score = 1.0
             venue_confirmed = True
@@ -4671,7 +4712,7 @@ class FactChecker:
             venue_confirmed = False
             venue_note = "Claimed venue could not be confirmed (preprint record)"
         else:
-            venue_result = venues_match(entry_venue, api_venue, cfg.venue_threshold)
+            venue_result = venues_match(claimed_venue, api_venue, cfg.venue_threshold)
             venue_outcome = venue_result.outcome
             venue_score = venue_result.score
             venue_confirmed = venue_result.is_confirmed
@@ -4682,7 +4723,7 @@ class FactChecker:
             )
         comparisons["venue"] = FieldComparison(
             "venue",
-            entry_venue,
+            claimed_venue,
             api_venue,
             venue_score,
             venue_confirmed,
@@ -4699,14 +4740,14 @@ class FactChecker:
         # downgrade the outcome to MISMATCH. Gated to mirror
         # ``_detect_author_fabrication`` (corroboration across two sources;
         # single dissenter never trips it; preprint records never anchor).
-        if comparisons["venue"].resolved_outcome is not MatchOutcome.MISMATCH and entry_venue and per_source_records:
-            consensus = self._detect_cross_source_venue_mismatch(entry_venue, per_source_records)
+        if comparisons["venue"].resolved_outcome is not MatchOutcome.MISMATCH and claimed_venue and per_source_records:
+            consensus = self._detect_cross_source_venue_mismatch(claimed_venue, per_source_records)
             if consensus:
                 comparisons["venue"].outcome = MatchOutcome.MISMATCH
                 comparisons["venue"].matches = False
                 comparisons["venue"].note = (
                     "Cross-source venue mismatch: order-reliable sources agree "
-                    f"the real venue is {consensus!r}, not {entry_venue!r}"
+                    f"the real venue is {consensus!r}, not {claimed_venue!r}"
                 )
 
         # Different-edition / reprint guard. A record with essentially the SAME
@@ -4762,6 +4803,7 @@ class FactChecker:
         best_score: float,
         comparisons: dict[str, FieldComparison],
         sources_with_hits: list[str],
+        entry_type: str = "",
     ) -> FactCheckStatus:
         """Determine final status from score and field comparisons.
 
@@ -4804,6 +4846,18 @@ class FactChecker:
 
         if best_score < self.config.abstention_below or wrong_paper_signature:
             return FactCheckStatus.NOT_FOUND
+
+        # Theses are absent from the paper databases this cascade queries --
+        # dissertations live in institutional/national repositories. So the
+        # top-scoring candidate is whatever unrelated paper shares a surname,
+        # and its fields say nothing about the cited work. Without a confirmed
+        # title there is no evidence of a problem, only a lookup the cascade
+        # cannot perform: abstain rather than assert a mismatch. Positive
+        # evidence still flags -- _validate_year/_validate_doi/
+        # _check_arxiv_id_consistency/_detect_chimeric_title all return before
+        # this method is reached.
+        if is_thesis_entry_type(entry_type) and not title_confirmed:
+            return FactCheckStatus.UNCONFIRMED
 
         # Positive evidence of a problem: a field that is a real MISMATCH (both
         # sides populated and conflicting). These take priority over abstention.
