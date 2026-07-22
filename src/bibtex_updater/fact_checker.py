@@ -214,6 +214,19 @@ class FactCheckStatus(Enum):
 
     # Academic verification statuses
     VERIFIED = "verified"
+    # No matching record was found. This asserts "the sources queried do not
+    # know this reference", NOT "this reference is fabricated" -- HALLUCINATED
+    # is reserved for positive evidence.
+    #
+    # It is an abstention, but NOT a neutral one: p_valid is 0.35 (below 0.5),
+    # and downstream integrations routinely collapse it into a hallucination
+    # label (the HALLMARK harness maps not_found -> HALLUCINATED unless
+    # coverage_incomplete is set). Anything gating on this output inherits that
+    # reading, so prefer UNCONFIRMED (p_valid 0.5) whenever a miss carries no
+    # information -- notably for document classes the databases structurally do
+    # not index: theses, journal front matter, national-language work. Users who
+    # WANT a clean miss to count opt in with --strict --strict-warn-cnv, which
+    # promotes it to STRICT_WARN_CNV; see docs/REFERENCE_FACT_CHECKER.md.
     NOT_FOUND = "not_found"
     # A matching record was found and nothing contradicts the entry, but at
     # least one claimed field could not be POSITIVELY CONFIRMED (e.g. only a
