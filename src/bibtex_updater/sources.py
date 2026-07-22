@@ -361,6 +361,28 @@ def _content_value(content: dict[str, Any], key: str) -> Any:
     return raw
 
 
+def _coerce_venue_string(raw: Any) -> str | None:
+    """Reduce an OpenReview venue field of any shape to a usable string.
+
+    ``venue``/``venueid`` come back as a list on some notes. Every venue helper
+    downstream (``is_preprint_venue``, ``is_preprint_or_series_venue``,
+    ``_normalize_venue_for_matching``) calls ``.lower()``, so a list raised
+    ``AttributeError`` mid-cascade; the per-entry handler swallowed it and the
+    entry vanished from the report. Returns the first non-empty string in a
+    list, the string itself, a stringified scalar, or ``None``.
+    """
+    if raw is None or isinstance(raw, str):
+        return raw or None
+    if isinstance(raw, list | tuple):
+        for item in raw:
+            if isinstance(item, str) and item.strip():
+                return item
+        return None
+    if isinstance(raw, int | float):
+        return str(raw)
+    return None
+
+
 def build_openreview_paperhash(title: str, first_author_last_name: str) -> str | None:
     """Construct OpenReview's ``paperhash`` exact-match key for a paper.
 
@@ -565,10 +587,13 @@ def openreview_acceptance(note: dict[str, Any]) -> str:
     content = note.get("content") or {}
     if not isinstance(content, dict):
         return OR_UNKNOWN
-    venue = _content_value(content, "venue")
-    venueid = _content_value(content, "venueid")
-    venue_s = str(venue or "")
-    venueid_l = str(venueid or "").lower()
+    # Coerced because OpenReview returns these as a LIST on some notes; the
+    # raw value used to reach ``is_preprint_venue`` below and raise
+    # ``'list' object has no attribute 'lower'``.
+    venue = _coerce_venue_string(_content_value(content, "venue"))
+    venueid = _coerce_venue_string(_content_value(content, "venueid"))
+    venue_s = venue or ""
+    venueid_l = (venueid or "").lower()
     venue_l = venue_s.lower()
 
     # 1. Preprint mirror (CoRR / arXiv) -- not a publication.
@@ -640,7 +665,13 @@ def openreview_note_to_candidate_record(note: dict[str, Any]) -> PublishedRecord
     if not authors:
         all_structured = False
 
-    venue = _content_value(content, "venue") or _content_value(content, "venueid")
+    # OpenReview returns ``venue``/``venueid`` as a LIST on some notes, and the
+    # downstream venue helpers all assume a string -- an uncoerced list reached
+    # ``is_preprint_venue`` and raised ``'list' object has no attribute 'lower'``,
+    # which the per-entry handler swallowed, silently dropping the entry from the
+    # report. Coerce to the first usable string, mirroring the defensive handling
+    # the neighbouring title/author/year fields already get.
+    venue = _coerce_venue_string(_content_value(content, "venue") or _content_value(content, "venueid"))
     # A preprint-labelled venue (e.g. a DBLP "CoRR" import surfaced on OpenReview)
     # is not a published-venue confirmation; drop it so the verifier treats the
     # venue as unconfirmable rather than matching against "CoRR".
