@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.1] - 2026-07-22
+
+Report persistence and the strict exit code now survive a chained run.
+
+### Fixed
+
+- **`--report` silently dropped in chained runs** (#52): `bibtex-check --resolve-first --report X.json` wrote the resolved bib and a console summary but never wrote `X.json` — `main()` returns from inside the chain driver before the report-writing tail, so every persistence obligation the parent CLI had already parsed was discarded. `bibtex-update --then-check --report` lost its JSONL the same way. Each driver now writes its own report: the checker path emits the same `{summary, entries}` schema as the plain path (so existing parsers are unaffected), with the chain view attached under a new `chain` key — trusted upgrades never reach the checker, so `entries` alone under-reports the input set, and the `chain` block is what accounts for every entry and records which were skipped as upgrades.
+- **`--strict` always exited 0 under `--resolve-first`** (#52): a CI gate on the strict exit code passed regardless of how many problematic entries were found. The chain path now applies the same gate as the plain checker — only positive-evidence problems fail, with `--strict-warn-cnv` opting into failing on abstentions.
+- **`BIBTEX_CHECK_STRICT=1` ignored when chaining** (#52): the env-var form of `--strict` never reached the chain, which reads strictness off the checker arg namespace.
+
 ## [1.5.0] - 2026-07-20
 
 Resolve→check chaining with a non-compensatory trust gate, OpenAlex premium API-key support, and a thread-safety fix in the adaptive rate limiter.
