@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-07-22
+
+Bibliographies outside the anglophone-ML mainstream no longer mismatch themselves.
+
+A 192-entry Hungarian telecom bibliography flagged 41% of its entries as problematic; most of those flags were the checker's fault, in defects invisible to an ML-conference corpus. On a held-out set of 44 independently built, DOI-verified valid entries, the false-positive rate falls from **50.0% to 2.3%** (verified 45.5% → 70.5%), with 21 entries fixed and none moving into a problematic status.
+
+Upgrade note: verdicts change for entries carrying `howpublished`, `editor`, publisher-series venues, accented names, `@proceedings` or theses. If you gate CI on `bibtex-check --strict`, expect fewer flags on such bibliographies. The given-name substitution detector is unchanged.
+
 ### Fixed
 
 - **A list-valued OpenReview venue crashed the check and silently dropped the entry.** OpenReview returns `venue`/`venueid` as a list on some notes, and the raw value reached `is_preprint_venue`, raising `'list' object has no attribute 'lower'`. The per-entry handler swallowed it, so the entry vanished from the report — worse than a wrong verdict, because nothing signalled the gap. Both the acceptance classifier and the record converter now coerce the field to its first usable string, and the CoRR/preprint gate still applies after coercion.
