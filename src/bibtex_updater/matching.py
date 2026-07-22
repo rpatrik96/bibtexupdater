@@ -903,20 +903,29 @@ _SERIES_MARKERS: tuple[str, ...] = (
 #: ``spotlight``, ``demo``, ``abstract``. Those name a TRACK within one venue,
 #: not a venue, and :func:`_strip_track_decorations` already removes them so
 #: ``ICML 2023 poster`` still confirms a claimed ``ICML 2023``.
-_SUBSUMPTION_BLOCKING_TOKENS: frozenset[str] = frozenset(
+#: Tokens naming a SEPARATE VOLUME of the same event (the companion/adjunct
+#: proceedings). These never name a venue on their own, so their presence on one
+#: side alone always means two different publications.
+_DISTINCT_VOLUME_TOKENS: frozenset[str] = frozenset({"companion", "adjunct", "supplement"})
+
+#: Tokens naming a satellite EVENT. Unlike the volume markers above, a workshop
+#: or tutorial is a venue in its own right and is routinely cited as one, so
+#: these need the added-topic test in :func:`adds_satellite_marker` rather than
+#: an unconditional block.
+_SATELLITE_EVENT_TOKENS: frozenset[str] = frozenset(
     {
         "workshop",
         "workshops",
-        "companion",
         "tutorial",
         "tutorials",
         "doctoral",
         "consortium",
         "satellite",
         "colocated",
-        "adjunct",
     }
 )
+
+_SUBSUMPTION_BLOCKING_TOKENS: frozenset[str] = _DISTINCT_VOLUME_TOKENS | _SATELLITE_EVENT_TOKENS
 
 #: Fewer tokens than this cannot establish venue identity on their own
 #: ("Automation" must not subsume "International Conference on Robotics and
@@ -974,17 +983,68 @@ def normalize_volume_title(title: str) -> str:
     return _normalize_venue_for_matching(normalized)
 
 
-def adds_satellite_marker(venue_a: str, venue_b: str) -> bool:
-    """True when exactly one side is marked as a satellite event.
+#: Generic venue-name scaffolding. Present in most conference names and
+#: therefore carrying no topical information -- what remains after removing
+#: these is what actually distinguishes one event from another.
+_VENUE_BOILERPLATE_TOKENS: frozenset[str] = frozenset(
+    {
+        "international",
+        "national",
+        "annual",
+        "joint",
+        "ieee",
+        "acm",
+        "ifip",
+        "usenix",
+        "european",
+        "asian",
+        "conference",
+        "symposium",
+        "congress",
+        "meeting",
+        "proceedings",
+        "on",
+        "the",
+        "of",
+        "in",
+        "and",
+        "for",
+        "at",
+        "st",
+        "nd",
+        "rd",
+        "th",
+    }
+)
 
-    A workshop/companion/doctoral-consortium volume shares almost every token
-    with its parent conference, so fuzzy similarity alone rates them a match.
-    They are different venues, and only an asymmetry in these markers reveals it
-    -- when BOTH sides are workshops, the markers say nothing either way.
+
+def adds_satellite_marker(venue_a: str, venue_b: str) -> bool:
+    """True when one side is a SATELLITE of the other, not merely longer.
+
+    A workshop shares almost every token with its parent conference, so fuzzy
+    similarity alone rates them a match ("ICML Workshop on Foundation Models" vs
+    "ICML"). But a workshop is also a venue in its own right, and indexes
+    routinely shorten ITS name too ("International Workshop on IP Operations and
+    Management" stored as "IP Operations and Management") -- treating that as a
+    different venue is the same false positive in reverse.
+
+    The discriminator is whether the longer side adds substantive TOPIC words
+    beyond the marker and generic scaffolding. "Foundation Models" is a distinct
+    event; "International ... on" is boilerplate around the same one. When both
+    sides carry the marker it says nothing either way.
     """
-    marked_a = bool(set(venue_a.split()) & _SUBSUMPTION_BLOCKING_TOKENS)
-    marked_b = bool(set(venue_b.split()) & _SUBSUMPTION_BLOCKING_TOKENS)
-    return marked_a != marked_b
+    tokens_a, tokens_b = set(venue_a.split()), set(venue_b.split())
+    # A companion/adjunct volume is a different publication of the same event,
+    # whatever else the names share -- no topic test applies.
+    if bool(tokens_a & _DISTINCT_VOLUME_TOKENS) != bool(tokens_b & _DISTINCT_VOLUME_TOKENS):
+        return True
+    marked_a = bool(tokens_a & _SATELLITE_EVENT_TOKENS)
+    marked_b = bool(tokens_b & _SATELLITE_EVENT_TOKENS)
+    if marked_a == marked_b:
+        return False
+    longer, shorter = (tokens_a, tokens_b) if marked_a else (tokens_b, tokens_a)
+    added_topic = (longer - shorter) - _SUBSUMPTION_BLOCKING_TOKENS - _VENUE_BOILERPLATE_TOKENS
+    return bool(added_topic)
 
 
 def venue_name_subsumes(venue_a: str, venue_b: str) -> bool:
@@ -1008,7 +1068,10 @@ def venue_name_subsumes(venue_a: str, venue_b: str) -> bool:
         return False
     if " ".join(shorter) not in " ".join(longer):
         return False
-    return not (set(longer) - set(shorter)) & _SUBSUMPTION_BLOCKING_TOKENS
+    # Same discriminator as :func:`adds_satellite_marker`: only a longer name
+    # that adds real TOPIC words names a different (satellite) event. Extra
+    # boilerplate around the marker is index truncation of the SAME venue.
+    return not adds_satellite_marker(" ".join(longer), " ".join(shorter))
 
 
 #: Hosting-*platform* markers. A record whose venue is only the platform name

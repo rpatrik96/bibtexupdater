@@ -151,6 +151,28 @@ class TestSubsumptionGuards:
         result = venues_match("International Conference on Robotics and Automation", "Automation")
         assert result.outcome is not MatchOutcome.MATCH
 
+    def test_workshop_whose_own_name_was_shortened_still_matches(self):
+        """A workshop is a venue too: dropping "International Workshop on" from
+        ITS OWN name is index truncation, not a satellite/parent confusion.
+
+        The discriminator is whether the longer side adds substantive TOPIC
+        words beyond the marker and boilerplate. "ICML Workshop on Foundation
+        Models" adds "foundation models" -- a different event. "International
+        Workshop on IP Operations and Management" adds nothing but boilerplate.
+        """
+        result = venues_match(
+            "International Workshop on IP Operations and Management",
+            "IP Operations and Management",
+        )
+        assert result.outcome is MatchOutcome.MATCH
+
+    def test_symposium_prefix_truncation_still_matches(self):
+        result = venues_match(
+            "International Workshop on Quality of Service",
+            "Quality of Service",
+        )
+        assert result.outcome is MatchOutcome.MATCH
+
     def test_unrelated_venues_still_mismatch(self):
         result = venues_match("Nature", "Science")
         assert result.outcome is MatchOutcome.MISMATCH
