@@ -83,6 +83,35 @@ Author handling: sources return authors in as-published order, so author-order d
 
 `hallucinated` is reserved for positive-evidence signals; a merely weak title-search match **abstains** as `not_found` rather than asserting fabrication.
 
+### What `not_found` does and does not assert
+
+`not_found` and `unconfirmed` share the could-not-verify bucket, but they are **not interchangeable**, and integrations must not treat them as such.
+
+| | `unconfirmed` | `not_found` |
+|---|---|---|
+| meaning | a record was found; some claimed field could not be confirmed | no matching record was found |
+| `p_valid` | 0.50 — neutral | **0.35 — negative polarity** |
+| how integrations read it | abstention | **commonly mapped to "hallucinated"** |
+
+`not_found` says *this tool searched its sources and found nothing*. It does **not** say the reference is fabricated. But because it carries negative polarity, downstream consumers routinely collapse it into a hallucination label — the HALLMARK harness, for instance, maps `not_found` → `HALLUCINATED` unless `coverage_incomplete` is set. Anything scoring or gating on this output inherits that reading, so state your own policy deliberately rather than letting the default decide it for you.
+
+The distinction bites hardest on **document classes the databases structurally never index**: dissertations, journal front matter (editorials, guest columns), and national-language work. A miss there carries no information about whether the work exists. Two concrete cases:
+
+- Enumerating every DOI under one journal's ISSN returns 300 records, all `type: journal-article` — its editorials are published but never deposited, so no lookup can ever confirm them.
+- Crossref/OpenAlex/DBLP/S2 do not index PhD theses; dissertations live in institutional and national repositories.
+
+For that reason `@phdthesis`/`@mastersthesis` abstain as `unconfirmed` (neutral) rather than `not_found` when the title does not confirm. Positive evidence still flags: DOI, year and arXiv-ID validation all run before this point.
+
+**Opting into the stricter policy.** If you *want* a clean exhaustive miss to count against an entry, use the existing strict flags rather than reinterpreting the status yourself:
+
+```bash
+bibtex-check refs.bib --strict --strict-warn-cnv    # exit 4 on could-not-verify too
+```
+
+`--strict-warn-cnv` promotes both `not_found` and `unconfirmed` to the visible fourth category `strict_warn_cnv`, so CI fails on entries the tool could not anchor. Default mode leaves the three-way verdict unchanged.
+
+Always check `coverage_incomplete` first: a `not_found` carrying that flag was reached while a source errored or was throttled, so it is not an exhaustive miss at all — re-run after a cooldown before drawing any conclusion.
+
 ## Status Codes
 
 | Status | Bucket | Description |

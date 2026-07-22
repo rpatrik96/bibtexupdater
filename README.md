@@ -237,7 +237,7 @@ python scripts/eval_hallmark.py --split /path/to/hallmark/data/v1.0/test_public.
 - **Multi-source validation**: Crossref, OpenAlex, DBLP, OpenReview, Semantic Scholar
 - **Detailed mismatch detection**: Title, author, year, venue comparisons
 - **Integrity checks**: DOI- and arXiv-ID-target consistency, ID-anchored author fabrication, chimeric-title detection
-- **Hallucination detection**: Reserves `hallucinated` for positive evidence (fabricated DOI, future/invalid year, ID misattribution); abstains (`not_found`) on weak matches
+- **Hallucination detection**: Reserves `hallucinated` for positive evidence (fabricated DOI, future/invalid year, ID misattribution); abstains (`not_found`) on weak matches. `not_found` means "the sources queried do not know this reference", not "this reference is fabricated" — but it carries negative polarity (`p_valid` 0.35) and integrations commonly map it to a hallucination label, so decide that policy deliberately ([what `not_found` does and does not assert](docs/REFERENCE_FACT_CHECKER.md#what-not_found-does-and-does-not-assert))
 - **Structured reports**: JSON and JSONL output formats
 - **CI/CD integration**: Strict mode with exit codes for automation
 
