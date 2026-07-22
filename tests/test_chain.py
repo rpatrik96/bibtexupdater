@@ -7,10 +7,12 @@ from a bibliographic database, so re-verifying it is redundant ("clean bib, fast
 
 from __future__ import annotations
 
+import json
 import logging
 from types import SimpleNamespace
 
-from bibtex_updater.chain import build_chain_report, select_entries_to_check
+import bibtex_updater.chain as chain_mod
+from bibtex_updater.chain import ChainResult, build_chain_report, select_entries_to_check
 from bibtex_updater.updater import ProcessResult
 
 
@@ -264,3 +266,153 @@ class TestArgBridging:
         assert resolve_args.rate_limit == 25
         assert resolve_args.max_workers == 5
         assert _default_resolved_out(["refs.bib"]) == "refs.resolved.bib"
+
+
+class _FakeProcessor:
+    """Stands in for FactCheckProcessor: only the two report hooks are exercised."""
+
+    def __init__(self, problematic: int = 0, warn_cnv: int = 0):
+        self._problematic = problematic
+        self._warn_cnv = warn_cnv
+
+    def generate_summary(self, results):
+        return {
+            "total": len(results),
+            "problematic_count": self._problematic,
+            "status_counts": {"strict_warn_cnv": self._warn_cnv},
+        }
+
+    def generate_json_report(self, results):
+        return {
+            "summary": self.generate_summary(results),
+            "entries": [{"key": r.entry_key, "status": r.status} for r in results],
+        }
+
+
+def _bib(tmp_path, key: str = "a"):
+    path = tmp_path / "refs.bib"
+    path.write_text(f"@article{{{key}, title={{Some title}}, author={{Doe, Jane}}, year={{2020}}}}\n")
+    return path
+
+
+def _stub_chain(monkeypatch, *, processor, check_results=(), results=None):
+    """Replace run_chain so the drivers are tested without network or resolver work."""
+    results = results or [_result("a", "no_change")]
+
+    def fake_run_chain(entries, resolve_args, logger, *, check_args):
+        return ChainResult(
+            results=results,
+            cleaned_entries=[r.updated for r in results],
+            check_results=list(check_results),
+            report=build_chain_report(results, list(check_results)),
+            processor=processor,
+        )
+
+    monkeypatch.setattr(chain_mod, "run_chain", fake_run_chain)
+
+
+class TestChainReportPersistence:
+    """A chain run must honor the same --report/--jsonl contract as the plain CLI.
+
+    The drivers return before their CLI's report-writing tail, so every persistence
+    obligation has to be discharged inside the driver itself.
+    """
+
+    def test_resolve_first_writes_the_json_report(self, tmp_path, monkeypatch):
+        from bibtex_updater.chain import run_check_resolve_first
+        from bibtex_updater.fact_checker import build_parser
+
+        bib, report = _bib(tmp_path), tmp_path / "check.json"
+        checks = [SimpleNamespace(entry_key="a", status="verified")]
+        _stub_chain(monkeypatch, processor=_FakeProcessor(), check_results=checks)
+
+        args = build_parser().parse_args([str(bib), "--resolve-first", "--report", str(report), "--no-cache"])
+        assert run_check_resolve_first(args, logging.getLogger("t")) == 0
+
+        assert report.exists(), "--report was silently dropped in resolve-first mode"
+        doc = json.loads(report.read_text())
+        assert doc["entries"][0]["key"] == "a"
+        assert doc["summary"]["total"] == 1
+        # The chain view records what the checker never saw (trusted upgrades).
+        assert doc["chain"]["summary"]["total"] == 1
+
+    def test_resolve_first_without_report_writes_nothing(self, tmp_path, monkeypatch):
+        from bibtex_updater.chain import run_check_resolve_first
+        from bibtex_updater.fact_checker import build_parser
+
+        bib = _bib(tmp_path)
+        _stub_chain(monkeypatch, processor=_FakeProcessor())
+
+        args = build_parser().parse_args([str(bib), "--resolve-first", "--no-cache"])
+        assert run_check_resolve_first(args, logging.getLogger("t")) == 0
+        assert not list(tmp_path.glob("*.json"))
+
+    def test_resolve_first_strict_exits_4_on_problematic(self, tmp_path, monkeypatch):
+        from bibtex_updater.chain import run_check_resolve_first
+        from bibtex_updater.fact_checker import build_parser
+
+        bib = _bib(tmp_path)
+        checks = [SimpleNamespace(entry_key="a", status="hallucinated")]
+        _stub_chain(monkeypatch, processor=_FakeProcessor(problematic=1), check_results=checks)
+
+        args = build_parser().parse_args([str(bib), "--resolve-first", "--strict", "--no-cache"])
+        assert run_check_resolve_first(args, logging.getLogger("t")) == 4
+
+    def test_resolve_first_strict_exits_0_when_clean(self, tmp_path, monkeypatch):
+        from bibtex_updater.chain import run_check_resolve_first
+        from bibtex_updater.fact_checker import build_parser
+
+        bib = _bib(tmp_path)
+        _stub_chain(monkeypatch, processor=_FakeProcessor(problematic=0))
+
+        args = build_parser().parse_args([str(bib), "--resolve-first", "--strict", "--no-cache"])
+        assert run_check_resolve_first(args, logging.getLogger("t")) == 0
+
+    def test_resolve_first_strict_warn_cnv_exits_4(self, tmp_path, monkeypatch):
+        from bibtex_updater.chain import run_check_resolve_first
+        from bibtex_updater.fact_checker import build_parser
+
+        bib = _bib(tmp_path)
+        _stub_chain(monkeypatch, processor=_FakeProcessor(warn_cnv=2))
+
+        args = build_parser().parse_args([str(bib), "--resolve-first", "--strict", "--strict-warn-cnv", "--no-cache"])
+        assert run_check_resolve_first(args, logging.getLogger("t")) == 4
+
+    def test_then_check_writes_the_resolver_jsonl_report(self, tmp_path, monkeypatch):
+        from bibtex_updater.chain import run_update_then_check
+        from bibtex_updater.updater import build_arg_parser
+
+        bib, report = _bib(tmp_path), tmp_path / "resolve.jsonl"
+        out = tmp_path / "out.bib"
+        _stub_chain(monkeypatch, processor=_FakeProcessor(), results=[_result("a", "upgraded")])
+
+        args = build_arg_parser().parse_args(
+            [str(bib), "--then-check", "-o", str(out), "--report", str(report), "--no-cache"]
+        )
+        assert run_update_then_check(args, logging.getLogger("t")) == 0
+
+        assert report.exists(), "--report was silently dropped in then-check mode"
+        lines = [json.loads(ln) for ln in report.read_text().splitlines() if ln.strip()]
+        assert [ln["key_old"] for ln in lines] == ["a"]
+        assert lines[0]["action"] == "upgraded"
+
+
+class TestStrictEnvPropagation:
+    """BIBTEX_CHECK_STRICT must reach the chain path, not just the plain one."""
+
+    def test_env_strict_is_folded_into_args_before_chaining(self, tmp_path, monkeypatch):
+        import bibtex_updater.fact_checker as fc
+
+        bib = _bib(tmp_path)
+        seen = {}
+
+        def fake_driver(check_args, logger):
+            seen["strict"] = check_args.strict
+            return 0
+
+        monkeypatch.setattr(chain_mod, "run_check_resolve_first", fake_driver)
+        monkeypatch.setenv("BIBTEX_CHECK_STRICT", "1")
+        monkeypatch.setattr("sys.argv", ["bibtex-check", str(bib), "--resolve-first", "--no-cache"])
+        fc.main()
+
+        assert seen["strict"] is True

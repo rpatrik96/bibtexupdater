@@ -15,6 +15,7 @@ could not resolve, failures -- still go to the checker, where verification matte
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from dataclasses import dataclass, field
@@ -220,6 +221,9 @@ class ChainResult:
     cleaned_entries: list[dict[str, Any]] = field(default_factory=list)
     check_results: list[Any] = field(default_factory=list)
     report: dict[str, Any] = field(default_factory=dict)
+    # The checker processor that produced ``check_results``. The drivers need it to
+    # emit the same JSON report and strict verdict as the plain checker CLI.
+    processor: Any = None
 
 
 def run_chain(
@@ -322,6 +326,7 @@ def run_chain(
         cleaned_entries=cleaned_entries,
         check_results=check_results,
         report=report,
+        processor=processor,
     )
 
 
@@ -434,6 +439,83 @@ def _print_report(report: dict[str, Any], logger: logging.Logger) -> None:
             logger.warning("  %s: %s", e.get("key"), e.get("check"))
 
 
+def _write_check_report(check_args: Any, result: ChainResult, logger: logging.Logger) -> None:
+    """Persist the checker's JSON report, matching the plain ``bibtex-check`` schema.
+
+    Both chain drivers return before ``fact_checker.main``'s report-writing tail, so
+    a chain run has to discharge ``--report`` itself or the flag is silently dropped.
+    """
+    report_path = getattr(check_args, "report", None)
+    if not report_path:
+        return
+
+    processor = result.processor
+    doc: dict[str, Any] = (
+        processor.generate_json_report(result.check_results)
+        if processor is not None
+        else {"summary": {}, "entries": []}
+    )
+    # Trusted upgrades never reach the checker, so ``entries`` covers only the
+    # verified subset. The chain view is attached alongside it so the report still
+    # accounts for every input entry and says which ones were skipped as upgrades.
+    doc["chain"] = result.report
+    try:
+        with open(report_path, "w", encoding="utf-8") as fh:
+            json.dump(doc, fh, indent=2, ensure_ascii=False)
+    except OSError as e:
+        logger.error("Failed to write JSON report %s: %s", report_path, e)
+        return
+    logger.info("JSON report written to %s", report_path)
+
+
+def _strict_exit_code(check_args: Any, result: ChainResult, logger: logging.Logger) -> int:
+    """Mirror the plain checker's strict gate: only positive-evidence problems fail.
+
+    Abstentions (could-not-verify) never fail on their own; ``--strict-warn-cnv``
+    opts into failing on them too.
+    """
+    if not getattr(check_args, "strict", False):
+        return 0
+    processor = result.processor
+    if processor is None:
+        return 0
+
+    from .fact_checker import FactCheckStatus
+
+    summary = processor.generate_summary(result.check_results)
+    problem_count = summary.get("problematic_count", 0)
+    if problem_count > 0:
+        logger.warning("Strict mode: %d PROBLEMATIC entries (positive evidence of a problem)", problem_count)
+        return 4
+    cnv_warn_count = summary.get("status_counts", {}).get(FactCheckStatus.STRICT_WARN_CNV.value, 0)
+    if getattr(check_args, "strict_warn_cnv", False) and cnv_warn_count > 0:
+        logger.warning(
+            "Strict mode (warn-cnv): %d STRICT_WARN_CNV entries (could-not-verify, opt-in fail)",
+            cnv_warn_count,
+        )
+        return 4
+    return 0
+
+
+def _write_update_report(update_args: Any, result: ChainResult, logger: logging.Logger) -> None:
+    """Persist the resolver's JSONL original->updated report (``bibtex-update --report``)."""
+    report_path = getattr(update_args, "report", None)
+    if not report_path:
+        return
+
+    from .updater import write_report_line
+
+    try:
+        with open(report_path, "w", encoding="utf-8") as fh:
+            for res in result.results:
+                if res is not None:
+                    write_report_line(fh, res)
+    except OSError as e:
+        logger.error("Failed to write JSONL report %s: %s", report_path, e)
+        return
+    logger.info("JSONL report written to %s", report_path)
+
+
 def run_update_then_check(update_args: Any, logger: logging.Logger) -> int:
     """Driver for ``bibtex-update --then-check``: upgrade, write clean bib, verify the rest."""
     entries = _load_entries(list(getattr(update_args, "inputs", []) or []), logger)
@@ -453,6 +535,7 @@ def run_update_then_check(update_args: Any, logger: logging.Logger) -> int:
         logger.warning("No -o/--output or --in-place given; cleaned bib not written")
 
     _print_report(result.report, logger)
+    _write_update_report(update_args, result, logger)
     return 0
 
 
@@ -472,4 +555,7 @@ def run_check_resolve_first(check_args: Any, logger: logging.Logger) -> int:
     _write_bib(result.cleaned_entries, out_path, logger)
 
     _print_report(result.report, logger)
-    return 0
+    _write_check_report(check_args, result, logger)
+    if getattr(check_args, "jsonl", None):
+        logger.info("JSONL report streamed to %s (%d entries)", check_args.jsonl, len(result.check_results))
+    return _strict_exit_code(check_args, result, logger)
