@@ -129,6 +129,68 @@ class TestVenueSubsumption:
         assert result.outcome is MatchOutcome.MATCH
 
 
+class TestBareAcronymVenueMatch:
+    """An index storing only a conference acronym matches the entry's own
+    parenthetical declaration of that acronym.
+
+    Six of the seven residual ``venue_mismatch`` flags on the Varga run were the
+    same shape: the record's venue is the bare acronym (``CNSM``) while the entry
+    spells the name out and appends the acronym itself
+    (``... Network and Service Management (CNSM)``). The parenthetical is the
+    venue's OWN declaration of its shorthand, so matching the two reads that
+    declaration rather than guessing an acronym from initials. The subsumption
+    rule cannot reach these: a bare acronym is a single token, below
+    ``_MIN_SUBSUMPTION_TOKENS``.
+    """
+
+    def test_bare_acronym_matches_entry_parenthetical(self):
+        result = venues_match(
+            "2023 19th International Conference on Network and Service Management (CNSM)",
+            "CNSM",
+        )
+        assert result.outcome is MatchOutcome.MATCH
+
+    def test_bare_acronym_match_is_symmetric(self):
+        result = venues_match(
+            "CNSM",
+            "2023 19th International Conference on Network and Service Management (CNSM)",
+        )
+        assert result.outcome is MatchOutcome.MATCH
+
+    def test_acronym_with_trailing_year_in_parenthetical(self):
+        result = venues_match(
+            "2024 IEEE/IFIP Network Operations and Management Symposium (NOMS 2024)",
+            "NOMS",
+        )
+        assert result.outcome is MatchOutcome.MATCH
+
+    def test_wrong_bare_acronym_still_mismatches(self):
+        # A bare acronym the entry does NOT declare is a genuine mismatch.
+        result = venues_match(
+            "2023 19th International Conference on Network and Service Management (CNSM)",
+            "NOMS",
+        )
+        assert result.outcome is MatchOutcome.MISMATCH
+
+    def test_two_letter_acronym_too_ambiguous_to_match_bare(self):
+        # Two-letter acronyms (IM, ML, IP...) collide across unrelated venues, so
+        # a BARE two-letter token must not match on the parenthetical alone. The
+        # spelled-out form is still covered by subsumption (see TestVenueSubsumption).
+        result = venues_match(
+            "International Symposium on Foobar Management (IM)",
+            "IM",
+        )
+        assert result.outcome is not MatchOutcome.MATCH
+
+    def test_acronym_rule_does_not_override_satellite_guard(self):
+        # A workshop declaring the parent's acronym is still a different venue.
+        result = venues_match(
+            "International Conference on Machine Learning Workshop (ICML)",
+            "ICML",
+        )
+        assert result.outcome is not MatchOutcome.MATCH
+
+
 class TestSubsumptionGuards:
     """Subsumption must not merge genuinely different venues."""
 

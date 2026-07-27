@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A venue stored as a bare acronym read as a different venue.** Indexes sometimes return only a conference's acronym (`CNSM`, `NOMS`, `DATE`) while the entry spells the name out and appends the acronym itself — `2023 19th International Conference on Network and Service Management (CNSM)`. The acronym is one token, below the subsumption length floor, so neither canonicalization nor name-containment reached it and the entry mismatched its own venue. A bare acronym on one side that the other side declares in its own parentheses is now the same venue: reading the entry's declared shorthand, not guessing an acronym from initials. Restricted to acronyms of three or more characters (`IM`, `ML` collide across unrelated venues), and applied after the satellite-event guard, so a workshop that names its parent's acronym is still a distinct venue.
+
 ## [1.6.0] - 2026-07-22
 
 Bibliographies outside the anglophone-ML mainstream no longer mismatch themselves.

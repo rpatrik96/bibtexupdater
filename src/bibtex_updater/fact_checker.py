@@ -62,6 +62,7 @@ from bibtex_updater.matching import (
     normalize_volume_title,
     symmetric_author_match,
     title_edit_distance,
+    venue_acronym_matches,
     venue_name_subsumes,
     volume_title_subsumed,
 )
@@ -1840,8 +1841,12 @@ def venues_match(venue_a: str, venue_b: str, threshold: float = 0.70) -> VenueMa
             return VenueMatchResult(MatchOutcome.MATCH, score)
         return VenueMatchResult(MatchOutcome.MISMATCH, score)
     # One name containing the other is a shortened index entry, not a different
-    # venue -- the fuzzy score is low only because the lengths differ.
-    if venue_name_subsumes(match_a, match_b):
+    # venue -- the fuzzy score is low only because the lengths differ. Likewise a
+    # bare acronym the entry itself declares parenthetically ("CNSM" vs
+    # "... Service Management (CNSM)") is the same venue stored short; the RAW
+    # strings are used because normalization strips the case and parentheses the
+    # declaration depends on.
+    if venue_name_subsumes(match_a, match_b) or venue_acronym_matches(venue_a, venue_b):
         return VenueMatchResult(MatchOutcome.MATCH, max(score, threshold))
     return VenueMatchResult(MatchOutcome.MISMATCH, score)
 
