@@ -1097,6 +1097,62 @@ def venue_name_subsumes(venue_a: str, venue_b: str) -> bool:
     return not adds_satellite_marker(" ".join(longer), " ".join(shorter))
 
 
+#: A parenthetical acronym a venue declares for itself: an uppercase run of
+#: >= 3 chars, optionally trailed by the repeated year -- ``(CNSM)``,
+#: ``(NOMS 2024)``, ``(ICT4S)``. Two-letter parentheticals are excluded on
+#: purpose: acronyms that short (IM, ML, IP) collide across unrelated venues and
+#: cannot establish identity on their own.
+_PARENTHETICAL_ACRONYM_RE = re.compile(r"\(\s*([A-Z][A-Z0-9]{2,})\b[^)]*\)")
+
+#: A venue string that is a single acronym-like token (>= 3 chars). The API
+#: casing is unreliable, so lowercase is accepted here -- the all-caps
+#: parenthetical on the OTHER side is what anchors the match.
+_BARE_ACRONYM_RE = re.compile(r"^[A-Za-z][A-Za-z0-9]{2,}$")
+
+
+def _declared_acronyms(venue: str) -> set[str]:
+    """The uppercase acronyms a venue declares in its own parentheses."""
+    return {m.group(1).lower() for m in _PARENTHETICAL_ACRONYM_RE.finditer(venue)}
+
+
+def _bare_acronym(venue: str) -> str | None:
+    """The venue reduced to a single acronym token, lowercased, or None.
+
+    A record whose whole venue string is one >= 3-char token once the year is
+    stripped ("CNSM", "2024 NOMS") is a bare acronym; a multi-word name is not.
+    """
+    stripped = re.sub(r"\b(?:19|20)\d{2}\b", " ", venue)
+    tokens = stripped.split()
+    if len(tokens) != 1:
+        return None
+    token = tokens[0]
+    return token.lower() if _BARE_ACRONYM_RE.match(token) else None
+
+
+def venue_acronym_matches(venue_a: str, venue_b: str) -> bool:
+    """True when one venue is a bare acronym the OTHER declares parenthetically.
+
+    Indexes sometimes store only a conference's acronym ("CNSM") while the entry
+    spells the name out and appends the acronym itself ("... Network and Service
+    Management (CNSM)"). The parenthetical is the venue's OWN declaration of its
+    shorthand, so matching the two reads that declaration -- it does not guess an
+    acronym from initials. A bare acronym is one token, below
+    :data:`_MIN_SUBSUMPTION_TOKENS`, so :func:`venue_name_subsumes` cannot reach
+    it; this closes that gap without weakening the length guard. Restricted to
+    >= 3-char acronyms, since shorter ones collide across unrelated venues.
+
+    Purely additive: it only turns a would-be MISMATCH into a MATCH, never the
+    reverse, and it runs after the satellite-marker guard, so a workshop that
+    declares its parent's acronym is still rejected.
+    """
+    bare_a, bare_b = _bare_acronym(venue_a), _bare_acronym(venue_b)
+    if bare_a and bare_a in _declared_acronyms(venue_b):
+        return True
+    if bare_b and bare_b in _declared_acronyms(venue_a):
+        return True
+    return False
+
+
 #: Hosting-*platform* markers. A record whose venue is only the platform name
 #: (OpenReview hosts ICLR, NeurIPS, TMLR, and many workshops) says nothing about
 #: the published venue, exactly like a preprint server -- so a venue comparison
