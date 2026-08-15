@@ -129,6 +129,23 @@ class TestDroppedKeySafetyNet:
         assert "broken_entry" in dropped
         assert "stdarticle2022" not in dropped
 
+    def test_missing_key_comma_is_detected_as_dropped(self):
+        raw = ARTICLE_ENTRY + "@article{missing_comma title = {Exact Value}}\n"
+        db = BibLoader().loads(raw)
+        parsed_ids = {e.get("ID") for e in db.entries}
+
+        assert detect_dropped_keys(raw, parsed_ids) == ["missing_comma"]
+
+    @pytest.mark.parametrize(
+        "declaration",
+        [
+            "@article{ title = {Missing Key}}\n",
+            '@string{journal_name = "Journal of Tests"}\n',
+        ],
+    )
+    def test_non_entry_declarations_do_not_invent_keys(self, declaration):
+        assert detect_dropped_keys(declaration, set()) == []
+
     def test_commented_out_entry_is_not_a_false_positive(self):
         """A full-line ``%``-commented ``@article{...}`` must NOT be reported dropped."""
         raw = ARTICLE_ENTRY + "% @article{commented_out, title = {Disabled}, year = {2020}}\n"

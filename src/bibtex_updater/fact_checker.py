@@ -17,6 +17,7 @@ It outputs detailed reports categorizing mismatches:
 - VENUE_MISMATCH: Journal/venue differs
 - PARTIAL_MATCH: Fallback for an unrecognized mismatched field
 - API_ERROR: Errors during API queries
+- PARSE_ERROR: A declared entry could not be read safely
 
 Usage:
     python reference_fact_checker.py input.bib --report report.json
@@ -41,7 +42,6 @@ from enum import Enum
 from typing import Any
 from urllib.parse import urlparse
 
-import bibtexparser
 import httpx
 from rapidfuzz.fuzz import token_sort_ratio
 
@@ -81,6 +81,7 @@ from bibtex_updater.sources import (
     openreview_note_to_candidate_record,
     select_top_k_by_title_similarity,
 )
+from bibtex_updater.updater import BibLoader, detect_dropped_keys
 from bibtex_updater.utils import (
     # API endpoints
     ARXIV_API,
@@ -297,6 +298,7 @@ class FactCheckStatus(Enum):
 
     # General
     SKIPPED = "skipped"  # Entry type not verifiable
+    PARSE_ERROR = "parse_error"  # Declared entry could not be read safely
 
 
 # Fix B: statuses that mean "could not verify" (abstention) rather than
@@ -848,15 +850,15 @@ class EntryClassifier:
                 reason="Contains working paper indicators",
             )
 
-        # Check for web reference (misc with URL in non-academic domain)
+        # Check for web reference (web-oriented type with URL in non-academic domain)
         url = self._extract_url(entry)
-        if url and entry_type == "misc":
+        if url and entry_type in ("misc", "online", "electronic"):
             if not self._is_academic_url(url):
                 # Check if it looks like a preprint (has eprint/archiveprefix)
                 if not entry.get("eprint") and not entry.get("archiveprefix"):
                     return ClassificationResult(
                         category=EntryCategory.WEB_REFERENCE,
-                        reason="misc entry with non-academic URL",
+                        reason=f"{entry_type} entry with non-academic URL",
                         extracted_url=url,
                     )
 
@@ -5123,6 +5125,108 @@ class UnifiedFactChecker:
         return verifier.verify(entry, classification)
 
 
+# ------------- Parser Recovery -------------
+
+
+_ENTRY_BLOCK_BOUNDARY_RE = re.compile(r"(?m)(?=^[ \t]*@)")
+_ENTRY_BLOCK_HEADER_RE = re.compile(
+    r"\A[ \t]*@(?P<entry_type>\w+)\s*\{\s*(?P<key>[^,\s{}=]+)" r"(?P<separator>\s*,|\s+(?=[A-Za-z][\w-]*\s*=))"
+)
+
+
+@dataclass(frozen=True)
+class RecoveredBibEntry:
+    """A dropped entry recovered by source-preserving structural repair."""
+
+    entry: dict[str, Any]
+    repairs: tuple[str, ...]
+
+
+def _entry_block(raw_text: str, key: str) -> tuple[str, re.Match[str]] | None:
+    """Return the isolated source block and header for a declared key."""
+    for block in _ENTRY_BLOCK_BOUNDARY_RE.split(raw_text):
+        header = _ENTRY_BLOCK_HEADER_RE.match(block)
+        if header and header.group("key") == key:
+            return block, header
+    return None
+
+
+def _unescaped_brace_balance(text: str) -> int | None:
+    """Return unmatched opening braces, or ``None`` after an unmatched close."""
+    balance = 0
+    for index, char in enumerate(text):
+        if char not in "{}":
+            continue
+        backslashes = 0
+        cursor = index - 1
+        while cursor >= 0 and text[cursor] == "\\":
+            backslashes += 1
+            cursor -= 1
+        if backslashes % 2:
+            continue
+        balance += 1 if char == "{" else -1
+        if balance < 0:
+            return None
+    return balance
+
+
+def recover_dropped_entry(raw_text: str, key: str) -> RecoveredBibEntry | None:
+    """Conservatively repair and reparse one dropped entry's source block.
+
+    Recovery only inserts a missing comma between the citation key and first
+    field, or appends unmatched closing braces at the block boundary. It never
+    edits text inside a field value. A retry is accepted only when a fresh
+    parser returns exactly one entry with the same citation key.
+    """
+    isolated = _entry_block(raw_text, key)
+    if isolated is None:
+        return None
+    block, header = isolated
+    repaired = block
+    repairs: list[str] = []
+
+    separator = header.group("separator")
+    if "," not in separator:
+        key_end = header.end("key")
+        repaired = f"{repaired[:key_end]},{repaired[key_end:]}"
+        repairs.append("inserted missing comma after citation key")
+
+    brace_balance = _unescaped_brace_balance(repaired)
+    if brace_balance is None:
+        return None
+    if brace_balance:
+        repaired += "}" * brace_balance
+        repairs.append(f"appended {brace_balance} missing closing brace(s)")
+
+    if not repairs:
+        return None
+
+    try:
+        recovered = BibLoader().loads(repaired).entries
+    except Exception:
+        return None
+    if len(recovered) != 1 or recovered[0].get("ID") != key:
+        return None
+    return RecoveredBibEntry(entry=recovered[0], repairs=tuple(repairs))
+
+
+def _parse_error_result(path: str, key: str, raw_text: str) -> FactCheckResult:
+    """Build the report row for a declared entry that remains unreadable."""
+    isolated = _entry_block(raw_text, key)
+    entry_type = isolated[1].group("entry_type").lower() if isolated else "unknown"
+    return FactCheckResult(
+        entry_key=key,
+        entry_type=entry_type,
+        status=FactCheckStatus.PARSE_ERROR,
+        overall_confidence=0.0,
+        field_comparisons={},
+        best_match=None,
+        api_sources_queried=[],
+        api_sources_with_hits=[],
+        errors=[f"Could not safely parse declared entry '{key}' from {path}"],
+    )
+
+
 # ------------- Processor & Reporting -------------
 
 
@@ -5363,7 +5467,10 @@ class FactCheckProcessor:
         return primed
 
     def process_entries(
-        self, entries: list[dict[str, Any]], jsonl_path: str | None = None, max_workers: int = 8
+        self,
+        entries: list[dict[str, Any] | FactCheckResult],
+        jsonl_path: str | None = None,
+        max_workers: int = 8,
     ) -> list[FactCheckResult]:
         """Process multiple entries and return results (concurrent version).
 
@@ -5371,14 +5478,16 @@ class FactCheckProcessor:
         so partial results survive timeouts and crashes.
 
         Args:
-            entries: List of BibTeX entries to process
+            entries: BibTeX entries to check and precomputed report rows to retain
             jsonl_path: Optional path to write JSONL results as they complete
             max_workers: Number of concurrent workers (default: 8)
         """
 
+        parsed_entries = [entry for entry in entries if isinstance(entry, dict)]
+
         # P1.3: Batch DOI pre-resolution before main processing loop
-        self.logger.info("Pre-validating DOIs for %d entries...", len(entries))
-        pre_validated_dois = self._batch_validate_dois(entries)
+        self.logger.info("Pre-validating DOIs for %d entries...", len(parsed_entries))
+        pre_validated_dois = self._batch_validate_dois(parsed_entries)
         if pre_validated_dois:
             failed_count = sum(1 for valid in pre_validated_dois.values() if not valid)
             self.logger.info(
@@ -5390,14 +5499,14 @@ class FactCheckProcessor:
         # author recheck) hit the cache instead of each making a serial,
         # rate-limited round-trip. Verdict-neutral; failures fall back to the
         # existing per-entry fetch. (Mirrors _batch_validate_dois.)
-        warmed = self._batch_warm_crossref_records(entries)
+        warmed = self._batch_warm_crossref_records(parsed_entries)
         if warmed:
             self.logger.info("Pre-fetched Crossref records for %d DOIs", warmed)
 
         # Bulk S2 prefetch (API-key deployments): one /paper/batch POST primes
         # the cache the per-entry get_paper lookups read. Best-effort -- any
         # failure leaves the per-entry fetches to do their own work.
-        prefetched = self._batch_prefetch_s2_records(entries)
+        prefetched = self._batch_prefetch_s2_records(parsed_entries)
         if prefetched:
             self.logger.info("Pre-fetched %d Semantic Scholar records via /paper/batch", prefetched)
 
@@ -5410,30 +5519,34 @@ class FactCheckProcessor:
             if jsonl_path:
                 jsonl_file = open(jsonl_path, "a")  # noqa: SIM115
 
-            def _process_one(index: int, entry: dict[str, Any]) -> FactCheckResult:
+            def _process_one(index: int, entry: dict[str, Any] | FactCheckResult) -> FactCheckResult:
                 """Process a single entry and write to JSONL if configured."""
-                self.logger.info("Checking %d/%d: %s", index + 1, len(entries), entry.get("ID", "?"))
-                try:
-                    # Pass the batch DOI pre-validation results to both checker
-                    # types (UnifiedFactChecker forwards them to its academic
-                    # verifier). Duck-typed stand-ins keep the bare call.
-                    if isinstance(self.checker, FactChecker | UnifiedFactChecker):
-                        result = self.checker.check_entry(entry, pre_validated_dois=pre_validated_dois)
-                    else:
-                        result = self.checker.check_entry(entry)
-                except Exception as exc:
-                    self.logger.error("Exception checking entry %s: %s", entry.get("ID", "?"), exc)
-                    result = FactCheckResult(
-                        entry_key=entry.get("ID", "unknown"),
-                        entry_type=entry.get("ENTRYTYPE", "misc").lower(),
-                        status=FactCheckStatus.API_ERROR,
-                        overall_confidence=0.0,
-                        field_comparisons={},
-                        best_match=None,
-                        api_sources_queried=[],
-                        api_sources_with_hits=[],
-                        errors=[f"Exception: {exc}"],
-                    )
+                if isinstance(entry, FactCheckResult):
+                    self.logger.info("Recording %d/%d: %s", index + 1, len(entries), entry.entry_key)
+                    result = entry
+                else:
+                    self.logger.info("Checking %d/%d: %s", index + 1, len(entries), entry.get("ID", "?"))
+                    try:
+                        # Pass the batch DOI pre-validation results to both checker
+                        # types (UnifiedFactChecker forwards them to its academic
+                        # verifier). Duck-typed stand-ins keep the bare call.
+                        if isinstance(self.checker, FactChecker | UnifiedFactChecker):
+                            result = self.checker.check_entry(entry, pre_validated_dois=pre_validated_dois)
+                        else:
+                            result = self.checker.check_entry(entry)
+                    except Exception as exc:
+                        self.logger.error("Exception checking entry %s: %s", entry.get("ID", "?"), exc)
+                        result = FactCheckResult(
+                            entry_key=entry.get("ID", "unknown"),
+                            entry_type=entry.get("ENTRYTYPE", "misc").lower(),
+                            status=FactCheckStatus.API_ERROR,
+                            overall_confidence=0.0,
+                            field_comparisons={},
+                            best_match=None,
+                            api_sources_queried=[],
+                            api_sources_with_hits=[],
+                            errors=[f"Exception: {exc}"],
+                        )
                 results[index] = result
 
                 if jsonl_file:
@@ -5563,6 +5676,9 @@ class FactCheckProcessor:
             "could_not_verify_rate": abstained_count / len(results) if results else 0,
             "abstained_count": abstained_count,
             "problematic_count": sum(counts.get(s, 0) for s in problematic_statuses),
+            # The checker could not read these entries. This is neither a
+            # verification abstention nor evidence that the citation is wrong.
+            "parse_error_count": counts[FactCheckStatus.PARSE_ERROR.value],
             # Abstentions/API errors reached while sources errored or were
             # throttled: not clean exhaustive misses (re-run after cooldown).
             "coverage_incomplete_count": sum(1 for r in results if r.coverage_incomplete),
@@ -5791,7 +5907,7 @@ Examples:
             "preprint-twin year abstains), author-set (single-source single-extra "
             "flag), author order (no alphabetization escape), and silent author-list "
             "truncation (flagged as AUTHOR_TRUNCATED). Exit code 4 if any PROBLEMATIC "
-            "entries remain. Also settable via BIBTEX_CHECK_STRICT=1."
+            "or unparseable entries remain. Also settable via BIBTEX_CHECK_STRICT=1."
         ),
     )
     p.add_argument(
@@ -6151,13 +6267,28 @@ def main() -> int:
         return run_check_resolve_first(args, logger)
 
     # Load entries from all BibTeX files
-    entries = []
+    entries: list[dict[str, Any] | FactCheckResult] = []
     for path in args.bibfiles:
         try:
             with open(path, encoding="utf-8") as f:
-                db = bibtexparser.load(f)
-                entries.extend(db.entries)
-                logger.info("Loaded %d entries from %s", len(db.entries), path)
+                raw_text = f.read()
+            db = BibLoader().loads(raw_text)
+            parsed_ids = {entry.get("ID") for entry in db.entries if entry.get("ID")}
+            for key in detect_dropped_keys(raw_text, parsed_ids):
+                recovered = recover_dropped_entry(raw_text, key)
+                if recovered is not None:
+                    logger.warning(
+                        "Parser dropped declared entry '%s' from %s; repaired it by %s",
+                        key,
+                        path,
+                        "; ".join(recovered.repairs),
+                    )
+                    db.entries.append(recovered.entry)
+                    continue
+                logger.error("Could not safely recover declared entry '%s' from %s", key, path)
+                entries.append(_parse_error_result(path, key, raw_text))
+            entries.extend(db.entries)
+            logger.info("Loaded %d entries from %s", len(db.entries), path)
         except FileNotFoundError:
             logger.error("File not found: %s", path)
             return 1
@@ -6193,7 +6324,7 @@ def main() -> int:
         if count > 0:
             logger.info("  %s: %d", status.upper(), count)
 
-    # Three clearly distinct buckets (Fix B): VERIFIED, COULD NOT VERIFY
+    # Four clearly distinct buckets: VERIFIED, COULD NOT VERIFY
     # (abstained -- no matching record found, NOT evidence of fabrication), and
     # PROBLEMATIC (positive evidence of a problem). "Could not verify" must never
     # be lumped in with either "verified" or "hallucinated".
@@ -6201,6 +6332,7 @@ def main() -> int:
     verified_n = summary.get("verified_count", 0)
     abstained_n = summary.get("abstained_count", 0)
     problematic_n = summary.get("problematic_count", 0)
+    parse_error_n = summary.get("parse_error_count", 0)
     logger.info("Results by bucket:")
     logger.info(
         "  (1) VERIFIED:            %d  (%.1f%%)",
@@ -6226,6 +6358,11 @@ def main() -> int:
         "  (3) PROBLEMATIC:         %d  (%.1f%%)  -- positive evidence of a problem",
         problematic_n,
         (problematic_n / total * 100) if total else 0.0,
+    )
+    logger.info(
+        "  (4) PARSE ERRORS:        %d  (%.1f%%)  -- entry could not be read; citation validity unknown",
+        parse_error_n,
+        (parse_error_n / total * 100) if total else 0.0,
     )
     logger.info("Verified rate: %.1f%%", summary["verified_rate"] * 100)
     logger.info("Could-not-verify rate: %.1f%%", summary["could_not_verify_rate"] * 100)
@@ -6266,11 +6403,10 @@ def main() -> int:
 
     # Exit code
     if strict_mode:
-        # Fix B: only POSITIVE-evidence problems gate the exit code. Abstentions
-        # (could-not-verify) are reported on their own line and do NOT count as
-        # confirmed hallucinations, so they no longer fail strict mode -- unless
-        # the user opts into --strict-warn-cnv, in which case STRICT_WARN_CNV
-        # entries also fail CI.
+        # Positive-evidence problems and parse errors gate the exit code.
+        # Abstentions (could-not-verify) do not fail strict mode unless the user
+        # opts into --strict-warn-cnv, in which case STRICT_WARN_CNV entries also
+        # fail CI.
         problem_count = summary["problematic_count"]
         cnv_warn_count = summary["status_counts"].get(FactCheckStatus.STRICT_WARN_CNV.value, 0)
         if abstained_n > 0:
@@ -6278,6 +6414,12 @@ def main() -> int:
                 "Strict mode: %d could-not-verify entries (abstained; not counted as failures)",
                 abstained_n,
             )
+        if parse_error_n > 0:
+            logger.warning(
+                "Strict mode: %d parse error entries could not be checked",
+                parse_error_n,
+            )
+            return 4
         if problem_count > 0:
             logger.warning("Strict mode: %d PROBLEMATIC entries (positive evidence of a problem)", problem_count)
             return 4

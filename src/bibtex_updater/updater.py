@@ -3931,12 +3931,15 @@ def write_report_line(fh, res: ProcessResult, src_file: str | None = None) -> No
     fh.write(json.dumps(line, ensure_ascii=False) + "\n")
 
 
-# Matches a BibTeX entry header: @type{ key , ... — captures the citation key.
+# Matches a BibTeX entry header and captures the citation key. The separator may
+# be the required comma or whitespace followed by an unambiguous field assignment;
+# the latter lets the checker report and repair a missing key comma.
 # Anchored to the start of a logical line (optional leading whitespace only) so
 # the scan does not false-positive on (a) full-line ``%`` comments — the comment
 # marker precedes ``@`` on the line — or (b) a ``@type{key,`` substring sitting
-# inside a field value, which is never at column ~0.
-_ENTRY_KEY_RE = re.compile(r"(?m)^[ \t]*@\w+\s*\{\s*([^,\s]+)\s*,")
+# inside a field value, which is never at column ~0. Empty-key entries and
+# @string/@preamble declarations do not match.
+_ENTRY_KEY_RE = re.compile(r"(?m)^[ \t]*@\w+\s*\{\s*([^,\s{}=]+)(?:\s*,|\s+(?=[A-Za-z][\w-]*\s*=))")
 
 
 def detect_dropped_keys(raw_text: str, parsed_ids: set[str]) -> list[str]:

@@ -491,6 +491,9 @@ P_VALID_ABSTAIN_STATUSES = frozenset(
         "strict_warn_preprint_year",
         "strict_warn_cnv",
         "skipped",
+        # The checker could not read the entry, so citation validity remains
+        # neutral. Reporting keeps this in its dedicated parse-error bucket.
+        "parse_error",
     }
 )
 
