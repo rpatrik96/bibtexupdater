@@ -15,7 +15,7 @@ It outputs detailed reports categorizing mismatches:
 - AUTHOR_MISMATCH: Author list differs
 - YEAR_MISMATCH: Publication year differs beyond tolerance
 - VENUE_MISMATCH: Journal/venue differs
-- PARTIAL_MATCH: Multiple fields differ
+- PARTIAL_MATCH: Fallback for an unrecognized mismatched field
 - API_ERROR: Errors during API queries
 
 Usage:
@@ -4900,6 +4900,12 @@ class FactChecker:
         # Positive evidence of a problem: a field that is a real MISMATCH (both
         # sides populated and conflicting). These take priority over abstention.
         mismatches = [name for name, c in comparisons.items() if c.is_mismatch]
+        mismatch_map = {
+            "title": FactCheckStatus.TITLE_MISMATCH,
+            "author": FactCheckStatus.AUTHOR_MISMATCH,
+            "year": FactCheckStatus.YEAR_MISMATCH,
+            "venue": FactCheckStatus.VENUE_MISMATCH,
+        }
 
         if mismatches:
             # P2.6: Prioritize venue mismatch when title+author are confirmed.
@@ -4939,14 +4945,13 @@ class FactChecker:
                     note = comparisons["title"].note or ""
                     if note.startswith("Strict near-miss"):
                         return FactCheckStatus.TITLE_NEAR_MISS
-                mismatch_map = {
-                    "title": FactCheckStatus.TITLE_MISMATCH,
-                    "author": FactCheckStatus.AUTHOR_MISMATCH,
-                    "year": FactCheckStatus.YEAR_MISMATCH,
-                    "venue": FactCheckStatus.VENUE_MISMATCH,
-                }
                 return mismatch_map.get(mismatches[0], FactCheckStatus.PARTIAL_MATCH)
 
+            # Multiple mismatches report the most decisive field while the
+            # report retains the complete ``mismatched_fields`` list.
+            for field in ("title", "author", "year", "venue"):
+                if field in mismatches:
+                    return mismatch_map[field]
             return FactCheckStatus.PARTIAL_MATCH
 
         # No mismatch, but require POSITIVE confirmation of every claimed field.

@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Entries with multiple mismatched fields now report the most decisive mismatch instead of `partial_match`.
+
+Upgrade note: entries previously reported as `partial_match` will now report a specific mismatch status, which changes how status-based consumers route them.
+
+### Fixed
+
+- **Multiple field mismatches collapsed to `partial_match`.** The checker selected a field-specific status only when exactly one field mismatched, so adding another incorrect field weakened the reported status. Multi-mismatch entries now report the most decisive mismatch in title, author, year, then venue order while retaining every mismatched field in the report.
+
 ## [1.6.1] - 2026-07-28
 
 A conference cited by name still matches when the index stores only its acronym.
