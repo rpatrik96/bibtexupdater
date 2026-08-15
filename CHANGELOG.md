@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.7.0] - 2026-08-15
+
 The checker reports every declared citation key, and an entry with several wrong fields no longer reads as a milder problem than one with a single wrong field.
 
 Upgrade note: checks and report totals now include `@online`, `@software`, `@dataset`, and other non-standard types that earlier versions omitted. The checker repairs dropped entries when it can restore their structure without changing field values. An entry it cannot repair receives a `parse_error` report row and its own summary count. Default mode continues checking; strict mode returns exit code 4 when parse errors remain. `@online` and `@electronic` entries with non-academic URLs now receive web-reference verdicts, so existing bibliography totals and verdicts may change.
