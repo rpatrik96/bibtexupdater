@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+The checker now loads every declared BibLaTeX entry type and refuses to continue when parsing drops a citation key.
+
+Upgrade note: checks and report totals now include `@online`, `@software`, `@dataset`, and other non-standard types that earlier versions omitted. `@online` and `@electronic` entries with non-academic URLs now receive web-reference verdicts, so existing bibliography totals and verdicts may change.
+
+### Fixed
+
+- **Non-standard BibLaTeX entries disappeared before checking.** The checker used bibtexparser's default parser, which ignores non-standard entry types before classification or reporting. It now shares the resolver's `BibLoader`, accepting its deliberate trade-off: typoed and unknown entry types remain visible rather than being discarded. The classifier routes `@online` and `@electronic` entries with non-academic URLs through web-reference verification. The checker also compares the citation keys declared in the raw input with the parsed IDs and aborts with an error naming each missing key if malformed input is still skipped, preventing a partial bibliography from yielding a smaller total.
+
 ## [1.6.1] - 2026-07-28
 
 A conference cited by name still matches when the index stores only its acronym.

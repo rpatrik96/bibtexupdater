@@ -41,7 +41,6 @@ from enum import Enum
 from typing import Any
 from urllib.parse import urlparse
 
-import bibtexparser
 import httpx
 from rapidfuzz.fuzz import token_sort_ratio
 
@@ -81,6 +80,7 @@ from bibtex_updater.sources import (
     openreview_note_to_candidate_record,
     select_top_k_by_title_similarity,
 )
+from bibtex_updater.updater import BibLoader, detect_dropped_keys
 from bibtex_updater.utils import (
     # API endpoints
     ARXIV_API,
@@ -848,15 +848,15 @@ class EntryClassifier:
                 reason="Contains working paper indicators",
             )
 
-        # Check for web reference (misc with URL in non-academic domain)
+        # Check for web reference (web-oriented type with URL in non-academic domain)
         url = self._extract_url(entry)
-        if url and entry_type == "misc":
+        if url and entry_type in ("misc", "online", "electronic"):
             if not self._is_academic_url(url):
                 # Check if it looks like a preprint (has eprint/archiveprefix)
                 if not entry.get("eprint") and not entry.get("archiveprefix"):
                     return ClassificationResult(
                         category=EntryCategory.WEB_REFERENCE,
-                        reason="misc entry with non-academic URL",
+                        reason=f"{entry_type} entry with non-academic URL",
                         extracted_url=url,
                     )
 
@@ -6147,18 +6147,33 @@ def main() -> int:
 
     # Load entries from all BibTeX files
     entries = []
+    loader = BibLoader()
+    dropped_entries: list[tuple[str, str]] = []
     for path in args.bibfiles:
         try:
             with open(path, encoding="utf-8") as f:
-                db = bibtexparser.load(f)
-                entries.extend(db.entries)
-                logger.info("Loaded %d entries from %s", len(db.entries), path)
+                raw_text = f.read()
+            db = loader.loads(raw_text)
+            parsed_ids = {entry.get("ID") for entry in db.entries if entry.get("ID")}
+            for key in detect_dropped_keys(raw_text, parsed_ids):
+                logger.error(
+                    "Parser dropped declared entry '%s' from %s; refusing to check a partial bibliography",
+                    key,
+                    path,
+                )
+                dropped_entries.append((path, key))
+            entries.extend(db.entries)
+            logger.info("Loaded %d entries from %s", len(db.entries), path)
         except FileNotFoundError:
             logger.error("File not found: %s", path)
             return 1
         except Exception as e:
             logger.error("Failed to parse %s: %s", path, e)
             return 1
+
+    if dropped_entries:
+        logger.error("Aborting because %d declared entries were not parsed", len(dropped_entries))
+        return 1
 
     if not entries:
         logger.error("No entries found in input files")
