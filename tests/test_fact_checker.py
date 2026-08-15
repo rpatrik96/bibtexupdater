@@ -482,7 +482,7 @@ class TestFactCheckerStatusDetermination:
         status = fact_checker._determine_status(0.85, comparisons, ["crossref"])
         assert status == FactCheckStatus.YEAR_MISMATCH
 
-    def test_partial_match_multiple_mismatches(self, fact_checker):
+    def test_title_outweighs_author_in_multiple_mismatches(self, fact_checker):
         comparisons = {
             "title": FieldComparison("title", "A", "B", 0.6, False),
             "author": FieldComparison("author", "X", "Y", 0.5, False),
@@ -490,7 +490,74 @@ class TestFactCheckerStatusDetermination:
             "venue": FieldComparison("venue", "J", "J", 1.0, True),
         }
         status = fact_checker._determine_status(0.70, comparisons, ["crossref"])
-        assert status == FactCheckStatus.PARTIAL_MATCH
+        assert status == FactCheckStatus.TITLE_MISMATCH
+
+    def test_chimera_second_mismatch_does_not_weaken_author_status(self, fact_checker):
+        title = "Additive Decoders for Latent Variables Identification and Cartesian-Product Extrapolation"
+        entry_authors = (
+            "Lachapelle, S{\\'e}bastien and Deleu, Tristan and Mahajan, Divyat and "
+            "Mitliagkas, Ioannis and Bengio, Yoshua and Lacoste-Julien, Simon and "
+            "Bhargav, Dhanya Sridhar"
+        )
+        record = PublishedRecord(
+            doi="",
+            title=title,
+            authors=[
+                {"given": "Sébastien", "family": "Lachapelle"},
+                {"given": "Divyat", "family": "Mahajan"},
+                {"given": "Ioannis", "family": "Mitliagkas"},
+                {"given": "Simon", "family": "Lacoste-Julien"},
+            ],
+            journal="Advances in Neural Information Processing Systems",
+            year=2023,
+            order_reliable=True,
+            structured_names=True,
+        )
+        per_source_records = {
+            "crossref": record,
+            "openalex": PublishedRecord(
+                doi="",
+                title=record.title,
+                authors=record.authors,
+                journal=record.journal,
+                year=record.year,
+                order_reliable=True,
+                structured_names=True,
+            ),
+        }
+
+        def comparisons_for(entry_year: str):
+            entry = {
+                "ID": "chimera",
+                "ENTRYTYPE": "inproceedings",
+                "title": title,
+                "author": entry_authors,
+                "booktitle": "Advances in Neural Information Processing Systems",
+                "year": entry_year,
+            }
+            return fact_checker._compare_all_fields(entry, record, per_source_records=per_source_records)
+
+        author_only = comparisons_for("2023")
+        author_and_year = comparisons_for("2024")
+        assert author_only["author"].is_mismatch
+        assert not author_only["year"].is_mismatch
+        assert author_and_year["author"].is_mismatch
+        assert author_and_year["year"].is_mismatch
+
+        author_only_status = fact_checker._determine_status(0.95, author_only, ["crossref", "openalex"])
+        author_and_year_status = fact_checker._determine_status(0.95, author_and_year, ["crossref", "openalex"])
+        assert author_only_status is FactCheckStatus.AUTHOR_MISMATCH
+        assert author_and_year_status is author_only_status
+
+    def test_venue_rule_wins_when_title_and_author_are_confirmed(self, fact_checker):
+        comparisons = {
+            "title": FieldComparison("title", "A", "A", 1.0, True),
+            "author": FieldComparison("author", "X", "X", 1.0, True),
+            "year": FieldComparison("year", "2023", "2024", 0.0, False),
+            "venue": FieldComparison("venue", "NeurIPS", "ICML", 0.0, False),
+        }
+        status = fact_checker._determine_status(0.90, comparisons, ["crossref"])
+        assert status is FactCheckStatus.VENUE_MISMATCH
 
 
 class TestPositiveConfirmationGate:
