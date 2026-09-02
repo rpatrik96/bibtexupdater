@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Upgrade note: `not_found` is now an exhaustive claim — every source consulted for the entry answered. An entry whose cascade included a source that could not be reached reports `api_error` instead, so bibliographies checked over a flaky connection will show `api_error` where earlier versions showed `not_found`. JSONL and JSON reports gain a `sources_failed` field naming those sources; existing fields are unchanged. A run in which more than 10% of entries hit a failed lookup now exits 5 in any mode.
+
+### Fixed
+
+- **A network outage was reported as thousands of references no database has heard of.** Every source client caught its own failures and returned an empty result, so a DNS failure, refused connection, TLS error, read timeout or exhausted 429/5xx retry budget was indistinguishable downstream from a database that had checked and found nothing. Mid-run wifi loss during a 5,043-reference check therefore produced `not_found` for 2,500 real, correctly-cited references, at exit code 0 with nothing logged — and `not_found` is the status a citation-hallucination screen reads as possible fabrication. The clients now raise `SourceUnavailableError` for a lookup that ends without an answer, the cascade records which sources failed per entry, and `not_found` is demoted to `api_error` whenever any of them did — including when the remaining sources answered cleanly and found nothing, because a partial cascade cannot establish an exhaustive miss. A source that answers with zero results is unaffected and still yields `not_found`. Failed lookups are logged with the affected sources, and the unreachable hosts named separately: an HTTP error response proves the network is up, so a 429 is a refusal to answer rather than an outage.
+
 ## [1.7.0] - 2026-08-15
 
 The checker reports every declared citation key, and an entry with several wrong fields no longer reads as a milder problem than one with a single wrong field.

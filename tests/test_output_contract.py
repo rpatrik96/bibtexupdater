@@ -293,16 +293,19 @@ def _build_checker(*, cr_search, oa_search) -> FactChecker:
 
 
 class TestCheckEntryEndToEnd:
-    def test_not_found_with_throttled_source_is_coverage_incomplete(self):
+    def test_partial_cascade_cannot_report_an_exhaustive_miss(self):
         """Crossref retrieves only an unrelated low-score candidate while
-        OpenAlex is throttled: the NOT_FOUND abstention must carry
-        coverage_incomplete=True and a neutral p_valid."""
+        OpenAlex is throttled. The scored verdict would be NOT_FOUND, but
+        NOT_FOUND asserts that every source answered and none holds the paper --
+        one source that never answered cannot support that, so the entry reports
+        api_error with coverage_incomplete and a neutral p_valid."""
         checker = _build_checker(
             cr_search=[_junk_crossref_message()],
             oa_search=Exception("429 Too Many Requests"),
         )
         result = checker.check_entry(_entry())
-        assert result.status is FactCheckStatus.NOT_FOUND
+        assert result.status is FactCheckStatus.API_ERROR
+        assert result.sources_failed == ["openalex"]
         assert any("OpenAlex" in e for e in result.errors)
         assert result.coverage_incomplete is True
         assert result.p_valid == pytest.approx(P_VALID_NEUTRAL)

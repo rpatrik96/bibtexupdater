@@ -15,11 +15,14 @@ from __future__ import annotations
 import logging
 from unittest.mock import MagicMock
 
+import pytest
+
 from bibtex_updater.fact_checker import (
     FactChecker,
     FactCheckerConfig,
     SemanticScholarClient,
 )
+from bibtex_updater.utils import SourceUnavailableError
 
 # ------------- Helpers -------------
 
@@ -214,11 +217,14 @@ class TestMatchTitle404:
         client = SemanticScholarClient(http)
         assert client.match_title("X") == [{"title": "X"}]
 
-    def test_network_error_returns_empty_list(self):
+    def test_network_error_raises(self):
+        """A 404 is S2 saying it has no match; a network error is S2 saying
+        nothing at all, and the two must not collapse into the same []."""
         http = MagicMock()
         http._request.side_effect = RuntimeError("boom")
         client = SemanticScholarClient(http)
-        assert client.match_title("X") == []
+        with pytest.raises(SourceUnavailableError):
+            client.match_title("X")
 
     def test_cascade_continues_without_error_on_match_miss(self):
         # End-to-end through the cascade: a real SemanticScholarClient whose

@@ -74,6 +74,7 @@ from bibtex_updater.utils import (
     RateLimiterRegistry,
     ResolutionCache,
     ResolutionCacheEntry,
+    SourceUnavailableError,
     SqliteCache,
     acl_anthology_bib_to_record,
     atomic_replace,
@@ -2019,7 +2020,13 @@ class Resolver:
         first_author = first_author_surname(entry)
         if not first_author:
             return None
-        notes = self.openreview.search("", limit=5, title=entry.get("title") or "", first_author=first_author)
+        try:
+            notes = self.openreview.search("", limit=5, title=entry.get("title") or "", first_author=first_author)
+        except SourceUnavailableError as exc:
+            # The resolver's job is to upgrade a preprint when it can; an
+            # OpenReview lookup that never completed leaves the entry alone.
+            self.logger.debug("OpenReview stage skipped: %s", exc)
+            return None
         if not notes:
             return None
 

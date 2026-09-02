@@ -40,12 +40,14 @@ from bibtex_updater.utils import (
     OPENREVIEW_API_V2,
     PublishedRecord,
     arxiv_id_from_datacite_doi,
+    as_source_failure,
     extract_arxiv_id_from_text,
     is_preprint_venue,
     last_name_from_person,
     latex_to_plain,
     normalize_issn,
     normalize_title_for_match,
+    raise_for_failed_lookup,
     strip_diacritics,
 )
 
@@ -138,7 +140,12 @@ class OpenAlexClient:
                 the fielded query yields zero results.
 
         Returns:
-            List of OpenAlex work dicts, never None. Empty on any error.
+            List of OpenAlex work dicts, never None. Empty when OpenAlex
+            answered and reported no works.
+
+        Raises:
+            SourceUnavailableError: the lookup ended without an answer
+                (unreachable host, error status, unparseable body).
         """
         per_page = max(1, min(int(limit), MAX_TOP_K))
 
@@ -169,7 +176,13 @@ class OpenAlexClient:
 
         Preserves the shared-HttpClient-vs-bare-httpx routing (rate limiting,
         caching, polite User-Agent on the shared path; hermetic fallback
-        otherwise). Returns ``[]`` on any non-200 status or exception.
+        otherwise).
+
+        Returns ``[]`` only when OpenAlex answered and reported no works. A
+        lookup that ends without an answer -- unreachable host, error status,
+        unparseable body -- raises :class:`SourceUnavailableError` instead, so
+        the cascade can record that this source was never consulted rather than
+        counting it as a source that knows nothing about the entry.
         """
         url = f"{OPENALEX_API}/works"
         if self.api_key:
@@ -183,17 +196,15 @@ class OpenAlexClient:
                     accept="application/json",
                     service="openalex",
                 )
-                if resp.status_code != 200:
-                    return []
-                data = resp.json() or {}
             else:
                 with httpx.Client(timeout=self.timeout) as client:
                     resp = client.get(url, params=params)
-                    if resp.status_code != 200:
-                        return []
-                    data = resp.json() or {}
-        except Exception:
-            return []
+            raise_for_failed_lookup("openalex", url, resp.status_code)
+            if resp.status_code != 200:
+                return []
+            data = resp.json() or {}
+        except Exception as exc:
+            raise as_source_failure("openalex", url, exc) from exc
         results = data.get("results") or []
         if not isinstance(results, list):
             return []
@@ -457,8 +468,11 @@ class OpenReviewClient:
                 to build the ``paperhash``; without it no lookup is possible.
 
         Returns:
-            List of OpenReview note dicts (never ``None``). Empty on any error,
-            on a missing title/author, or when nothing matches.
+            List of OpenReview note dicts (never ``None``). Empty on a missing
+            title/author, or when OpenReview answered and nothing matched.
+
+        Raises:
+            SourceUnavailableError: the lookup ended without an answer.
 
         FIX B1: when paperhash returns 0 notes (LaTeX escapes in the title,
         author-name spelling drift, etc.), fall back to ``/notes/search?term=``
@@ -496,8 +510,7 @@ class OpenReviewClient:
         if notes:
             return notes
         # API v2 fallback: only reached when v1 paperhash AND v1 term both
-        # missed -- the note may live on the v2-only host. Defensive like every
-        # other path: any error / non-200 yields [].
+        # missed -- the note may live on the v2-only host.
         return self._fetch(term_params, url=f"{OPENREVIEW_API_V2}/notes/search")
 
     def _fetch(self, params: dict[str, Any], url: str | None = None) -> list[dict[str, Any]]:
@@ -507,7 +520,11 @@ class OpenReviewClient:
         fallback passes the ``api2.openreview.net/notes/search`` URL instead
         (both hosts answer ``{"notes": [...]}``). Preserves
         shared-HttpClient-vs-bare-httpx routing (rate limiting + caching on the
-        shared path). Returns ``[]`` on any non-200 status or exception.
+        shared path).
+
+        Returns ``[]`` only when OpenReview answered and reported no notes; a
+        lookup that ends without an answer raises
+        :class:`SourceUnavailableError` (see :meth:`OpenAlexClient._fetch`).
         """
         if url is None:
             url = f"{OPENREVIEW_API}/notes"
@@ -520,17 +537,15 @@ class OpenReviewClient:
                     accept="application/json",
                     service="openreview",
                 )
-                if resp.status_code != 200:
-                    return []
-                data = resp.json() or {}
             else:
                 with httpx.Client(timeout=self.timeout) as client:
                     resp = client.get(url, params=params)
-                    if resp.status_code != 200:
-                        return []
-                    data = resp.json() or {}
-        except Exception:
-            return []
+            raise_for_failed_lookup("openreview", url, resp.status_code)
+            if resp.status_code != 200:
+                return []
+            data = resp.json() or {}
+        except Exception as exc:
+            raise as_source_failure("openreview", url, exc) from exc
         notes = data.get("notes") or []
         if not isinstance(notes, list):
             return []

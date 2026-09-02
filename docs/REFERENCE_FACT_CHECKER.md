@@ -93,6 +93,8 @@ Author handling: sources return authors in as-published order, so author-order d
 | `p_valid` | 0.50 — neutral | **0.35 — negative polarity** |
 | how integrations read it | abstention | **commonly mapped to "hallucinated"** |
 
+`not_found` is an **exhaustive** claim: every source consulted for the entry completed its lookup, and none holds a matching record. A lookup that ends without an answer — DNS failure, connection refused, TLS error, connection reset, read/connect timeout, an exhausted 429/5xx retry budget, an open circuit, an error status — cannot support that claim, so the entry reports `api_error` instead, and it does so even when the other sources answered cleanly and found nothing. A partial cascade establishes no exhaustive miss. The `sources_failed` field names the sources behind the demotion.
+
 `not_found` says *this tool searched its sources and found nothing*. It does **not** say the reference is fabricated. But because it carries negative polarity, downstream consumers routinely collapse it into a hallucination label — the HALLMARK harness, for instance, maps `not_found` → `HALLUCINATED` unless `coverage_incomplete` is set. Anything scoring or gating on this output inherits that reading, so state your own policy deliberately rather than letting the default decide it for you.
 
 The distinction bites hardest on **document classes the databases structurally never index**: dissertations, journal front matter (editorials, guest columns), and national-language work. A miss there carries no information about whether the work exists. Two concrete cases:
@@ -131,7 +133,7 @@ Always check `coverage_incomplete` first: a `not_found` carrying that flag was r
 | `arxiv_id_mismatch` | problematic | Cited arXiv ID resolves to a different paper |
 | `future_date` / `invalid_year` | problematic | Year in the future / missing / implausible |
 | `doi_not_found` | problematic | DOI returns HTTP 404/410 |
-| `api_error` | — | Errors occurred during API queries |
+| `api_error` | — | At least one source lookup did not complete, so the check was not technically successful. Also emitted in place of `not_found` in that case — see `sources_failed` |
 | `skipped` | — | Entry type not verifiable |
 
 Web references (`url_*`), books (`book_*`), and working papers (`working_paper_*`) have their own status families; see `--skip-web`, `--skip-books`, `--skip-working-papers`.
@@ -207,6 +209,7 @@ Per-line fields:
 | `confidence` | 0–1 confidence that the **assigned status is the right call**. Direction-free: a confident `hallucinated` and a confident `verified` both carry high `confidence` |
 | `p_valid` | 0–1 probability that the entry **as cited** refers to a real publication with correct metadata — **threshold/rank on this**, not on `confidence`. Verified-polarity statuses map above 0.5, problem-polarity below 0.5, abstentions sit at 0.5, and a clean exhaustive `not_found` at 0.35. Note `preprint_only` is problem-polarity for `p_valid` (the claimed venue is contradicted) even though the verdict itself is confident |
 | `confidence_score` | additive 0–100 numeric confidence (next section) |
+| `sources_failed` | source names whose lookup for this entry did not complete. Non-empty means the cascade was partial: the entry cannot carry `not_found`, and whatever it does carry rests on less evidence than a clean run |
 | `mismatched_fields`, `api_sources`, `errors` | non-confirmed field names, sources with hits, and per-source error strings |
 
 ## Exit Codes
@@ -216,6 +219,9 @@ Per-line fields:
 | 0 | Success (or non-strict mode) |
 | 1 | Input error (file not found, parse error) |
 | 4 | Strict mode: not-found or hallucinated entries found |
+| 5 | Source outage: more than 10% of entries had a source lookup that did not complete, in any mode. The run checked less than it appears to have checked — discard its could-not-verify verdicts and re-run once the sources are reachable |
+
+Below that 10% the affected entries are still logged (with the sources and the unreachable hosts named) and still report `api_error`; only the run-wide verdict stands.
 
 ## CI/CD Integration
 
