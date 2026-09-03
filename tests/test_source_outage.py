@@ -48,6 +48,7 @@ from bibtex_updater.fact_checker import (
 from bibtex_updater.fact_checker import main as fact_checker_main
 from bibtex_updater.sources import OpenAlexClient, OpenReviewClient
 from bibtex_updater.utils import (
+    ABSENCE_STATUS_CODES,
     HttpClient,
     RateLimiterRegistry,
     SourceUnavailableError,
@@ -176,6 +177,33 @@ class TestHttpClientSurfacesFailedLookups:
         http = _http(side_effect=httpx.ConnectError(DNS_FAILURE))
         with pytest.raises(RuntimeError):
             http._request("GET", "https://api.crossref.org/works", service="crossref")
+
+
+class TestOnlyAnAnswerCountsAsConsulted:
+    """The academic side already required an answer rather than a reachable host.
+
+    ``_request`` retries and then raises on 429/5xx, while a 401/403 comes back
+    as an ordinary response and the adapter raises on it. Both routes end in
+    ``SourceUnavailableError``, so these tests sit at the adapter, which is the
+    layer the rule belongs to.
+    """
+
+    @pytest.mark.parametrize("status", [401, 403, 429, 500, 503])
+    def test_a_refusal_or_a_failure_never_reads_as_an_answer(self, status):
+        resp = MagicMock()
+        resp.status_code = status
+        resp.headers = {}
+        with pytest.raises(SourceUnavailableError):
+            CrossrefClient(_http(response=resp)).search("deep learning smith")
+
+    @pytest.mark.parametrize("status", sorted(ABSENCE_STATUS_CODES))
+    def test_an_absence_status_is_an_answer(self, status):
+        """404 and 410 state the record is not there, which is the evidence a
+        miss rests on. These come back as an empty result, never as a failure."""
+        resp = MagicMock()
+        resp.status_code = status
+        resp.headers = {}
+        assert CrossrefClient(_http(response=resp)).search("deep learning smith") == []
 
 
 # ===========================================================================
@@ -352,10 +380,15 @@ def _unreachable(exc: Exception):
     return handler
 
 
-class TestWebReferenceRequiresAReachableHost:
-    """``url_not_found`` asserts the page is gone. Only a response can support
-    that; a host that was never reached says nothing about the page, exactly as
-    an unreachable database says nothing about a paper."""
+class TestWebReferenceRequiresAnAnswer:
+    """``url_not_found`` asserts the page is gone, so only an answer supports it.
+
+    Two ways to have no answer. The host was never reached, which says nothing
+    about the page, exactly as an unreachable database says nothing about a
+    paper. Or the host answered without addressing the question: a 401/403
+    refused to tell us, a 429 declined for now, a 5xx failed. Only 404 and 410
+    state that the resource is not there.
+    """
 
     @pytest.mark.parametrize(
         "exc",
@@ -399,18 +432,52 @@ class TestWebReferenceRequiresAReachableHost:
         assert result.url_check.lookup_failed is False
         assert result.url_check.status_code == 404
 
+    def test_410_gone_also_asserts_absence(self):
+        """The host explicitly says the resource is gone. That is an answer."""
+        result = _web_verifier(lambda request: httpx.Response(410)).verify(_web_entry(), _classification())
+
+        assert result.status is FactCheckStatus.URL_NOT_FOUND
+        assert result.sources_failed == []
+        assert result.url_check is not None and result.url_check.lookup_failed is False
+
+    @pytest.mark.parametrize("status", [401, 403, 429, 500, 503])
+    def test_a_refusal_or_a_failure_is_not_a_dead_page(self, status):
+        """The host is up and talking, which proves nothing about the page. A
+        401 demands credentials, a 403 refuses, a 429 declines for now, a 5xx
+        failed. Academic URLs sit behind bot-blocking 403s and flaky proxies, so
+        reading any of these as a dead citation repeats the original error one
+        layer in."""
+        result = _web_verifier(lambda request: httpx.Response(status)).verify(_web_entry(), _classification())
+
+        assert result.status is not FactCheckStatus.URL_NOT_FOUND
+        assert result.status is FactCheckStatus.API_ERROR
+        assert result.sources_failed == ["url_check"]
+        assert result.url_check is not None
+        assert result.url_check.lookup_failed is True
+        assert result.url_check.status_code == status
+        assert result.coverage_incomplete is True
+
     def test_reachable_page_still_verifies(self):
         result = _web_verifier(lambda request: httpx.Response(200)).verify(_web_entry(), _classification())
 
         assert result.status is FactCheckStatus.URL_ACCESSIBLE
         assert result.sources_failed == []
 
-    def test_dead_network_and_dead_page_no_longer_look_alike(self):
-        """The web half of the same regression, in one assertion."""
-        outage = _web_verifier(_unreachable(httpx.ConnectError(DNS_FAILURE))).verify(_web_entry(), _classification())
-        gone = _web_verifier(lambda request: httpx.Response(404)).verify(_web_entry(), _classification())
+    def test_a_dead_page_is_distinguishable_from_every_way_of_not_answering(self):
+        """The web half of the regression, in one assertion. Before the fix all
+        four of these were ``url_not_found``; only the last one earns it."""
+        unreachable = _web_verifier(_unreachable(httpx.ConnectError(DNS_FAILURE)))
+        refused = _web_verifier(lambda request: httpx.Response(403))
+        broken = _web_verifier(lambda request: httpx.Response(503))
+        gone = _web_verifier(lambda request: httpx.Response(404))
 
-        assert (outage.status, gone.status) == (FactCheckStatus.API_ERROR, FactCheckStatus.URL_NOT_FOUND)
+        verdicts = [v.verify(_web_entry(), _classification()).status for v in (unreachable, refused, broken, gone)]
+        assert verdicts == [
+            FactCheckStatus.API_ERROR,
+            FactCheckStatus.API_ERROR,
+            FactCheckStatus.API_ERROR,
+            FactCheckStatus.URL_NOT_FOUND,
+        ]
 
 
 # ===========================================================================

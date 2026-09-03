@@ -95,7 +95,7 @@ Author handling: sources return authors in as-published order, so author-order d
 
 `not_found` is an **exhaustive** claim: every source consulted for the entry completed its lookup, and none holds a matching record. A lookup that ends without an answer — DNS failure, connection refused, TLS error, connection reset, read/connect timeout, an exhausted 429/5xx retry budget, an open circuit, an error status — cannot support that claim, so the entry reports `api_error` instead, and it does so even when the other sources answered cleanly and found nothing. A partial cascade establishes no exhaustive miss. The `sources_failed` field names the sources behind the demotion.
 
-The same rule governs web references. `url_not_found` means the host answered and the page is not there; a host that was never reached says nothing about whether the page exists, so a DNS failure, refused connection, TLS error or timeout reports `api_error` with `sources_failed: ["url_check"]`. A real HTTP 404 is an answer and stays `url_not_found`.
+The same rule governs web references. `url_not_found` means the host answered that the page is not there, which only HTTP 404 and 410 do. Every other way of not getting an answer reports `api_error` with `sources_failed: ["url_check"]`: an unreachable host (DNS failure, refused connection, TLS error, timeout), a refusal (401, 403), a deferral (429), and a failure (5xx). A host that is up and talking has proved nothing about the page, so a bot-blocking 403 on an academic URL no longer reads as a dead citation.
 
 `not_found` says *this tool searched its sources and found nothing*. It does **not** say the reference is fabricated. But because it carries negative polarity, downstream consumers routinely collapse it into a hallucination label — the HALLMARK harness, for instance, maps `not_found` → `HALLUCINATED` unless `coverage_incomplete` is set. Anything scoring or gating on this output inherits that reading, so state your own policy deliberately rather than letting the default decide it for you.
 
@@ -138,7 +138,7 @@ Always check `coverage_incomplete` first: a `not_found` carrying that flag was r
 | `api_error` | — | At least one source lookup did not complete, so the check was not technically successful. Also emitted in place of `not_found` in that case — see `sources_failed` |
 | `skipped` | — | Entry type not verifiable |
 
-Web references (`url_*`), books (`book_*`), and working papers (`working_paper_*`) have their own status families; see `--skip-web`, `--skip-books`, `--skip-working-papers`. `url_not_found` requires a response: an unreachable host reports `api_error`, and the `url_check.lookup_failed` field in the JSON report says which of the two happened.
+Web references (`url_*`), books (`book_*`), and working papers (`working_paper_*`) have their own status families; see `--skip-web`, `--skip-books`, `--skip-working-papers`. `url_not_found` requires an answer, meaning HTTP 404 or 410; an unreachable host, a 401/403 refusal, a 429 or a 5xx all report `api_error` instead, and the `url_check.lookup_failed` field in the JSON report says which of the two happened.
 
 ## Numeric confidence score
 

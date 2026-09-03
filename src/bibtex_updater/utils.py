@@ -95,15 +95,28 @@ class CircuitOpenError(SourceUnavailableError):
         super().__init__(service, cause=f"circuit open for service {service!r}")
 
 
+#: HTTP statuses that positively assert the requested resource is not there.
+#: Only these support a "does not exist" verdict. Every other non-2xx says the
+#: host refused to tell us (401, 403, 429) or failed to answer (5xx), and
+#: neither is the same claim: a lookup that was declined establishes nothing
+#: about whether the thing exists.
+#:
+#: 410 is included because it is an explicit statement of absence. On a query
+#: endpoint a 410 would strictly speaking retire the interface rather than the
+#: record, but no bibliographic source in the cascade serves one, and the code
+#: is rare enough that one shared definition is worth more than two lists.
+ABSENCE_STATUS_CODES = frozenset({404, 410})
+
+
 def raise_for_failed_lookup(service: str, url: str, status_code: int) -> None:
     """Raise :class:`SourceUnavailableError` unless the status carries an answer.
 
-    200 is an answer (an empty result set is still an answer), and 404 is the
-    endpoint stating it holds no such record -- also an answer, and the normal
-    miss for the single-record endpoints. Every other status ends the lookup
-    with nothing said about the entry.
+    200 is an answer, and an empty result set is still an answer. So is a status
+    in :data:`ABSENCE_STATUS_CODES`: the endpoint stating it holds no such
+    record, which is the normal miss for the single-record endpoints. Every
+    other status ends the lookup with nothing said about the entry.
     """
-    if status_code in (200, 404):
+    if status_code == 200 or status_code in ABSENCE_STATUS_CODES:
         return
     raise SourceUnavailableError(service, url, f"HTTP {status_code}", transport_failure=status_code >= 500)
 

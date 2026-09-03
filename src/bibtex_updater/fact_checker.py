@@ -89,6 +89,7 @@ from bibtex_updater.sources import (
 from bibtex_updater.updater import BibLoader, detect_dropped_keys
 from bibtex_updater.utils import (
     # API endpoints
+    ABSENCE_STATUS_CODES,
     ARXIV_API,
     CROSSREF_API,
     DBLP_API_SEARCH,
@@ -288,9 +289,13 @@ class FactCheckStatus(Enum):
     # Web reference statuses
     URL_VERIFIED = "url_verified"  # URL accessible and content matches
     URL_ACCESSIBLE = "url_accessible"  # URL returns 200, no content check
-    # The host answered and the page is not there (HTTP >= 400). An unreachable
-    # host is NOT this: a DNS failure, refused connection, TLS error or timeout
-    # says nothing about whether the page exists, and reports API_ERROR instead.
+    # The host answered that the page is not there: HTTP 404 or 410, the only
+    # two statuses that assert absence (utils.ABSENCE_STATUS_CODES). Nothing
+    # else earns this verdict. A 401/403 means the host refused to tell us, a
+    # 429 means it declined to answer now, a 5xx means it failed to answer, and
+    # an unreachable host (DNS, refused connection, TLS, timeout) never answered
+    # at all. Each of those reports API_ERROR: none establishes that the page
+    # is gone, and this status is read as evidence that a citation is dead.
     URL_NOT_FOUND = "url_not_found"
     URL_CONTENT_MISMATCH = "url_content_mismatch"  # Page content differs from entry
 
@@ -1089,9 +1094,11 @@ class WebVerifier(BaseVerifier):
         # Check URL accessibility
         url_result = self._check_url(url)
 
-        # The host was never reached, so nothing was learned about the page.
-        # URL_NOT_FOUND asserts the page is gone; a dead network cannot support
-        # that any more than a dead network can support NOT_FOUND for a paper.
+        # Nothing was learned about the page: the host was never reached, or it
+        # answered with a refusal (401/403/429) or a failure (5xx) rather than a
+        # verdict on the page. URL_NOT_FOUND asserts the page is gone, and none
+        # of those support that any more than a dead network supports NOT_FOUND
+        # for a paper.
         if url_result.lookup_failed:
             return self._make_result(
                 entry,
@@ -1103,7 +1110,7 @@ class WebVerifier(BaseVerifier):
                 sources_failed=["url_check"],
             )
 
-        # The host answered, with a status saying the page is not there.
+        # The host answered 404 or 410: the page is positively not there.
         if not url_result.accessible:
             return self._make_result(
                 entry,
@@ -1164,10 +1171,11 @@ class WebVerifier(BaseVerifier):
         checks ride the same connection pool as every other request instead of
         opening a parallel ``requests`` pool.
 
-        A response of any status is an answer about the page and sets
-        ``accessible`` from it. An exception means the host was never reached,
-        which is a failed lookup: ``lookup_failed`` is set so the caller reports
-        an error rather than claiming the page is gone.
+        Only a status in :data:`ABSENCE_STATUS_CODES` (404, 410) answers the
+        question the caller is asking, which is whether the page is there. A
+        401/403 refusal, a 429, a 5xx and an exception all leave that question
+        unanswered, so they set ``lookup_failed`` and the caller reports an
+        error instead of claiming the page is gone.
         """
         try:
             # Use HEAD request to minimize data transfer
@@ -1181,13 +1189,17 @@ class WebVerifier(BaseVerifier):
 
             is_redirect = len(resp.history) > 0
             final_url = str(resp.url) if is_redirect else None
+            accessible = resp.status_code < 400
 
             return URLCheckResult(
                 url=url,
-                accessible=resp.status_code < 400,
+                accessible=accessible,
                 status_code=resp.status_code,
                 is_redirect=is_redirect,
                 final_url=final_url,
+                # The host answered, but not with an answer about the page.
+                lookup_failed=not accessible and resp.status_code not in ABSENCE_STATUS_CODES,
+                error=None if accessible or resp.status_code in ABSENCE_STATUS_CODES else f"HTTP {resp.status_code}",
             )
         except httpx.ConnectError as e:
             if self._is_ssl_failure(e):
