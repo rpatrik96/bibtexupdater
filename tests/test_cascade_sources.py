@@ -44,6 +44,7 @@ from bibtex_updater.sources import (
     MAX_TOP_K,
     AuthorIntersectionResult,
     OpenAlexClient,
+    build_openreview_paperhashes,
     cross_source_author_intersection,
     openalex_work_to_candidate_record,
     select_top_k_by_title_similarity,
@@ -788,9 +789,15 @@ class TestLatexFreeRetrievalTitles(TestQueryCascade):
         # DBLP free-text query is brace-free (pre-existing FIX B2 behavior).
         dblp_query = fc.dblp.search.call_args[0][0]
         assert "{" not in dblp_query and self.PLAIN_TITLE in dblp_query
-        # OpenReview paperhash title is brace-free.
+        # OpenReview is the exception: it gets the RAW title, because its
+        # paperhash index keeps the maths ``latex_to_plain`` deletes
+        # (``$\\ell_p$`` indexes as ``\\ell_p``). The client runs its own
+        # de-LaTeX, which drops the braces just as this one does.
         or_kwargs = fc.openreview.search.call_args.kwargs
-        assert or_kwargs["title"] == self.PLAIN_TITLE
+        assert or_kwargs["title"] == self.LATEX_TITLE
+        assert build_openreview_paperhashes(or_kwargs["title"], or_kwargs["first_author"]) == [
+            "yu|the_combinatorial_brain_surgeon_pruning_weights_that_cancel_one_another_in_neural_networks"
+        ]
         # Semantic Scholar free-text query is brace-free.
         s2_query = fc.s2.search.call_args[0][0]
         assert "{" not in s2_query and self.PLAIN_TITLE in s2_query

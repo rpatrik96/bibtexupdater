@@ -25,6 +25,7 @@ references" (2026), Algorithm 1.
 
 from __future__ import annotations
 
+import html
 import os
 import re
 import threading
@@ -44,8 +45,10 @@ from bibtex_updater.utils import (
     OPENREVIEW_SERVICE,
     PublishedRecord,
     SourceUnavailableError,
+    _reduce_trailing_to_surname,
     arxiv_id_from_datacite_doi,
     as_source_failure,
+    decode_latex_accents,
     extract_arxiv_id_from_text,
     is_preprint_venue,
     last_name_from_person,
@@ -67,6 +70,7 @@ __all__ = [
     "OR_PREPRINT",
     "OR_UNKNOWN",
     "build_openreview_paperhash",
+    "build_openreview_paperhashes",
     "select_top_k_by_title_similarity",
     "cross_source_author_intersection",
     "AuthorIntersectionResult",
@@ -399,39 +403,126 @@ def _coerce_venue_string(raw: Any) -> str | None:
     return None
 
 
-def build_openreview_paperhash(title: str, first_author_last_name: str) -> str | None:
-    """Construct OpenReview's ``paperhash`` exact-match key for a paper.
+#: Latin-1 Supplement letters (U+00DF-U+00FF) that OpenReview's paperhash index
+#: KEEPS. Everything above that block -- Latin Extended-A and beyond -- is
+#: DROPPED, not folded: ``Karlaš`` indexes as ``karla`` and ``Jovanović`` as
+#: ``jovanovi``, while ``Akyürek`` keeps its ``ü``. Measured across 6,698 live
+#: notes on both hosts (ICLR, ICML, NeurIPS, TMLR, COLM).
+_OR_LATIN1_LETTERS = "\u00df-\u00ff"
 
-    OpenReview indexes every note under ``<firstauthor_lastname>|<title>`` where
-    the title is lowercased, stripped of non-alphanumeric punctuation (colons,
-    hyphens, apostrophes are *removed*, not spaced -- "Few-Shot" -> "fewshot",
-    "BERT:" -> "bert"), whitespace-collapsed, and spaces become underscores. The
-    author prefix is the first author's last name, lowercased.
+#: Characters the title slug keeps beyond letters and digits. OpenReview does
+#: NOT strip the maths that survives into a title: ``$\ell_p$`` indexes as
+#: ``\ell_p`` and ``RoboMP$^2$`` as ``robomp^2``, so the backslash, caret,
+#: brackets and underscore are part of the key.
+_OR_TITLE_KEEP = rf"a-z0-9{_OR_LATIN1_LETTERS}_\\\^\[\]"
+_OR_NAME_KEEP = rf"a-z0-9{_OR_LATIN1_LETTERS}"
 
-    FIX B1: the paperhash index PRESERVES author diacritics
-    (``Müller`` -> ``müller``), and OpenReview returns 0 notes for the folded
-    ``muller`` form. The folding is dropped here. We also LaTeX-strip the title
-    so ``{B}rain {S}urgeon`` -> ``brain_surgeon`` and ``log_{2}(T)`` ->
-    ``log_2_t``, matching OpenReview's plain-text title index.
+#: Font/emphasis wrappers whose *content* belongs in the title. Dropping the
+#: command but keeping the braced text is what OpenReview's own plain-text
+#: title carries.
+_OR_MARKUP_CMD_RE = re.compile(r"\\(?:emph|textbf|textit|texttt|textsc|textrm|textsf|mbox|text|rm|it|bf|sc|tt)\s*\{")
 
-    Returns ``None`` when either component is empty (an un-hashable entry).
+#: LaTeX-escaped literals that survive into the indexed title as the bare
+#: character.
+_OR_ESCAPED_LITERALS = {r"\&": "&", r"\%": "%", r"\$": "$", r"\#": "#", r"\_": "_"}
+
+
+def _openreview_delatex(text: str) -> str:
+    r"""De-LaTeX a field the way OpenReview's stored plain text reads.
+
+    Unlike :func:`~bibtex_updater.utils.latex_to_plain` this does NOT delete
+    maths: ``latex_to_plain`` drops everything between ``$``…``$``, which erases
+    exactly the ``\ell_p`` and ``^2`` fragments OpenReview keeps in the index.
+    Accent macros still decode to real Unicode (``{\"u}`` -> ``ü``), because the
+    folded ``u`` form returns nothing.
     """
-    # Preserve diacritics in the surname: OpenReview's index keys on the raw
-    # lower-cased unicode form. Allow any unicode letter / digit; only strip
-    # punctuation and whitespace.
-    last = (first_author_last_name or "").lower().strip()
-    last = re.sub(r"[\W_]+", "", last, flags=re.UNICODE)
-    norm_title = latex_to_plain(title or "").lower()
-    # Drop punctuation (colon, hyphen, brace remnants), keep unicode word
-    # characters + spaces.
-    norm_title = re.sub(r"[^\w\s]", "", norm_title, flags=re.UNICODE)
-    # Underscores remaining from LaTeX subscripts (``log_2``) act like spaces
-    # in OpenReview's hash; collapse them with whitespace.
-    norm_title = norm_title.replace("_", " ")
-    norm_title = "_".join(norm_title.split())
-    if not last or not norm_title:
-        return None
-    return f"{last}|{norm_title}"
+    if not text:
+        return ""
+    out = html.unescape(text)
+    out = decode_latex_accents(out)
+    out = _OR_MARKUP_CMD_RE.sub("{", out)
+    for escaped, literal in _OR_ESCAPED_LITERALS.items():
+        out = out.replace(escaped, literal)
+    out = out.replace("{", "").replace("}", "")
+    return re.sub(r"\s+", " ", out).strip()
+
+
+def _openreview_slug(text: str, keep: str) -> str:
+    """Lowercase, drop every character outside ``keep``, join words with ``_``.
+
+    Punctuation is REMOVED rather than spaced, which is why "Few-Shot" indexes
+    as ``fewshot`` and "BERT:" as ``bert``.
+    """
+    lowered = text.lower()
+    lowered = re.sub(rf"[^{keep} ]+", "", lowered, flags=re.UNICODE)
+    return "_".join(lowered.split())
+
+
+def _openreview_surname_token(first_author: str) -> str:
+    """Reduce a first-author name to the token OpenReview hashes on.
+
+    OpenReview keys on the LAST whitespace token of the name and discards
+    nobiliary particles with it: ``Marine Le Morvan`` -> ``morvan``,
+    ``Julius von Kügelgen`` -> ``kügelgen``, ``Aaron van den Oord`` -> ``oord``.
+    Accepts either BibTeX order ("Le Morvan, Marine") or display order, and is
+    idempotent on an already-reduced surname. Diacritics survive here; the
+    caller decides which of the two indexed forms to issue.
+    """
+    plain = _openreview_delatex(first_author or "")
+    last = plain.split(",", 1)[0] if "," in plain else plain
+    # Punctuation is deleted, not spaced, so ``O'Brien`` stays one token and
+    # reduces to ``obrien`` rather than to ``brien``.
+    last = re.sub(r"[^\w\s-]", "", last.lower(), flags=re.UNICODE)
+    tokens = _reduce_trailing_to_surname([t for t in last.split() if t])
+    return tokens[-1] if tokens else ""
+
+
+def build_openreview_paperhashes(title: str, first_author: str) -> list[str]:
+    """Every ``paperhash`` form under which OpenReview may have indexed a paper.
+
+    OpenReview indexes each note as ``<firstauthor_surname>|<title>``, both
+    slugified: lowercased, punctuation deleted rather than spaced ("Few-Shot"
+    -> ``fewshot``, "BERT:" -> ``bert``), whitespace collapsed, spaces to
+    underscores.
+
+    Two forms come back, in query order:
+
+    1. **Diacritic-preserving.** ``Akyürek`` indexes as ``akyürek`` and the
+       ASCII-folded ``akyurek`` returns nothing.
+    2. **ASCII-folded.** OpenReview keeps Latin-1 but DROPS Latin Extended, so
+       ``Karlaš`` indexes as ``karla`` -- while the DBLP mirror of the same
+       paper, whose name arrives already transliterated, indexes as ``karlas``.
+       Both are live records with different note ids. A client cannot know which
+       range a surname falls in, so it issues both.
+
+    The two forms collapse to one entry for the overwhelmingly common
+    unaccented case, which keeps the request budget at one hash per host.
+    Returns ``[]`` when either component slugs to nothing.
+    """
+    surname = _openreview_surname_token(first_author)
+    plain_title = _openreview_delatex(title or "")
+    hashes: list[str] = []
+    for name, text in ((surname, plain_title), (strip_diacritics(surname), strip_diacritics(plain_title))):
+        name_slug = _openreview_slug(name, _OR_NAME_KEEP)
+        title_slug = _openreview_slug(text, _OR_TITLE_KEEP)
+        if not name_slug or not title_slug:
+            continue
+        candidate = f"{name_slug}|{title_slug}"
+        if candidate not in hashes:
+            hashes.append(candidate)
+    return hashes
+
+
+def build_openreview_paperhash(title: str, first_author_last_name: str) -> str | None:
+    """The primary (diacritic-preserving) ``paperhash`` for a paper.
+
+    Thin wrapper over :func:`build_openreview_paperhashes` for callers that want
+    a single key. ``None`` when the entry is un-hashable. Prefer the plural form
+    in a lookup: an ASCII-transliterated mirror of the same paper is indexed
+    under the folded hash alone.
+    """
+    hashes = build_openreview_paperhashes(title, first_author_last_name)
+    return hashes[0] if hashes else None
 
 
 class OpenReviewClient:
@@ -491,6 +582,11 @@ class OpenReviewClient:
             with self._refused_lock:
                 self._refused_urls.add(url)
 
+    #: Host order for every ``/notes`` lookup. v2 first: it holds the 2023+
+    #: venues (ICLR 2024 alone has 2,260 notes there and 0 on v1), which is the
+    #: dominant shape in a modern ML bibliography.
+    NOTES_HOSTS = (OPENREVIEW_API_V2, OPENREVIEW_API)
+
     def search(
         self,
         query: str,
@@ -505,81 +601,108 @@ class OpenReviewClient:
                 signature symmetric with the other cascade clients).
             limit: Max notes to retrieve (capped at ``MAX_TOP_K``).
             title: Raw paper title. Required to build the ``paperhash``.
-            first_author: First author's *last* name (already reduced). Required
-                to build the ``paperhash``; without it no lookup is possible.
+            first_author: First author's name -- the raw BibTeX name where the
+                caller has it, so the diacritics and the nobiliary particles
+                OpenReview keys on survive. An already-reduced surname still
+                works. Required to build the ``paperhash``.
 
         Returns:
             List of OpenReview note dicts (never ``None``). Empty on a missing
-            title/author, or when OpenReview answered and nothing matched.
+            title/author, or when every host answered and nothing matched.
 
         Raises:
-            SourceUnavailableError: the lookup ended without an answer.
+            SourceUnavailableError: the lookup ended without an answer from at
+                least one host and nothing was found.
 
-        FIX B1: when paperhash returns 0 notes (LaTeX escapes in the title,
-        author-name spelling drift, etc.), fall back to ``/notes/search?term=``
-        with the plain title so the cascade still gets a chance to confirm the
-        venue. A fabricated paper still returns 0 notes under both queries:
-        the index is closed-world over OpenReview-hosted submissions.
+        **The two hosts are disjoint, and the paperhash lookup runs against
+        both.** Counted live under an authenticated session: ICLR 2024 has 0
+        notes on v1 and 2,260 on v2, NeurIPS 2024 0 and 4,035, TMLR 0 and 4,639,
+        while ICLR 2021 has 860 on v1 and 0 on v2. v1 holds the pre-2023 venues
+        and v2 everything from 2023 on, so querying v1 alone can never confirm a
+        modern ML paper. A miss is exhaustive only once both have answered.
+        (One token authenticates both hosts. The two differ on the ``count``
+        parameter -- v2 requires ``count=true`` to return a total, v1 rejects it
+        with ``400 AdditionalPropertiesError`` and returns ``count`` by default
+        -- which is why no lookup here asks for one.)
 
-        The term search runs against both hosts. Venues that migrated to
-        ``api2.openreview.net`` (ICLR 2024+, NeurIPS 2023+, most 2024+ venues)
-        are invisible on the legacy v1 host and vice versa, so a miss is only
-        exhaustive once both have answered. v2 notes wrap content fields as
-        ``{"value": ...}``, which the converters already accept.
+        Up to two hashes are issued per host, covering the diacritic-preserving
+        and ASCII-folded index forms (see
+        :func:`build_openreview_paperhashes`); an unaccented name collapses them
+        to one.
+
+        FIX B1: when every paperhash returns 0 notes (author-name spelling
+        drift, a title OpenReview stores differently), fall back to
+        ``/notes/search?term=`` with the plain title on both hosts so the
+        cascade still gets a chance to confirm the venue. A fabricated paper
+        still returns 0 notes under every query: the index is closed-world over
+        OpenReview-hosted submissions.
 
         Challenge gate: ``/notes`` answers ``403 ChallengeRequiredError`` to an
         anonymous caller on both hosts, so without credentials the paperhash
-        lookup cannot run and the term fallbacks are never reached. The refusal
-        is latched, and every later entry fails the lookup without issuing a
-        request: 68 of 68 sampled lookups in one screening run were refused
-        alike, and re-asking a gated endpoint per entry buys a round trip and a
-        circuit-breaker tick for an answer that is not coming. The failure is
-        still raised per entry, so a refused OpenReview lookup keeps blocking
-        the exhaustive ``not_found`` claim exactly as any other failed lookup
-        does. Credentials through :class:`~bibtex_updater.utils.OpenReviewAuth`
-        restore the exact lookup, and with it the term fallbacks.
+        lookup cannot run. The refusal is latched per host, and every later
+        entry fails that host without issuing a request: 68 of 68 sampled
+        lookups in one screening run were refused alike, and re-asking a gated
+        endpoint per entry buys a round trip and a circuit-breaker tick for an
+        answer that is not coming. The failure is still raised per entry, so a
+        refused OpenReview lookup keeps blocking the exhaustive ``not_found``
+        claim exactly as any other failed lookup does. Credentials through
+        :class:`~bibtex_updater.utils.OpenReviewAuth` restore the exact lookup.
         """
         per_page = max(1, min(int(limit), MAX_TOP_K))
-        paperhash = build_openreview_paperhash(title or "", first_author or "")
-        notes: list[dict[str, Any]] = []
-        notes_url = f"{OPENREVIEW_API}/notes"
-        if paperhash:
+        paperhashes = build_openreview_paperhashes(title or "", first_author or "")
+        # The first lookup that ended without an answer. Held rather than raised
+        # so a host that IS answering still gets its chance to confirm the
+        # paper; re-raised at the end when nothing was found, which is what
+        # keeps a half-answered miss out of the exhaustive ``not_found`` claim.
+        failure: SourceUnavailableError | None = None
+
+        for host in self.NOTES_HOSTS:
+            notes_url = f"{host}/notes"
             if self._is_refused(notes_url):
-                # Already gated this run. The lookup still fails, so the entry
-                # cannot become a ``not_found``, but it fails without a request.
-                raise SourceUnavailableError(
+                # Already gated this run: record the failure without a request.
+                failure = failure or SourceUnavailableError(
                     "openreview",
                     notes_url,
                     "challenge-gated for anonymous callers; set OPENREVIEW_USERNAME / OPENREVIEW_PASSWORD",
                     transport_failure=False,
                     status_code=403,
                 )
-            params = {"paperhash": paperhash, "limit": per_page}
-            try:
-                notes = self._fetch(params)
-            except SourceUnavailableError as exc:
-                self._latch_refusal(notes_url, exc)
-                raise
-        if notes:
-            return notes
+                continue
+            for paperhash in paperhashes:
+                try:
+                    notes = self._fetch({"paperhash": paperhash, "limit": per_page}, url=notes_url)
+                except SourceUnavailableError as exc:
+                    self._latch_refusal(notes_url, exc)
+                    failure = failure or exc
+                    # This host is out for this entry; the other one may answer.
+                    break
+                if notes:
+                    return notes
+
         # FIX B1 fallback: term= search against the LaTeX-stripped title.
         # Gated to require first_author (and a built paperhash) so this only
-        # fires when paperhash was attempted and missed (LaTeX escapes / author
-        # spelling drift); never on author-less searches where the cascade
-        # already gave up.
-        if not first_author or not paperhash:
-            return []
-        plain_title = latex_to_plain(title or "").strip()
-        if not plain_title:
-            return []
-        term_params = {"term": plain_title, "limit": per_page}
-        # v1 covers the venues that never migrated, v2 the ones that did (ICLR
-        # 2024+, NeurIPS 2023+); a note on one host is invisible on the other,
-        # so both are tried before the miss is called exhaustive.
-        notes = self._fetch(term_params, url=f"{OPENREVIEW_API}/notes/search")
-        if notes:
-            return notes
-        return self._fetch(term_params, url=f"{OPENREVIEW_API_V2}/notes/search")
+        # fires when paperhash was attempted and missed; never on author-less
+        # searches where the cascade already gave up. Also skipped when a host
+        # failed to answer: an anonymous run is challenge-gated on every
+        # ``/notes`` request, and ``/notes/search`` is paced at 5 requests per
+        # minute, so walking it per entry would cost hours for a lookup the
+        # failure has already disqualified from claiming ``not_found``.
+        if failure is None and first_author and paperhashes:
+            plain_title = latex_to_plain(title or "").strip()
+            if plain_title:
+                term_params = {"term": plain_title, "limit": per_page}
+                for host in self.NOTES_HOSTS:
+                    try:
+                        notes = self._fetch(term_params, url=f"{host}/notes/search")
+                    except SourceUnavailableError as exc:
+                        failure = failure or exc
+                        continue
+                    if notes:
+                        return notes
+
+        if failure is not None:
+            raise failure
+        return []
 
     def _fetch(self, params: dict[str, Any], url: str | None = None) -> list[dict[str, Any]]:
         """Issue a single OpenReview request, return the note list.
@@ -657,6 +780,15 @@ OR_PREPRINT = "preprint"
 OR_UNKNOWN = "unknown"
 
 _OR_NOT_ACCEPTED_RE = re.compile(r"withdrawn|rejected|desk[_-]?reject", re.IGNORECASE)
+#: Venue ids under which OpenReview hosts SELF-CLAIMED metadata rather than a
+#: submission it ran: ``Public_Article`` is what an author's ORCID/Crossref
+#: profile import writes (251,508 notes live), ``Archive`` is a self-uploaded
+#: record (26,809). Their ``venue`` strings look exactly like an accepted
+#: paper's -- "WWW 2026", "Information Sciences" -- so the year rule below would
+#: read them as acceptance. OpenReview did not review these and cannot vouch for
+#: them, so they never confirm a venue. This matters more now that the paperhash
+#: lookup reaches v2, where the whole self-claimed pool lives.
+_OR_SELF_CLAIMED_VENUEID_RE = re.compile(r"^openreview\.net/(?:public_article|archive)\b", re.IGNORECASE)
 _OR_DBLP_CONF_RE = re.compile(r"dblp\.org/conf/", re.IGNORECASE)
 _OR_NATIVE_CONF_RE = re.compile(r"\.cc/\d{4}/conference\b", re.IGNORECASE)
 _OR_YEAR_RE = re.compile(r"\b(?:19|20)\d{2}\b")
@@ -686,6 +818,10 @@ def openreview_acceptance(note: dict[str, Any]) -> str:
     venueid_l = (venueid or "").lower()
     venue_l = venue_s.lower()
 
+    # 0. Self-claimed profile metadata -- OpenReview is a mirror here, not a
+    #    registry, so it can say nothing about acceptance.
+    if _OR_SELF_CLAIMED_VENUEID_RE.match(venueid_l):
+        return OR_UNKNOWN
     # 1. Preprint mirror (CoRR / arXiv) -- not a publication.
     if is_preprint_venue(venue) or "journals/corr" in venueid_l:
         return OR_PREPRINT
@@ -761,11 +897,19 @@ def openreview_note_to_candidate_record(note: dict[str, Any]) -> PublishedRecord
     # which the per-entry handler swallowed, silently dropping the entry from the
     # report. Coerce to the first usable string, mirroring the defensive handling
     # the neighbouring title/author/year fields already get.
-    venue = _coerce_venue_string(_content_value(content, "venue") or _content_value(content, "venueid"))
+    raw_venueid = _coerce_venue_string(_content_value(content, "venueid"))
+    venue = _coerce_venue_string(_content_value(content, "venue") or raw_venueid)
     # A preprint-labelled venue (e.g. a DBLP "CoRR" import surfaced on OpenReview)
     # is not a published-venue confirmation; drop it so the verifier treats the
     # venue as unconfirmable rather than matching against "CoRR".
     if is_preprint_venue(venue):
+        venue = None
+    # Same treatment, for the same reason, for a self-claimed ORCID/Crossref
+    # profile import: its "WWW 2026" is the author's own assertion, so it must
+    # not confirm an entry's venue claim (and the year recovered from it below
+    # must not confirm the year either). The record can still corroborate title
+    # and authors, which is all OpenReview actually knows here.
+    if _OR_SELF_CLAIMED_VENUEID_RE.match((raw_venueid or "").lower()):
         venue = None
 
     year = None

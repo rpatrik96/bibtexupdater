@@ -18,6 +18,12 @@ from bibtex_updater.updater import (
 from bibtex_updater.utils import HttpClient, PublishedRecord
 
 
+@pytest.fixture(autouse=True)
+def _isolated_openreview_token_cache(tmp_path, monkeypatch):
+    """No test may read or write the developer's real OpenReview token cache."""
+    monkeypatch.setenv("BIBTEX_CHECK_OPENREVIEW_TOKEN_CACHE", str(tmp_path / "openreview-tokens.json"))
+
+
 @pytest.fixture
 def make_entry():
     """Factory fixture for creating BibTeX entries."""

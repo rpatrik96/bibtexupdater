@@ -10,8 +10,12 @@ HTTP infrastructure with caching and rate limiting, and API client utilities.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import collections
+import contextlib
 import errno
+import hashlib
 import html
 import json
 import logging
@@ -27,6 +31,7 @@ import unicodedata
 import xml.etree.ElementTree as ET
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -1917,10 +1922,158 @@ OPENREVIEW_SEARCH_SERVICE = "openreview_search"
 OPENREVIEW_ENV_USERNAME = "OPENREVIEW_USERNAME"
 OPENREVIEW_ENV_PASSWORD = "OPENREVIEW_PASSWORD"
 
-#: Statuses that mean an OpenReview request was refused rather than answered,
-#: and so are worth one re-login before giving up (an expired token reads as a
-#: refusal). 403 is what the challenge gate returns to an anonymous caller.
+#: Statuses that mean an OpenReview request was REFUSED rather than answered.
+#: Latched per endpoint by the client so the rest of the run costs nothing.
+#: 403 is what the challenge gate returns to a caller it does not recognize.
 OPENREVIEW_AUTH_REFRESH_STATUS = frozenset({401, 403})
+
+#: Statuses that mean the TOKEN is stale and one re-login is worth trying.
+#: Only 401 (``TokenExpiredError``). A 403 is ``ChallengeRequiredError``: the
+#: request arrived without recognized credentials at all, and logging in again
+#: answers a question that was not asked -- it burns one of the four logins
+#: OpenReview allows in a two-minute window and comes back 403 just the same.
+OPENREVIEW_TOKEN_REFRESH_STATUS = frozenset({401})
+
+#: Environment variable controlling the cross-process token cache. Unset means
+#: the default location; a path overrides it; ``0``/``off``/``false``/``none``
+#: turns persistence off and restores the login-per-process behaviour.
+OPENREVIEW_ENV_TOKEN_CACHE = "BIBTEX_CHECK_OPENREVIEW_TOKEN_CACHE"
+
+_OPENREVIEW_TOKEN_CACHE_OFF = frozenset({"0", "off", "false", "no", "none", ""})
+
+#: Seconds shaved off a token's own expiry before it is considered usable, so a
+#: token that expires mid-request is refreshed rather than retried.
+_OPENREVIEW_TOKEN_SKEW = 300.0
+
+#: Lifetime assumed when a token's ``exp`` claim cannot be read. OpenReview
+#: issues 24-hour JWTs; half that is short enough to be safe and long enough to
+#: cover a sharded run.
+_OPENREVIEW_TOKEN_FALLBACK_TTL = 12 * 3600.0
+
+
+def _default_openreview_token_cache_path() -> Path:
+    """Where the shared OpenReview token lives: the user cache dir, never the repo."""
+    base = os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
+    return Path(base) / "bibtex-updater" / "openreview-tokens.json"
+
+
+def _jwt_expiry(token: str) -> float | None:
+    """Read the ``exp`` claim out of a JWT payload, or ``None``.
+
+    The payload is decoded, never verified: the client is not the audience and
+    has no key. The claim is used only to decide when to log in again, so a
+    wrong answer costs one extra login and nothing else.
+    """
+    parts = (token or "").split(".")
+    if len(parts) < 2:
+        return None
+    payload = parts[1]
+    payload += "=" * (-len(payload) % 4)
+    try:
+        claims = json.loads(base64.urlsafe_b64decode(payload).decode("utf-8"))
+    except (ValueError, binascii.Error, UnicodeDecodeError):
+        return None
+    exp = claims.get("exp")
+    if isinstance(exp, int | float) and exp > 0:
+        # OpenReview mints ``exp`` in milliseconds; a plain-seconds claim would
+        # sit near 1.8e9, so anything far above that is a millisecond stamp.
+        return float(exp) / 1000.0 if exp > 1e11 else float(exp)
+    return None
+
+
+class OpenReviewTokenStore:
+    """Cross-process cache for OpenReview bearer tokens.
+
+    ``bibtex-check`` logs in once per process, which is right for one long run
+    and wrong for a sharded one: three shards over one bibliography produced
+    about 45 logins and OpenReview answered ``429`` to 60 of them, degrading
+    those runs to anonymous. ``/login`` refuses after four logins in roughly two
+    minutes, while the JWT it issues is valid for a full 24 hours and
+    authenticates BOTH hosts. Persisting the token turns the whole fleet into
+    one login.
+
+    The file holds tokens only, never the password, keyed by the SHA-256 of the
+    username so a second account cannot pick up the first one's token and the
+    address itself never lands on disk. It is written atomically at mode 0600
+    inside a 0700 directory, under the user cache dir rather than anywhere near
+    a repository. Every failure is non-fatal: an unreadable or unwritable cache
+    degrades to the login-per-process behaviour it replaced.
+    """
+
+    VERSION = 1
+
+    def __init__(self, path: Path | str) -> None:
+        self.path = Path(path)
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _key(username: str, origin: str) -> str:
+        digest = hashlib.sha256((username or "").strip().lower().encode("utf-8")).hexdigest()
+        return f"{digest}::{origin}"
+
+    def _read(self) -> dict[str, Any]:
+        try:
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        if not isinstance(raw, dict) or raw.get("version") != self.VERSION:
+            return {}
+        tokens = raw.get("tokens")
+        return tokens if isinstance(tokens, dict) else {}
+
+    def _write(self, tokens: dict[str, Any]) -> None:
+        payload = json.dumps({"version": self.VERSION, "tokens": tokens})
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            fd, tmp = tempfile.mkstemp(dir=str(self.path.parent), prefix=".openreview-tokens-")
+            try:
+                os.fchmod(fd, 0o600)
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    fh.write(payload)
+                os.replace(tmp, self.path)
+                os.chmod(self.path, 0o600)
+            except BaseException:
+                # A half-written temp file must never be left behind, and a
+                # failed write must never end the run.
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp)
+                raise
+        except OSError as exc:
+            logger.debug("OpenReview token cache not written (%s)", type(exc).__name__)
+
+    def get(self, username: str, origin: str) -> str | None:
+        """A cached token for this account and host, or ``None`` if none is live."""
+        with self._lock:
+            entry = self._read().get(self._key(username, origin))
+        if not isinstance(entry, dict):
+            return None
+        token = entry.get("token")
+        expires = entry.get("expires")
+        if not isinstance(token, str) or not token.strip():
+            return None
+        if not isinstance(expires, int | float) or expires <= time.time():
+            return None
+        return token
+
+    def put(self, username: str, origin: str, token: str) -> None:
+        """Persist ``token``, expiring at its own ``exp`` claim less a safety margin."""
+        expiry = _jwt_expiry(token)
+        if expiry is None:
+            expiry = time.time() + _OPENREVIEW_TOKEN_FALLBACK_TTL
+        expiry -= _OPENREVIEW_TOKEN_SKEW
+        if expiry <= time.time():
+            return
+        with self._lock:
+            tokens = self._read()
+            tokens[self._key(username, origin)] = {"token": token, "expires": expiry}
+            self._write(tokens)
+
+    def drop(self, username: str, origin: str) -> None:
+        """Forget a token another process may still be presenting."""
+        with self._lock:
+            tokens = self._read()
+            if tokens.pop(self._key(username, origin), None) is not None:
+                self._write(tokens)
 
 
 class OpenReviewAuth:
@@ -1945,20 +2098,44 @@ class OpenReviewAuth:
 
     Tokens are per host. v1 and v2 issue separate ones, so :meth:`token_for_url`
     keys on the URL's origin and logs in to that origin on first use.
+
+    A token also outlives the process. :class:`OpenReviewTokenStore` persists it
+    to the user cache dir, so a sharded run logs in once between all its shards
+    instead of once per shard -- which is what walked one three-shard run into
+    ``429`` on 60 of its 45 logins. Set
+    ``BIBTEX_CHECK_OPENREVIEW_TOKEN_CACHE=0`` to keep the old
+    login-per-process behaviour, or to a path to move the file.
     """
 
     LOGIN_PATH = "/login"
 
-    def __init__(self, username: str, password: str, timeout: float = 15.0) -> None:
+    def __init__(
+        self,
+        username: str,
+        password: str,
+        timeout: float = 15.0,
+        token_store: OpenReviewTokenStore | None = None,
+    ) -> None:
         self._username = (username or "").strip()
         self._password = password or ""
         self._timeout = timeout
+        self._store = token_store
         self._lock = threading.Lock()
         self._tokens: dict[str, str] = {}
         # Origins whose login failed. A bad password fails identically for every
         # entry, so one attempt per origin per run is enough; the rest of the run
         # proceeds anonymously.
         self._disabled: set[str] = set()
+
+    @staticmethod
+    def _store_from_env(env: Mapping[str, str]) -> OpenReviewTokenStore | None:
+        """Resolve the token-cache setting: default path, an override, or off."""
+        raw = env.get(OPENREVIEW_ENV_TOKEN_CACHE)
+        if raw is None:
+            return OpenReviewTokenStore(_default_openreview_token_cache_path())
+        if raw.strip().lower() in _OPENREVIEW_TOKEN_CACHE_OFF:
+            return None
+        return OpenReviewTokenStore(raw.strip())
 
     @classmethod
     def from_env(
@@ -1976,7 +2153,7 @@ class OpenReviewAuth:
         password = source.get(OPENREVIEW_ENV_PASSWORD) or ""
         if not user or not password:
             return None
-        return cls(user, password)
+        return cls(user, password, token_store=cls._store_from_env(source))
 
     @property
     def username(self) -> str:
@@ -2013,12 +2190,20 @@ class OpenReviewAuth:
                 return token
             if origin in self._disabled:
                 return None
+        if self._store is not None:
+            cached = self._store.get(self._username, origin)
+            if cached:
+                with self._lock:
+                    self._tokens[origin] = cached
+                return cached
         token = self._login(origin)
         with self._lock:
             if token:
                 self._tokens[origin] = token
             else:
                 self._disabled.add(origin)
+        if token and self._store is not None:
+            self._store.put(self._username, origin, token)
         return token
 
     def invalidate(self, url: str) -> None:
@@ -2032,6 +2217,10 @@ class OpenReviewAuth:
             return
         with self._lock:
             self._tokens.pop(origin, None)
+        # Drop the shared copy too: another process presenting the same expired
+        # token would be refused identically.
+        if self._store is not None:
+            self._store.drop(self._username, origin)
 
     def _login(self, origin: str) -> str | None:
         """POST the credentials to ``<origin>/login`` and return the token.
@@ -2485,10 +2674,14 @@ class HttpClient:
                 # Adaptive rate limiting feedback for every REAL response,
                 # including a retryable 429/5xx before it is raised below.
                 self._adapt_rate_limiter(service, resp)
+                # 401 only. A 403 means the request was never recognized as
+                # authenticated (``ChallengeRequiredError``), which no amount of
+                # logging in again changes, and logins are the scarce resource:
+                # four in two minutes and OpenReview starts refusing them.
                 if (
                     openreview_token
                     and not auth_refreshed
-                    and resp.status_code in OPENREVIEW_AUTH_REFRESH_STATUS
+                    and resp.status_code in OPENREVIEW_TOKEN_REFRESH_STATUS
                     and self.openreview_auth is not None
                 ):
                     auth_refreshed = True

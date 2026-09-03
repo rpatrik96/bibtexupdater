@@ -127,6 +127,7 @@ from bibtex_updater.utils import (
     record_looks_alphabetized,
     s2_data_to_record,
     same_surname_given_order_violation,
+    split_authors_bibtex,
     strip_diacritics,
 )
 
@@ -3805,8 +3806,15 @@ class FactChecker:
             if self.openreview is None:
                 return
             sources_queried.append("openreview")
+            # RAW title and RAW author name, not the shared retrieval forms:
+            # ``latex_to_plain`` deletes maths, and ``first_author_surname``
+            # ASCII-folds the surname -- and OpenReview's paperhash index keeps
+            # both ("$\\ell_p$" indexes as "\\ell_p", "Akyürek" as "akyürek",
+            # and the folded "akyurek" returns nothing). The client runs its own
+            # normalization and issues the folded form as a second hash.
+            or_first_author = (split_authors_bibtex(entry_authors(entry)) or [first_author])[0]
             try:
-                or_notes = self.openreview.search(query, limit=top_k, title=retrieval_title, first_author=first_author)
+                or_notes = self.openreview.search(query, limit=top_k, title=raw_title, first_author=or_first_author)
             except Exception as exc:
                 or_notes = []
                 _record_failure("openreview", "OpenReview", exc)
@@ -4446,8 +4454,6 @@ class FactChecker:
         Returns the absent-everywhere surname keys (already deduped) when ALL
         gates pass; returns ``None`` otherwise (no flag).
         """
-        from bibtex_updater.utils import split_authors_bibtex
-
         entry_names = split_authors_bibtex(entry_author_field or "")
         # Drop "and others" / "et al" sentinel forms: their presence means the
         # entry's author list is explicitly truncated, so missing trailing
