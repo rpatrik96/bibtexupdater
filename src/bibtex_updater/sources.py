@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import os
 import re
+import threading
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import quote
@@ -38,7 +39,11 @@ from bibtex_updater.utils import (
     OPENALEX_API,
     OPENREVIEW_API,
     OPENREVIEW_API_V2,
+    OPENREVIEW_AUTH_REFRESH_STATUS,
+    OPENREVIEW_SEARCH_SERVICE,
+    OPENREVIEW_SERVICE,
     PublishedRecord,
+    SourceUnavailableError,
     arxiv_id_from_datacite_doi,
     as_source_failure,
     extract_arxiv_id_from_text,
@@ -444,11 +449,47 @@ class OpenReviewClient:
     Mirrors :class:`OpenAlexClient`: optional shared ``http`` (rate limiting +
     caching via ``service="openreview"``), bare ``httpx`` fallback for hermetic
     use, and ``[]`` on any error / non-200.
+
+    OpenReview keeps ``/notes`` behind a browser challenge, so an anonymous
+    caller gets ``403 ChallengeRequiredError`` there on both hosts and the
+    paperhash lookup cannot run. Credentials
+    (:class:`~bibtex_updater.utils.OpenReviewAuth`, opt-in through
+    ``OPENREVIEW_USERNAME`` / ``OPENREVIEW_PASSWORD`` or
+    ``--openreview-username``, and carried by the shared ``http`` client)
+    restore it. Without them every lookup here fails, which is the honest
+    outcome: an endpoint that declined to answer can never support the
+    exhaustive ``not_found`` claim. The refusal is latched so the rest of the
+    run costs nothing.
     """
 
     def __init__(self, http: Any | None = None, timeout: float = 20.0) -> None:
         self.http = http
         self.timeout = timeout
+        # Endpoints that refused this run (HTTP 401/403). OpenReview gates
+        # ``/notes`` behind a browser challenge for anonymous callers, which is a
+        # configuration state rather than a blip: re-issuing the same refused
+        # request once per entry buys a round trip and a circuit-breaker tick for
+        # an answer that is not coming. The latch is per endpoint, not per
+        # service, so an authenticated run whose token covers one host is not
+        # punished for the other, and so the source's circuit stays free to
+        # describe what the transport is actually doing.
+        self._refused_urls: set[str] = set()
+        self._refused_lock = threading.Lock()
+
+    def _is_refused(self, url: str) -> bool:
+        """Has this endpoint already refused us in this run?"""
+        with self._refused_lock:
+            return url in self._refused_urls
+
+    def _latch_refusal(self, url: str, exc: SourceUnavailableError) -> None:
+        """Remember a 401/403 so later entries skip straight past this endpoint.
+
+        Only a refusal latches. A timeout, a 5xx or an exhausted retry budget is
+        transient and belongs to the circuit breaker, which already paces it.
+        """
+        if exc.status_code in OPENREVIEW_AUTH_REFRESH_STATUS:
+            with self._refused_lock:
+                self._refused_urls.add(url)
 
     def search(
         self,
@@ -480,19 +521,45 @@ class OpenReviewClient:
         venue. A fabricated paper still returns 0 notes under both queries:
         the index is closed-world over OpenReview-hosted submissions.
 
-        API v2 fallback: venues that migrated to ``api2.openreview.net`` (ICLR
-        2024+, NeurIPS 2023+, most 2024+ venues) are INVISIBLE on the legacy v1
-        host, so when BOTH v1 lookups miss we issue the same term search against
-        the v2 ``/notes/search`` endpoint. Same gating as the v1 term fallback
-        (requires ``first_author`` + a built paperhash); v2 notes wrap content
-        fields as ``{"value": ...}``, which the converters already accept.
+        The term search runs against both hosts. Venues that migrated to
+        ``api2.openreview.net`` (ICLR 2024+, NeurIPS 2023+, most 2024+ venues)
+        are invisible on the legacy v1 host and vice versa, so a miss is only
+        exhaustive once both have answered. v2 notes wrap content fields as
+        ``{"value": ...}``, which the converters already accept.
+
+        Challenge gate: ``/notes`` answers ``403 ChallengeRequiredError`` to an
+        anonymous caller on both hosts, so without credentials the paperhash
+        lookup cannot run and the term fallbacks are never reached. The refusal
+        is latched, and every later entry fails the lookup without issuing a
+        request: 68 of 68 sampled lookups in one screening run were refused
+        alike, and re-asking a gated endpoint per entry buys a round trip and a
+        circuit-breaker tick for an answer that is not coming. The failure is
+        still raised per entry, so a refused OpenReview lookup keeps blocking
+        the exhaustive ``not_found`` claim exactly as any other failed lookup
+        does. Credentials through :class:`~bibtex_updater.utils.OpenReviewAuth`
+        restore the exact lookup, and with it the term fallbacks.
         """
         per_page = max(1, min(int(limit), MAX_TOP_K))
         paperhash = build_openreview_paperhash(title or "", first_author or "")
         notes: list[dict[str, Any]] = []
+        notes_url = f"{OPENREVIEW_API}/notes"
         if paperhash:
+            if self._is_refused(notes_url):
+                # Already gated this run. The lookup still fails, so the entry
+                # cannot become a ``not_found``, but it fails without a request.
+                raise SourceUnavailableError(
+                    "openreview",
+                    notes_url,
+                    "challenge-gated for anonymous callers; set OPENREVIEW_USERNAME / OPENREVIEW_PASSWORD",
+                    transport_failure=False,
+                    status_code=403,
+                )
             params = {"paperhash": paperhash, "limit": per_page}
-            notes = self._fetch(params)
+            try:
+                notes = self._fetch(params)
+            except SourceUnavailableError as exc:
+                self._latch_refusal(notes_url, exc)
+                raise
         if notes:
             return notes
         # FIX B1 fallback: term= search against the LaTeX-stripped title.
@@ -506,21 +573,23 @@ class OpenReviewClient:
         if not plain_title:
             return []
         term_params = {"term": plain_title, "limit": per_page}
-        notes = self._fetch(term_params)
+        # v1 covers the venues that never migrated, v2 the ones that did (ICLR
+        # 2024+, NeurIPS 2023+); a note on one host is invisible on the other,
+        # so both are tried before the miss is called exhaustive.
+        notes = self._fetch(term_params, url=f"{OPENREVIEW_API}/notes/search")
         if notes:
             return notes
-        # API v2 fallback: only reached when v1 paperhash AND v1 term both
-        # missed -- the note may live on the v2-only host.
         return self._fetch(term_params, url=f"{OPENREVIEW_API_V2}/notes/search")
 
     def _fetch(self, params: dict[str, Any], url: str | None = None) -> list[dict[str, Any]]:
         """Issue a single OpenReview request, return the note list.
 
-        ``url`` defaults to the legacy v1 ``/notes`` endpoint; the API v2
-        fallback passes the ``api2.openreview.net/notes/search`` URL instead
-        (both hosts answer ``{"notes": [...]}``). Preserves
-        shared-HttpClient-vs-bare-httpx routing (rate limiting + caching on the
-        shared path).
+        ``url`` defaults to the legacy v1 ``/notes`` endpoint; the term-search
+        fallbacks pass the v1 and v2 ``/notes/search`` URLs instead (all three
+        answer ``{"notes": [...]}``). Preserves
+        shared-HttpClient-vs-bare-httpx routing (rate limiting, caching and
+        OpenReview credentials on the shared path; the bare-``httpx`` fallback
+        is anonymous and hermetic by design).
 
         Returns ``[]`` only when OpenReview answered and reported no notes; a
         lookup that ends without an answer raises
@@ -528,6 +597,11 @@ class OpenReviewClient:
         """
         if url is None:
             url = f"{OPENREVIEW_API}/notes"
+        # OpenReview paces its two endpoint families very differently: 180
+        # requests per minute on ``/notes``, against 5 on the v1 ``/notes/search``
+        # and 20 on the v2 one. They stay one source for the circuit breaker and
+        # for ``sources_failed``, and get separate rate limiters.
+        rate_limit_service = OPENREVIEW_SEARCH_SERVICE if url.endswith("/notes/search") else OPENREVIEW_SERVICE
         try:
             if self.http is not None and hasattr(self.http, "_request"):
                 resp = self.http._request(
@@ -535,7 +609,8 @@ class OpenReviewClient:
                     url,
                     params=params,
                     accept="application/json",
-                    service="openreview",
+                    service=OPENREVIEW_SERVICE,
+                    rate_limit_service=rate_limit_service,
                 )
             else:
                 with httpx.Client(timeout=self.timeout) as client:

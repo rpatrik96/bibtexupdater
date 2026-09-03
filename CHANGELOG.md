@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.9.0] - 2026-09-03
+
+OpenReview answers again. Its exact title + first-author lookup went behind a browser challenge, and an anonymous run had been getting nothing from the source for every entry.
+
+Nothing a consumer routes on changes: the statuses, the report schema and the exit codes are identical to 1.8.1. Credentials are optional and there is no new required configuration. What changes is how much OpenReview contributes, and what a run does when an endpoint refuses to answer.
+
+Upgrade note: set `OPENREVIEW_USERNAME` and `OPENREVIEW_PASSWORD` (or pass `--openreview-username` and keep the password in the environment) to restore OpenReview's exact title + first-author lookup. Both halves are needed, both are optional, and a login that fails leaves the run anonymous rather than ending it. An anonymous run still consults OpenReview, still reports the refusal in `sources_failed`, and still cannot report `not_found` for an entry the source declined to answer about. What it no longer does is pay for the refusal once per entry.
+
+### Fixed
+
+- **OpenReview refused every lookup, and the refusal cost a round trip per entry.** OpenReview put its `/notes` endpoints behind a browser challenge, so `api.openreview.net/notes?paperhash=` and `api2.openreview.net/notes` both answer `403 ChallengeRequiredError` to an anonymous caller. That is the exact title + first-author lookup the cascade relies on for the ICLR, NeurIPS and TMLR papers the DOI and CS-index sources can only leave unconfirmed. Measured over a 5,043-reference screening run: 68 of 68 sampled OpenReview lookups failed with 403, so the source contributed nothing while still costing a request and a circuit-breaker tick every time. A gated endpoint is gated for a configuration reason rather than a transient one, so the refusal is now remembered and later entries fail the lookup without issuing a request. The failure is still raised per entry, so it keeps blocking the exhaustive `not_found` claim exactly as any other failed lookup does, and its message names the credentials that would fix it. The latch is per endpoint rather than per source, so an authenticated run whose token covers one host is not punished for the other, and the source's circuit stays free to describe what the transport is doing.
+
+- **A refused lookup could not be told apart from a throttled or a failed one.** `SourceUnavailableError` recorded whether the host was reached but not what it said, so a caller deciding how to react to a 403 had to parse the message. It now carries `status_code`, the HTTP status when one arrived and `None` for a transport error. The `not_found` contract is unchanged: a 403 was already a failed lookup and never an answer, and it still is.
+
+- **OpenReview's endpoint families were paced by one rate limiter.** `/notes` declares 180 requests per minute, while `/notes/search` declares 5 on the v1 host and 20 on v2, so a single limit either throttles the exact lookup to a crawl or walks the search endpoints into a 429. The search endpoints now have their own limiter, fixed at 5 per minute and not scaled by `--rate-limit`, since going past a declared limit buys a 429 and a retry rather than throughput. They also keep their place in the cascade, reached after the exact lookup answered and found nothing, rather than being promoted into a substitute for it: at 5 requests per minute they would become the bottleneck for a whole screening run, and they answer with reviews and unrelated notes besides. Circuit state, health-aware ordering and `sources_failed` still see one OpenReview source.
+
+- **The v1 term fallback queried an endpoint that does not serve it.** It sent `term=` to `api.openreview.net/notes`, which serves the `paperhash` filter; the host's full-text search lives at `/notes/search`, which is where the v2 fallback already pointed. Both hosts are now searched at `/notes/search`, so a paperhash miss reaches the venues that never migrated as well as the ones that did.
+
+### Added
+
+- **`--openreview-username USER`** (or `OPENREVIEW_USERNAME`) authenticates the OpenReview lookups, which is what gets past the challenge gate on `/notes`. The password is read from `OPENREVIEW_PASSWORD` only and is never accepted as a flag, which would put it in the process table. The client logs in once per host, reuses the token for the run, and refreshes it once when a request that carried it is refused, which is what an expired token looks like from the client side. The login POST goes out on its own HTTP client, so the credentials never reach the shared rate limiter, retry loop or response cache, and neither the password nor the token is ever logged.
+
 ## [1.8.1] - 2026-09-03
 
 A source that is down is consulted after the ones that are answering, instead of ahead of them.

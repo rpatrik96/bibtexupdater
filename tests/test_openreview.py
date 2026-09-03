@@ -211,7 +211,10 @@ class TestOpenReviewV2Fallback:
         assert http._request.call_args.args[1] == f"{OPENREVIEW_API}/notes"
 
     def test_v1_term_hit_skips_v2(self):
-        # v1 term fallback hit -> two requests, both v1, no v2 call.
+        # v1 term fallback hit -> two requests, both on the v1 host, no v2 call.
+        # The term search runs against ``/notes/search``: ``/notes`` serves the
+        # paperhash filter and answers 403 to a term query from an anonymous
+        # caller, so the full-text endpoint is the one that can answer it.
         http = MagicMock()
         http._request.side_effect = [
             _ok([]),
@@ -223,8 +226,8 @@ class TestOpenReviewV2Fallback:
 
         assert out
         assert http._request.call_count == 2
-        for call in http._request.call_args_list:
-            assert call.args[1] == f"{OPENREVIEW_API}/notes"
+        assert http._request.call_args_list[0].args[1] == f"{OPENREVIEW_API}/notes"
+        assert http._request.call_args_list[1].args[1] == f"{OPENREVIEW_API}/notes/search"
 
     def test_v1_double_miss_falls_back_to_v2(self):
         # (2) v1 paperhash miss + v1 term miss -> v2 /notes/search is queried
@@ -245,6 +248,7 @@ class TestOpenReviewV2Fallback:
 
         assert out == [v2_note]
         assert http._request.call_count == 3
+        assert http._request.call_args_list[1].args[1] == f"{OPENREVIEW_API}/notes/search"
         v2_call = http._request.call_args_list[2]
         assert v2_call.args[1] == f"{OPENREVIEW_API_V2}/notes/search"
         assert v2_call.kwargs["service"] == "openreview"
