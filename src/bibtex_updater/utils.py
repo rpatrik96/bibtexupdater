@@ -2096,8 +2096,15 @@ class OpenReviewAuth:
     on a bare ``httpx`` client, so the shared :class:`HttpClient` never sees the
     credentials and never writes the token to disk.
 
-    Tokens are per host. v1 and v2 issue separate ones, so :meth:`token_for_url`
-    keys on the URL's origin and logs in to that origin on first use.
+    One token covers both hosts. A login on either origin returns a JWT that
+    ``api.openreview.net`` and ``api2.openreview.net`` both accept, verified
+    live: a token minted at ``api2`` answers 200 on
+    ``api.openreview.net/notes?paperhash=`` and on ``api2/notes``, where an
+    anonymous caller is refused on both. :meth:`token_for_url` therefore keys on
+    the URL's origin but adopts a token already held for the sibling host rather
+    than logging in again, and logs in only when neither host has one. Logins are
+    the scarce resource: roughly four in two minutes and OpenReview answers 429,
+    and a run that asks both hosts per entry would otherwise spend two.
 
     A token also outlives the process. :class:`OpenReviewTokenStore` persists it
     to the user cache dir, so a sharded run logs in once between all its shards
@@ -2108,6 +2115,11 @@ class OpenReviewAuth:
     """
 
     LOGIN_PATH = "/login"
+
+    #: Origins that honour one another's tokens (see the class docstring). A
+    #: token held for any of these is presented at all of them, and a token
+    #: invalidated at one is dropped at every origin that held the same string.
+    SHARED_ORIGINS: tuple[str, ...] = (OPENREVIEW_API_V2, OPENREVIEW_API)
 
     def __init__(
         self,
@@ -2174,28 +2186,45 @@ class OpenReviewAuth:
             return ""
         return f"{parts.scheme}://{parts.netloc}"
 
+    @classmethod
+    def _siblings(cls, origin: str) -> tuple[str, ...]:
+        """The other origins that accept ``origin``'s token."""
+        if origin not in cls.SHARED_ORIGINS:
+            return ()
+        return tuple(other for other in cls.SHARED_ORIGINS if other != origin)
+
     def token_for_url(self, url: str) -> str | None:
         """Return a bearer token for ``url``'s host, logging in on first use.
 
-        ``None`` means the caller should proceed anonymously: the URL had no
-        recoverable origin, or the login to that origin already failed in this
-        run.
+        A token already held for the sibling host is adopted instead of buying a
+        second login, in memory and from the shared cache alike. ``None`` means
+        the caller should proceed anonymously: the URL had no recoverable
+        origin, or no host has a token and the login to this one already failed
+        in this run.
         """
         origin = self._origin(url)
         if not origin:
             return None
+        siblings = self._siblings(origin)
         with self._lock:
-            token = self._tokens.get(origin)
-            if token:
-                return token
-            if origin in self._disabled:
-                return None
+            for held in (origin, *siblings):
+                token = self._tokens.get(held)
+                if token:
+                    self._tokens[origin] = token
+                    return token
+            disabled = origin in self._disabled
         if self._store is not None:
-            cached = self._store.get(self._username, origin)
-            if cached:
-                with self._lock:
-                    self._tokens[origin] = cached
-                return cached
+            for cached_at in (origin, *siblings):
+                cached = self._store.get(self._username, cached_at)
+                if cached:
+                    with self._lock:
+                        self._tokens[origin] = cached
+                    return cached
+        # Only now does a login become the answer: the check comes after the
+        # sibling lookups so a host whose own ``/login`` was throttled still
+        # rides on the other one's token instead of falling back to anonymous.
+        if disabled:
+            return None
         token = self._login(origin)
         with self._lock:
             if token:
@@ -2210,17 +2239,27 @@ class OpenReviewAuth:
         """Drop the cached token for ``url``'s host so the next call logs in again.
 
         Called when a request that carried a token was refused, which is what an
-        expired token looks like from the client side.
+        expired token looks like from the client side. The same string held for
+        the sibling host goes with it: both hosts accept the token, so both
+        refuse it once it expires, and leaving one copy behind would hand the
+        next lookup the token that was just rejected.
         """
         origin = self._origin(url)
         if not origin:
             return
         with self._lock:
-            self._tokens.pop(origin, None)
-        # Drop the shared copy too: another process presenting the same expired
+            stale = self._tokens.pop(origin, None)
+            for other in self._siblings(origin):
+                if stale is not None and self._tokens.get(other) == stale:
+                    self._tokens.pop(other, None)
+        # Drop the shared copies too: another process presenting the same expired
         # token would be refused identically.
         if self._store is not None:
+            shared = stale if stale is not None else self._store.get(self._username, origin)
             self._store.drop(self._username, origin)
+            for other in self._siblings(origin):
+                if shared is not None and self._store.get(self._username, other) == shared:
+                    self._store.drop(self._username, other)
 
     def _login(self, origin: str) -> str | None:
         """POST the credentials to ``<origin>/login`` and return the token.

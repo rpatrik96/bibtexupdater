@@ -549,21 +549,22 @@ class OpenReviewClient:
     ``--openreview-username``, and carried by the shared ``http`` client)
     restore it. Without them every lookup here fails, which is the honest
     outcome: an endpoint that declined to answer can never support the
-    exhaustive ``not_found`` claim. The refusal is latched so the rest of the
-    run costs nothing.
+    exhaustive ``not_found`` claim, and the anonymous refusal is latched so the
+    rest of the run costs nothing. A refusal of an authenticated request is
+    transient instead, and never latches (see :meth:`_latch_refusal`).
     """
 
     def __init__(self, http: Any | None = None, timeout: float = 20.0) -> None:
         self.http = http
         self.timeout = timeout
-        # Endpoints that refused this run (HTTP 401/403). OpenReview gates
-        # ``/notes`` behind a browser challenge for anonymous callers, which is a
-        # configuration state rather than a blip: re-issuing the same refused
-        # request once per entry buys a round trip and a circuit-breaker tick for
-        # an answer that is not coming. The latch is per endpoint, not per
-        # service, so an authenticated run whose token covers one host is not
-        # punished for the other, and so the source's circuit stays free to
-        # describe what the transport is actually doing.
+        # Endpoints that refused an ANONYMOUS request this run (HTTP 401/403).
+        # OpenReview gates ``/notes`` behind a browser challenge for anonymous
+        # callers, which is a configuration state rather than a blip: re-issuing
+        # the same refused request once per entry buys a round trip and a
+        # circuit-breaker tick for an answer that is not coming. The latch is per
+        # endpoint, not per service, so a 403 on one host never closes the other,
+        # and so the source's circuit stays free to describe what the transport
+        # is actually doing.
         self._refused_urls: set[str] = set()
         self._refused_lock = threading.Lock()
 
@@ -572,15 +573,48 @@ class OpenReviewClient:
         with self._refused_lock:
             return url in self._refused_urls
 
+    def _token_for(self, url: str) -> str | None:
+        """The bearer token this run puts on ``url``, or ``None`` if it sends none.
+
+        Reads the shared client's credentials rather than re-deriving them, so
+        the answer is exactly what :meth:`HttpClient._request` attached. The
+        token is already in memory by the time a refusal comes back, so this
+        costs no login and no round trip; a run without credentials, and a host
+        whose login failed, both answer ``None``.
+        """
+        auth = getattr(self.http, "openreview_auth", None)
+        if auth is None:
+            return None
+        try:
+            return auth.token_for_url(url)  # type: ignore[no-any-return]
+        except Exception:  # noqa: BLE001 - diagnosing a refusal must never raise
+            return None
+
     def _latch_refusal(self, url: str, exc: SourceUnavailableError) -> None:
-        """Remember a 401/403 so later entries skip straight past this endpoint.
+        """Remember an ANONYMOUS 401/403 so later entries skip past this endpoint.
 
         Only a refusal latches. A timeout, a 5xx or an exhausted retry budget is
         transient and belongs to the circuit breaker, which already paces it.
+
+        A refusal of a request that carried a bearer token does not latch either,
+        because it is not a configuration state. Measured over three concurrent
+        shards of a 5,043-reference run: 844 authenticated ``api2/notes``
+        responses came back 200, while each 250-entry process took exactly one
+        403 -- and latching that one refusal reported ``set OPENREVIEW_USERNAME /
+        OPENREVIEW_PASSWORD`` for the 160 to 173 entries that followed it, on a
+        run where both were set. v2 holds ICLR 2024+, NeurIPS 2023+, TMLR and
+        COLM, so the source stopped contributing to the modern half of the
+        bibliography. A genuinely revoked token converges on the latch anyway:
+        OpenReview answers 401, the client re-logs in once, and a login that
+        fails leaves the origin disabled, so the next request goes out anonymous
+        and its 403 latches here.
         """
-        if exc.status_code in OPENREVIEW_AUTH_REFRESH_STATUS:
-            with self._refused_lock:
-                self._refused_urls.add(url)
+        if exc.status_code not in OPENREVIEW_AUTH_REFRESH_STATUS:
+            return
+        if self._token_for(url):
+            return
+        with self._refused_lock:
+            self._refused_urls.add(url)
 
     #: Host order for every ``/notes`` lookup. v2 first: it holds the 2023+
     #: venues (ICLR 2024 alone has 2,260 notes there and 0 on v1), which is the
@@ -639,14 +673,17 @@ class OpenReviewClient:
 
         Challenge gate: ``/notes`` answers ``403 ChallengeRequiredError`` to an
         anonymous caller on both hosts, so without credentials the paperhash
-        lookup cannot run. The refusal is latched per host, and every later
+        lookup cannot run. That refusal is latched per host, and every later
         entry fails that host without issuing a request: 68 of 68 sampled
         lookups in one screening run were refused alike, and re-asking a gated
         endpoint per entry buys a round trip and a circuit-breaker tick for an
-        answer that is not coming. The failure is still raised per entry, so a
-        refused OpenReview lookup keeps blocking the exhaustive ``not_found``
-        claim exactly as any other failed lookup does. Credentials through
-        :class:`~bibtex_updater.utils.OpenReviewAuth` restore the exact lookup.
+        answer that is not coming. An authenticated caller is refused for
+        transient reasons instead, so its 403 is raised for the entry and
+        forgotten rather than latched. The failure is still raised per entry
+        either way, so a refused OpenReview lookup keeps blocking the exhaustive
+        ``not_found`` claim exactly as any other failed lookup does. Credentials
+        through :class:`~bibtex_updater.utils.OpenReviewAuth` restore the exact
+        lookup.
         """
         per_page = max(1, min(int(limit), MAX_TOP_K))
         paperhashes = build_openreview_paperhashes(title or "", first_author or "")
