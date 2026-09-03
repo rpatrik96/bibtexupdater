@@ -249,7 +249,13 @@ The order is throughput-aware: CrossRef and OpenAlex (polite pool, ~100 req/min)
 
 OpenReview owns the submission record for most ML conferences, so it positively confirms ICLR/NeurIPS/TMLR papers that the DOI- and CS-index sources above can only leave in the "could-not-verify" bucket. Retrieval uses *fielded* title search (CrossRef `query.title`, OpenAlex `title.search`) rather than a free-text title+author blob, which keeps DOI-less ML-conference titles ranked correctly.
 
-OpenReview keeps its `/notes` endpoints behind a browser challenge, so the exact title + first-author lookup answers `403` to an anonymous caller. An anonymous run reports that refusal honestly (the entry cannot become a `not_found`) and stops re-issuing the refused request per entry. Supplying an OpenReview account restores the lookup:
+OpenReview runs two hosts, and they hold disjoint sets of notes. Counted live under an authenticated session: ICLR 2024 has 0 notes on `api.openreview.net` and 2,260 on `api2.openreview.net`, NeurIPS 2024 0 and 4,035, TMLR 0 and 4,639, while ICLR 2021 has 860 on v1 and 0 on v2. v1 holds the pre-2023 venues and v2 everything from 2023 on, so the exact title + first-author lookup runs against v2 first and then v1, and a miss counts as exhaustive only once both have answered.
+
+The lookup key is OpenReview's own `paperhash`, which the client reproduces character for character: Latin-1 diacritics are preserved (`Akyürek` indexes as `akyürek`, and the folded `akyurek` returns nothing) while Latin Extended is dropped rather than folded (`Karlaš` indexes as `karla`); a title keeps the maths that survives into it (`$\ell_p$` indexes as `\ell_p`, `RoboMP$^2$` as `robomp^2`); and the surname is the last whitespace token, so `Marine Le Morvan` indexes as `morvan`. Because a client cannot know which Unicode range a name falls in — and because the DBLP mirror of the same paper arrives already transliterated, as a separate note — both the diacritic-preserving and the ASCII-folded form are issued. Across 617 previously unresolvable references this raises the OpenReview resolution rate from 71.3% to 74.6%.
+
+A `venueid` of `OpenReview.net/Public_Article` or `OpenReview.net/Archive` is self-claimed ORCID/Crossref profile metadata rather than a submission OpenReview ran. Its `venue` string looks exactly like an accepted paper's ("WWW 2026", "Information Sciences"), so such a note never confirms a venue, a year, or an acceptance status; it can still corroborate a title and an author list, which is all OpenReview actually knows there.
+
+OpenReview keeps its `/notes` endpoints behind a browser challenge, so the exact title + first-author lookup answers `403` to an anonymous caller. An anonymous run reports that refusal honestly (the entry cannot become a `not_found`) and stops re-issuing the refused request per endpoint. Supplying an OpenReview account restores the lookup:
 
 ```bash
 export OPENREVIEW_USERNAME=you@example.org   # or pass --openreview-username
@@ -257,6 +263,8 @@ export OPENREVIEW_PASSWORD=...               # read from the environment only
 ```
 
 Both halves are needed and both are optional: without them the run proceeds anonymously, and a login that fails degrades to anonymous rather than ending the run. The password is never accepted as a flag, never logged, and never written to the response cache.
+
+The bearer token is cached across processes, at `~/.cache/bibtex-updater/openreview-tokens.json` (mode 0600, under `$XDG_CACHE_HOME` when set) and keyed by a hash of the username, so neither the address nor the password lands on disk. One token authenticates both hosts and is valid for 24 hours, while `/login` starts refusing after four logins in about two minutes — which is what degraded a three-shard run to anonymous after OpenReview answered `429` to 60 of its ~45 logins. A `401` refreshes the token once; a `403` is a challenge, not a stale token, and spends no login. Set `BIBTEX_CHECK_OPENREVIEW_TOKEN_CACHE=0` for the previous login-per-process behaviour, or to a path to move the file.
 
 ```bash
 # Verification with top-3 candidates per source

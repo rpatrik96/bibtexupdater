@@ -31,6 +31,7 @@ from bibtex_updater.sources import (
     OpenReviewClient,
     _content_value,
     build_openreview_paperhash,
+    build_openreview_paperhashes,
     openreview_note_to_candidate_record,
 )
 from bibtex_updater.utils import (
@@ -124,6 +125,92 @@ class TestBuildOpenReviewPaperhash:
         assert build_openreview_paperhash("Some Title", "  ") is None
 
 
+class TestOpenReviewPaperhashMatchesTheLiveIndex:
+    """Every expectation here was read off the live index under an
+    authenticated session, by issuing the hash and counting the notes returned.
+    The pre-fix normalizer produced the "misses" column and got 0 notes.
+    """
+
+    @pytest.mark.parametrize(
+        "title, author, expected",
+        [
+            # Latin-1 is PRESERVED. "akyürek|..." returns 2 notes on v1;
+            # "akyurek|..." returns 0.
+            (
+                "What Learning Algorithm Is In-Context Learning? Investigations with Linear Models",
+                'Aky{\\"u}rek, Ekin',
+                "akyürek|what_learning_algorithm_is_incontext_learning_investigations_with_linear_models",
+            ),
+            (
+                "Nonparametric Identifiability of Causal Representations from Unknown Interventions",
+                'von K{\\"u}gelgen, Julius',
+                "kügelgen|nonparametric_identifiability_of_causal_representations_from_unknown_interventions",
+            ),
+            # Latin Extended is DROPPED, not folded: "Karlaš" indexes as
+            # "karla" (1 note on v2); the folded "karlas" is a DIFFERENT note
+            # (the DBLP mirror), which is why both forms are issued.
+            (
+                "Data Debugging with Shapley Importance over Machine Learning Pipelines",
+                "Karla\u0161, Bojan",
+                "karla|data_debugging_with_shapley_importance_over_machine_learning_pipelines",
+            ),
+            # Maths survives into the title key: the backslash, the underscore
+            # and the caret are all part of it (2 notes on v2 for the first,
+            # 0 for the punctuation-stripped form).
+            (
+                "Rethinking 3D Convolution in $\\ell_p$-norm Space",
+                "Li Zhang",
+                "zhang|rethinking_3d_convolution_in_\\ell_pnorm_space",
+            ),
+            (
+                "Optimality of Matrix Mechanism on $\\ell_p^p$-metric",
+                "Zongrui Zou",
+                "zou|optimality_of_matrix_mechanism_on_\\ell_p^pmetric",
+            ),
+            # The surname is the LAST whitespace token; nobiliary particles go
+            # with the rest of the name. "morvan|..." returns 2 notes on v1,
+            # "le_morvan|..." returns 0.
+            (
+                "NeuMiss networks: differentiable programming for supervised learning with missing values",
+                "Le Morvan, Marine",
+                "morvan|neumiss_networks_differentiable_programming_for_supervised_learning_with_missing_values",
+            ),
+            (
+                "Representation Learning with Contrastive Predictive Coding",
+                "van den Oord, Aaron",
+                "oord|representation_learning_with_contrastive_predictive_coding",
+            ),
+            # Punctuation inside a surname is deleted, not spaced, so O'Brien
+            # stays one token.
+            (
+                "A Few Bad Neurons: Isolating and Surgically Correcting Sycophancy",
+                "O'Brien, Kyle",
+                "obrien|a_few_bad_neurons_isolating_and_surgically_correcting_sycophancy",
+            ),
+        ],
+    )
+    def test_reproduces_a_live_hash(self, title, author, expected):
+        assert expected in build_openreview_paperhashes(title, author)
+
+    def test_issues_both_diacritic_forms(self):
+        assert build_openreview_paperhashes("A Title", 'Aky{\\"u}rek, Ekin') == [
+            "akyürek|a_title",
+            "akyurek|a_title",
+        ]
+
+    def test_collapses_to_one_form_when_unaccented(self):
+        assert build_openreview_paperhashes("A Title", "Kingma, Diederik P.") == ["kingma|a_title"]
+
+    def test_accepts_an_already_reduced_surname(self):
+        # The cascade used to hand the client a folded, reduced surname; that
+        # input must still hash the same way.
+        assert build_openreview_paperhashes("A Title", "kingma") == ["kingma|a_title"]
+
+    def test_empty_when_unhashable(self):
+        assert build_openreview_paperhashes("", "kingma") == []
+        assert build_openreview_paperhashes("A Title", "") == []
+
+
 # ------------- OpenReviewClient.search -------------
 
 
@@ -192,92 +279,154 @@ class TestOpenReviewClientSearch:
 # ------------- API v2 fallback -------------
 
 
-class TestOpenReviewV2Fallback:
-    """Venues that migrated to api2.openreview.net (ICLR 2024+, NeurIPS 2023+)
-    are invisible to the legacy v1 host; when v1 paperhash AND v1 term both
-    miss, the same term search runs against the v2 ``/notes/search`` endpoint.
+class TestOpenReviewTwoHostPaperhash:
+    """The two hosts are DISJOINT, so the paperhash lookup runs against both.
+
+    Counted live under an authenticated session: ICLR 2024 has 0 notes on v1
+    and 2,260 on v2, NeurIPS 2024 0 and 4,035, TMLR 0 and 4,639; ICLR 2021 has
+    860 on v1 and 0 on v2. A v1-only paperhash lookup can never confirm a
+    2023-or-later paper, which is the dominant shape in a modern ML
+    bibliography.
     """
 
-    def test_v1_paperhash_hit_skips_v2(self):
-        # (1) A v1 paperhash hit must short-circuit: exactly one request, to v1.
+    def test_v2_is_queried_first(self):
+        # Before the fix the single paperhash request went to v1.
         http = MagicMock()
-        http._request.return_value = _ok([_v1_note("Adam", ["D Kingma"], ["~Diederik_Kingma1"])])
+        http._request.return_value = _ok([_v2_note("Adam", ["D Kingma"], ["~Diederik_Kingma1"])])
         client = OpenReviewClient(http=http)
 
         out = client.search("blob", title="Adam", first_author="kingma")
 
         assert out
         assert http._request.call_count == 1
-        assert http._request.call_args.args[1] == f"{OPENREVIEW_API}/notes"
+        assert http._request.call_args.args[1] == f"{OPENREVIEW_API_V2}/notes"
 
-    def test_v1_term_hit_skips_v2(self):
-        # v1 term fallback hit -> two requests, both on the v1 host, no v2 call.
-        # The term search runs against ``/notes/search``: ``/notes`` serves the
-        # paperhash filter and answers 403 to a term query from an anonymous
-        # caller, so the full-text endpoint is the one that can answer it.
-        http = MagicMock()
-        http._request.side_effect = [
-            _ok([]),
-            _ok([_v1_note("Adam", ["D Kingma"], ["~Diederik_Kingma1"])]),
-        ]
-        client = OpenReviewClient(http=http)
-
-        out = client.search("blob", title="Adam", first_author="kingma")
-
-        assert out
-        assert http._request.call_count == 2
-        assert http._request.call_args_list[0].args[1] == f"{OPENREVIEW_API}/notes"
-        assert http._request.call_args_list[1].args[1] == f"{OPENREVIEW_API}/notes/search"
-
-    def test_v1_double_miss_falls_back_to_v2(self):
-        # (2) v1 paperhash miss + v1 term miss -> v2 /notes/search is queried
-        # with the same LaTeX-stripped term, through the shared client with
-        # the openreview service tag; the v2-shaped note parses correctly.
+    def test_v2_only_venue_found_where_v1_misses(self):
+        # The regression this whole change exists for: a 2024 ICLR paper is
+        # invisible on v1 and present on v2. v1 answers "no notes", v2 answers
+        # with the paper.
         v2_note = _v2_note(
-            "Sparse {A}ttention Revisited",
+            "Sparse Attention Revisited",
             ["Grace Hopper", "Alan Turing"],
             ["~Grace_Hopper1", "~Alan_Turing1"],
             venue="ICLR 2024 poster",
             venueid="ICLR.cc/2024/Conference",
         )
+
+        def by_host(method, url, **kwargs):
+            return _ok([v2_note]) if url.startswith(OPENREVIEW_API_V2) else _ok([])
+
         http = MagicMock()
-        http._request.side_effect = [_ok([]), _ok([]), _ok([v2_note])]
+        http._request.side_effect = by_host
         client = OpenReviewClient(http=http)
 
-        out = client.search("blob", limit=3, title="Sparse {A}ttention Revisited", first_author="hopper")
+        out = client.search("blob", limit=3, title="Sparse Attention Revisited", first_author="hopper")
 
         assert out == [v2_note]
-        assert http._request.call_count == 3
-        assert http._request.call_args_list[1].args[1] == f"{OPENREVIEW_API}/notes/search"
-        v2_call = http._request.call_args_list[2]
-        assert v2_call.args[1] == f"{OPENREVIEW_API_V2}/notes/search"
-        assert v2_call.kwargs["service"] == "openreview"
-        # LaTeX-stripped term, same params shape as the v1 term fallback.
-        assert v2_call.kwargs["params"] == {"term": "Sparse Attention Revisited", "limit": 3}
+        call = http._request.call_args_list[0]
+        assert call.args[1] == f"{OPENREVIEW_API_V2}/notes"
+        assert call.kwargs["service"] == "openreview"
+        assert call.kwargs["params"] == {"paperhash": "hopper|sparse_attention_revisited", "limit": 3}
 
         rec = openreview_note_to_candidate_record(out[0])
         assert rec is not None
-        assert rec.title == "Sparse {A}ttention Revisited"
         assert rec.journal == "ICLR 2024 poster"
         assert rec.year == 2024  # recovered from the venue string
-        assert rec.structured_names is True  # families from the tilde handles
+        assert rec.structured_names is True
         assert rec.surname_keys() == ["hopper", "turing"]
-        assert rec.order_reliable is True  # same as the v1 converter
 
-    def test_v2_error_raises(self):
-        # (3) A v2 failure surfaces: the v1 hosts answered with nothing, but the
-        # v2 host never answered at all, so the search is not exhaustive.
+    def test_v1_queried_when_v2_misses(self):
+        # A pre-2023 venue lives on v1 alone, so a v2 miss is not the end.
+        v1_note = _v1_note("Adam", ["D Kingma"], ["~Diederik_Kingma1"], venue="ICLR 2015")
         http = MagicMock()
-        http._request.side_effect = [_ok([]), _ok([]), RuntimeError("v2 down")]
+        http._request.side_effect = [_ok([]), _ok([v1_note])]
+        client = OpenReviewClient(http=http)
+
+        out = client.search("blob", title="Adam", first_author="kingma")
+
+        assert out == [v1_note]
+        urls = [c.args[1] for c in http._request.call_args_list]
+        assert urls == [f"{OPENREVIEW_API_V2}/notes", f"{OPENREVIEW_API}/notes"]
+
+    def test_both_hash_forms_are_issued(self):
+        # OpenReview keeps Latin-1 and drops Latin Extended, and the DBLP mirror
+        # of the same paper arrives already transliterated. A client cannot tell
+        # which form a name lands in, so it asks for both.
+        http = MagicMock()
+        http._request.return_value = _ok([])
+        client = OpenReviewClient(http=http)
+
+        client.search("blob", title="A Title", first_author="Karla\u0161, Bojan")
+
+        hashes = [
+            c.kwargs["params"]["paperhash"] for c in http._request.call_args_list if "paperhash" in c.kwargs["params"]
+        ]
+        assert hashes[:2] == ["karla|a_title", "karlas|a_title"]
+        # Both hosts get both forms before the miss is called exhaustive.
+        assert hashes == ["karla|a_title", "karlas|a_title"] * 2
+
+    def test_single_hash_when_name_is_unaccented(self):
+        # The common case must not double the request budget.
+        http = MagicMock()
+        http._request.return_value = _ok([])
+        client = OpenReviewClient(http=http)
+
+        client.search("blob", title="A Title", first_author="Kingma, Diederik P.")
+
+        hashes = [
+            c.kwargs["params"]["paperhash"] for c in http._request.call_args_list if "paperhash" in c.kwargs["params"]
+        ]
+        assert hashes == ["kingma|a_title", "kingma|a_title"]
+
+    def test_term_fallback_runs_on_both_hosts_after_a_double_miss(self):
+        http = MagicMock()
+        http._request.side_effect = [_ok([]), _ok([]), _ok([]), _ok([_v1_note("T U V", ["A B"], ["~A_B1"])])]
+        client = OpenReviewClient(http=http)
+
+        out = client.search("blob", limit=3, title="T U V", first_author="a")
+
+        assert out
+        urls = [c.args[1] for c in http._request.call_args_list]
+        assert urls == [
+            f"{OPENREVIEW_API_V2}/notes",
+            f"{OPENREVIEW_API}/notes",
+            f"{OPENREVIEW_API_V2}/notes/search",
+            f"{OPENREVIEW_API}/notes/search",
+        ]
+        assert http._request.call_args_list[2].kwargs["params"] == {"term": "T U V", "limit": 3}
+
+    def test_a_host_that_never_answered_raises(self):
+        # One host answered "nothing"; the other never answered at all, so the
+        # miss is not exhaustive and cannot support ``not_found``.
+        def by_host(method, url, **kwargs):
+            if url.startswith(OPENREVIEW_API_V2):
+                raise RuntimeError("v2 down")
+            return _ok([])
+
+        http = MagicMock()
+        http._request.side_effect = by_host
         client = OpenReviewClient(http=http)
         with pytest.raises(SourceUnavailableError):
             client.search("b", title="T U V", first_author="a")
 
-    def test_v2_non_200_raises(self):
+    def test_a_hit_on_the_healthy_host_survives_the_other_failing(self):
+        v2_note = _v2_note("T U V", ["A B"], ["~A_B1"], venue="ICLR 2024")
+
+        def by_host(method, url, **kwargs):
+            if url.startswith(OPENREVIEW_API_V2):
+                return _ok([v2_note])
+            raise RuntimeError("v1 down")
+
         http = MagicMock()
+        http._request.side_effect = by_host
+        client = OpenReviewClient(http=http)
+        assert client.search("b", title="T U V", first_author="a") == [v2_note]
+
+    def test_v2_non_200_raises(self):
         resp_500 = MagicMock()
         resp_500.status_code = 500
-        http._request.side_effect = [_ok([]), _ok([]), resp_500]
+        http = MagicMock()
+        http._request.side_effect = [resp_500, _ok([])]
         client = OpenReviewClient(http=http)
         with pytest.raises(SourceUnavailableError):
             client.search("b", title="T U V", first_author="a")
@@ -287,13 +436,12 @@ class TestOpenReviewV2Fallback:
         bad.status_code = 200
         bad.json.return_value = {"notes": "not-a-list"}
         http = MagicMock()
-        http._request.side_effect = [_ok([]), _ok([]), bad]
+        http._request.side_effect = [bad, _ok([]), _ok([]), _ok([])]
         client = OpenReviewClient(http=http)
         assert client.search("b", title="T U V", first_author="a") == []
 
-    def test_no_v2_without_first_author(self):
-        # Same gating as the v1 term fallback: author-less searches never
-        # reach the term/v2 paths at all.
+    def test_no_request_without_first_author(self):
+        # Same gating as before: author-less searches never reach any path.
         http = MagicMock()
         http._request.return_value = _ok([])
         client = OpenReviewClient(http=http)
@@ -461,10 +609,12 @@ class TestOpenReviewCascadeWiring:
             "crossref-fallback",
             "openalex-fallback",
         ]
-        # OpenReview got the raw title + reduced first-author surname.
+        # OpenReview gets the RAW title and the RAW first-author name: the
+        # shared retrieval forms delete maths and ASCII-fold the surname, and
+        # OpenReview's paperhash index keeps both.
         kwargs = openreview.search.call_args.kwargs
         assert kwargs["title"] == "Some ICLR Paper"
-        assert kwargs["first_author"] == "doe"
+        assert kwargs["first_author"] == "Doe, Jane"
 
     def test_high_confidence_openreview_short_circuits_before_s2(self):
         title = "A Highly Specific ICLR Submission Title"

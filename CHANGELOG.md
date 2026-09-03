@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.10.0] - 2026-09-03
+
+1.9.0 got past OpenReview's challenge gate. This release fixes what the lookup did once it was through: it asked one of the two hosts, under a key that did not match the index, and logged in once per process to do it.
+
+Nothing a consumer routes on changes: the statuses, the report schema, the exit codes and the CLI flags are identical to 1.9.0. What changes is how many entries OpenReview can confirm, and how a sharded run spends its logins.
+
+Upgrade note: the bearer token is now cached across processes at `~/.cache/bibtex-updater/openreview-tokens.json` (mode 0600, under `$XDG_CACHE_HOME` when set). It holds tokens only, keyed by a hash of the username, so neither the address nor the password lands on disk. Set `BIBTEX_CHECK_OPENREVIEW_TOKEN_CACHE=0` to keep the 1.9.0 login-per-process behaviour, or to a path to move the file.
+
+### Fixed
+
+- **The paperhash lookup queried only the legacy host, which holds no modern ML paper.** OpenReview runs two hosts and they are disjoint. Counted live under an authenticated session: `ICLR.cc/2024/Conference` has 0 notes on `api.openreview.net` and 2,260 on `api2.openreview.net`, `NeurIPS.cc/2024/Conference` 0 and 4,035, `TMLR` 0 and 4,639 — while `ICLR.cc/2021/Conference` has 860 on v1 and 0 on v2. v1 holds the pre-2023 venues and v2 everything from 2023 on, so a v1-only exact lookup could never confirm the shape that dominates a current ML bibliography. The lookup now runs v2 first and then v1, and a miss counts as exhaustive only once both have answered. A host that never answered is still a failed lookup and still blocks the exhaustive `not_found` claim; a host that is challenge-gated is still latched per endpoint, so the other one is not punished for it.
+
+- **The paperhash normalizer did not reproduce OpenReview's own key.** Measured against 6,698 live notes across ICLR, ICML, NeurIPS, TMLR and COLM on both hosts, it diverged in three ways, each of which returns zero notes for a paper OpenReview holds. Diacritics: OpenReview preserves the Latin-1 block and DROPS Latin Extended rather than folding it, so `Akyürek` indexes as `akyürek` and `Karlaš` as `karla`, while the cascade was handing the lookup an ASCII-folded surname; LaTeX accents are now decoded to Unicode first, and because a client cannot know which range a name falls in, both the diacritic-preserving and the ASCII-folded hash are issued (they collapse to one for an unaccented name, and the folded form separately catches the transliterated DBLP mirror, which is a different note). Titles: the backslash, caret, brackets and underscore are part of the key, so `$\ell_p$` indexes as `\ell_p` and `RoboMP$^2$` as `robomp^2` — the old normalizer stripped them, and the shared retrieval title deletes maths outright, so every maths-bearing title missed. Surnames: the key is the last whitespace token with the particles discarded, which the entry side already produced correctly. Over 617 previously unresolvable references the OpenReview resolution rate goes from 71.3% to 74.6%, recovering 20 entries and losing none.
+
+- **A self-claimed profile import could confirm a venue OpenReview never reviewed.** A note under `venueid` `OpenReview.net/Public_Article` is ORCID/Crossref profile metadata an author submitted about their own work (251,508 such notes live), and `OpenReview.net/Archive` is a self-upload (26,809). Their `venue` strings are indistinguishable from an accepted paper's — "WWW 2026", "Information Sciences" — so the year rule read them as acceptance. They now classify as `unknown` and carry no venue and no year into the candidate record, which can still corroborate a title and an author list. This matters more now that the paperhash lookup reaches v2, where the whole self-claimed pool lives.
+
+- **Logins were spent per process, and OpenReview refuses the fourth in two minutes.** The client logged in once per process and never reused the token, which is right for one long run and wrong for a sharded one: three shards over one bibliography produced about 45 logins and OpenReview answered `429` to 60 of them, degrading those runs to anonymous. The token is valid for 24 hours and authenticates both hosts, so it is now cached across processes and the whole fleet logs in once. A `401 TokenExpiredError` refreshes it exactly once per request and drops the shared copy; a `403 ChallengeRequiredError` means the request was never recognized as authenticated, so it no longer spends a login answering a question that was not asked.
+
+### Added
+
+- **`BIBTEX_CHECK_OPENREVIEW_TOKEN_CACHE`** controls the cross-process token cache: unset uses the default path, a path moves the file, and `0`/`off`/`false`/`none` turns persistence off. The file is written atomically at mode 0600 inside a 0700 directory and holds no password and no username. Every failure is non-fatal: an unreadable or unwritable cache degrades to the login-per-process behaviour it replaced.
+
+- **`build_openreview_paperhashes(title, first_author)`** returns every form under which OpenReview may have indexed a paper. `build_openreview_paperhash` keeps its signature and returns the first of them.
+
 ## [1.9.0] - 2026-09-03
 
 OpenReview answers again. Its exact title + first-author lookup went behind a browser challenge, and an anonymous run had been getting nothing from the source for every entry.

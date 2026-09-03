@@ -10,6 +10,7 @@ from bibtex_updater.sources import (
     OR_PREPRINT,
     OR_UNKNOWN,
     openreview_acceptance,
+    openreview_note_to_candidate_record,
 )
 
 
@@ -106,3 +107,58 @@ class TestOpenReviewAcceptanceV2Shapes:
         ]
         for venue, venueid in cases:
             assert openreview_acceptance(_note(venue, venueid)) == openreview_acceptance(_v2_note(venue, venueid))
+
+
+class TestSelfClaimedProfileMetadataNeverConfirms:
+    """``OpenReview.net/Public_Article`` is an ORCID/Crossref profile import and
+    ``OpenReview.net/Archive`` a self-upload: 251,508 and 26,809 notes live, all
+    of them on the v2 host the paperhash lookup now reaches. Their ``venue``
+    strings are indistinguishable from an accepted paper's ("WWW 2026",
+    "Information Sciences"), so the year rule would read them as acceptance --
+    but OpenReview never reviewed them and cannot vouch for them.
+    """
+
+    @pytest.mark.parametrize(
+        "venue,venueid",
+        [
+            ("WWW 2026", "OpenReview.net/Public_Article"),
+            ("Information Sciences", "OpenReview.net/Public_Article"),
+            ("CYBERNETICS AND PHYSICS 2024", "OpenReview.net/Archive"),
+        ],
+    )
+    def test_status_is_unknown(self, venue, venueid):
+        assert openreview_acceptance(_note(venue, venueid)) == OR_UNKNOWN
+        assert openreview_acceptance(_v2_note(venue, venueid)) == OR_UNKNOWN
+
+    def test_the_record_carries_no_venue_and_no_year(self):
+        note = {
+            "content": {
+                "title": {"value": "Language Model Representations for Tabular Classification"},
+                "authors": {"value": ["Grace Hopper"]},
+                "authorids": {"value": ["~Grace_Hopper1"]},
+                "venue": {"value": "WWW 2026"},
+                "venueid": {"value": "OpenReview.net/Public_Article"},
+            }
+        }
+        rec = openreview_note_to_candidate_record(note)
+        assert rec is not None
+        # Title and authors still corroborate; the self-claimed venue and the
+        # year recovered from it must not confirm the entry's claim.
+        assert rec.journal is None
+        assert rec.year is None
+        assert rec.acceptance == OR_UNKNOWN
+
+    def test_a_real_venue_is_unaffected(self):
+        note = {
+            "content": {
+                "title": {"value": "Sparse Attention Revisited"},
+                "authors": {"value": ["Grace Hopper"]},
+                "authorids": {"value": ["~Grace_Hopper1"]},
+                "venue": {"value": "ICLR 2024 poster"},
+                "venueid": {"value": "ICLR.cc/2024/Conference"},
+            }
+        }
+        rec = openreview_note_to_candidate_record(note)
+        assert rec.journal == "ICLR 2024 poster"
+        assert rec.year == 2024
+        assert rec.acceptance == OR_ACCEPTED
