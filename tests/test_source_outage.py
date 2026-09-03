@@ -25,20 +25,27 @@ from unittest.mock import MagicMock
 import httpx
 import pytest
 
+import bibtex_updater.utils as utils_module
 from bibtex_updater.fact_checker import (
     EXIT_SOURCE_OUTAGE,
     NETWORK_OUTAGE_ENTRY_FRACTION,
     ArxivClient,
+    ClassificationResult,
     CrossrefClient,
     DBLPClient,
+    EntryCategory,
     FactChecker,
     FactCheckerConfig,
     FactCheckProcessor,
     FactCheckResult,
     FactCheckStatus,
     SemanticScholarClient,
+    WebVerifier,
+    WebVerifierConfig,
     _report_source_outage,
+    build_parser,
 )
+from bibtex_updater.fact_checker import main as fact_checker_main
 from bibtex_updater.sources import OpenAlexClient, OpenReviewClient
 from bibtex_updater.utils import (
     HttpClient,
@@ -219,6 +226,19 @@ class TestNotFoundRequiresCompleteCoverage:
         assert result.sources_failed == ["dblp"]
         assert result.coverage_incomplete is True
 
+    def test_outage_and_clean_miss_differ_only_in_the_transport(self):
+        """The regression in one assertion, for a reviewer reading the diff.
+
+        Both runs ask the same sources about the same entry and both end with no
+        usable candidate. The only difference is whether the sources answered.
+        Before the fix these two lines were equal, and both read ``not_found``.
+        """
+        outage = _checker(_http(side_effect=httpx.ConnectError(DNS_FAILURE))).check_entry(_entry())
+        clean = _checker(_http(side_effect=_EmptyTransport())).check_entry(_entry())
+
+        assert (outage.status, clean.status) == (FactCheckStatus.API_ERROR, FactCheckStatus.NOT_FOUND)
+        assert (outage.coverage_incomplete, clean.coverage_incomplete) == (True, False)
+
     def test_failed_source_names_reach_the_jsonl(self):
         http = _http(side_effect=httpx.ConnectError(DNS_FAILURE))
         result = _checker(http).check_entry(_entry())
@@ -292,3 +312,228 @@ class TestRunLevelOutageReport:
         with caplog.at_level(logging.WARNING, logger=LOGGER.name):
             assert _report_source_outage(summary, http, LOGGER) == 0
         assert "dblp" in caplog.text
+
+
+# ===========================================================================
+# Web references: url_not_found needs a host that answered
+# ===========================================================================
+
+
+def _web_verifier(handler, logger=LOGGER) -> WebVerifier:
+    """WebVerifier over a hermetic httpx.MockTransport (mirrors test_fact_checker)."""
+    http = MagicMock()
+    http.client = httpx.Client(transport=httpx.MockTransport(handler))
+    return WebVerifier(http, WebVerifierConfig(), logger)
+
+
+def _web_entry() -> dict[str, str]:
+    return {
+        "ID": "post2024",
+        "ENTRYTYPE": "online",
+        "title": "A Blog Post About Widgets",
+        "author": "Smith, Jane",
+        "url": "https://example.com/widgets",
+        "year": "2024",
+    }
+
+
+def _classification() -> ClassificationResult:
+    return ClassificationResult(
+        category=EntryCategory.WEB_REFERENCE,
+        reason="url",
+        extracted_url="https://example.com/widgets",
+    )
+
+
+def _unreachable(exc: Exception):
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise exc
+
+    return handler
+
+
+class TestWebReferenceRequiresAReachableHost:
+    """``url_not_found`` asserts the page is gone. Only a response can support
+    that; a host that was never reached says nothing about the page, exactly as
+    an unreachable database says nothing about a paper."""
+
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            httpx.ConnectError(DNS_FAILURE),
+            httpx.ConnectError("connection refused"),
+            httpx.ConnectTimeout("timed out"),
+            httpx.ReadTimeout("read timed out"),
+        ],
+        ids=["dns", "refused", "connect-timeout", "read-timeout"],
+    )
+    def test_unreachable_host_is_not_url_not_found(self, exc):
+        verifier = _web_verifier(_unreachable(exc))
+        result = verifier.verify(_web_entry(), _classification())
+
+        assert result.status is not FactCheckStatus.URL_NOT_FOUND
+        assert result.status is FactCheckStatus.API_ERROR
+        assert result.sources_failed == ["url_check"]
+        assert result.url_check is not None and result.url_check.lookup_failed is True
+        assert result.coverage_incomplete is True
+
+    def test_tls_failure_is_a_failed_lookup(self):
+        import ssl
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise httpx.ConnectError("handshake failed") from ssl.SSLCertVerificationError("verify failed")
+
+        result = _web_verifier(handler).verify(_web_entry(), _classification())
+
+        assert result.status is FactCheckStatus.API_ERROR
+        assert result.url_check is not None and "SSL error" in (result.url_check.error or "")
+
+    def test_genuine_404_is_still_url_not_found(self):
+        """The control: the host answered, and the page is not there. That IS
+        evidence, and the verdict must not drift to an error status."""
+        result = _web_verifier(lambda request: httpx.Response(404)).verify(_web_entry(), _classification())
+
+        assert result.status is FactCheckStatus.URL_NOT_FOUND
+        assert result.sources_failed == []
+        assert result.url_check is not None
+        assert result.url_check.lookup_failed is False
+        assert result.url_check.status_code == 404
+
+    def test_reachable_page_still_verifies(self):
+        result = _web_verifier(lambda request: httpx.Response(200)).verify(_web_entry(), _classification())
+
+        assert result.status is FactCheckStatus.URL_ACCESSIBLE
+        assert result.sources_failed == []
+
+    def test_dead_network_and_dead_page_no_longer_look_alike(self):
+        """The web half of the same regression, in one assertion."""
+        outage = _web_verifier(_unreachable(httpx.ConnectError(DNS_FAILURE))).verify(_web_entry(), _classification())
+        gone = _web_verifier(lambda request: httpx.Response(404)).verify(_web_entry(), _classification())
+
+        assert (outage.status, gone.status) == (FactCheckStatus.API_ERROR, FactCheckStatus.URL_NOT_FOUND)
+
+
+# ===========================================================================
+# --outage-threshold: the exit-5 gate is tunable, never switchable-off
+# ===========================================================================
+
+
+class TestOutageThresholdFlag:
+    def test_default_is_the_module_constant(self):
+        args = build_parser().parse_args(["refs.bib"])
+        assert args.outage_threshold == NETWORK_OUTAGE_ENTRY_FRACTION
+
+    @pytest.mark.parametrize("value", ["1.5", "-0.1", "abc", ""])
+    def test_out_of_range_and_non_numeric_are_rejected(self, value):
+        with pytest.raises(SystemExit):
+            build_parser().parse_args(["refs.bib", "--outage-threshold", value])
+
+    @pytest.mark.parametrize("value", ["0", "0.25", "1"])
+    def test_the_whole_fraction_range_is_accepted(self, value):
+        args = build_parser().parse_args(["refs.bib", "--outage-threshold", value])
+        assert args.outage_threshold == float(value)
+
+    def test_threshold_moves_the_verdict_in_both_directions(self):
+        summary = {"total": 100, "sources_failed_count": 5, "failed_source_counts": {"dblp": 5}}
+        http = MagicMock()
+        http.unreachable_hosts = {}
+
+        assert _report_source_outage(summary, http, LOGGER, 0.10) == 0
+        assert _report_source_outage(summary, http, LOGGER, 0.01) == EXIT_SOURCE_OUTAGE
+
+        summary["sources_failed_count"] = 50
+        summary["failed_source_counts"] = {"dblp": 50}
+        assert _report_source_outage(summary, http, LOGGER, 0.10) == EXIT_SOURCE_OUTAGE
+        assert _report_source_outage(summary, http, LOGGER, 0.90) == 0
+
+
+# ===========================================================================
+# The same flag, driven through the real CLI
+# ===========================================================================
+
+
+UNREACHABLE_TITLE_TOKEN = "Unreachable"
+
+
+def _bib(tmp_path, n_entries: int, failing: set[int]) -> str:
+    """A bibliography whose entries at ``failing`` indices carry a title token
+    the faked transport refuses to answer for.
+
+    Callers interleave the failing indices so the per-service circuit breaker
+    (four consecutive failures) never trips and turns a partial outage into a
+    total one -- that cascade is real and correct, but it is not what these
+    tests are measuring.
+    """
+    blocks = []
+    for i in range(n_entries):
+        marker = f"{UNREACHABLE_TITLE_TOKEN} " if i in failing else ""
+        blocks.append(
+            f"@article{{entry{i},\n"
+            f"  title = {{{marker}Sparse Coding Study Number {i}}},\n"
+            f"  author = {{Smith, Jane and Doe, John}},\n"
+            f"  journal = {{Journal of Widget Research}},\n"
+            f"  year = {{2023}}\n"
+            f"}}\n"
+        )
+    path = tmp_path / "refs.bib"
+    path.write_text("\n".join(blocks), encoding="utf-8")
+    return str(path)
+
+
+def _install_selective_transport(monkeypatch) -> None:
+    """Every HttpClient the CLI builds answers 200-empty, except for requests
+    carrying the marker token, which fail DNS resolution."""
+    empty = _EmptyTransport()
+    real_init = HttpClient.__init__
+
+    def patched_init(self, *args, **kwargs):
+        real_init(self, *args, **kwargs)
+
+        def transport(method, url, **request_kwargs):
+            if UNREACHABLE_TITLE_TOKEN.lower() in f"{url} {request_kwargs.get('params')}".lower():
+                raise httpx.ConnectError(DNS_FAILURE)
+            return empty()
+
+        self.client = MagicMock()
+        self.client.request.side_effect = transport
+
+    monkeypatch.setattr(HttpClient, "__init__", patched_init)
+    monkeypatch.setattr(utils_module.RateLimiter, "wait", lambda self: None)
+
+
+def _run_cli(bib: str, *extra: str) -> int:
+    argv = ["bibtex-check", bib, "--no-cache", "--no-check-dois", "--academic-only", "--workers", "1", *extra]
+    import sys
+
+    original = sys.argv
+    sys.argv = argv
+    try:
+        return fact_checker_main()
+    finally:
+        sys.argv = original
+
+
+class TestOutageThresholdThroughTheCLI:
+    def test_a_lower_threshold_condemns_a_run_the_default_lets_pass(self, tmp_path, monkeypatch):
+        """One entry of twenty (5%) had a source it could not reach."""
+        _install_selective_transport(monkeypatch)
+        bib = _bib(tmp_path, n_entries=20, failing={0})
+
+        assert _run_cli(bib) == 0
+        assert _run_cli(bib, "--outage-threshold", "0.01") == EXIT_SOURCE_OUTAGE
+
+    def test_a_higher_threshold_tolerates_a_run_the_default_condemns(self, tmp_path, monkeypatch):
+        """Half the run (every other entry) could not be checked."""
+        _install_selective_transport(monkeypatch)
+        bib = _bib(tmp_path, n_entries=20, failing=set(range(0, 20, 2)))
+
+        assert _run_cli(bib) == EXIT_SOURCE_OUTAGE
+        assert _run_cli(bib, "--outage-threshold", "0.9") == 0
+
+    def test_exit_5_is_not_gated_on_strict_mode(self, tmp_path, monkeypatch):
+        """The whole point of the code: a poisoned run must not exit 0 just
+        because the user did not ask for strict checking."""
+        _install_selective_transport(monkeypatch)
+        bib = _bib(tmp_path, n_entries=4, failing={0, 1, 2, 3})
+
+        assert _run_cli(bib) == EXIT_SOURCE_OUTAGE

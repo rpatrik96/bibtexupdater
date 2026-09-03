@@ -7,11 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Upgrade note: `not_found` is now an exhaustive claim — every source consulted for the entry answered. An entry whose cascade included a source that could not be reached reports `api_error` instead, so bibliographies checked over a flaky connection will show `api_error` where earlier versions showed `not_found`. JSONL and JSON reports gain a `sources_failed` field naming those sources; existing fields are unchanged. A run in which more than 10% of entries hit a failed lookup now exits 5 in any mode.
+Upgrade note: `not_found` is now an exhaustive claim — every source consulted for the entry answered. An entry whose cascade included a source that could not be reached reports `api_error` instead, so bibliographies checked over a flaky connection will show `api_error` where earlier versions showed `not_found`. The same rule reaches web references: `url_not_found` now requires a response, and an unreachable host reports `api_error`. JSONL and JSON reports gain a `sources_failed` field naming those sources, and the JSON report's `url_check` block gains `lookup_failed`; existing fields are unchanged. A run in which the fraction of entries with a failed lookup reaches `--outage-threshold` (default 10%) now exits 5 in any mode.
 
 ### Fixed
 
 - **A network outage was reported as thousands of references no database has heard of.** Every source client caught its own failures and returned an empty result, so a DNS failure, refused connection, TLS error, read timeout or exhausted 429/5xx retry budget was indistinguishable downstream from a database that had checked and found nothing. Mid-run wifi loss during a 5,043-reference check therefore produced `not_found` for 2,500 real, correctly-cited references, at exit code 0 with nothing logged — and `not_found` is the status a citation-hallucination screen reads as possible fabrication. The clients now raise `SourceUnavailableError` for a lookup that ends without an answer, the cascade records which sources failed per entry, and `not_found` is demoted to `api_error` whenever any of them did — including when the remaining sources answered cleanly and found nothing, because a partial cascade cannot establish an exhaustive miss. A source that answers with zero results is unaffected and still yields `not_found`. Failed lookups are logged with the affected sources, and the unreachable hosts named separately: an HTTP error response proves the network is up, so a 429 is a refusal to answer rather than an outage.
+
+- **An unreachable host read as a dead web page.** `url_not_found` — whose own definition read "404 or domain unreachable" — was returned for a DNS failure, refused connection, TLS error or timeout, the same conflation as above in the web-reference family. It now requires a response: a real HTTP 404 stays `url_not_found`, while a host that was never reached reports `api_error` with `sources_failed: ["url_check"]`, and `url_check.lookup_failed` in the JSON report records which of the two happened.
+
+### Added
+
+- **`--outage-threshold FLOAT`** sets the fraction of entries (0–1) with a failed source lookup at which a run exits 5, defaulting to the previous fixed 10%. `0` fails on a single failed lookup; `1` fails only when every entry was affected. There is no value that switches the gate off — it decides when a degraded run becomes a condemned one, never whether failed lookups are reported.
 
 ## [1.7.0] - 2026-08-15
 

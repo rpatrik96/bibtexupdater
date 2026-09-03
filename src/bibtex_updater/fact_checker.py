@@ -288,7 +288,10 @@ class FactCheckStatus(Enum):
     # Web reference statuses
     URL_VERIFIED = "url_verified"  # URL accessible and content matches
     URL_ACCESSIBLE = "url_accessible"  # URL returns 200, no content check
-    URL_NOT_FOUND = "url_not_found"  # 404 or domain unreachable
+    # The host answered and the page is not there (HTTP >= 400). An unreachable
+    # host is NOT this: a DNS failure, refused connection, TLS error or timeout
+    # says nothing about whether the page exists, and reports API_ERROR instead.
+    URL_NOT_FOUND = "url_not_found"
     URL_CONTENT_MISMATCH = "url_content_mismatch"  # Page content differs from entry
 
     # Book statuses
@@ -786,6 +789,12 @@ class URLCheckResult:
     is_redirect: bool = False
     final_url: str | None = None
     error: str | None = None
+    # True when the check never reached the host (DNS, connection refused/reset,
+    # TLS, timeout). ``accessible`` is False either way, but only a response
+    # carries evidence about the page: an unreachable host is a failed lookup,
+    # the same distinction the academic cascade draws between a source that
+    # answered with nothing and a source that never answered.
+    lookup_failed: bool = False
 
 
 @dataclass
@@ -1033,6 +1042,7 @@ class BaseVerifier(ABC):
         errors: list[str] | None = None,
         url_check: URLCheckResult | None = None,
         book_match: BookRecord | None = None,
+        sources_failed: list[str] | None = None,
     ) -> FactCheckResult:
         """Create a FactCheckResult with common fields."""
         return FactCheckResult(
@@ -1045,6 +1055,7 @@ class BaseVerifier(ABC):
             api_sources_queried=api_sources_queried or [],
             api_sources_with_hits=api_sources_with_hits or [],
             errors=errors or [],
+            sources_failed=sources_failed or [],
             category=category,
             url_check=url_check,
             book_match=book_match,
@@ -1078,6 +1089,21 @@ class WebVerifier(BaseVerifier):
         # Check URL accessibility
         url_result = self._check_url(url)
 
+        # The host was never reached, so nothing was learned about the page.
+        # URL_NOT_FOUND asserts the page is gone; a dead network cannot support
+        # that any more than a dead network can support NOT_FOUND for a paper.
+        if url_result.lookup_failed:
+            return self._make_result(
+                entry,
+                FactCheckStatus.API_ERROR,
+                EntryCategory.WEB_REFERENCE,
+                url_check=url_result,
+                api_sources_queried=["url_check"],
+                errors=[url_result.error] if url_result.error else [],
+                sources_failed=["url_check"],
+            )
+
+        # The host answered, with a status saying the page is not there.
         if not url_result.accessible:
             return self._make_result(
                 entry,
@@ -1137,6 +1163,11 @@ class WebVerifier(BaseVerifier):
         Uses the SHARED httpx client (``self.http.client``) so web-reference
         checks ride the same connection pool as every other request instead of
         opening a parallel ``requests`` pool.
+
+        A response of any status is an answer about the page and sets
+        ``accessible`` from it. An exception means the host was never reached,
+        which is a failed lookup: ``lookup_failed`` is set so the caller reports
+        an error rather than claiming the page is gone.
         """
         try:
             # Use HEAD request to minimize data transfer
@@ -1160,12 +1191,12 @@ class WebVerifier(BaseVerifier):
             )
         except httpx.ConnectError as e:
             if self._is_ssl_failure(e):
-                return URLCheckResult(url=url, accessible=False, error=f"SSL error: {e}")
-            return URLCheckResult(url=url, accessible=False, error=f"Connection error: {e}")
+                return URLCheckResult(url=url, accessible=False, lookup_failed=True, error=f"SSL error: {e}")
+            return URLCheckResult(url=url, accessible=False, lookup_failed=True, error=f"Connection error: {e}")
         except httpx.TimeoutException:
-            return URLCheckResult(url=url, accessible=False, error="Request timed out")
+            return URLCheckResult(url=url, accessible=False, lookup_failed=True, error="Request timed out")
         except Exception as e:
-            return URLCheckResult(url=url, accessible=False, error=str(e))
+            return URLCheckResult(url=url, accessible=False, lookup_failed=True, error=str(e))
 
     def _verify_content(self, url: str, entry: dict[str, Any]) -> float | None:
         """Verify that page content matches entry metadata."""
@@ -5873,6 +5904,7 @@ class FactCheckProcessor:
                     "status_code": r.url_check.status_code,
                     "is_redirect": r.url_check.is_redirect,
                     "final_url": r.url_check.final_url,
+                    "lookup_failed": r.url_check.lookup_failed,
                     "error": r.url_check.error,
                 }
             # Add book match details
@@ -5927,16 +5959,36 @@ class FactCheckProcessor:
 # ------------- CLI -------------
 
 
-#: Fraction of checked entries with at least one failed source lookup above
-#: which the whole run is treated as poisoned rather than merely degraded. A
-#: healthy run sits at ~0; the 2026-09-02 wifi drop put 25 output chunks at
-#: 85-98%, and the run still exited 0.
+#: Default fraction of checked entries with at least one failed source lookup
+#: above which the whole run is treated as poisoned rather than merely degraded.
+#: A healthy run sits at ~0; the 2026-09-02 wifi drop put 25 output chunks at
+#: 85-98%, and the run still exited 0. Tunable per run with --outage-threshold;
+#: kept as the module default so importers keep a stable value to read.
 NETWORK_OUTAGE_ENTRY_FRACTION: float = 0.10
 
 #: Exit code for a run whose source lookups failed above that fraction. Distinct
 #: from the strict-mode gate (4), which reports on the bibliography; this one
-#: reports that the check itself did not happen.
+#: reports that the check itself did not happen. It fires in every mode, not
+#: only under --strict: a silent exit 0 over a run whose lookups never left the
+#: machine is the failure this exists to prevent.
 EXIT_SOURCE_OUTAGE: int = 5
+
+
+def outage_threshold_arg(value: str) -> float:
+    """Parse --outage-threshold: a fraction of entries in [0, 1].
+
+    ``0`` fails the run on a single failed lookup; ``1`` fails it only when
+    every entry was affected. There is deliberately no value that switches the
+    check off -- the threshold decides when a degraded run becomes a condemned
+    one, never whether failed lookups are reported at all.
+    """
+    try:
+        fraction = float(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(f"expected a number in [0, 1], got {value!r}") from None
+    if not 0.0 <= fraction <= 1.0:
+        raise argparse.ArgumentTypeError(f"must be a fraction in [0, 1], got {fraction}")
+    return fraction
 
 
 #: Placeholder polite-pool contact used when no real --mailto /
@@ -6075,6 +6127,19 @@ Examples:
         ),
     )
     p.add_argument("--verbose", "-v", action="store_true", help="Enable debug logging")
+    p.add_argument(
+        "--outage-threshold",
+        type=outage_threshold_arg,
+        default=NETWORK_OUTAGE_ENTRY_FRACTION,
+        metavar="FLOAT",
+        help=(
+            f"Fraction of entries (0-1) with a failed source lookup above which the run "
+            f"exits {EXIT_SOURCE_OUTAGE} as a source outage, in every mode "
+            f"(default: {NETWORK_OUTAGE_ENTRY_FRACTION:g}). 0 fails on a single failed "
+            f"lookup; 1 fails only when every entry was affected. Failed lookups are "
+            f"logged and reported as api_error regardless of this setting."
+        ),
+    )
 
     thresholds = p.add_argument_group("thresholds")
     thresholds.add_argument(
@@ -6372,13 +6437,15 @@ def _report_source_outage(
     summary: dict[str, Any],
     http_client: HttpClient | None,
     logger: logging.Logger,
+    threshold: float = NETWORK_OUTAGE_ENTRY_FRACTION,
 ) -> int:
     """Log what the sources failed to answer and return the run's exit code.
 
-    Returns ``EXIT_SOURCE_OUTAGE`` when failed lookups touched more than
-    ``NETWORK_OUTAGE_ENTRY_FRACTION`` of the checked entries, and 0 otherwise.
-    Below that fraction the failures are still logged -- they are real, and the
-    affected entries are unusable -- but they do not condemn the whole run.
+    Returns ``EXIT_SOURCE_OUTAGE`` when failed lookups touched at least
+    ``threshold`` of the checked entries (``--outage-threshold``, defaulting to
+    ``NETWORK_OUTAGE_ENTRY_FRACTION``), and 0 otherwise. Below that fraction the
+    failures are still logged -- they are real, and the affected entries are
+    unusable -- but they do not condemn the whole run.
 
     Hosts are named separately from services because only a transport-layer
     failure says a host was unreachable: an HTTP error response proves DNS
@@ -6410,15 +6477,15 @@ def _report_source_outage(
             ", ".join(f"{host} ({count})" for host, count in sorted(unreachable.items())),
         )
 
-    if fraction < NETWORK_OUTAGE_ENTRY_FRACTION:
+    if fraction < threshold:
         return 0
 
     logger.error(
         "Source outage: %.1f%% of entries could not be checked against a complete set of sources "
-        "(threshold %.0f%%). Treat this run as incomplete and discard its could-not-verify verdicts; "
+        "(threshold %g%%). Treat this run as incomplete and discard its could-not-verify verdicts; "
         "exiting %d.",
         fraction * 100,
-        NETWORK_OUTAGE_ENTRY_FRACTION * 100,
+        threshold * 100,
         EXIT_SOURCE_OUTAGE,
     )
     return EXIT_SOURCE_OUTAGE
@@ -6618,7 +6685,7 @@ def main() -> int:
     # checked, and the affected entries carry API_ERROR rather than a verdict.
     # Say so loudly: the failure this guards against is a silent exit 0 over
     # thousands of entries whose lookups never left the machine.
-    outage_code = _report_source_outage(summary, http_client, logger)
+    outage_code = _report_source_outage(summary, http_client, logger, args.outage_threshold)
 
     # Exit code
     if strict_mode:
