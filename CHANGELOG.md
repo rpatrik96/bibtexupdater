@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.8.1] - 2026-09-03
+
+A source that is down is consulted after the ones that are answering, instead of ahead of them.
+
+Nothing a consumer routes on changes: the statuses, the report schema, the exit codes and the CLI flags are all identical to 1.8.0. What changes is the order in which sources are consulted while one of them is unhealthy, and how long a persistently dead service is left alone.
+
+### Fixed
+
+- **A source that was down was still consulted first, for nearly every entry.** The cascade consults its sources in a fixed order and short-circuits as soon as one fully confirms the entry, so an early source is reached for almost every reference. When that source is unreachable, every entry pays its retry budget and its timeout before a healthy source gets a turn. The order is now health-aware: a source whose circuit is open, or which has been failing consistently during the run, is moved behind the sources that are still answering. Health is read from the per-service circuit breaker that already existed rather than from a second tally, the sort is stable and keyed on health alone, and with every source healthy the order is exactly what it was. Reordering never drops a source: a demoted one is still consulted, still records its failure in `sources_failed`, and still blocks the exhaustive `not_found` claim, so the 1.8.0 contract is untouched. The measurement behind this, over a two-day screening run of 5,043 references: a five-minute reachability probe found dblp unreachable in 32 of 36 samples, sustained across both days, while Crossref, OpenAlex and arXiv stayed healthy. This was not the dominant cause of the throughput drop observed on that run — that was self-inflicted rate limiting on healthy sources, from three processes each running its own limiter.
+
+- **A service that stayed dead was retried about forty times an hour.** Four consecutive failed lookups paused a service for a flat 90 seconds, so a run against a service that was down for two days never settled into leaving it alone; it re-attempted it roughly every 90 seconds, four failures each time. Each reopening of the same service's circuit now doubles the pause, capped at 30 minutes. The first cooldown is unchanged at 90 seconds, so a brief blip still recovers in 90 seconds, while a service that is down for an hour is probed a handful of times rather than forty. The escalation is per service and lives for the life of the process; only the current cooldown is persisted to the cache, as before.
+
 ## [1.8.0] - 2026-09-03
 
 A verdict of `not_found` now means every source answered, so a network outage no longer reads as thousands of references that no database has heard of.
