@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.10.1] - 2026-09-03
+
+1.9.0 got past OpenReview's challenge gate and 1.10.0 fixed what the lookup did once it was through. This release fixes what happened when a lookup that was already authenticated was refused once: the run stopped asking OpenReview at all, and told the user to set the credentials they had set.
+
+Nothing a consumer routes on changes: the statuses, the report schema, the exit codes and the CLI flags are identical to 1.10.0. What changes is that one refusal no longer costs the rest of the run its OpenReview lookups.
+
 ### Fixed
 
 - **One refused OpenReview request silenced the source for the rest of the process, on a run that was authenticated.** The refusal latch that 1.9.0 added reads a 403 as a standing configuration state, which is what it is for an anonymous caller: no credentials, no `/notes`, and re-asking per entry buys nothing. It latched an authenticated 403 the same way. Measured over three concurrent shards of a 5,043-reference screening run under 1.10.0: 844 authenticated `api2.openreview.net/notes` responses came back 200 and were cached, while each 250-entry process took exactly one 403, and that single refusal reported `challenge-gated for anonymous callers; set OPENREVIEW_USERNAME / OPENREVIEW_PASSWORD` for the 160 to 173 entries that followed it, on a run where both were set. v2 holds ICLR 2024+, NeurIPS 2023+, TMLR and COLM, so OpenReview stopped contributing to the modern half of the bibliography. A refusal of a request that carried a bearer token is now raised for its entry and forgotten rather than latched. The anonymous case is unchanged and still costs one request per host per run, and a genuinely revoked token converges on the latch anyway: OpenReview answers 401 to it, the client re-logs in once, and a failed re-login leaves the origin disabled, so the next request goes out anonymous and its 403 latches.
