@@ -6137,7 +6137,11 @@ def _cli_service_rate_limits(rate_limit: int, s2_api_key: str | None) -> dict[st
         # /notes/search declares 5 req/min, so this one does not scale with
         # --rate-limit: going past it buys a 429 and a retry, not throughput.
         "openreview_search": 5,
-        "arxiv": 20,
+        # arXiv publishes ~20/min PER CALLER, not per process. Sharding a corpus
+        # across N processes multiplies the offered load by N, which buys 429s and
+        # an open circuit rather than throughput. A launcher that shards divides
+        # the caller budget by setting BIBTEX_ARXIV_RATE.
+        "arxiv": max(1, int(os.environ.get("BIBTEX_ARXIV_RATE", "20"))),
         "semanticscholar": 60 if s2_api_key else max(5, int(10 * rate_scale)),
         "openlibrary": max(10, int(30 * rate_scale)),
         "google_books": max(10, int(30 * rate_scale)),

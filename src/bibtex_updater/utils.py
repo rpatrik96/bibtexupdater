@@ -217,7 +217,7 @@ def retry_after_seconds(exc: httpx.HTTPError, fallback: float, cap: float = 60.0
 
 # API endpoints
 CROSSREF_API = "https://api.crossref.org/works"
-ARXIV_API = "http://export.arxiv.org/api/query"
+ARXIV_API = "https://export.arxiv.org/api/query"  # http:// 301-redirects here anyway
 DBLP_API_SEARCH = "https://dblp.org/search/publ/api"
 DBLP_API_VENUE_SEARCH = "https://dblp.org/search/venue/api"
 S2_API = "https://api.semanticscholar.org/graph/v1"
