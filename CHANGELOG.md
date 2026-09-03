@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 A verdict of `not_found` now means every source answered, so a network outage no longer reads as thousands of references that no database has heard of.
 
+If you gate CI on `bibtex-check` or route on the statuses it emits, re-read what `not_found` asserts before upgrading. It carries a stronger claim than it did in 1.7.0, and anything mapping it to a fabrication label was until now also mapping every failed lookup there.
+
 Upgrade note: `not_found` is now an exhaustive claim — every source consulted for the entry answered. An entry whose cascade included a source that could not be reached reports `api_error` instead, so bibliographies checked over a flaky connection will show `api_error` where earlier versions showed `not_found`. The same rule reaches web references: `url_not_found` now requires an answer, meaning HTTP 404 or 410, and an unreachable host, a 401/403 refusal, a 429 or a 5xx all report `api_error`. JSONL and JSON reports gain a `sources_failed` field naming those sources, and the JSON report's `url_check` block gains `lookup_failed`; existing fields are unchanged. A run in which the fraction of entries with a failed lookup reaches `--outage-threshold` (default 10%) now exits 5 in any mode.
 
 ### Fixed
