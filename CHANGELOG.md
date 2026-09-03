@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A cold token cache let every worker thread that wanted the same OpenReview origin issue its own `POST /login` at once.** `token_for_url` had no lock around the login step, so a `ThreadPoolExecutor` with no cached token yet sent one login per thread for the same host. OpenReview refuses roughly the fourth login within two minutes with `429`, and each thread that lost that race latched its origin as disabled and proceeded anonymously for the rest of the process. Measured over a 5,043-reference screening run: 44 logins came back `429` against 3 that succeeded, which is what degraded those runs to anonymous, and it is also the race that made the 403-latch bug fixed in 1.10.1 reachable, since the anonymous requests it produced were what a 403 used to latch permanently. `token_for_url` now takes a per-origin lock before logging in: the first thread to arrive logs in, the rest wait and reuse its result once it is cached, a failed login is shared the same way instead of retried per thread, and a login to one origin never blocks a lookup against the other. The cross-process token store from 1.10.0 and the sibling-token sharing from 1.10.1 already hid most of this in practice, so the race was real but non-urgent.
+
 ## [1.10.1] - 2026-09-03
 
 1.9.0 got past OpenReview's challenge gate and 1.10.0 fixed what the lookup did once it was through. This release fixes what happened when a lookup that was already authenticated was refused once: the run stopped asking OpenReview at all, and told the user to set the credentials they had set.
