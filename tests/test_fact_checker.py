@@ -20,7 +20,7 @@ from bibtex_updater.fact_checker import (
     build_verification_result,
 )
 from bibtex_updater.matching import MatchOutcome
-from bibtex_updater.utils import PublishedRecord
+from bibtex_updater.utils import PublishedRecord, SourceUnavailableError
 
 # ------------- Fixtures -------------
 
@@ -697,7 +697,7 @@ class TestDetectionRatePreservation:
             year=2020,
         )
 
-        def fake_cascade(entry, query, sq, sh, errors):
+        def fake_cascade(entry, query, sq, sh, errors, failed=None):
             sq.extend(["crossref", "dblp"])
             sh.extend(["crossref", "dblp"])
             return [
@@ -760,7 +760,7 @@ class TestFactCheckerCheckEntry:
             year=2019,
         )
 
-        def fake_cascade(entry, query, sq, sh, errors):
+        def fake_cascade(entry, query, sq, sh, errors, failed=None):
             sq.append("crossref")
             sh.append("crossref")
             return [(fact_checker._score_candidate(query, ["smith"], unrelated), unrelated, "crossref")]
@@ -805,7 +805,7 @@ class TestCheckEntryThreadSafety:
         same time -- the exact window where shared-instance state would race.
         """
 
-        def fake_cascade(entry, query, sq, sh, errors):
+        def fake_cascade(entry, query, sq, sh, errors, failed=None):
             sq.append("crossref")
             sh.append("crossref")
             rec = self._matching_record(entry)
@@ -1140,27 +1140,35 @@ class TestFactCheckProcessor:
 class TestCrossrefClient:
     """Tests for CrossrefClient."""
 
-    def test_search_returns_empty_on_error(self, fake_http):
+    def test_search_raises_on_network_error(self, fake_http):
+        """A lookup that never completed must not read as zero hits."""
         fake_http._request.side_effect = Exception("Network error")
         client = CrossrefClient(fake_http)
-        results = client.search("test query")
-        assert results == []
+        with pytest.raises(SourceUnavailableError):
+            client.search("test query")
 
-    def test_search_returns_empty_on_non_200(self, fake_http):
+    def test_search_raises_on_non_200(self, fake_http):
         fake_http._request.return_value = MagicMock(status_code=500)
         client = CrossrefClient(fake_http)
-        results = client.search("test query")
-        assert results == []
+        with pytest.raises(SourceUnavailableError) as exc_info:
+            client.search("test query")
+        assert exc_info.value.transport_failure is True
+
+    def test_search_returns_empty_when_crossref_reports_no_items(self, fake_http):
+        """The one case that IS evidence: Crossref answered, with nothing."""
+        fake_http._request.return_value = MagicMock(status_code=200, json=lambda: {"message": {"items": []}})
+        client = CrossrefClient(fake_http)
+        assert client.search("test query") == []
 
 
 class TestDBLPClient:
     """Tests for DBLPClient."""
 
-    def test_search_returns_empty_on_error(self, fake_http):
+    def test_search_raises_on_network_error(self, fake_http):
         fake_http._request.side_effect = Exception("Network error")
         client = DBLPClient(fake_http)
-        results = client.search("test query")
-        assert results == []
+        with pytest.raises(SourceUnavailableError):
+            client.search("test query")
 
     def test_search_handles_single_hit_as_dict(self, fake_http):
         fake_http._request.return_value = MagicMock(
@@ -1174,17 +1182,20 @@ class TestDBLPClient:
 class TestSemanticScholarClient:
     """Tests for SemanticScholarClient."""
 
-    def test_search_returns_empty_on_error(self, fake_http):
+    def test_search_raises_on_network_error(self, fake_http):
         fake_http._request.side_effect = Exception("Network error")
         client = SemanticScholarClient(fake_http)
-        results = client.search("test query")
-        assert results == []
+        with pytest.raises(SourceUnavailableError):
+            client.search("test query")
 
-    def test_search_returns_empty_on_non_200(self, fake_http):
+    def test_search_raises_on_429_without_calling_it_an_outage(self, fake_http):
+        """A 429 is a refusal to answer, not an unreachable host: the lookup
+        failed, but the network is demonstrably up."""
         fake_http._request.return_value = MagicMock(status_code=429)
         client = SemanticScholarClient(fake_http)
-        results = client.search("test query")
-        assert results == []
+        with pytest.raises(SourceUnavailableError) as exc_info:
+            client.search("test query")
+        assert exc_info.value.transport_failure is False
 
 
 # ------------- Entry Classification Tests -------------

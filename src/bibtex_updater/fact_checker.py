@@ -7,7 +7,11 @@ This tool validates that bibliographic entries in BibTeX files:
 
 It outputs detailed reports categorizing mismatches:
 - VERIFIED: Every claimed field positively confirmed against an external record
-- NOT_FOUND: No matching record found in any database
+- NOT_FOUND: Every source consulted completed its lookup and none holds a
+  matching record. A source that could not be reached (DNS, connection, TLS,
+  timeout, exhausted 429/5xx retries, open circuit, error status) blocks this
+  verdict -- the entry reports API_ERROR instead, because a partial cascade
+  cannot support an exhaustive miss
 - UNCONFIRMED: Record found and nothing contradicted, but a claimed field could
   not be positively confirmed (e.g. preprint-only venue, incomplete authors)
 - HALLUCINATED: Very low match score, likely fabricated
@@ -16,7 +20,8 @@ It outputs detailed reports categorizing mismatches:
 - YEAR_MISMATCH: Publication year differs beyond tolerance
 - VENUE_MISMATCH: Journal/venue differs
 - PARTIAL_MATCH: Fallback for an unrecognized mismatched field
-- API_ERROR: Errors during API queries
+- API_ERROR: At least one source lookup did not complete, so the check was not
+  technically successful (also emitted in place of NOT_FOUND in that case)
 - PARSE_ERROR: A declared entry could not be read safely
 
 Usage:
@@ -84,6 +89,7 @@ from bibtex_updater.sources import (
 from bibtex_updater.updater import BibLoader, detect_dropped_keys
 from bibtex_updater.utils import (
     # API endpoints
+    ABSENCE_STATUS_CODES,
     ARXIV_API,
     CROSSREF_API,
     DBLP_API_SEARCH,
@@ -99,6 +105,7 @@ from bibtex_updater.utils import (
     # API converters
     arxiv_atom_to_record,
     arxiv_id_from_datacite_doi,
+    as_source_failure,
     authors_last_names,
     crossref_message_to_record,
     dblp_hit_to_candidate_record,
@@ -114,6 +121,7 @@ from bibtex_updater.utils import (
     latex_to_plain,
     normalize_doi_for_resolution,
     normalize_title_for_match,
+    raise_for_failed_lookup,
     record_looks_alphabetized,
     s2_data_to_record,
     same_surname_given_order_violation,
@@ -220,6 +228,15 @@ class FactCheckStatus(Enum):
     # know this reference", NOT "this reference is fabricated" -- HALLUCINATED
     # is reserved for positive evidence.
     #
+    # It is an EXHAUSTIVE claim, so it requires a technically successful check:
+    # every source consulted for the entry answered. If any lookup ended without
+    # an answer -- DNS failure, connection refused, TLS error, connection reset,
+    # read timeout, an exhausted 429/5xx retry budget, an open circuit, an error
+    # status -- the entry reports API_ERROR instead, even when the other sources
+    # answered cleanly and found nothing (see _not_found_needs_complete_coverage).
+    # The alternative cost hours: a mid-run wifi drop turned 2,500 real,
+    # correctly-cited references into not_found at exit code 0.
+    #
     # It is an abstention, but NOT a neutral one: p_valid is 0.35 (below 0.5),
     # and downstream integrations routinely collapse it into a hallucination
     # label (the HALLMARK harness maps not_found -> HALLUCINATED unless
@@ -252,6 +269,9 @@ class FactCheckStatus(Enum):
     NONEXISTENT_VENUE = "nonexistent_venue"
     PARTIAL_MATCH = "partial_match"
     HALLUCINATED = "hallucinated"
+    # At least one source lookup for the entry did not complete, so nothing
+    # exhaustive can be claimed about it. Always carries coverage_incomplete;
+    # calibration treats it as an abstention with a neutral p_valid.
     API_ERROR = "api_error"
     ARXIV_ID_MISMATCH = "arxiv_id_mismatch"  # Entry's cited arXiv ID resolves to a different paper
     DOI_MISMATCH = "doi_mismatch"  # Entry's cited DOI resolves to a different paper
@@ -269,7 +289,14 @@ class FactCheckStatus(Enum):
     # Web reference statuses
     URL_VERIFIED = "url_verified"  # URL accessible and content matches
     URL_ACCESSIBLE = "url_accessible"  # URL returns 200, no content check
-    URL_NOT_FOUND = "url_not_found"  # 404 or domain unreachable
+    # The host answered that the page is not there: HTTP 404 or 410, the only
+    # two statuses that assert absence (utils.ABSENCE_STATUS_CODES). Nothing
+    # else earns this verdict. A 401/403 means the host refused to tell us, a
+    # 429 means it declined to answer now, a 5xx means it failed to answer, and
+    # an unreachable host (DNS, refused connection, TLS, timeout) never answered
+    # at all. Each of those reports API_ERROR: none establishes that the page
+    # is gone, and this status is read as evidence that a citation is dead.
+    URL_NOT_FOUND = "url_not_found"
     URL_CONTENT_MISMATCH = "url_content_mismatch"  # Page content differs from entry
 
     # Book statuses
@@ -328,7 +355,11 @@ def _is_abstained_status(status: FactCheckStatus) -> bool:
     return status.value in ABSTAINED_STATUS_VALUES
 
 
-def _compute_coverage_incomplete(status: FactCheckStatus, errors: list[str]) -> bool:
+def _compute_coverage_incomplete(
+    status: FactCheckStatus,
+    errors: list[str],
+    sources_failed: list[str] | None = None,
+) -> bool:
     """True when an abstention verdict may be due to source errors/throttling.
 
     A NOT_FOUND/UNCONFIRMED produced while sources were erroring or
@@ -337,6 +368,7 @@ def _compute_coverage_incomplete(status: FactCheckStatus, errors: list[str]) -> 
     evidence of fabrication. ``errors`` is the per-entry error list -- it
     captures per-source exceptions (including ``CircuitOpenError`` texts)
     appended in ``_query_cascade`` and the pre-check helpers.
+    ``sources_failed`` names the sources behind those exceptions.
 
     Rules:
 
@@ -351,7 +383,7 @@ def _compute_coverage_incomplete(status: FactCheckStatus, errors: list[str]) -> 
     if status is FactCheckStatus.API_ERROR:
         return True
     if _is_abstained_status(status) or status is FactCheckStatus.STRICT_WARN_CNV:
-        return bool(errors)
+        return bool(errors) or bool(sources_failed)
     return False
 
 
@@ -431,6 +463,13 @@ class FactCheckResult:
     # without racing on shared mutable state.
     author_intersection: AuthorIntersectionResult | None = None
     source_records: dict[str, PublishedRecord | None] = field(default_factory=dict)
+    # Sources whose lookup for THIS entry did not complete: DNS/connection/TLS
+    # failure, read timeout, an exhausted 429/5xx retry budget, an open circuit,
+    # an error status, an unparseable body. A source listed here said nothing
+    # about the entry, so it can neither confirm it nor support the exhaustive
+    # miss NOT_FOUND asserts. Recorded per source per entry, because a run can
+    # be healthy overall while one entry's every source timed out.
+    sources_failed: list[str] = field(default_factory=list)
     # Output contract -- both fields are DERIVED, recomputed in __post_init__
     # from (status, errors, overall_confidence) at EVERY construction site
     # (check_entry's early returns, the cascade assembly, the verifier
@@ -452,7 +491,7 @@ class FactCheckResult:
 
     def __post_init__(self) -> None:
         """Derive the output-contract fields from the verdict itself."""
-        self.coverage_incomplete = _compute_coverage_incomplete(self.status, self.errors)
+        self.coverage_incomplete = _compute_coverage_incomplete(self.status, self.errors, self.sources_failed)
         self.p_valid = p_valid_from_result(self.status.value, self.overall_confidence, self.coverage_incomplete)
 
 
@@ -755,6 +794,12 @@ class URLCheckResult:
     is_redirect: bool = False
     final_url: str | None = None
     error: str | None = None
+    # True when the check never reached the host (DNS, connection refused/reset,
+    # TLS, timeout). ``accessible`` is False either way, but only a response
+    # carries evidence about the page: an unreachable host is a failed lookup,
+    # the same distinction the academic cascade draws between a source that
+    # answered with nothing and a source that never answered.
+    lookup_failed: bool = False
 
 
 @dataclass
@@ -1002,6 +1047,7 @@ class BaseVerifier(ABC):
         errors: list[str] | None = None,
         url_check: URLCheckResult | None = None,
         book_match: BookRecord | None = None,
+        sources_failed: list[str] | None = None,
     ) -> FactCheckResult:
         """Create a FactCheckResult with common fields."""
         return FactCheckResult(
@@ -1014,6 +1060,7 @@ class BaseVerifier(ABC):
             api_sources_queried=api_sources_queried or [],
             api_sources_with_hits=api_sources_with_hits or [],
             errors=errors or [],
+            sources_failed=sources_failed or [],
             category=category,
             url_check=url_check,
             book_match=book_match,
@@ -1047,6 +1094,23 @@ class WebVerifier(BaseVerifier):
         # Check URL accessibility
         url_result = self._check_url(url)
 
+        # Nothing was learned about the page: the host was never reached, or it
+        # answered with a refusal (401/403/429) or a failure (5xx) rather than a
+        # verdict on the page. URL_NOT_FOUND asserts the page is gone, and none
+        # of those support that any more than a dead network supports NOT_FOUND
+        # for a paper.
+        if url_result.lookup_failed:
+            return self._make_result(
+                entry,
+                FactCheckStatus.API_ERROR,
+                EntryCategory.WEB_REFERENCE,
+                url_check=url_result,
+                api_sources_queried=["url_check"],
+                errors=[url_result.error] if url_result.error else [],
+                sources_failed=["url_check"],
+            )
+
+        # The host answered 404 or 410: the page is positively not there.
         if not url_result.accessible:
             return self._make_result(
                 entry,
@@ -1106,6 +1170,12 @@ class WebVerifier(BaseVerifier):
         Uses the SHARED httpx client (``self.http.client``) so web-reference
         checks ride the same connection pool as every other request instead of
         opening a parallel ``requests`` pool.
+
+        Only a status in :data:`ABSENCE_STATUS_CODES` (404, 410) answers the
+        question the caller is asking, which is whether the page is there. A
+        401/403 refusal, a 429, a 5xx and an exception all leave that question
+        unanswered, so they set ``lookup_failed`` and the caller reports an
+        error instead of claiming the page is gone.
         """
         try:
             # Use HEAD request to minimize data transfer
@@ -1119,22 +1189,26 @@ class WebVerifier(BaseVerifier):
 
             is_redirect = len(resp.history) > 0
             final_url = str(resp.url) if is_redirect else None
+            accessible = resp.status_code < 400
 
             return URLCheckResult(
                 url=url,
-                accessible=resp.status_code < 400,
+                accessible=accessible,
                 status_code=resp.status_code,
                 is_redirect=is_redirect,
                 final_url=final_url,
+                # The host answered, but not with an answer about the page.
+                lookup_failed=not accessible and resp.status_code not in ABSENCE_STATUS_CODES,
+                error=None if accessible or resp.status_code in ABSENCE_STATUS_CODES else f"HTTP {resp.status_code}",
             )
         except httpx.ConnectError as e:
             if self._is_ssl_failure(e):
-                return URLCheckResult(url=url, accessible=False, error=f"SSL error: {e}")
-            return URLCheckResult(url=url, accessible=False, error=f"Connection error: {e}")
+                return URLCheckResult(url=url, accessible=False, lookup_failed=True, error=f"SSL error: {e}")
+            return URLCheckResult(url=url, accessible=False, lookup_failed=True, error=f"Connection error: {e}")
         except httpx.TimeoutException:
-            return URLCheckResult(url=url, accessible=False, error="Request timed out")
+            return URLCheckResult(url=url, accessible=False, lookup_failed=True, error="Request timed out")
         except Exception as e:
-            return URLCheckResult(url=url, accessible=False, error=str(e))
+            return URLCheckResult(url=url, accessible=False, lookup_failed=True, error=str(e))
 
     def _verify_content(self, url: str, entry: dict[str, Any]) -> float | None:
         """Verify that page content matches entry metadata."""
@@ -1227,7 +1301,9 @@ class BookVerifier(BaseVerifier):
                 errors.append(f"Google Books: {e}")
 
         if not candidates:
-            status = FactCheckStatus.API_ERROR if errors and not sources_with_hits else FactCheckStatus.BOOK_NOT_FOUND
+            # BOOK_NOT_FOUND is an exhaustive claim over the book databases, so
+            # one failed lookup blocks it even when the other source answered.
+            status = FactCheckStatus.API_ERROR if errors else FactCheckStatus.BOOK_NOT_FOUND
             return self._make_result(
                 entry,
                 status,
@@ -1523,7 +1599,14 @@ class CrossrefClient:
                 the fielded result set. Only used when ``title`` is supplied.
 
         Returns:
-            List of Crossref message items, never None. Empty on any error.
+            List of Crossref message items, never None. Empty when Crossref
+            answered and reported no items.
+
+        Raises:
+            SourceUnavailableError: the lookup ended without an answer
+                (unreachable host, error status, unparseable body). A source
+                that never answered is not evidence that the entry is absent,
+                so this must reach the caller rather than read as zero hits.
         """
         if title and title.strip():
             params: dict[str, Any] = {"query.title": title.strip(), "rows": rows}
@@ -1533,12 +1616,13 @@ class CrossrefClient:
             params = {"query.bibliographic": query, "rows": rows}
         try:
             resp = self.http._request("GET", CROSSREF_API, params=params, accept="application/json", service="crossref")
+            raise_for_failed_lookup("crossref", CROSSREF_API, resp.status_code)
             if resp.status_code != 200:
                 return []
             items = resp.json().get("message", {}).get("items", [])
             return items
-        except Exception:
-            return []
+        except Exception as exc:
+            raise as_source_failure("crossref", CROSSREF_API, exc) from exc
 
     def get_by_doi(self, doi: str) -> dict[str, Any] | None:
         """Fetch the Crossref ``message`` record a DOI resolves to.
@@ -1570,10 +1654,15 @@ class DBLPClient:
         self.http = http
 
     def search(self, query: str, max_hits: int = 10) -> list[dict[str, Any]]:
-        """Search DBLP for bibliographic records."""
+        """Search DBLP for bibliographic records.
+
+        Empty only when DBLP answered and reported no hits; a lookup that ends
+        without an answer raises :class:`SourceUnavailableError`.
+        """
         params = {"q": query, "h": max_hits, "format": "json"}
         try:
             resp = self.http._request("GET", DBLP_API_SEARCH, params=params, accept="application/json", service="dblp")
+            raise_for_failed_lookup("dblp", DBLP_API_SEARCH, resp.status_code)
             if resp.status_code != 200:
                 return []
             data = resp.json()
@@ -1581,8 +1670,8 @@ class DBLPClient:
             if isinstance(hits, dict):
                 hits = [hits]
             return hits
-        except Exception:
-            return []
+        except Exception as exc:
+            raise as_source_failure("dblp", DBLP_API_SEARCH, exc) from exc
 
     def search_venues(self, query: str, max_hits: int = 10) -> list[dict[str, Any]] | None:
         """Search the DBLP *venue* registry (``/search/venue/api``).
@@ -1625,16 +1714,21 @@ class SemanticScholarClient:
         self.http = http
 
     def search(self, query: str, limit: int = 10) -> list[dict[str, Any]]:
-        """Search Semantic Scholar for papers."""
+        """Search Semantic Scholar for papers.
+
+        Empty only when S2 answered and reported no data; a lookup that ends
+        without an answer raises :class:`SourceUnavailableError`.
+        """
         params = {"query": query, "limit": limit, "fields": self.FIELDS}
         url = f"{S2_API}/paper/search"
         try:
             resp = self.http._request("GET", url, params=params, accept="application/json", service="semanticscholar")
+            raise_for_failed_lookup("semanticscholar", url, resp.status_code)
             if resp.status_code != 200:
                 return []
             return resp.json().get("data", []) or []
-        except Exception:
-            return []
+        except Exception as exc:
+            raise as_source_failure("semanticscholar", url, exc) from exc
 
     def match_title(self, title: str) -> list[dict[str, Any]]:
         """Single best title match via ``/paper/search/match``.
@@ -1643,17 +1737,19 @@ class SemanticScholarClient:
         HTTP 404 means "no match found" -- a NORMAL miss, not an error: the
         shared HttpClient only retries 429/5xx, so a 404 passes straight
         through as a non-200 and this returns ``[]`` without recording an
-        error. Any other non-200 / parse / network failure also yields ``[]``.
+        error. Any other non-200 / parse / network failure ended the lookup
+        without an answer and raises :class:`SourceUnavailableError`.
         """
         params = {"query": title, "fields": self.FIELDS}
         url = f"{S2_API}/paper/search/match"
         try:
             resp = self.http._request("GET", url, params=params, accept="application/json", service="semanticscholar")
+            raise_for_failed_lookup("semanticscholar", url, resp.status_code)
             if resp.status_code != 200:
                 return []
             return resp.json().get("data", []) or []
-        except Exception:
-            return []
+        except Exception as exc:
+            raise as_source_failure("semanticscholar", url, exc) from exc
 
     def get_paper(self, paper_id: str) -> dict[str, Any] | None:
         """Get paper details by S2 paper ID, DOI, or arXiv ID.
@@ -1683,15 +1779,20 @@ class ArxivClient:
         self.http = http
 
     def fetch_atom(self, arxiv_id: str) -> str | None:
-        """Fetch the raw Atom feed for a single arXiv ID, or None on failure."""
+        """Fetch the raw Atom feed for a single arXiv ID.
+
+        ``None`` means arXiv answered and holds no such ID; a lookup that ends
+        without an answer raises :class:`SourceUnavailableError`.
+        """
         params = {"id_list": arxiv_id}
         try:
             resp = self.http._request("GET", ARXIV_API, params=params, accept="application/atom+xml", service="arxiv")
+            raise_for_failed_lookup("arxiv", ARXIV_API, resp.status_code)
             if resp.status_code != 200:
                 return None
             return resp.text
-        except Exception:
-            return None
+        except Exception as exc:
+            raise as_source_failure("arxiv", ARXIV_API, exc) from exc
 
 
 # ------------- Venue Matching -------------
@@ -2423,6 +2524,9 @@ class FactChecker:
         errors: list[str] = []
         sources_queried: list[str] = []
         sources_with_hits: list[str] = []
+        # Sources whose lookup did not complete for THIS entry (see the
+        # FactCheckResult field and _not_found_needs_complete_coverage).
+        sources_failed: list[str] = []
 
         title = entry.get("title", "")
         title_norm = normalize_title_for_match(title)
@@ -2505,15 +2609,18 @@ class FactChecker:
 
         query = f"{title_norm} {first_author}".strip()
         # Item 1: cascading source order (CrossRef -> OpenAlex -> DBLP -> S2).
-        candidates = self._query_cascade(entry, query, sources_queried, sources_with_hits, errors)
+        candidates = self._query_cascade(entry, query, sources_queried, sources_with_hits, errors, sources_failed)
 
         # Authoritative arXiv-by-ID lookup. Added as an extra candidate so valid
         # but not-yet-indexed preprints verify instead of being flagged
         # HALLUCINATED/NOT_FOUND from a failed title search.
-        candidates.extend(self._query_arxiv_by_id(entry, sources_queried, sources_with_hits, errors))
+        candidates.extend(self._query_arxiv_by_id(entry, sources_queried, sources_with_hits, errors, sources_failed))
 
         if not candidates:
+            # Nothing came back at all. That is a clean exhaustive miss only if
+            # every source actually answered; otherwise the run never asked them.
             status = FactCheckStatus.API_ERROR if errors else FactCheckStatus.NOT_FOUND
+            status = self._not_found_needs_complete_coverage(status, sources_failed)
             status = self._apply_strict_warn_cnv(status)
             # No candidates -> no per-entry intersection/source records. These
             # ride on the result (not self) so concurrent entries don't clobber
@@ -2528,6 +2635,7 @@ class FactChecker:
                 api_sources_queried=sources_queried,
                 api_sources_with_hits=sources_with_hits,
                 errors=errors,
+                sources_failed=sources_failed,
                 author_intersection=None,
                 source_records={},
             )
@@ -2544,6 +2652,7 @@ class FactChecker:
                 api_sources_queried=sources_queried,
                 api_sources_with_hits=sources_with_hits,
                 errors=["Chimeric title detected: tokens borrowed from multiple different papers"],
+                sources_failed=sources_failed,
                 author_intersection=None,
                 source_records={},
             )
@@ -2634,6 +2743,12 @@ class FactChecker:
                         "registries and no source reports it for this paper"
                     )
 
+        # A scored NOT_FOUND is still an exhaustive claim: the sources answered
+        # and only unrelated papers came back. If one of them never answered,
+        # that claim is unsupported -- demote before the promotion below, so the
+        # opt-in CNV bucket cannot inherit an unsupported miss either.
+        status = self._not_found_needs_complete_coverage(status, sources_failed)
+
         # --strict-warn-cnv: promote could-not-verify abstentions (NOT_FOUND /
         # UNCONFIRMED) to STRICT_WARN_CNV so opt-in users can fail CI on
         # exhaustive review. Kept distinct from PROBLEMATIC: the three-way
@@ -2652,6 +2767,7 @@ class FactChecker:
             errors=errors,
             intersection=intersection,
             best_per_source=best_per_source,
+            sources_failed=sources_failed,
         )
 
     def _assemble_match_result(
@@ -2667,6 +2783,7 @@ class FactChecker:
         errors: list[str],
         intersection: AuthorIntersectionResult,
         best_per_source: dict[str, PublishedRecord | None],
+        sources_failed: list[str] | None = None,
     ) -> FactCheckResult:
         """Assemble the final result for a matched record.
 
@@ -2727,6 +2844,7 @@ class FactChecker:
             api_sources_queried=sources_queried,
             api_sources_with_hits=sources_with_hits,
             errors=errors,
+            sources_failed=list(sources_failed or []),
             # Per-entry state carried on the result (not stashed on self) so
             # concurrent check_entry calls don't clobber each other.
             author_intersection=intersection,
@@ -3370,6 +3488,7 @@ class FactChecker:
         sources_queried: list[str],
         sources_with_hits: list[str],
         errors: list[str],
+        sources_failed: list[str] | None = None,
     ) -> list[tuple[float, PublishedRecord, str]]:
         """Look the entry up on arXiv by its ID and return it as a scored candidate.
 
@@ -3388,6 +3507,8 @@ class FactChecker:
             rec = self._arxiv_record(arxiv_id)
         except Exception as e:
             errors.append(f"arXiv: {e}")
+            if sources_failed is not None and "arxiv" not in sources_failed:
+                sources_failed.append("arxiv")
             return []
         if rec is None:
             return []
@@ -3405,6 +3526,7 @@ class FactChecker:
         sources_queried: list[str],
         sources_with_hits: list[str],
         errors: list[str],
+        sources_failed: list[str] | None = None,
     ) -> list[tuple[float, PublishedRecord, str]]:
         """Source order: CrossRef -> [S2 /match, key only] -> OpenAlex -> DBLP ->
         OpenReview -> Semantic Scholar relevance search.
@@ -3452,6 +3574,20 @@ class FactChecker:
         top_k = max(1, min(int(self.config.top_k), MAX_TOP_K))
 
         all_candidates: list[tuple[float, PublishedRecord, str]] = []
+        failed = sources_failed if sources_failed is not None else []
+
+        def _record_failure(source_name: str, label: str, exc: BaseException) -> None:
+            """Note that a source lookup ended without an answer.
+
+            The text goes to ``errors`` (what a reader sees); the source name goes
+            to ``sources_failed``, which is what the verdict gate reads -- a source
+            that never answered cannot corroborate the entry and cannot support the
+            exhaustive miss NOT_FOUND asserts.
+            """
+            errors.append(f"{label}: {exc}")
+            if source_name not in failed:
+                failed.append(source_name)
+
         # Per-invocation memo for the _has_full_confirmation stop condition:
         # the same candidate records are re-checked after every cascade step,
         # and _compare_all_fields is the expensive part. Keyed by id(rec)
@@ -3475,7 +3611,7 @@ class FactChecker:
             cr_items = self.crossref.search(query, rows=top_k, title=retrieval_title, author=first_author)
         except Exception as exc:
             cr_items = []
-            errors.append(f"Crossref: {exc}")
+            _record_failure("crossref", "Crossref", exc)
         cr_records: list[PublishedRecord] = []
         for item in cr_items or []:
             rec = crossref_message_to_record(item)
@@ -3505,7 +3641,7 @@ class FactChecker:
                 s2_match_data = self.s2.match_title(retrieval_title)
             except Exception as exc:
                 s2_match_data = []
-                errors.append(f"Semantic Scholar (match): {exc}")
+                _record_failure("semanticscholar", "Semantic Scholar (match)", exc)
             s2_match_records: list[PublishedRecord] = []
             for item in s2_match_data or []:
                 rec = s2_data_to_record(item)
@@ -3539,7 +3675,7 @@ class FactChecker:
                 oa_items = self.openalex.search(query, limit=top_k, title=retrieval_title)
             except Exception as exc:
                 oa_items = []
-                errors.append(f"OpenAlex: {exc}")
+                _record_failure("openalex", "OpenAlex", exc)
             oa_records: list[PublishedRecord] = []
             for item in oa_items or []:
                 rec = openalex_work_to_candidate_record(item)
@@ -3568,7 +3704,7 @@ class FactChecker:
                 dblp_hits = self.dblp.search(dblp_query, max_hits=top_k)
             except Exception as exc:
                 dblp_hits = []
-                errors.append(f"DBLP: {exc}")
+                _record_failure("dblp", "DBLP", exc)
             dblp_records: list[PublishedRecord] = []
             for hit in dblp_hits or []:
                 rec = dblp_hit_to_candidate_record(hit)
@@ -3599,7 +3735,7 @@ class FactChecker:
                 or_notes = self.openreview.search(query, limit=top_k, title=retrieval_title, first_author=first_author)
             except Exception as exc:
                 or_notes = []
-                errors.append(f"OpenReview: {exc}")
+                _record_failure("openreview", "OpenReview", exc)
             or_records: list[PublishedRecord] = []
             for note in or_notes or []:
                 rec = openreview_note_to_candidate_record(note)
@@ -3626,7 +3762,7 @@ class FactChecker:
                 s2_data = self.s2.search(s2_query, limit=top_k)
             except Exception as exc:
                 s2_data = []
-                errors.append(f"Semantic Scholar: {exc}")
+                _record_failure("semanticscholar", "Semantic Scholar", exc)
             s2_records: list[PublishedRecord] = []
             for item in s2_data or []:
                 rec = s2_data_to_record(item)
@@ -3651,7 +3787,7 @@ class FactChecker:
         usable = [c for c in all_candidates if c[0] >= self.config.abstention_below]
         if not usable and raw_title.strip():
             self._relaxed_author_retrieval(
-                entry, raw_title, top_k, all_candidates, sources_queried, sources_with_hits, errors
+                entry, raw_title, top_k, all_candidates, sources_queried, sources_with_hits, errors, failed
             )
         return all_candidates
 
@@ -3664,6 +3800,7 @@ class FactChecker:
         sources_queried: list[str],
         sources_with_hits: list[str],
         errors: list[str],
+        sources_failed: list[str] | None = None,
     ) -> None:
         """Title-only retry on Crossref + OpenAlex when the strict cascade
         returned nothing usable. Tags fallback candidates with the
@@ -3674,6 +3811,13 @@ class FactChecker:
         wrong-paper candidate that passes the title gate but fails the
         author gate routes to AUTHOR_MISMATCH, not VERIFIED.
         """
+        failed = sources_failed if sources_failed is not None else []
+
+        def _record_failure(source_name: str, label: str, exc: BaseException) -> None:
+            errors.append(f"{label}: {exc}")
+            if source_name not in failed:
+                failed.append(source_name)
+
         # Retrieval-only LaTeX strip (mirrors ``_query_cascade``); scoring below
         # still normalizes the ORIGINAL title.
         retrieval_title = latex_to_plain(raw_title or "")
@@ -3692,7 +3836,7 @@ class FactChecker:
             cr_items = self.crossref.search(retrieval_title, rows=top_k, title=retrieval_title)
         except Exception as exc:
             cr_items = []
-            errors.append(f"Crossref (fallback): {exc}")
+            _record_failure("crossref", "Crossref (fallback)", exc)
         cr_records: list[PublishedRecord] = []
         for item in cr_items or []:
             rec = crossref_message_to_record(item)
@@ -3709,7 +3853,7 @@ class FactChecker:
                 oa_items = self.openalex.search(retrieval_title, limit=top_k, title=retrieval_title)
             except Exception as exc:
                 oa_items = []
-                errors.append(f"OpenAlex (fallback): {exc}")
+                _record_failure("openalex", "OpenAlex (fallback)", exc)
             oa_records: list[PublishedRecord] = []
             for item in oa_items or []:
                 rec = openalex_work_to_candidate_record(item)
@@ -4822,6 +4966,26 @@ class FactChecker:
 
         return comparisons
 
+    @staticmethod
+    def _not_found_needs_complete_coverage(status: FactCheckStatus, sources_failed: list[str]) -> FactCheckStatus:
+        """Demote NOT_FOUND to API_ERROR when a source lookup did not complete.
+
+        NOT_FOUND is an exhaustive claim: every source consulted answered, and
+        none holds the paper. One source that never answered breaks that claim,
+        and it breaks it even when the others answered cleanly and found nothing
+        -- a partial cascade cannot establish an exhaustive miss. Downstream
+        consumers read NOT_FOUND as negative polarity (the HALLMARK harness maps
+        it to HALLUCINATED), so the demotion is what keeps a network outage from
+        reading as thousands of fabricated references.
+
+        Only NOT_FOUND is gated. UNCONFIRMED claims nothing exhaustive and keeps
+        its verdict with ``coverage_incomplete`` set; VERIFIED and the problem
+        statuses rest on positive evidence a failed source cannot undermine.
+        """
+        if status is FactCheckStatus.NOT_FOUND and sources_failed:
+            return FactCheckStatus.API_ERROR
+        return status
+
     def _apply_strict_warn_cnv(self, status: FactCheckStatus) -> FactCheckStatus:
         """Promote could-not-verify abstentions to STRICT_WARN_CNV under opt-in.
 
@@ -5018,6 +5182,9 @@ class AcademicVerifier(BaseVerifier):
             api_sources_queried=result.api_sources_queried,
             api_sources_with_hits=result.api_sources_with_hits,
             errors=result.errors,
+            # Must be carried, not re-derived: the demotion of an unsupported
+            # NOT_FOUND already happened upstream, and this is the record of why.
+            sources_failed=result.sources_failed,
             category=EntryCategory.ACADEMIC,
             url_check=None,
             book_match=None,
@@ -5573,6 +5740,10 @@ class FactCheckProcessor:
                                 "confidence_score": float(getattr(result, "confidence_score", 0.0)),
                                 "mismatched_fields": [n for n, c in result.field_comparisons.items() if not c.matches],
                                 "api_sources": result.api_sources_with_hits,
+                                # Sources whose lookup did not complete for this
+                                # entry. Non-empty means the cascade was partial,
+                                # so no exhaustive miss can be read off the status.
+                                "sources_failed": result.sources_failed,
                                 "errors": result.errors,
                             },
                             ensure_ascii=False,
@@ -5660,6 +5831,13 @@ class FactCheckProcessor:
             FactCheckStatus.GIVEN_NAME_SUBSTITUTION.value,
         ]
 
+        # Per-source tally of lookups that did not complete, so a run-wide
+        # outage names the sources it hit rather than only counting entries.
+        failed_source_counts: dict[str, int] = {}
+        for r in results:
+            for source in r.sources_failed:
+                failed_source_counts[source] = failed_source_counts.get(source, 0) + 1
+
         # Calculate verified rate including new verified statuses
         verified_statuses = ["verified", "url_verified", "url_accessible", "book_verified", "working_paper_verified"]
         verified_count = sum(counts.get(s, 0) for s in verified_statuses)
@@ -5682,6 +5860,11 @@ class FactCheckProcessor:
             # Abstentions/API errors reached while sources errored or were
             # throttled: not clean exhaustive misses (re-run after cooldown).
             "coverage_incomplete_count": sum(1 for r in results if r.coverage_incomplete),
+            # Entries for which at least one source lookup did not complete, and
+            # the per-source tally behind that count. A run with a nonzero
+            # figure here checked less than it looks like it checked.
+            "sources_failed_count": sum(1 for r in results if r.sources_failed),
+            "failed_source_counts": failed_source_counts,
         }
 
     def generate_json_report(self, results: list[FactCheckResult]) -> dict[str, Any]:
@@ -5715,6 +5898,7 @@ class FactCheckProcessor:
                 "best_match": None,
                 "api_sources_queried": r.api_sources_queried,
                 "api_sources_with_hits": r.api_sources_with_hits,
+                "sources_failed": r.sources_failed,
                 "errors": r.errors,
             }
             if r.best_match:
@@ -5732,6 +5916,7 @@ class FactCheckProcessor:
                     "status_code": r.url_check.status_code,
                     "is_redirect": r.url_check.is_redirect,
                     "final_url": r.url_check.final_url,
+                    "lookup_failed": r.url_check.lookup_failed,
                     "error": r.url_check.error,
                 }
             # Add book match details
@@ -5773,6 +5958,8 @@ class FactCheckProcessor:
                         "confidence_score": float(getattr(r, "confidence_score", 0.0)),
                         "mismatched_fields": [n for n, c in r.field_comparisons.items() if not c.matches],
                         "api_sources": r.api_sources_with_hits,
+                        # Sources whose lookup did not complete (see process_entries).
+                        "sources_failed": r.sources_failed,
                         "errors": r.errors,
                     },
                     ensure_ascii=False,
@@ -5782,6 +5969,38 @@ class FactCheckProcessor:
 
 
 # ------------- CLI -------------
+
+
+#: Default fraction of checked entries with at least one failed source lookup
+#: above which the whole run is treated as poisoned rather than merely degraded.
+#: A healthy run sits at ~0; the 2026-09-02 wifi drop put 25 output chunks at
+#: 85-98%, and the run still exited 0. Tunable per run with --outage-threshold;
+#: kept as the module default so importers keep a stable value to read.
+NETWORK_OUTAGE_ENTRY_FRACTION: float = 0.10
+
+#: Exit code for a run whose source lookups failed above that fraction. Distinct
+#: from the strict-mode gate (4), which reports on the bibliography; this one
+#: reports that the check itself did not happen. It fires in every mode, not
+#: only under --strict: a silent exit 0 over a run whose lookups never left the
+#: machine is the failure this exists to prevent.
+EXIT_SOURCE_OUTAGE: int = 5
+
+
+def outage_threshold_arg(value: str) -> float:
+    """Parse --outage-threshold: a fraction of entries in [0, 1].
+
+    ``0`` fails the run on a single failed lookup; ``1`` fails it only when
+    every entry was affected. There is deliberately no value that switches the
+    check off -- the threshold decides when a degraded run becomes a condemned
+    one, never whether failed lookups are reported at all.
+    """
+    try:
+        fraction = float(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(f"expected a number in [0, 1], got {value!r}") from None
+    if not 0.0 <= fraction <= 1.0:
+        raise argparse.ArgumentTypeError(f"must be a fraction in [0, 1], got {fraction}")
+    return fraction
 
 
 #: Placeholder polite-pool contact used when no real --mailto /
@@ -5920,6 +6139,19 @@ Examples:
         ),
     )
     p.add_argument("--verbose", "-v", action="store_true", help="Enable debug logging")
+    p.add_argument(
+        "--outage-threshold",
+        type=outage_threshold_arg,
+        default=NETWORK_OUTAGE_ENTRY_FRACTION,
+        metavar="FLOAT",
+        help=(
+            f"Fraction of entries (0-1) with a failed source lookup above which the run "
+            f"exits {EXIT_SOURCE_OUTAGE} as a source outage, in every mode "
+            f"(default: {NETWORK_OUTAGE_ENTRY_FRACTION:g}). 0 fails on a single failed "
+            f"lookup; 1 fails only when every entry was affected. Failed lookups are "
+            f"logged and reported as api_error regardless of this setting."
+        ),
+    )
 
     thresholds = p.add_argument_group("thresholds")
     thresholds.add_argument(
@@ -6213,6 +6445,64 @@ def build_checker_processor(
     return FactCheckProcessor(checker, logger), http
 
 
+def _report_source_outage(
+    summary: dict[str, Any],
+    http_client: HttpClient | None,
+    logger: logging.Logger,
+    threshold: float = NETWORK_OUTAGE_ENTRY_FRACTION,
+) -> int:
+    """Log what the sources failed to answer and return the run's exit code.
+
+    Returns ``EXIT_SOURCE_OUTAGE`` when failed lookups touched at least
+    ``threshold`` of the checked entries (``--outage-threshold``, defaulting to
+    ``NETWORK_OUTAGE_ENTRY_FRACTION``), and 0 otherwise. Below that fraction the
+    failures are still logged -- they are real, and the affected entries are
+    unusable -- but they do not condemn the whole run.
+
+    Hosts are named separately from services because only a transport-layer
+    failure says a host was unreachable: an HTTP error response proves DNS
+    resolved, TCP connected and TLS negotiated, so a 429 is a refusal to answer,
+    not an outage.
+    """
+    total = int(summary.get("total", 0) or 0)
+    failed_entries = int(summary.get("sources_failed_count", 0) or 0)
+    if not failed_entries or not total:
+        return 0
+
+    per_source = summary.get("failed_source_counts") or {}
+    breakdown = ", ".join(f"{name} ({count})" for name, count in sorted(per_source.items()))
+    fraction = failed_entries / total
+    unreachable = http_client.unreachable_hosts if http_client is not None else {}
+
+    logger.warning(
+        "%d of %d entries (%.1f%%) had at least one source lookup that did not complete: %s. "
+        "Those entries report api_error, not not_found -- a source that never answered is not "
+        "evidence that a reference is absent. Re-run them once the sources are reachable.",
+        failed_entries,
+        total,
+        fraction * 100,
+        breakdown or "unknown",
+    )
+    if unreachable:
+        logger.warning(
+            "Hosts that could not be reached (DNS / connection / TLS / timeout / 5xx): %s",
+            ", ".join(f"{host} ({count})" for host, count in sorted(unreachable.items())),
+        )
+
+    if fraction < threshold:
+        return 0
+
+    logger.error(
+        "Source outage: %.1f%% of entries could not be checked against a complete set of sources "
+        "(threshold %g%%). Treat this run as incomplete and discard its could-not-verify verdicts; "
+        "exiting %d.",
+        fraction * 100,
+        threshold * 100,
+        EXIT_SOURCE_OUTAGE,
+    )
+    return EXIT_SOURCE_OUTAGE
+
+
 def main() -> int:
     """Main entry point."""
     args = build_parser().parse_args()
@@ -6302,7 +6592,9 @@ def main() -> int:
 
     logger.info("Total entries to check: %d", len(entries))
 
-    processor, _ = build_checker_processor(args, logger, strict_mode=strict_mode, strict_warn_cnv=strict_warn_cnv)
+    processor, http_client = build_checker_processor(
+        args, logger, strict_mode=strict_mode, strict_warn_cnv=strict_warn_cnv
+    )
 
     # Process entries (stream JSONL if path provided)
     results = processor.process_entries(entries, jsonl_path=args.jsonl, max_workers=args.workers)
@@ -6401,6 +6693,12 @@ def main() -> int:
     if args.jsonl:
         logger.info("JSONL report streamed to %s (%d entries)", args.jsonl, len(results))
 
+    # A run whose sources did not answer checked less than it looks like it
+    # checked, and the affected entries carry API_ERROR rather than a verdict.
+    # Say so loudly: the failure this guards against is a silent exit 0 over
+    # thousands of entries whose lookups never left the machine.
+    outage_code = _report_source_outage(summary, http_client, logger, args.outage_threshold)
+
     # Exit code
     if strict_mode:
         # Positive-evidence problems and parse errors gate the exit code.
@@ -6430,7 +6728,7 @@ def main() -> int:
             )
             return 4
 
-    return 0
+    return outage_code
 
 
 if __name__ == "__main__":

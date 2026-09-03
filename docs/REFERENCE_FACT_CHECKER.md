@@ -93,6 +93,10 @@ Author handling: sources return authors in as-published order, so author-order d
 | `p_valid` | 0.50 — neutral | **0.35 — negative polarity** |
 | how integrations read it | abstention | **commonly mapped to "hallucinated"** |
 
+`not_found` is an **exhaustive** claim: every source consulted for the entry completed its lookup, and none holds a matching record. A lookup that ends without an answer — DNS failure, connection refused, TLS error, connection reset, read/connect timeout, an exhausted 429/5xx retry budget, an open circuit, an error status — cannot support that claim, so the entry reports `api_error` instead, and it does so even when the other sources answered cleanly and found nothing. A partial cascade establishes no exhaustive miss. The `sources_failed` field names the sources behind the demotion.
+
+The same rule governs web references. `url_not_found` means the host answered that the page is not there, which only HTTP 404 and 410 do. Every other way of not getting an answer reports `api_error` with `sources_failed: ["url_check"]`: an unreachable host (DNS failure, refused connection, TLS error, timeout), a refusal (401, 403), a deferral (429), and a failure (5xx). A host that is up and talking has proved nothing about the page, so a bot-blocking 403 on an academic URL no longer reads as a dead citation.
+
 `not_found` says *this tool searched its sources and found nothing*. It does **not** say the reference is fabricated. But because it carries negative polarity, downstream consumers routinely collapse it into a hallucination label — the HALLMARK harness, for instance, maps `not_found` → `HALLUCINATED` unless `coverage_incomplete` is set. Anything scoring or gating on this output inherits that reading, so state your own policy deliberately rather than letting the default decide it for you.
 
 The distinction bites hardest on **document classes the databases structurally never index**: dissertations, journal front matter (editorials, guest columns), and national-language work. A miss there carries no information about whether the work exists. Two concrete cases:
@@ -131,10 +135,10 @@ Always check `coverage_incomplete` first: a `not_found` carrying that flag was r
 | `arxiv_id_mismatch` | problematic | Cited arXiv ID resolves to a different paper |
 | `future_date` / `invalid_year` | problematic | Year in the future / missing / implausible |
 | `doi_not_found` | problematic | DOI returns HTTP 404/410 |
-| `api_error` | — | Errors occurred during API queries |
+| `api_error` | — | At least one source lookup did not complete, so the check was not technically successful. Also emitted in place of `not_found` in that case — see `sources_failed` |
 | `skipped` | — | Entry type not verifiable |
 
-Web references (`url_*`), books (`book_*`), and working papers (`working_paper_*`) have their own status families; see `--skip-web`, `--skip-books`, `--skip-working-papers`.
+Web references (`url_*`), books (`book_*`), and working papers (`working_paper_*`) have their own status families; see `--skip-web`, `--skip-books`, `--skip-working-papers`. `url_not_found` requires an answer, meaning HTTP 404 or 410; an unreachable host, a 401/403 refusal, a 429 or a 5xx all report `api_error` instead, and the `url_check.lookup_failed` field in the JSON report says which of the two happened.
 
 ## Numeric confidence score
 
@@ -148,7 +152,7 @@ The JSONL output carries an additive 0–100 `confidence_score` summarizing per-
 
 ```
 usage: bibtex-check [-h] [--report FILE] [--jsonl FILE] [--strict]
-                    [--strict-warn-cnv] [--verbose]
+                    [--strict-warn-cnv] [--verbose] [--outage-threshold FLOAT]
                     [--title-threshold FLOAT] [--author-threshold FLOAT]
                     [--year-tolerance INT] [--venue-threshold FLOAT]
                     [--cache-file FILE] [--rate-limit INT] [--s2-api-key KEY]
@@ -168,6 +172,7 @@ usage: bibtex-check [-h] [--report FILE] [--jsonl FILE] [--strict]
 | `--report`, `-r FILE` | — | Write full JSON report to FILE |
 | `--jsonl FILE` | — | Write one JSON object per line (streamed) |
 | `--strict` | off | Exit code 4 if not-found / hallucinated entries found |
+| `--outage-threshold FLOAT` | 0.10 | Fraction of entries (0–1) with a failed source lookup above which the run exits 5, in every mode. `0` fails on a single failed lookup; `1` fails only when every entry was affected |
 | `--verbose`, `-v` | off | Enable debug logging |
 
 **Thresholds:** `--title-threshold` (0.90), `--author-threshold` (0.80), `--year-tolerance` (1), `--venue-threshold` (0.70).
@@ -207,6 +212,7 @@ Per-line fields:
 | `confidence` | 0–1 confidence that the **assigned status is the right call**. Direction-free: a confident `hallucinated` and a confident `verified` both carry high `confidence` |
 | `p_valid` | 0–1 probability that the entry **as cited** refers to a real publication with correct metadata — **threshold/rank on this**, not on `confidence`. Verified-polarity statuses map above 0.5, problem-polarity below 0.5, abstentions sit at 0.5, and a clean exhaustive `not_found` at 0.35. Note `preprint_only` is problem-polarity for `p_valid` (the claimed venue is contradicted) even though the verdict itself is confident |
 | `confidence_score` | additive 0–100 numeric confidence (next section) |
+| `sources_failed` | source names whose lookup for this entry did not complete. Non-empty means the cascade was partial: the entry cannot carry `not_found`, and whatever it does carry rests on less evidence than a clean run |
 | `mismatched_fields`, `api_sources`, `errors` | non-confirmed field names, sources with hits, and per-source error strings |
 
 ## Exit Codes
@@ -216,6 +222,9 @@ Per-line fields:
 | 0 | Success (or non-strict mode) |
 | 1 | Input error (file not found, parse error) |
 | 4 | Strict mode: not-found or hallucinated entries found |
+| 5 | Source outage: the fraction of entries with a source lookup that did not complete reached `--outage-threshold` (default 10%), in any mode. The run checked less than it appears to have checked — discard its could-not-verify verdicts and re-run once the sources are reachable |
+
+Below the threshold the affected entries are still logged (with the sources and the unreachable hosts named) and still report `api_error`; only the run-wide verdict stands. `--outage-threshold` tunes where that line sits but cannot switch the check off: a silent exit 0 over a run whose lookups never left the machine is what the code exists to prevent, so it fires in default mode as well as under `--strict`.
 
 ## CI/CD Integration
 

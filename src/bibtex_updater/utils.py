@@ -28,6 +28,7 @@ import xml.etree.ElementTree as ET
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 from rapidfuzz.distance import Levenshtein
@@ -35,17 +36,101 @@ from rapidfuzz.distance import Levenshtein
 logger = logging.getLogger(__name__)
 
 
-class CircuitOpenError(Exception):
+#: Stable substring stamped into every :class:`SourceUnavailableError` message.
+#: The per-entry ``errors`` list is plain text by design, so this marker is what
+#: lets a reader (and a downstream consumer) tell "the source answered and knew
+#: nothing" apart from "the source never answered".
+SOURCE_UNAVAILABLE_MARKER = "lookup did not complete"
+
+
+class SourceUnavailableError(RuntimeError):
+    """A source lookup did not complete, so its silence says nothing.
+
+    Raised when a query to a bibliographic source ends without an answer about
+    the entry: DNS resolution failure, connection refused, TLS error,
+    connection reset, read/connect timeout, an exhausted 429/5xx retry budget,
+    an error status the client cannot interpret, or an unparseable body. A
+    source that answers with zero results is the opposite case and never raises
+    -- only that one is evidence about the entry, and only that one may support
+    a ``not_found`` verdict.
+
+    ``transport_failure`` separates "the host was never reached" (DNS, TCP,
+    TLS, timeouts, 5xx) from "the host answered with an error" (4xx, an
+    unparseable 200). An HTTP error response proves the network is up, so a 429
+    must never be read as an outage; both still mean the lookup failed.
+
+    Subclasses :class:`RuntimeError` so code that already catches the bare
+    ``RuntimeError`` the retry loop used to raise keeps working.
+    """
+
+    def __init__(
+        self,
+        service: str,
+        url: str = "",
+        cause: BaseException | str | None = None,
+        *,
+        transport_failure: bool = True,
+    ) -> None:
+        self.service = service or ""
+        self.url = url or ""
+        self.host = urlsplit(url).netloc if url else ""
+        self.transport_failure = transport_failure
+        detail = str(cause).strip() if cause is not None else ""
+        where = f" {self.host}" if self.host else ""
+        message = f"{self.service or 'source'}{where} {SOURCE_UNAVAILABLE_MARKER}"
+        if detail:
+            message = f"{message}: {detail}"
+        super().__init__(message)
+
+
+class CircuitOpenError(SourceUnavailableError):
     """Raised when a service's circuit breaker is open, to skip the request fast.
 
-    Source clients catch this via their broad ``except`` and return an empty
-    result, so a throttled service stops being hammered while the cascade falls
-    through to the next source.
+    The circuit opens only after sustained 429/5xx, so an open circuit means the
+    service is not answering: this is a failed lookup, not an empty one, and the
+    cascade records it as such while falling through to the next source.
     """
 
     def __init__(self, service: str) -> None:
-        super().__init__(f"circuit open for service {service!r}")
-        self.service = service
+        super().__init__(service, cause=f"circuit open for service {service!r}")
+
+
+#: HTTP statuses that positively assert the requested resource is not there.
+#: Only these support a "does not exist" verdict. Every other non-2xx says the
+#: host refused to tell us (401, 403, 429) or failed to answer (5xx), and
+#: neither is the same claim: a lookup that was declined establishes nothing
+#: about whether the thing exists.
+#:
+#: 410 is included because it is an explicit statement of absence. On a query
+#: endpoint a 410 would strictly speaking retire the interface rather than the
+#: record, but no bibliographic source in the cascade serves one, and the code
+#: is rare enough that one shared definition is worth more than two lists.
+ABSENCE_STATUS_CODES = frozenset({404, 410})
+
+
+def raise_for_failed_lookup(service: str, url: str, status_code: int) -> None:
+    """Raise :class:`SourceUnavailableError` unless the status carries an answer.
+
+    200 is an answer, and an empty result set is still an answer. So is a status
+    in :data:`ABSENCE_STATUS_CODES`: the endpoint stating it holds no such
+    record, which is the normal miss for the single-record endpoints. Every
+    other status ends the lookup with nothing said about the entry.
+    """
+    if status_code == 200 or status_code in ABSENCE_STATUS_CODES:
+        return
+    raise SourceUnavailableError(service, url, f"HTTP {status_code}", transport_failure=status_code >= 500)
+
+
+def as_source_failure(service: str, url: str, exc: BaseException) -> SourceUnavailableError:
+    """Wrap an exception raised during a source lookup, preserving its class.
+
+    Only ``httpx.TransportError`` (DNS, connect, TLS, read/write, pool timeout)
+    means the host was never reached; an unparseable body or any other
+    exception failed the lookup with the network intact.
+    """
+    if isinstance(exc, SourceUnavailableError):
+        return exc
+    return SourceUnavailableError(service, url, exc, transport_failure=isinstance(exc, httpx.TransportError))
 
 
 # ------------- Constants & Regex -------------
@@ -1842,7 +1927,34 @@ class HttpClient:
         self._circuit_fail_streak: dict[str, int] = {}
         self._circuit_open_until: dict[str, float] = {}
         self._tripped_services: set[str] = set()
+        # Run-level tally of lookups that ended without an answer. ``_unreachable_hosts``
+        # counts only transport-layer failures (DNS, TCP, TLS, timeouts, 5xx), which are
+        # the ones that actually indicate the host was never reached; an HTTP error
+        # response proves the network is up and lands in ``_failed_services`` alone.
+        self._unreachable_hosts: dict[str, int] = {}
+        self._failed_services: dict[str, int] = {}
+        self._failure_lock = threading.Lock()
         self._load_circuit_state()
+
+    @property
+    def unreachable_hosts(self) -> dict[str, int]:
+        """Hosts that could not be reached this run, mapped to failure counts."""
+        with self._failure_lock:
+            return dict(self._unreachable_hosts)
+
+    @property
+    def failed_services(self) -> dict[str, int]:
+        """Services whose lookups ended without an answer, mapped to counts."""
+        with self._failure_lock:
+            return dict(self._failed_services)
+
+    def _record_lookup_failure(self, exc: SourceUnavailableError) -> None:
+        """Tally a lookup that ended without an answer (see the properties above)."""
+        with self._failure_lock:
+            key = exc.service or exc.host or "unknown"
+            self._failed_services[key] = self._failed_services.get(key, 0) + 1
+            if exc.transport_failure and exc.host:
+                self._unreachable_hosts[exc.host] = self._unreachable_hosts.get(exc.host, 0) + 1
 
     @property
     def rate_limiter(self) -> RateLimiter | RateLimiterRegistry:
@@ -2047,9 +2159,12 @@ class HttpClient:
                     headers={"X-From-Cache": "1"},
                 )
         if self._circuit_is_open(service):
-            raise CircuitOpenError(service or "")
+            circuit_exc = CircuitOpenError(service or "")
+            self._record_lookup_failure(circuit_exc)
+            raise circuit_exc
         backoff = 1.0
         attempts = 6
+        last_exc: httpx.HTTPError | None = None
         limiter = self._get_limiter_for_service(service)
         for attempt in range(attempts):
             limiter.wait()
@@ -2088,6 +2203,7 @@ class HttpClient:
                 self._record_service_success(service)
                 return resp
             except httpx.HTTPError as exc:
+                last_exc = exc
                 # Don't sleep after the final attempt -- we're about to give up, so
                 # the backoff would just be a wasted stall on a dead or rate-limited
                 # source. Honor a server Retry-After (DBLP/Crossref 429/503) over the
@@ -2096,7 +2212,16 @@ class HttpClient:
                     time.sleep(retry_after_seconds(exc, backoff) + random.uniform(0, 0.5))
                     backoff = min(backoff * 2, 16.0)
         self._record_service_failure(service)
-        raise RuntimeError(f"Network failure after retries for {url}")
+        # We gave up without an answer. A 429 (or any 4xx) proves the host is up and
+        # talking, so only a transport error or a 5xx counts as unreachable -- but
+        # either way the lookup did not complete, and callers must not read the
+        # missing answer as "this source knows nothing about the entry".
+        transport = True
+        if isinstance(last_exc, httpx.HTTPStatusError):
+            transport = last_exc.response.status_code >= 500
+        failure = SourceUnavailableError(service or "", url, last_exc, transport_failure=transport)
+        self._record_lookup_failure(failure)
+        raise failure
 
 
 # ------------- Venue-identity helpers -------------

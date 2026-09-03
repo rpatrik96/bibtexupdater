@@ -33,7 +33,12 @@ from bibtex_updater.sources import (
     build_openreview_paperhash,
     openreview_note_to_candidate_record,
 )
-from bibtex_updater.utils import OPENREVIEW_API, OPENREVIEW_API_V2, RateLimiterRegistry
+from bibtex_updater.utils import (
+    OPENREVIEW_API,
+    OPENREVIEW_API_V2,
+    RateLimiterRegistry,
+    SourceUnavailableError,
+)
 
 # ------------- Helpers -------------
 
@@ -158,12 +163,14 @@ class TestOpenReviewClientSearch:
         client = OpenReviewClient(http=http)
         assert client.search("b", title="T", first_author="a") == []
 
-    def test_empty_on_exception(self):
+    def test_raises_on_exception(self):
         http = MagicMock()
         http._request.side_effect = RuntimeError("network down")
         client = OpenReviewClient(http=http)
-        # Must never raise -- the cascade depends on a quiet [] on failure.
-        assert client.search("b", title="T", first_author="a") == []
+        # A quiet [] here made a dead network look like "OpenReview does not
+        # host this paper", which is the claim not_found rests on.
+        with pytest.raises(SourceUnavailableError):
+            client.search("b", title="T", first_author="a")
 
     def test_empty_on_malformed_json(self):
         http = MagicMock()
@@ -253,20 +260,23 @@ class TestOpenReviewV2Fallback:
         assert rec.surname_keys() == ["hopper", "turing"]
         assert rec.order_reliable is True  # same as the v1 converter
 
-    def test_v2_error_returns_empty(self):
-        # (3) Any v2 failure -> [] (never raises into the cascade).
+    def test_v2_error_raises(self):
+        # (3) A v2 failure surfaces: the v1 hosts answered with nothing, but the
+        # v2 host never answered at all, so the search is not exhaustive.
         http = MagicMock()
         http._request.side_effect = [_ok([]), _ok([]), RuntimeError("v2 down")]
         client = OpenReviewClient(http=http)
-        assert client.search("b", title="T U V", first_author="a") == []
+        with pytest.raises(SourceUnavailableError):
+            client.search("b", title="T U V", first_author="a")
 
-    def test_v2_non_200_returns_empty(self):
+    def test_v2_non_200_raises(self):
         http = MagicMock()
         resp_500 = MagicMock()
         resp_500.status_code = 500
         http._request.side_effect = [_ok([]), _ok([]), resp_500]
         client = OpenReviewClient(http=http)
-        assert client.search("b", title="T U V", first_author="a") == []
+        with pytest.raises(SourceUnavailableError):
+            client.search("b", title="T U V", first_author="a")
 
     def test_v2_malformed_notes_returns_empty(self):
         bad = MagicMock()
