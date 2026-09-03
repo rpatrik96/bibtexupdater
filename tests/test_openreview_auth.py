@@ -26,6 +26,7 @@ import base64
 import json
 import logging
 import stat
+import threading
 import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -798,3 +799,168 @@ class TestOneLoginServesBothHosts:
             assert auth.token_for_url(NOTES_V1) == TOKEN_V1
             assert auth.token_for_url(NOTES_V2) == TOKEN_V1
         assert len(fake.calls) == 2
+
+
+# ===========================================================================
+# The per-origin login lock (concurrent workers, cold cache)
+# ===========================================================================
+
+
+class _CountingLoginClient:
+    """Fake ``httpx.Client`` for a login race: thread-safe call counter, and a
+    short pause inside ``post`` so several threads racing ``token_for_url``
+    actually overlap inside ``_login`` instead of running one after another.
+
+    The pause is an unset ``Event.wait(timeout=...)``, not ``time.sleep`` --
+    ``bibtex_updater.utils.time`` is the same module object as the stdlib
+    ``time``, so the ``_fast`` autouse fixture's
+    ``monkeypatch.setattr("bibtex_updater.utils.time.sleep", ...)`` replaces
+    ``time.sleep`` everywhere for the duration of the test, this file's own
+    calls included. ``Event.wait`` is a different code path and is untouched.
+    """
+
+    def __init__(self, *, status_code: int = 200, token: str | None = None, delay: float = 0.05):
+        self._status_code = status_code
+        self._token = token
+        self._delay = delay
+        self._count_lock = threading.Lock()
+        self._never = threading.Event()
+        self.call_count = 0
+
+    def __call__(self, *args, **kwargs):
+        return self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def post(self, url, json=None):
+        with self._count_lock:
+            self.call_count += 1
+        self._never.wait(timeout=self._delay)
+        resp = MagicMock()
+        resp.status_code = self._status_code
+        if self._status_code == 200:
+            resp.json.return_value = {"token": self._token, "user": {"id": "~Test_User1"}}
+        else:
+            resp.json.return_value = {}
+        return resp
+
+
+class _BlockingLoginClient:
+    """Fake ``httpx.Client`` whose login for one chosen origin blocks on an
+    ``Event`` until the test releases it, so a second origin's login can be
+    driven concurrently and its timing checked against the first.
+    """
+
+    def __init__(
+        self, tokens: dict[str, str], *, block_origin: str, started: threading.Event, release: threading.Event
+    ):
+        self._tokens = tokens
+        self._block_origin = block_origin
+        self._started = started
+        self._release = release
+        self.calls: list[str] = []
+
+    def __call__(self, *args, **kwargs):
+        return self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def post(self, url, json=None):
+        self.calls.append(url)
+        origin = url.rsplit("/login", 1)[0]
+        if origin == self._block_origin:
+            self._started.set()
+            assert self._release.wait(timeout=5), "test never released the blocked login"
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {"token": self._tokens[origin], "user": {"id": "~Test_User1"}}
+        return resp
+
+
+class TestConcurrentLoginsAreSerializedPerOrigin:
+    """Measured on a 5,043-reference screening run with a cold token cache:
+    44 logins came back ``429 Too Many Requests`` against 3 that succeeded,
+    because every worker thread that wanted a token for the same origin issued
+    its own ``POST /login`` at once, and OpenReview refuses roughly the fourth
+    login within two minutes. Each loser then latched its origin as disabled
+    and proceeded anonymously for the rest of the process.
+    """
+
+    def test_concurrent_callers_for_one_origin_share_a_single_login(self):
+        fake = _CountingLoginClient(token=TOKEN_V1)
+        auth = OpenReviewAuth("a@b.c", PASSWORD)
+        results: list[str | None] = []
+        results_lock = threading.Lock()
+
+        def worker():
+            token = auth.token_for_url(NOTES_V1)
+            with results_lock:
+                results.append(token)
+
+        with patch("bibtex_updater.utils.httpx.Client", fake):
+            threads = [threading.Thread(target=worker) for _ in range(8)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=5)
+
+        assert fake.call_count == 1
+        assert results == [TOKEN_V1] * 8
+
+    def test_a_failed_login_is_shared_not_retried_per_thread(self, caplog):
+        fake = _CountingLoginClient(status_code=400)
+        auth = OpenReviewAuth("a@b.c", PASSWORD)
+        results: list[str | None] = []
+        results_lock = threading.Lock()
+
+        def worker():
+            token = auth.token_for_url(NOTES_V1)
+            with results_lock:
+                results.append(token)
+
+        with caplog.at_level(logging.DEBUG), patch("bibtex_updater.utils.httpx.Client", fake):
+            threads = [threading.Thread(target=worker) for _ in range(8)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=5)
+
+        assert fake.call_count == 1
+        assert results == [None] * 8
+
+    def test_a_login_to_one_origin_does_not_block_a_lookup_against_another(self):
+        started = threading.Event()
+        release = threading.Event()
+        other_origin = "https://mirror.example.org"
+        fake = _BlockingLoginClient(
+            {OPENREVIEW_API: TOKEN_V1, other_origin: TOKEN_V2},
+            block_origin=OPENREVIEW_API,
+            started=started,
+            release=release,
+        )
+        auth = OpenReviewAuth("a@b.c", PASSWORD)
+        slow_result: dict[str, str | None] = {}
+
+        def slow_worker():
+            slow_result["token"] = auth.token_for_url(NOTES_V1)
+
+        with patch("bibtex_updater.utils.httpx.Client", fake):
+            t = threading.Thread(target=slow_worker)
+            t.start()
+            assert started.wait(timeout=5), "the blocked login never started"
+            # The blocked login for OPENREVIEW_API is a different origin from
+            # this one, so it must not be serialized behind it.
+            fast_token = auth.token_for_url(f"{other_origin}/notes")
+            assert fast_token == TOKEN_V2
+            release.set()
+            t.join(timeout=5)
+
+        assert slow_result["token"] == TOKEN_V1

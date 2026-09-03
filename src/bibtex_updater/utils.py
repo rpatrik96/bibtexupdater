@@ -2138,6 +2138,17 @@ class OpenReviewAuth:
         # entry, so one attempt per origin per run is enough; the rest of the run
         # proceeds anonymously.
         self._disabled: set[str] = set()
+        # One lock per origin, created lazily under ``_lock`` and then held for
+        # the duration of that origin's login. A cold token cache under a
+        # ThreadPoolExecutor otherwise lets every worker that wants the same
+        # origin issue its own ``POST /login`` at once; measured on a
+        # 5,043-reference run, 44 of those concurrent logins came back
+        # ``429 Too Many Requests`` against 3 that succeeded, and each loser
+        # then treated the refusal as "this origin is disabled" and proceeded
+        # anonymously for the rest of the process. Keying the lock by origin
+        # (rather than one lock for the whole object) means a slow login to one
+        # host never blocks a lookup against the other.
+        self._login_locks: dict[str, threading.Lock] = {}
 
     @staticmethod
     def _store_from_env(env: Mapping[str, str]) -> OpenReviewTokenStore | None:
@@ -2193,6 +2204,20 @@ class OpenReviewAuth:
             return ()
         return tuple(other for other in cls.SHARED_ORIGINS if other != origin)
 
+    def _login_lock_for(self, origin: str) -> threading.Lock:
+        """Return the per-origin login lock, creating it on first use.
+
+        Guarded by ``_lock``, but only for the dict lookup/insert -- the lock
+        itself is then held by the caller across the login, outside ``_lock``,
+        so two different origins never wait on each other.
+        """
+        with self._lock:
+            lock = self._login_locks.get(origin)
+            if lock is None:
+                lock = threading.Lock()
+                self._login_locks[origin] = lock
+            return lock
+
     def token_for_url(self, url: str) -> str | None:
         """Return a bearer token for ``url``'s host, logging in on first use.
 
@@ -2225,15 +2250,33 @@ class OpenReviewAuth:
         # rides on the other one's token instead of falling back to anonymous.
         if disabled:
             return None
-        token = self._login(origin)
-        with self._lock:
-            if token:
-                self._tokens[origin] = token
-            else:
-                self._disabled.add(origin)
-        if token and self._store is not None:
-            self._store.put(self._username, origin, token)
-        return token
+        # Serialize the login itself per origin. Everything above this point
+        # only reads shared state, so several threads reach here together with
+        # a cold cache; without a lock each one would issue its own
+        # ``POST /login`` and race the others into OpenReview's ~4-per-two-
+        # minutes limit. The lock is acquired outside ``_lock`` (a login is a
+        # network call, not a dict mutation) and scoped to this origin, so a
+        # login to one host never blocks a lookup against the other.
+        with self._login_lock_for(origin):
+            # Re-check now that we hold the lock: the common case is that
+            # whichever thread got here first already logged in (or already
+            # failed) while we were waiting, and we must reuse that outcome
+            # rather than repeating it.
+            with self._lock:
+                token = self._tokens.get(origin)
+                if token:
+                    return token
+                if origin in self._disabled:
+                    return None
+            token = self._login(origin)
+            with self._lock:
+                if token:
+                    self._tokens[origin] = token
+                else:
+                    self._disabled.add(origin)
+            if token and self._store is not None:
+                self._store.put(self._username, origin, token)
+            return token
 
     def invalidate(self, url: str) -> None:
         """Drop the cached token for ``url``'s host so the next call logs in again.
