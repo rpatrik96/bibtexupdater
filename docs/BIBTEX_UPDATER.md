@@ -74,6 +74,7 @@ usage: bibtex_updater.py [-h] [-o OUTPUT | --in-place] [--keep-preprint-note]
 | `--no-cache` | Disable caching entirely for fresh lookups |
 | `--clear-cache` | Clear existing cache files before running |
 | `--s2-api-key` | Semantic Scholar API key (or set `S2_API_KEY`) |
+| `--openreview-username` | OpenReview account for authenticated OpenReview lookups (or set `OPENREVIEW_USERNAME`); password from `OPENREVIEW_PASSWORD` only |
 | `--user-agent` | Custom User-Agent for API requests (or set `BIBTEX_UPDATER_USER_AGENT`) |
 | `--mark-resolved` | Tag updated entries with `_resolved_from` field to skip on re-runs |
 | `--force-recheck` | Ignore `_resolved_from` markers and reprocess all entries |

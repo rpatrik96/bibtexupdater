@@ -57,6 +57,7 @@ class TestCliServiceRateLimits:
             "openalex": 150,
             "dblp": 30,
             "openreview": 30,
+            "openreview_search": 5,
             "arxiv": 20,
             "semanticscholar": 10,
             "openlibrary": 30,
@@ -78,6 +79,9 @@ class TestCliServiceRateLimits:
         assert limits["openreview"] == 60
         # arXiv NEVER scales up: ~1 req/3s politeness ask.
         assert limits["arxiv"] == 20
+        # Neither does OpenReview's full-text search: the endpoint declares
+        # 5 req/min, and going past it buys a 429 rather than throughput.
+        assert limits["openreview_search"] == 5
 
     def test_huge_scale_still_capped(self):
         limits = _cli_service_rate_limits(900, "key")

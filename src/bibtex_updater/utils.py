@@ -70,11 +70,17 @@ class SourceUnavailableError(RuntimeError):
         cause: BaseException | str | None = None,
         *,
         transport_failure: bool = True,
+        status_code: int | None = None,
     ) -> None:
         self.service = service or ""
         self.url = url or ""
         self.host = urlsplit(url).netloc if url else ""
         self.transport_failure = transport_failure
+        #: The HTTP status that ended the lookup, when one was received. ``None``
+        #: for a transport error, where no response arrived. A caller that wants
+        #: to tell a refusal (401/403) apart from a throttle (429) or a server
+        #: fault (5xx) reads this rather than parsing the message.
+        self.status_code = status_code
         detail = str(cause).strip() if cause is not None else ""
         where = f" {self.host}" if self.host else ""
         message = f"{self.service or 'source'}{where} {SOURCE_UNAVAILABLE_MARKER}"
@@ -118,7 +124,13 @@ def raise_for_failed_lookup(service: str, url: str, status_code: int) -> None:
     """
     if status_code == 200 or status_code in ABSENCE_STATUS_CODES:
         return
-    raise SourceUnavailableError(service, url, f"HTTP {status_code}", transport_failure=status_code >= 500)
+    raise SourceUnavailableError(
+        service,
+        url,
+        f"HTTP {status_code}",
+        transport_failure=status_code >= 500,
+        status_code=status_code,
+    )
 
 
 def as_source_failure(service: str, url: str, exc: BaseException) -> SourceUnavailableError:
@@ -130,7 +142,14 @@ def as_source_failure(service: str, url: str, exc: BaseException) -> SourceUnava
     """
     if isinstance(exc, SourceUnavailableError):
         return exc
-    return SourceUnavailableError(service, url, exc, transport_failure=isinstance(exc, httpx.TransportError))
+    status = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else None
+    return SourceUnavailableError(
+        service,
+        url,
+        exc,
+        transport_failure=isinstance(exc, httpx.TransportError),
+        status_code=status,
+    )
 
 
 # ------------- Constants & Regex -------------
@@ -205,13 +224,16 @@ EUROPEPMC_API = "https://www.ebi.ac.uk/europepmc/webservices/rest"
 # Legacy OpenReview API. The v2 host (api2.openreview.net) does NOT serve the
 # ``paperhash`` exact-match filter, but the legacy ``api.openreview.net/notes``
 # endpoint does -- and that is the authoritative title+first-author lookup the
-# cascade relies on. Public read is keyless.
+# cascade relies on. ``/notes`` is behind a browser challenge for anonymous
+# callers (403 ChallengeRequiredError) and needs a bearer token; the full-text
+# ``/notes/search`` endpoint on the same host still answers keyless.
 OPENREVIEW_API = "https://api.openreview.net"
 # OpenReview API v2. Venues that migrated to v2 (ICLR 2024+, NeurIPS 2023+,
-# most 2024+ venues) are INVISIBLE on the legacy v1 host, so the client falls
-# back to ``GET /notes/search?term=<title>`` here when both v1 lookups miss.
+# most 2024+ venues) are INVISIBLE on the legacy v1 host, so the client runs
+# ``GET /notes/search?term=<title>`` against both hosts when paperhash misses.
 # v2 wraps every note content field as ``{"value": ...}`` (the converters
-# accept both shapes via ``_content_value``). Public read is keyless.
+# accept both shapes via ``_content_value``). Same challenge gate as v1:
+# ``/notes`` needs a token, ``/notes/search`` answers keyless.
 OPENREVIEW_API_V2 = "https://api2.openreview.net"
 
 
@@ -1366,7 +1388,8 @@ class RateLimiterRegistry:
         "aclanthology": 30,  # ACL Anthology: 30/min (conservative)
         "openalex": 100,  # Conservative default; OpenAlex polite pool allows ~10 req/sec
         "europepmc": 20,  # Europe PMC: conservative rate limit
-        "openreview": 30,  # OpenReview: 30/min (conservative; keyless public read)
+        "openreview": 30,  # OpenReview /notes: 180/min declared; 30 is conservative
+        "openreview_search": 5,  # OpenReview /notes/search declares 5/min
     }
 
     def __init__(self, limits: dict[str, int] | None = None) -> None:
@@ -1873,6 +1896,181 @@ class ResolutionCache:
 # ------------- HTTP Client -------------
 
 
+#: Service tag for OpenReview's ``/notes`` endpoints: the paperhash lookup and
+#: the note-id fetches. OpenReview declares 180 requests per minute there
+#: (``ratelimit-policy: 180;w=60``).
+OPENREVIEW_SERVICE = "openreview"
+
+#: Separate rate-limit tag for the ``/notes/search`` full-text endpoints, which
+#: declare 5 requests per minute (``ratelimit-policy: 5;w=60``) -- 36 times
+#: tighter than ``/notes`` on the same host. One limiter cannot serve both
+#: without either throttling the exact lookup to a crawl or walking the search
+#: endpoint into a 429 on every entry, so the two are paced separately. Circuit
+#: state and failure accounting stay under :data:`OPENREVIEW_SERVICE`, so the
+#: cascade still sees one source.
+OPENREVIEW_SEARCH_SERVICE = "openreview_search"
+
+#: Environment variables carrying optional OpenReview credentials. Both must be
+#: set before authentication is attempted; either one alone leaves the client
+#: anonymous. The password is read from the environment only and never from a
+#: command-line flag, which would put it in the process table.
+OPENREVIEW_ENV_USERNAME = "OPENREVIEW_USERNAME"
+OPENREVIEW_ENV_PASSWORD = "OPENREVIEW_PASSWORD"
+
+#: Statuses that mean an OpenReview request was refused rather than answered,
+#: and so are worth one re-login before giving up (an expired token reads as a
+#: refusal). 403 is what the challenge gate returns to an anonymous caller.
+OPENREVIEW_AUTH_REFRESH_STATUS = frozenset({401, 403})
+
+
+class OpenReviewAuth:
+    """Optional OpenReview credentials, exchanged for a per-host bearer token.
+
+    OpenReview stopped serving its ``/notes`` endpoints to anonymous callers.
+    Both ``api.openreview.net/notes?paperhash=`` -- the exact title +
+    first-author lookup the cascade relies on -- and ``api2.openreview.net/notes``
+    answer ``403 ChallengeRequiredError`` with a browser challenge URL, so an
+    unauthenticated screening run gets nothing from the source while still
+    paying a round trip per entry. A logged-in caller carries a bearer token
+    and is not challenged. The full-text ``/notes/search`` endpoints still
+    answer anonymously on both hosts, so credentials widen what OpenReview can
+    confirm rather than being required for it to contribute at all.
+
+    Credentials stay optional. Without them every client here behaves as it did
+    before, and a login that fails degrades the run to anonymous instead of
+    ending it. The password reaches this class from the environment only, is
+    never logged, and never enters the response cache: the login POST goes out
+    on a bare ``httpx`` client, so the shared :class:`HttpClient` never sees the
+    credentials and never writes the token to disk.
+
+    Tokens are per host. v1 and v2 issue separate ones, so :meth:`token_for_url`
+    keys on the URL's origin and logs in to that origin on first use.
+    """
+
+    LOGIN_PATH = "/login"
+
+    def __init__(self, username: str, password: str, timeout: float = 15.0) -> None:
+        self._username = (username or "").strip()
+        self._password = password or ""
+        self._timeout = timeout
+        self._lock = threading.Lock()
+        self._tokens: dict[str, str] = {}
+        # Origins whose login failed. A bad password fails identically for every
+        # entry, so one attempt per origin per run is enough; the rest of the run
+        # proceeds anonymously.
+        self._disabled: set[str] = set()
+
+    @classmethod
+    def from_env(
+        cls,
+        username: str | None = None,
+        env: Mapping[str, str] | None = None,
+    ) -> OpenReviewAuth | None:
+        """Build credentials from ``username`` (or its env var) plus the password env var.
+
+        Returns ``None`` when either half is missing, which is the ordinary case
+        and leaves the caller anonymous.
+        """
+        source = os.environ if env is None else env
+        user = (username or source.get(OPENREVIEW_ENV_USERNAME) or "").strip()
+        password = source.get(OPENREVIEW_ENV_PASSWORD) or ""
+        if not user or not password:
+            return None
+        return cls(user, password)
+
+    @property
+    def username(self) -> str:
+        return self._username
+
+    def __repr__(self) -> str:
+        # Deliberately opaque: this object holds a password and a bearer token,
+        # and a repr lands in tracebacks and debug logs.
+        return "OpenReviewAuth(<credentials hidden>)"
+
+    __str__ = __repr__
+
+    @staticmethod
+    def _origin(url: str) -> str:
+        """``https://api2.openreview.net/notes?x=1`` -> ``https://api2.openreview.net``."""
+        parts = urlsplit(url or "")
+        if not parts.scheme or not parts.netloc:
+            return ""
+        return f"{parts.scheme}://{parts.netloc}"
+
+    def token_for_url(self, url: str) -> str | None:
+        """Return a bearer token for ``url``'s host, logging in on first use.
+
+        ``None`` means the caller should proceed anonymously: the URL had no
+        recoverable origin, or the login to that origin already failed in this
+        run.
+        """
+        origin = self._origin(url)
+        if not origin:
+            return None
+        with self._lock:
+            token = self._tokens.get(origin)
+            if token:
+                return token
+            if origin in self._disabled:
+                return None
+        token = self._login(origin)
+        with self._lock:
+            if token:
+                self._tokens[origin] = token
+            else:
+                self._disabled.add(origin)
+        return token
+
+    def invalidate(self, url: str) -> None:
+        """Drop the cached token for ``url``'s host so the next call logs in again.
+
+        Called when a request that carried a token was refused, which is what an
+        expired token looks like from the client side.
+        """
+        origin = self._origin(url)
+        if not origin:
+            return
+        with self._lock:
+            self._tokens.pop(origin, None)
+
+    def _login(self, origin: str) -> str | None:
+        """POST the credentials to ``<origin>/login`` and return the token.
+
+        Never raises: every failure returns ``None`` and is logged with the
+        status alone. The response body is not logged, because it carries the
+        token on success.
+        """
+        url = f"{origin}{self.LOGIN_PATH}"
+        try:
+            with httpx.Client(timeout=self._timeout, follow_redirects=True) as client:
+                resp = client.post(url, json={"id": self._username, "password": self._password})
+        except Exception as exc:  # noqa: BLE001 - a failed login must not end the run
+            logger.warning(
+                "OpenReview login to %s did not complete (%s); continuing anonymously",
+                origin,
+                type(exc).__name__,
+            )
+            return None
+        if resp.status_code != 200:
+            logger.warning(
+                "OpenReview login to %s failed (HTTP %s); continuing anonymously",
+                origin,
+                resp.status_code,
+            )
+            return None
+        try:
+            data = resp.json() or {}
+        except Exception:  # noqa: BLE001 - an unparseable body is a failed login
+            logger.warning("OpenReview login to %s returned an unreadable body; continuing anonymously", origin)
+            return None
+        token = data.get("token") or data.get("access_token")
+        if not isinstance(token, str) or not token.strip():
+            logger.warning("OpenReview login to %s returned no token; continuing anonymously", origin)
+            return None
+        logger.info("OpenReview authenticated against %s", origin)
+        return token.strip()
+
+
 class HttpClient:
     """HTTP client with caching, rate limiting, and retry logic."""
 
@@ -1921,6 +2119,7 @@ class HttpClient:
         cache: DiskCache | SqliteCache,
         verbose: bool = False,
         s2_api_key: str | None = None,
+        openreview_auth: OpenReviewAuth | None = None,
     ):
         """Initialize HTTP client.
 
@@ -1932,6 +2131,10 @@ class HttpClient:
             cache: DiskCache or SqliteCache instance for caching responses
             verbose: Enable verbose logging
             s2_api_key: Optional Semantic Scholar API key for authenticated requests
+            openreview_auth: Optional OpenReview credentials. When supplied, every
+                request tagged ``service="openreview"`` carries a bearer token,
+                which is what the ``/notes`` endpoints now require. ``None`` keeps
+                the client anonymous, exactly as before.
         """
         self.client = httpx.Client(
             timeout=httpx.Timeout(timeout),
@@ -1944,6 +2147,7 @@ class HttpClient:
         self.cache = cache
         self.verbose = verbose
         self.s2_api_key = s2_api_key
+        self.openreview_auth = openreview_auth
         # Per-service circuit-breaker state (see CIRCUIT_* and _request). These
         # dicts are read and written from every worker thread, so all access goes
         # through ``_circuit_lock``; it is reentrant because _record_service_failure
@@ -2207,6 +2411,7 @@ class HttpClient:
         accept: str | None = None,
         json_body: dict[str, Any] | list[Any] | None = None,
         service: str | None = None,
+        rate_limit_service: str | None = None,
     ) -> httpx.Response:
         """Make an HTTP request with caching and retries.
 
@@ -2216,8 +2421,15 @@ class HttpClient:
             params: Query parameters
             accept: Accept header value
             json_body: JSON body for POST requests
-            service: Optional service name for per-service rate limiting
-                    (e.g., 'crossref', 'dblp', 'semanticscholar', 'arxiv')
+            service: Optional service name for the circuit breaker, health
+                    reporting and failure accounting (e.g., 'crossref', 'dblp',
+                    'semanticscholar', 'arxiv'), and for rate limiting unless
+                    ``rate_limit_service`` overrides it.
+            rate_limit_service: Optional separate name for the rate limiter,
+                    for a source whose endpoints declare different limits.
+                    OpenReview is the case that needs it: ``/notes`` allows 180
+                    requests per minute and ``/notes/search`` allows 5, while
+                    both are one source as far as the cascade is concerned.
         """
         cache_key = None
         if self.cache:
@@ -2250,7 +2462,11 @@ class HttpClient:
         backoff = 1.0
         attempts = 6
         last_exc: httpx.HTTPError | None = None
-        limiter = self._get_limiter_for_service(service)
+        limiter = self._get_limiter_for_service(rate_limit_service or service)
+        # One re-login is allowed per request: an expired OpenReview token is
+        # refused exactly like an absent one, and the only way to tell them apart
+        # is to log in again and retry.
+        auth_refreshed = False
         for attempt in range(attempts):
             limiter.wait()
             try:
@@ -2260,10 +2476,24 @@ class HttpClient:
                 # Add Semantic Scholar API key if available
                 if service == "semanticscholar" and self.s2_api_key:
                     headers["x-api-key"] = self.s2_api_key
+                openreview_token: str | None = None
+                if service == OPENREVIEW_SERVICE and self.openreview_auth is not None:
+                    openreview_token = self.openreview_auth.token_for_url(url)
+                    if openreview_token:
+                        headers["Authorization"] = f"Bearer {openreview_token}"
                 resp = self.client.request(method, url, params=params, headers=headers, json=json_body)
                 # Adaptive rate limiting feedback for every REAL response,
                 # including a retryable 429/5xx before it is raised below.
                 self._adapt_rate_limiter(service, resp)
+                if (
+                    openreview_token
+                    and not auth_refreshed
+                    and resp.status_code in OPENREVIEW_AUTH_REFRESH_STATUS
+                    and self.openreview_auth is not None
+                ):
+                    auth_refreshed = True
+                    self.openreview_auth.invalidate(url)
+                    continue
                 if resp.status_code in self.RETRYABLE_STATUS:
                     raise httpx.HTTPStatusError("Retryable status", request=resp.request, response=resp)
                 if self.cache and cache_key and resp.status_code == 200:
@@ -3143,7 +3373,8 @@ class AsyncRateLimiterRegistry:
         "aclanthology": 30,  # ACL Anthology: 30/min (conservative)
         "openalex": 100,  # OpenAlex: polite pool (~10 req/sec max)
         "europepmc": 20,  # Europe PMC: conservative rate limit
-        "openreview": 30,  # OpenReview: 30/min (conservative; keyless public read)
+        "openreview": 30,  # OpenReview /notes: 180/min declared; 30 is conservative
+        "openreview_search": 5,  # OpenReview /notes/search declares 5/min
     }
 
     def __init__(self, limits: dict[str, int] | None = None) -> None:

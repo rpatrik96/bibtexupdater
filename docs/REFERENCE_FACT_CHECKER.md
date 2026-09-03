@@ -177,7 +177,7 @@ usage: bibtex-check [-h] [--report FILE] [--jsonl FILE] [--strict]
 
 **Thresholds:** `--title-threshold` (0.90), `--author-threshold` (0.80), `--year-tolerance` (1), `--venue-threshold` (0.70).
 
-**API options:** `--cache-file` (`.cache.fact_checker.json`), `--rate-limit` (45 req/min, scales per-service limits), `--s2-api-key KEY` (or `S2_API_KEY` env var), `--mailto EMAIL` (or `BIBTEX_CHECK_MAILTO`; polite-pool contact for Crossref/OpenAlex, feeds the User-Agent and the `--openalex-mailto` default), `--no-cache`, `--no-check-dois`, `--no-check-years`, `--no-check-venue-existence` (disable the DBLP/OpenAlex venue-registry existence check behind `nonexistent_venue`), `--no-fast-path` (always run the full cascade; disables the DOI/arXiv identifier-anchored fast paths), `--workers N` (8).
+**API options:** `--cache-file` (`.cache.fact_checker.json`), `--rate-limit` (45 req/min, scales per-service limits), `--s2-api-key KEY` (or `S2_API_KEY` env var), `--openreview-username USER` (or `OPENREVIEW_USERNAME`; the password comes from `OPENREVIEW_PASSWORD` only, and both are optional — without them OpenReview's `/notes` endpoints answer 403 and only its full-text search contributes), `--mailto EMAIL` (or `BIBTEX_CHECK_MAILTO`; polite-pool contact for Crossref/OpenAlex, feeds the User-Agent and the `--openalex-mailto` default), `--no-cache`, `--no-check-dois`, `--no-check-years`, `--no-check-venue-existence` (disable the DBLP/OpenAlex venue-registry existence check behind `nonexistent_venue`), `--no-fast-path` (always run the full cascade; disables the DOI/arXiv identifier-anchored fast paths), `--workers N` (8).
 
 **Cascade (CheckIfExist):** `--top-k N` (3, max 10) candidates per source; `--openalex-mailto EMAIL` for the OpenAlex polite pool.
 

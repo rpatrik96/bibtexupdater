@@ -249,6 +249,15 @@ The order is throughput-aware: CrossRef and OpenAlex (polite pool, ~100 req/min)
 
 OpenReview owns the submission record for most ML conferences, so it positively confirms ICLR/NeurIPS/TMLR papers that the DOI- and CS-index sources above can only leave in the "could-not-verify" bucket. Retrieval uses *fielded* title search (CrossRef `query.title`, OpenAlex `title.search`) rather than a free-text title+author blob, which keeps DOI-less ML-conference titles ranked correctly.
 
+OpenReview keeps its `/notes` endpoints behind a browser challenge, so the exact title + first-author lookup answers `403` to an anonymous caller. An anonymous run reports that refusal honestly (the entry cannot become a `not_found`) and stops re-issuing the refused request per entry. Supplying an OpenReview account restores the lookup:
+
+```bash
+export OPENREVIEW_USERNAME=you@example.org   # or pass --openreview-username
+export OPENREVIEW_PASSWORD=...               # read from the environment only
+```
+
+Both halves are needed and both are optional: without them the run proceeds anonymously, and a login that fails degrades to anonymous rather than ending the run. The password is never accepted as a flag, never logged, and never written to the response cache.
+
 ```bash
 # Verification with top-3 candidates per source
 bibtex-check references.bib --top-k 3 --jsonl out.jsonl

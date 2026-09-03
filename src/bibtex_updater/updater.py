@@ -70,6 +70,7 @@ from bibtex_updater.utils import (
     S2_API,
     AsyncHttpClient,
     HttpClient,
+    OpenReviewAuth,
     PublishedRecord,
     RateLimiterRegistry,
     ResolutionCache,
@@ -3690,6 +3691,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Semantic Scholar API key (or set S2_API_KEY env var)",
     )
     p.add_argument(
+        "--openreview-username",
+        metavar="USER",
+        help="OpenReview account (email or ~profile id) for authenticated OpenReview lookups "
+        "(or set OPENREVIEW_USERNAME). The password is read from OPENREVIEW_PASSWORD only.",
+    )
+    p.add_argument(
         "--user-agent",
         metavar="UA",
         help="User-Agent header for API requests (or set BIBTEX_UPDATER_USER_AGENT env var). "
@@ -4077,6 +4084,9 @@ def setup_http_client(args: argparse.Namespace) -> HttpClient:
         cache=cache,
         verbose=args.verbose,
         s2_api_key=s2_api_key,
+        # Optional: without it OpenReview's exact title+author endpoint answers
+        # 403 and only its full-text search contributes.
+        openreview_auth=OpenReviewAuth.from_env(getattr(args, "openreview_username", None)),
     )
 
 

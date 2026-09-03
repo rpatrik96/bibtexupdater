@@ -100,6 +100,7 @@ from bibtex_updater.utils import (
     GivenNameVariety,
     # Text normalization
     HttpClient,
+    OpenReviewAuth,
     # Data classes
     PublishedRecord,
     SqliteCache,
@@ -6127,6 +6128,9 @@ def _cli_service_rate_limits(rate_limit: int, s2_api_key: str | None) -> dict[st
         "openalex": min(300, max(10, int(150 * rate_scale))),
         "dblp": min(60, max(10, int(30 * rate_scale))),
         "openreview": min(60, max(10, int(30 * rate_scale))),
+        # /notes/search declares 5 req/min, so this one does not scale with
+        # --rate-limit: going past it buys a 429 and a retry, not throughput.
+        "openreview_search": 5,
         "arxiv": 20,
         "semanticscholar": 60 if s2_api_key else max(5, int(10 * rate_scale)),
         "openlibrary": max(10, int(30 * rate_scale)),
@@ -6284,6 +6288,17 @@ Examples:
         "--s2-api-key",
         metavar="KEY",
         help="Semantic Scholar API key for higher rate limits (or set S2_API_KEY env var)",
+    )
+    api_opts.add_argument(
+        "--openreview-username",
+        metavar="USER",
+        help=(
+            "OpenReview account (email or ~profile id) used to authenticate the "
+            "OpenReview lookups, or set OPENREVIEW_USERNAME. The password is read "
+            "from OPENREVIEW_PASSWORD only, never from a flag. Without credentials "
+            "OpenReview's exact title+author endpoint answers 403 and only its "
+            "full-text search contributes."
+        ),
     )
     api_opts.add_argument(
         "--openalex-api-key",
@@ -6444,6 +6459,11 @@ def build_checker_processor(
     openalex_api_key = getattr(args, "openalex_api_key", None) or os.environ.get("OPENALEX_API_KEY")
     if openalex_api_key:
         logger.info("Using OpenAlex API key (premium pool, bypasses keyless daily credit budget)")
+    # Optional. Without it the OpenReview /notes endpoints answer 403 and only
+    # the full-text search contributes; the run is otherwise unchanged.
+    openreview_auth = OpenReviewAuth.from_env(getattr(args, "openreview_username", None))
+    if openreview_auth is not None:
+        logger.info("Using OpenReview credentials (unlocks the exact title+author lookup)")
 
     # Polite-pool identity: --mailto flag wins over BIBTEX_CHECK_MAILTO; when
     # set it lands in the User-Agent and becomes the --openalex-mailto default.
@@ -6463,6 +6483,7 @@ def build_checker_processor(
             rate_limiter=limiter,
             cache=cache,
             s2_api_key=s2_api_key,
+            openreview_auth=openreview_auth,
         )
 
     # Setup fact checker
