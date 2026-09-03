@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **The measured OpenReview resolution rate in the docs now covers both 1.10.0 fixes together.** The 1.10.0 notes report 71.3% to 74.6%, which is the normalizer's own contribution over a corpus already queried on both hosts. Re-measured against the live API over the same 617 references: the single-host lookup under the old key resolves 136 of them (22.0%), both hosts under the old key resolve 438 (71.0%), and both hosts under the corrected key resolve 457 (74.1%). Reaching the second host recovers most of the gap and reproducing the key recovers the accented authors and maths-bearing titles the second host still misses.
+
 ## [1.10.0] - 2026-09-03
 
 1.9.0 got past OpenReview's challenge gate. This release fixes what the lookup did once it was through: it asked one of the two hosts, under a key that did not match the index, and logged in once per process to do it.
