@@ -158,6 +158,7 @@ class TestChallengeGatedNotesEndpoint:
         refusal is remembered and later entries fail without a request.
         """
         http = MagicMock()
+        http.openreview_auth = None  # anonymous: what the latch is for
         http._request.return_value = _status(403)
         client = OpenReviewClient(http=http)
 
@@ -176,6 +177,7 @@ class TestChallengeGatedNotesEndpoint:
         names the missing configuration.
         """
         http = MagicMock()
+        http.openreview_auth = None  # anonymous: what the latch is for
         http._request.return_value = _status(403)
         client = OpenReviewClient(http=http)
         with pytest.raises(SourceUnavailableError):
@@ -336,15 +338,20 @@ class TestOpenReviewAuthLogin:
         assert fake.calls[0][0] == f"{OPENREVIEW_API}/login"
         assert fake.calls[0][1] == {"id": "a@b.c", "password": PASSWORD}
 
-    def test_each_host_gets_its_own_token(self):
+    def test_an_unrelated_origin_gets_its_own_token(self):
+        """Token sharing is scoped to the hosts that honour one another's tokens.
+
+        The two OpenReview hosts do (see :class:`TestOneLoginServesBothHosts`);
+        anything else keys on its own origin and logs in for itself.
+        """
         fake = _FakeLoginClient([_login_ok(TOKEN_V1), _login_ok(TOKEN_V2)])
         auth = OpenReviewAuth("a@b.c", PASSWORD)
         with patch("bibtex_updater.utils.httpx.Client", fake):
             assert auth.token_for_url(NOTES_V1) == TOKEN_V1
-            assert auth.token_for_url(SEARCH_V2) == TOKEN_V2
+            assert auth.token_for_url("https://mirror.example.org/notes") == TOKEN_V2
         assert [url for url, _ in fake.calls] == [
             f"{OPENREVIEW_API}/login",
-            f"{OPENREVIEW_API_V2}/login",
+            "https://mirror.example.org/login",
         ]
 
     def test_a_rejected_login_degrades_to_anonymous(self, caplog):
@@ -426,6 +433,16 @@ def _http(auth=None, response=None, side_effect=None) -> HttpClient:
 
 def _sent_headers(http) -> list[dict]:
     return [call.kwargs["headers"] for call in http.client.request.call_args_list]
+
+
+def _urls_sent(http) -> list[str]:
+    """The URLs a mocked shared client actually put on the wire, in order."""
+    return [call.args[1] for call in http.client.request.call_args_list]
+
+
+def _sent(http) -> list[tuple[str, dict]]:
+    """Each request as ``(url, headers)``, so a header can be tied to its host."""
+    return list(zip(_urls_sent(http), _sent_headers(http), strict=True))
 
 
 class TestHttpClientCarriesTheToken:
@@ -657,3 +674,127 @@ class TestTokenReuseAcrossProcesses:
     def test_expiry_comes_from_the_token_itself(self):
         assert _jwt_expiry(_jwt(1800000000)) == 1800000000.0
         assert _jwt_expiry("not-a-jwt") is None
+
+
+# ===========================================================================
+# A refusal to an authenticated request is a blip, not a configuration state
+# ===========================================================================
+
+
+class TestAnAuthenticatedRefusalIsNotLatched:
+    """The defect a 5,043-reference screening run surfaced.
+
+    The latch was built for the anonymous case, where a 403 states a standing
+    configuration: no credentials, no ``/notes``, and re-asking per entry buys
+    nothing. A credentialled run is the opposite case. Measured over three
+    concurrent shards of that run under v1.10.0: 844 authenticated
+    ``api2.openreview.net/notes`` responses came back 200 and were cached, while
+    each 250-entry process took exactly one 403 -- and that single refusal
+    latched the host, so 160 to 173 of the remaining entries in the process
+    reported ``challenge-gated for anonymous callers; set OPENREVIEW_USERNAME /
+    OPENREVIEW_PASSWORD`` on a run where both were set. OpenReview holds ICLR
+    2024+, NeurIPS 2023+, TMLR and COLM on v2 alone, so the source contributed
+    nothing to the modern half of the bibliography.
+    """
+
+    def test_a_transient_403_does_not_gag_the_rest_of_the_run(self):
+        """One refused v2 lookup, then the next entry asks v2 again -- with the token."""
+        auth = OpenReviewAuth("a@b.c", PASSWORD)
+        with patch("bibtex_updater.utils.httpx.Client", _FakeLoginClient([_login_ok(TOKEN_V2)])):
+            http = _http(
+                auth=auth,
+                side_effect=[_status(403), _notes([]), _notes([_note()])],
+            )
+            client = OpenReviewClient(http=http)
+            with pytest.raises(SourceUnavailableError):
+                client.search("q", title="Adam: A Method", first_author="kingma")
+            out = client.search("q", title="Adam: A Method", first_author="kingma")
+
+        # The second entry reached v2, which is where every 2023+ venue lives.
+        second_lookup = _urls_sent(http)[2:]
+        assert NOTES_V2 in second_lookup
+        v2_headers = [h for u, h in _sent(http)[2:] if u == NOTES_V2]
+        assert v2_headers and all(h["Authorization"] == f"Bearer {TOKEN_V2}" for h in v2_headers)
+        assert out == [_note()]
+
+    def test_an_anonymous_403_still_latches(self):
+        """The behaviour the latch was built for is unchanged.
+
+        No credentials means no ``/notes`` for the whole run, and re-issuing the
+        refused request per entry costs a round trip for an answer that is not
+        coming.
+        """
+        http = _http(response=_status(403))
+        client = OpenReviewClient(http=http)
+        for _ in range(3):
+            with pytest.raises(SourceUnavailableError):
+                client.search("q", title="Adam: A Method", first_author="kingma")
+        # Two requests in total: one per host, on the first entry only.
+        assert sorted(set(_urls_sent(http))) == sorted({NOTES_V1, NOTES_V2})
+        assert http.client.request.call_count == 2
+
+    def test_a_refusal_on_one_host_leaves_the_other_alone(self):
+        """v1 and v2 index disjoint venues, so one gate must not close both."""
+        auth = OpenReviewAuth("a@b.c", PASSWORD)
+        with patch("bibtex_updater.utils.httpx.Client", _FakeLoginClient([_login_ok(TOKEN_V2)])):
+            http = _http(auth=auth, side_effect=[_status(403), _notes([_note()])])
+            out = OpenReviewClient(http=http).search("q", title="Adam: A Method", first_author="kingma")
+        assert out == [_note()]
+        assert _urls_sent(http) == [NOTES_V2, NOTES_V1]
+
+
+class TestOneLoginServesBothHosts:
+    """OpenReview mints one JWT and both hosts accept it.
+
+    Verified live: a token from ``POST api2.openreview.net/login`` answers 200
+    on ``api.openreview.net/notes?paperhash=`` and on ``api2/notes``, where an
+    anonymous caller is refused on both. Logins are the scarce resource --
+    roughly four in two minutes and OpenReview starts answering 429 -- so
+    querying both hosts must cost one login, not one per host.
+    """
+
+    def test_a_token_minted_at_one_host_is_presented_at_the_other(self):
+        fake = _FakeLoginClient([_login_ok(TOKEN_V2)])
+        auth = OpenReviewAuth("a@b.c", PASSWORD)
+        with patch("bibtex_updater.utils.httpx.Client", fake):
+            assert auth.token_for_url(NOTES_V2) == TOKEN_V2
+            assert auth.token_for_url(NOTES_V1) == TOKEN_V2
+            assert auth.token_for_url(SEARCH_V1) == TOKEN_V2
+        assert [url for url, _ in fake.calls] == [f"{OPENREVIEW_API_V2}/login"]
+
+    def test_a_shared_token_is_read_from_the_cache_for_either_host(self, tmp_path):
+        """A sharded fleet logs in once between all its shards, for both hosts."""
+        store = OpenReviewTokenStore(tmp_path / "openreview-tokens.json")
+        token = _jwt(time.time() + 3600)
+        store.put("a@b.c", OPENREVIEW_API_V2, token)
+        auth = OpenReviewAuth("a@b.c", PASSWORD, token_store=store)
+        fake = _FakeLoginClient([])
+        with patch("bibtex_updater.utils.httpx.Client", fake):
+            assert auth.token_for_url(NOTES_V1) == token
+        assert fake.calls == []
+
+    def test_invalidating_a_shared_token_drops_it_everywhere(self, tmp_path):
+        """An expired token is refused at both hosts, so both copies must go."""
+        store = OpenReviewTokenStore(tmp_path / "openreview-tokens.json")
+        auth = OpenReviewAuth("a@b.c", PASSWORD, token_store=store)
+        token = _jwt(time.time() + 3600)
+        with patch("bibtex_updater.utils.httpx.Client", _FakeLoginClient([_login_ok(token)])):
+            assert auth.token_for_url(NOTES_V2) == token
+            assert auth.token_for_url(NOTES_V1) == token
+        auth.invalidate(NOTES_V1)
+        assert store.get("a@b.c", OPENREVIEW_API_V2) is None
+        assert store.get("a@b.c", OPENREVIEW_API) is None
+        fake = _FakeLoginClient([_login_ok("second-token")])
+        with patch("bibtex_updater.utils.httpx.Client", fake):
+            assert auth.token_for_url(NOTES_V2) == "second-token"
+        assert len(fake.calls) == 1
+
+    def test_a_disabled_host_still_uses_a_sibling_token(self):
+        """A 429 on one ``/login`` must not cost the run its authenticated lookups."""
+        fake = _FakeLoginClient([_status(429), _login_ok(TOKEN_V1)])
+        auth = OpenReviewAuth("a@b.c", PASSWORD)
+        with patch("bibtex_updater.utils.httpx.Client", fake):
+            assert auth.token_for_url(NOTES_V2) is None
+            assert auth.token_for_url(NOTES_V1) == TOKEN_V1
+            assert auth.token_for_url(NOTES_V2) == TOKEN_V1
+        assert len(fake.calls) == 2
