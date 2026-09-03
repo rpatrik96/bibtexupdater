@@ -1890,7 +1890,28 @@ class HttpClient:
     # of bursting into it. State is persisted to the cache for cross-run pacing.
     CIRCUIT_FAIL_THRESHOLD = 4
     CIRCUIT_COOLDOWN = 90.0
+    # Each REopening of the same service's circuit multiplies the cooldown by
+    # CIRCUIT_COOLDOWN_GROWTH, up to CIRCUIT_COOLDOWN_MAX: 90s, 180s, 360s, 720s,
+    # 1440s, then 1800s for every later reopening. The first cooldown stays short
+    # so a brief blip costs almost nothing, while a service that is genuinely down
+    # for hours settles into a handful of probes per hour instead of ~40. Measured
+    # motivation: over a two-day screening run a reachability probe found dblp
+    # unreachable in 32 of 36 five-minute samples, and the flat 90s cooldown had
+    # the run re-attempting it roughly 40 times an hour, four failures each.
+    CIRCUIT_COOLDOWN_GROWTH = 2.0
+    CIRCUIT_COOLDOWN_MAX = 1800.0
     _CIRCUIT_CACHE_KEY = "__bibtex_updater_circuit_open_until__"
+
+    # Health tiers reported by :meth:`service_health`, ordered so that a plain
+    # ascending sort puts the healthiest source first.
+    HEALTH_OK = 0
+    HEALTH_DEGRADED = 1
+    HEALTH_CIRCUIT_OPEN = 2
+
+    #: Consecutive-failure count at which a service counts as DEGRADED -- failing
+    #: consistently, but not yet enough to trip the breaker. Half the trip
+    #: threshold, so a single transient error never demotes a source.
+    CIRCUIT_DEGRADED_STREAK = 2
 
     def __init__(
         self,
@@ -1923,9 +1944,17 @@ class HttpClient:
         self.cache = cache
         self.verbose = verbose
         self.s2_api_key = s2_api_key
-        # Per-service circuit-breaker state (see CIRCUIT_* and _request).
+        # Per-service circuit-breaker state (see CIRCUIT_* and _request). These
+        # dicts are read and written from every worker thread, so all access goes
+        # through ``_circuit_lock``; it is reentrant because _record_service_failure
+        # consults _circuit_is_open while holding it. Cache I/O and logging happen
+        # outside the lock so a slow disk never serializes the pool.
+        self._circuit_lock = threading.RLock()
         self._circuit_fail_streak: dict[str, int] = {}
         self._circuit_open_until: dict[str, float] = {}
+        # How many times each service's circuit has opened in this process, which
+        # is what escalates the cooldown (see _next_cooldown).
+        self._circuit_open_count: dict[str, int] = {}
         self._tripped_services: set[str] = set()
         # Run-level tally of lookups that ended without an answer. ``_unreachable_hosts``
         # counts only transport-layer failures (DNS, TCP, TLS, timeouts, 5xx), which are
@@ -1983,7 +2012,39 @@ class HttpClient:
     @property
     def tripped_services(self) -> set[str]:
         """Services whose circuit opened this run (sustained throttling / 5xx)."""
-        return set(self._tripped_services)
+        with self._circuit_lock:
+            return set(self._tripped_services)
+
+    @property
+    def open_circuits(self) -> set[str]:
+        """Services whose circuit is open RIGHT NOW, so a request would be refused.
+
+        Distinct from :attr:`tripped_services`, which is sticky for the whole run:
+        this set empties again once a cooldown expires. Callers that order work by
+        source health read this rather than keeping a health tally of their own.
+        """
+        now = time.time()
+        with self._circuit_lock:
+            return {svc for svc, until in self._circuit_open_until.items() if until > now}
+
+    def service_health(self, service: str | None) -> int:
+        """Health tier for ``service``: lower is healthier.
+
+        ``HEALTH_OK`` when the circuit is closed and nothing is failing,
+        ``HEALTH_DEGRADED`` once ``CIRCUIT_DEGRADED_STREAK`` consecutive requests
+        have failed, ``HEALTH_CIRCUIT_OPEN`` while the breaker is open. The tiers
+        are integers so a caller can sort candidate sources by them directly. An
+        unknown or unnamed service reports ``HEALTH_OK``: absence of evidence of
+        trouble is treated as health, never as a reason to demote a source.
+        """
+        if not service:
+            return self.HEALTH_OK
+        now = time.time()
+        with self._circuit_lock:
+            if now < self._circuit_open_until.get(service, 0.0):
+                return self.HEALTH_CIRCUIT_OPEN
+            streak = self._circuit_fail_streak.get(service, 0)
+        return self.HEALTH_DEGRADED if streak >= self.CIRCUIT_DEGRADED_STREAK else self.HEALTH_OK
 
     def _load_circuit_state(self) -> None:
         """Load any still-open per-service cooldowns persisted by an earlier run."""
@@ -2003,39 +2064,63 @@ class HttpClient:
                     continue
                 if ts_f > now:
                     kept[svc] = ts_f
-            self._circuit_open_until = kept
+            with self._circuit_lock:
+                self._circuit_open_until = kept
 
     def _persist_circuit_state(self) -> None:
         if not self.cache:
             return
+        with self._circuit_lock:
+            snapshot = dict(self._circuit_open_until)
         try:
-            self.cache.set(self._CIRCUIT_CACHE_KEY, self._circuit_open_until)
+            self.cache.set(self._CIRCUIT_CACHE_KEY, snapshot)
         except Exception:
             pass
 
     def _circuit_is_open(self, service: str | None) -> bool:
-        return bool(service) and time.time() < self._circuit_open_until.get(service, 0.0)
+        if not service:
+            return False
+        with self._circuit_lock:
+            return time.time() < self._circuit_open_until.get(service, 0.0)
+
+    def _next_cooldown(self, service: str) -> float:
+        """Cooldown for the circuit ``service`` is about to open, in seconds.
+
+        The nth opening in this process waits ``CIRCUIT_COOLDOWN *
+        CIRCUIT_COOLDOWN_GROWTH ** (n - 1)``, capped at ``CIRCUIT_COOLDOWN_MAX``.
+        Caller must hold ``_circuit_lock``.
+        """
+        opened = self._circuit_open_count.get(service, 0) + 1
+        self._circuit_open_count[service] = opened
+        return min(self.CIRCUIT_COOLDOWN * self.CIRCUIT_COOLDOWN_GROWTH ** (opened - 1), self.CIRCUIT_COOLDOWN_MAX)
 
     def _record_service_success(self, service: str | None) -> None:
-        if service:
+        if not service:
+            return
+        with self._circuit_lock:
             self._circuit_fail_streak[service] = 0
 
     def _record_service_failure(self, service: str | None) -> None:
         if not service:
             return
-        streak = self._circuit_fail_streak.get(service, 0) + 1
-        self._circuit_fail_streak[service] = streak
-        if streak >= self.CIRCUIT_FAIL_THRESHOLD and not self._circuit_is_open(service):
-            self._circuit_open_until[service] = time.time() + self.CIRCUIT_COOLDOWN
-            self._tripped_services.add(service)
-            self._persist_circuit_state()
-            logger.warning(
-                "Service %r is rate-limited/unavailable (sustained 429/5xx); pausing it for %ds. "
-                "Entries needing it may be left UNRESOLVED due to throttling, not absence -- "
-                "re-run after the cooldown to retry them.",
-                service,
-                int(self.CIRCUIT_COOLDOWN),
-            )
+        cooldown: float | None = None
+        with self._circuit_lock:
+            streak = self._circuit_fail_streak.get(service, 0) + 1
+            self._circuit_fail_streak[service] = streak
+            if streak >= self.CIRCUIT_FAIL_THRESHOLD and not self._circuit_is_open(service):
+                cooldown = self._next_cooldown(service)
+                self._circuit_open_until[service] = time.time() + cooldown
+                self._tripped_services.add(service)
+        if cooldown is None:
+            return
+        self._persist_circuit_state()
+        logger.warning(
+            "Service %r is rate-limited/unavailable (sustained 429/5xx); pausing it for %ds. "
+            "Entries needing it may be left UNRESOLVED due to throttling, not absence -- "
+            "re-run after the cooldown to retry them.",
+            service,
+            int(cooldown),
+        )
 
     @staticmethod
     def _is_cacheable_text(content_type: str) -> bool:

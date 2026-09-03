@@ -42,6 +42,7 @@ import ssl
 import sys
 import threading
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -2035,6 +2036,10 @@ def _doi_resolves(client: httpx.Client, doi: str) -> bool | None:
 class FactChecker:
     """Validates bibliographic entries against external APIs."""
 
+    #: Inventory of the metadata sources the checker can consult. This is a SET
+    #: written as a list, not the cascade order: the order steps actually run in
+    #: is built in ``_query_cascade`` and then health-sorted by
+    #: ``_health_ordered_steps``.
     API_SOURCES = ["crossref", "dblp", "semanticscholar", "openalex", "openreview"]
 
     def __init__(
@@ -3519,6 +3524,63 @@ class FactChecker:
         score = self._score_candidate(title_norm, authors_ref, rec)
         return [(score, rec, "arxiv")]
 
+    def _http_client(self) -> Any:
+        """The HTTP client shared by every source client, or None.
+
+        Every source client is constructed around one :class:`HttpClient`, and
+        the Crossref client is the one the cascade can always reach, so this is
+        where the per-service circuit state lives. Tests hand in mocks, hence the
+        defensive ``getattr``.
+        """
+        return getattr(self.crossref, "http", None)
+
+    def _health_ordered_steps(
+        self, steps: list[tuple[str, Callable[[], None]]]
+    ) -> list[tuple[str, Callable[[], None]]]:
+        """Reorder cascade steps so healthy sources are consulted first.
+
+        Health comes from the shared HTTP client's circuit breaker
+        (:meth:`HttpClient.service_health`), not from a second tally of our own:
+        a source whose circuit is open, or which has been failing consistently
+        this run, sorts after the ones that are answering. The sort is STABLE and
+        keyed only on the health tier, so with every source healthy the declared
+        order comes back unchanged, and two steps that share a source name (the
+        Semantic Scholar match and search steps) keep their relative order in
+        every case.
+
+        Reordering changes the order alone. No step is dropped for being
+        unhealthy: an unreachable source still gets its turn, still raises, and
+        still lands in ``sources_failed``, which is what the v1.8.0 ``not_found``
+        contract reads. Demoting it only means a healthy source gets the first
+        chance to answer, and the cascade's existing short-circuit can then end
+        the entry before the dead source costs it a timeout.
+
+        Measured motivation: over a two-day screening run of 5,043 references, a
+        five-minute reachability probe found dblp unreachable in 32 of 36
+        samples while Crossref, OpenAlex and arXiv stayed healthy. dblp sat ahead
+        of OpenReview and keyless Semantic Scholar in the cascade, so nearly
+        every entry paid its failure before reaching a source that could answer.
+        """
+        http = self._http_client()
+        probe = getattr(http, "service_health", None)
+        if not callable(probe):
+            return list(steps)
+
+        def _tier(source_name: str) -> int:
+            try:
+                value = probe(source_name)
+            except Exception:
+                # A health probe that raises tells us nothing about the source.
+                # Treat it as healthy so ordering degrades to today's behavior.
+                return 0
+            # Mocked clients return a Mock here, not a tier. Anything that is not
+            # a plain int means "no health signal", which must never demote.
+            if isinstance(value, bool) or not isinstance(value, int):
+                return 0
+            return value
+
+        return sorted(steps, key=lambda step: _tier(step[0]))
+
     def _query_cascade(
         self,
         entry: dict[str, Any],
@@ -3556,6 +3618,13 @@ class FactChecker:
         right after Crossref (single best title match, one round-trip) and the
         final S2 relevance search is skipped whenever the match step
         contributed, keeping total S2 spend at one call per entry.
+
+        Order rationale (health): the order above is the DECLARED order, and it
+        is what runs while every source is answering. When a source's circuit is
+        open or it has been failing consistently, ``_health_ordered_steps`` moves
+        its step behind the healthy ones so a reachable source gets the first
+        chance to answer. The set of sources consulted is unchanged: a demoted
+        source still runs, still fails, and still lands in ``sources_failed``.
 
         Returns:
             List of ``(score, record, source_name)`` tuples, possibly from
@@ -3605,23 +3674,28 @@ class FactChecker:
                     best_local = score
             return best_local
 
+        # Every cascade step below is a closure, so the SEQUENCE can be reordered
+        # by source health without duplicating a line of retrieval logic. The list
+        # assembled after them is the declared order, and it is exactly the order
+        # that runs when every source is healthy (see ``_health_ordered_steps``).
+        s2_match_contributed = False
+
         # ----- Step 1: CrossRef (fielded query.title + query.author) -----
-        sources_queried.append("crossref")
-        try:
-            cr_items = self.crossref.search(query, rows=top_k, title=retrieval_title, author=first_author)
-        except Exception as exc:
-            cr_items = []
-            _record_failure("crossref", "Crossref", exc)
-        cr_records: list[PublishedRecord] = []
-        for item in cr_items or []:
-            rec = crossref_message_to_record(item)
-            if rec:
-                cr_records.append(rec)
-        if cr_records:
-            sources_with_hits.append("crossref")
-        _ingest("crossref", cr_records)
-        if self._has_full_confirmation(entry, all_candidates, memo=confirmation_memo):
-            return all_candidates
+        def _step_crossref() -> None:
+            sources_queried.append("crossref")
+            try:
+                cr_items = self.crossref.search(query, rows=top_k, title=retrieval_title, author=first_author)
+            except Exception as exc:
+                cr_items = []
+                _record_failure("crossref", "Crossref", exc)
+            cr_records: list[PublishedRecord] = []
+            for item in cr_items or []:
+                rec = crossref_message_to_record(item)
+                if rec:
+                    cr_records.append(rec)
+            if cr_records:
+                sources_with_hits.append("crossref")
+            _ingest("crossref", cr_records)
 
         # ----- Step 1b: Semantic Scholar title match (API-key deployments) -----
         # The "slowest w/o key" premise behind querying S2 last INVERTS when the
@@ -3633,9 +3707,8 @@ class FactChecker:
         # found" (a normal miss, never recorded as an error). When this step
         # contributes >= 1 record, the final S2 relevance-search step is skipped
         # so the per-entry S2 spend never doubles.
-        s2_match_contributed = False
-        s2_key = getattr(getattr(self.crossref, "http", None), "s2_api_key", None)
-        if isinstance(s2_key, str) and s2_key.strip():
+        def _step_s2_match() -> None:
+            nonlocal s2_match_contributed
             sources_queried.append("semanticscholar")
             try:
                 s2_match_data = self.s2.match_title(retrieval_title)
@@ -3651,24 +3724,24 @@ class FactChecker:
                 sources_with_hits.append("semanticscholar")
                 s2_match_contributed = True
             _ingest("semanticscholar", s2_match_records)
-            if self._has_full_confirmation(entry, all_candidates, memo=confirmation_memo):
-                return all_candidates
 
         # ----- Step 2: OpenAlex (high-rate aggregator, broad coverage) -----
-        if self.openalex is None:
-            # Lazily build a default OpenAlex client, reusing the shared HTTP
-            # client reachable through the Crossref client. Without a shared
-            # client we skip OpenAlex rather than fabricate a bare, unthrottled
-            # connection -- this keeps tests hermetic and avoids impolite
-            # off-pool traffic.
-            shared_http = getattr(self.crossref, "http", None)
-            if shared_http is not None:
-                self.openalex = OpenAlexClient(
-                    http=shared_http,
-                    mailto=self.config.openalex_mailto,
-                    api_key=self.config.openalex_api_key,
-                )
-        if self.openalex is not None:
+        def _step_openalex() -> None:
+            if self.openalex is None:
+                # Lazily build a default OpenAlex client, reusing the shared HTTP
+                # client reachable through the Crossref client. Without a shared
+                # client we skip OpenAlex rather than fabricate a bare, unthrottled
+                # connection -- this keeps tests hermetic and avoids impolite
+                # off-pool traffic.
+                shared_http = getattr(self.crossref, "http", None)
+                if shared_http is not None:
+                    self.openalex = OpenAlexClient(
+                        http=shared_http,
+                        mailto=self.config.openalex_mailto,
+                        api_key=self.config.openalex_api_key,
+                    )
+            if self.openalex is None:
+                return
             sources_queried.append("openalex")
             try:
                 # Fielded filter=title.search:<plain title>, free-text fallback.
@@ -3684,15 +3757,15 @@ class FactChecker:
             if oa_records:
                 sources_with_hits.append("openalex")
             _ingest("openalex", oa_records)
-            if self._has_full_confirmation(entry, all_candidates, memo=confirmation_memo):
-                return all_candidates
 
         # ----- Step 3: DBLP (authoritative ICML/ICLR/NeurIPS index) -----
         # DBLP's q= is a token-AND matcher (not BM25 relevance), so the raw
         # title + surname locates the exact paper. Uses the permissive
         # dblp_hit_to_candidate_record so DOI-less / CoRR conference hits are
         # kept as scorable candidates (the strict resolver converter drops them).
-        if self.dblp is not None:
+        def _step_dblp() -> None:
+            if self.dblp is None:
+                return
             sources_queried.append("dblp")
             # FIX B2: latex-strip + Unicode-fold the DBLP retrieval query so
             # ``{B}rain {S}urgeon`` and ``Müller`` index correctly. This is a
@@ -3713,8 +3786,6 @@ class FactChecker:
             if dblp_records:
                 sources_with_hits.append("dblp")
             _ingest("dblp", dblp_records)
-            if self._has_full_confirmation(entry, all_candidates, memo=confirmation_memo):
-                return all_candidates
 
         # ----- Step 4: OpenReview (authoritative ICLR/NeurIPS/TMLR registry) -----
         # OpenReview owns the submission record for most ML conferences, which the
@@ -3725,11 +3796,13 @@ class FactChecker:
         # first. Lazily built from the shared HTTP client (reachable via Crossref),
         # mirroring the OpenAlex step; skipped if no shared client is available so
         # tests stay hermetic and no impolite off-pool traffic is created.
-        if self.openreview is None:
-            shared_http = getattr(self.crossref, "http", None)
-            if shared_http is not None:
-                self.openreview = OpenReviewClient(http=shared_http)
-        if self.openreview is not None:
+        def _step_openreview() -> None:
+            if self.openreview is None:
+                shared_http = getattr(self.crossref, "http", None)
+                if shared_http is not None:
+                    self.openreview = OpenReviewClient(http=shared_http)
+            if self.openreview is None:
+                return
             sources_queried.append("openreview")
             try:
                 or_notes = self.openreview.search(query, limit=top_k, title=retrieval_title, first_author=first_author)
@@ -3744,16 +3817,18 @@ class FactChecker:
             if or_records:
                 sources_with_hits.append("openreview")
             _ingest("openreview", or_records)
-            if self._has_full_confirmation(entry, all_candidates, memo=confirmation_memo):
-                return all_candidates
 
         # ----- Step 5: Semantic Scholar (preprint coverage; slowest w/o key) -----
         # Skipped when the key-gated match step (1b) already contributed a
         # record: the /match endpoint returned S2's single best answer for this
         # title, so a second S2 search would double the spend for no new
         # information. When the match step missed (or there is no key), this
-        # step runs exactly as before.
-        if not s2_match_contributed:
+        # step runs exactly as before. Health reordering never separates this
+        # step from the match step: both carry the ``semanticscholar`` name, so
+        # they share a health tier and the stable sort keeps match ahead of it.
+        def _step_s2_search() -> None:
+            if s2_match_contributed:
+                return
             if "semanticscholar" not in sources_queried:
                 sources_queried.append("semanticscholar")
             try:
@@ -3771,6 +3846,20 @@ class FactChecker:
             if s2_records and "semanticscholar" not in sources_with_hits:
                 sources_with_hits.append("semanticscholar")
             _ingest("semanticscholar", s2_records)
+
+        steps: list[tuple[str, Callable[[], None]]] = [("crossref", _step_crossref)]
+        s2_key = getattr(getattr(self.crossref, "http", None), "s2_api_key", None)
+        if isinstance(s2_key, str) and s2_key.strip():
+            steps.append(("semanticscholar", _step_s2_match))
+        steps.append(("openalex", _step_openalex))
+        steps.append(("dblp", _step_dblp))
+        steps.append(("openreview", _step_openreview))
+        steps.append(("semanticscholar", _step_s2_search))
+
+        for _source_name, run_step in self._health_ordered_steps(steps):
+            run_step()
+            if self._has_full_confirmation(entry, all_candidates, memo=confirmation_memo):
+                return all_candidates
 
         # FIX X4: relaxed-author retrieval fallback. For DOI-less, title-and-
         # author-strict cascade queries that returned zero usable candidates,
