@@ -108,6 +108,40 @@ class TestCliServiceRateLimits:
 
 
 # ===========================================================================
+# arXiv rate budget: BIBTEX_ARXIV_RATE (per-caller, not per-process)
+# ===========================================================================
+
+
+class TestArxivRateEnvOverride:
+    def test_default_is_20_when_env_unset(self, monkeypatch):
+        monkeypatch.delenv("BIBTEX_ARXIV_RATE", raising=False)
+        limits = _cli_service_rate_limits(45, None)
+        assert limits["arxiv"] == 20
+
+    def test_explicit_value_is_honored(self, monkeypatch):
+        monkeypatch.setenv("BIBTEX_ARXIV_RATE", "7")
+        limits = _cli_service_rate_limits(45, None)
+        assert limits["arxiv"] == 7
+
+    def test_zero_floors_to_one(self, monkeypatch):
+        # A shard count that would divide the budget to zero must not disable
+        # the caller entirely -- max(1, ...) keeps it a working rate limit.
+        monkeypatch.setenv("BIBTEX_ARXIV_RATE", "0")
+        limits = _cli_service_rate_limits(45, None)
+        assert limits["arxiv"] == 1
+
+    def test_negative_floors_to_one(self, monkeypatch):
+        monkeypatch.setenv("BIBTEX_ARXIV_RATE", "-5")
+        limits = _cli_service_rate_limits(45, None)
+        assert limits["arxiv"] == 1
+
+    def test_not_scaled_by_rate_limit_flag(self, monkeypatch):
+        monkeypatch.setenv("BIBTEX_ARXIV_RATE", "9")
+        limits = _cli_service_rate_limits(900, None)
+        assert limits["arxiv"] == 9
+
+
+# ===========================================================================
 # HttpClient -> adapt() wiring
 # ===========================================================================
 
