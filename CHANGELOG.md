@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.10.3] - 2026-09-04
+
+arXiv publishes its rate limit per caller. This release stops a sharded run from spending that budget N times over.
+
+Nothing a consumer routes on changes: the statuses, the report schema, the exit codes and the CLI flags are identical to 1.10.2.
+
+### Fixed
+
+- **`_cli_service_rate_limits` gave arXiv a flat 20/min per process, but arXiv rate-limits the caller.** A run sharded across three processes therefore offered arXiv 60 requests a minute. arXiv answered `429`, the circuit breaker opened on its fourth failure with the cooldown escalating to 1800s, and arXiv went on answering only 90 of 750 lookups. The tell was that a single-process probe over the same entries reached arXiv 6 times out of 6 while the shards were starving, which is what separated self-inflicted load from an arXiv outage. `BIBTEX_ARXIV_RATE` now lets a launcher that shards divide the caller budget across its processes; unset, the limit stays 20 and nothing changes for a single-process run. Measured over the same three-shard load after the fix: arXiv answered 18 of 18. The file already carried the precedent one line above, where `openreview_search: 5` explains that a per-caller limit must not scale with `--rate-limit`; arXiv is the same case and was missed.
+- **`ARXIV_API` was the one endpoint constant still on `http://`.** arXiv `301`-redirects it to HTTPS. The client is built with `follow_redirects=True`, so this was never the cause of the failures above -- it cost one redirect hop per call, which matters only because the budget it spends is small.
+
+## [1.10.2] - 2026-09-03
+
+One login per origin, not one per thread.
+
 ### Fixed
 
 - **A cold token cache let every worker thread that wanted the same OpenReview origin issue its own `POST /login` at once.** `token_for_url` had no lock around the login step, so a `ThreadPoolExecutor` with no cached token yet sent one login per thread for the same host. OpenReview refuses roughly the fourth login within two minutes with `429`, and each thread that lost that race latched its origin as disabled and proceeded anonymously for the rest of the process. Measured over a 5,043-reference screening run: 44 logins came back `429` against 3 that succeeded, which is what degraded those runs to anonymous, and it is also the race that made the 403-latch bug fixed in 1.10.1 reachable, since the anonymous requests it produced were what a 403 used to latch permanently. `token_for_url` now takes a per-origin lock before logging in: the first thread to arrive logs in, the rest wait and reuse its result once it is cached, a failed login is shared the same way instead of retried per thread, and a login to one origin never blocks a lookup against the other. The cross-process token store from 1.10.0 and the sibling-token sharing from 1.10.1 already hid most of this in practice, so the race was real but non-urgent.
