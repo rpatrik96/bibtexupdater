@@ -38,7 +38,7 @@ __all__ = [
 # Three buckets, with a strict ordering the priors MUST respect:
 #
 #   CLEARLY-CORRECT  (high, ~0.85-0.90): a positive record confirms the entry.
-#       verified / preprint_only / published_version_exists / *_verified.
+#       verified / published_version_exists / *_verified.
 #
 #   CLEARLY-PROBLEM  (high): positive evidence the entry is wrong.
 #       - STRONGEST (~0.92-0.95): the evidence is self-contained and not a fuzzy
@@ -61,11 +61,12 @@ __all__ = [
 _CONF_CORRECT = 0.88  # CLEARLY-CORRECT anchor
 _PROB_STRONG = 0.93  # CLEARLY-PROBLEM, self-contained positive evidence
 _PROB_SOFT = 0.78  # CLEARLY-PROBLEM, single fuzzy-compared field disagrees
+_PROB_WEAK = 0.45  # CLEARLY-PROBLEM, real but weak evidence (see doi_not_found)
+_CORRECT_WEAK = 0.45  # CLEARLY-CORRECT, real but weak evidence (see url_accessible)
 _ABSTAIN = 0.45  # DON'T-KNOW, near-neutral, strictly below both above
 STATUS_BASE_CONFIDENCE = {
     # --- CLEARLY-CORRECT: a positive record confirms the entry ---
     "verified": _CONF_CORRECT,
-    "preprint_only": _CONF_CORRECT,
     "published_version_exists": _CONF_CORRECT,
     "url_verified": _CONF_CORRECT,
     "book_verified": _CONF_CORRECT,
@@ -77,6 +78,14 @@ STATUS_BASE_CONFIDENCE = {
     "doi_mismatch": _PROB_STRONG,  # cited DOI resolves to a different paper
     "arxiv_id_mismatch": _PROB_STRONG,  # cited arXiv ID resolves elsewhere
     # --- CLEARLY-PROBLEM (soft): one disagreeing field, rest match ---
+    # A preprint cited as published: the claimed venue is unconfirmed and the
+    # record is preprint-only. It sat at _CONF_CORRECT while carrying PROBLEM
+    # polarity, so p_valid_from_result read 0.88 as confidence in a PROBLEM and
+    # returned 0.060 -- more confidently invalid than title_mismatch (0.110) and
+    # nearly as extreme as a DOI resolving to a different paper (0.035). A
+    # preprint-as-published is weaker evidence than either, so the ordering was
+    # inverted. Soft-problem is where the other unconfirmed-venue verdicts live.
+    "preprint_only": _PROB_SOFT,
     "title_mismatch": _PROB_SOFT,
     "author_mismatch": _PROB_SOFT,
     "given_name_substitution": _PROB_SOFT,  # surnames match, a given name is a different person
@@ -93,11 +102,18 @@ STATUS_BASE_CONFIDENCE = {
     "not_found": _ABSTAIN,
     "unconfirmed": _ABSTAIN,
     "api_error": _ABSTAIN,
-    "doi_not_found": _ABSTAIN,
+    # Weak but real evidence, so PROBLEM polarity is right -- but it was drawing
+    # _ABSTAIN, documented as "DON'T-KNOW, near-neutral". Same number, now from
+    # a constant that means what the polarity says. p_valid is unchanged at 0.275.
+    "doi_not_found": _PROB_WEAK,
     "url_not_found": _ABSTAIN,
     "book_not_found": _ABSTAIN,
     "working_paper_not_found": _ABSTAIN,
-    "url_accessible": _ABSTAIN,  # 200 only, no content check -> weak signal
+    # HTTP 200 with no content check: the page is reachable, which weakly
+    # supports the entry but confirms nothing about the paper. VALID polarity is
+    # right; drawing _ABSTAIN was borrowing the don't-know anchor to assert
+    # something. Same number, now from a constant that says so.
+    "url_accessible": _CORRECT_WEAK,  # 200 only, no content check -> weak signal
     # --- not verifiable ---
     "skipped": 0.0,
 }
