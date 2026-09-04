@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A bibliographic index can serve a work under the correct identifier and the correct author list but a different paper's title, and the checker read that as evidence about the entry.** OpenAlex does this today for ToolLLM (`10.48550/arxiv.2307.16789`, served as "Counterfactually Auditable Lifecycle Certification for Autonomous Agents"), Constitutional AI (`10.48550/arxiv.2212.08073`) and LoRA (`10.48550/arxiv.2106.09685`) — each with the paper's real authors, each verified by resolving the arXiv ID directly. Normalized title similarity for those pairs is 0.35–0.39, so the blended candidate score lands at 0.54–0.57: above `abstention_below`, and above the `wrong_paper_signature` bar because the author list corroborates perfectly. The entry therefore verdicted `title_mismatch` on one index's disagreement with itself, and downstream that reads as a fabricated citation. Measured over a 267-submission screening run, the signature came from a corrupt record three times for every real citation error. `_split_corrupt_index_records` now drops a candidate that is anchored on the entry's own DOI or arXiv ID, whose authors the entry confirms, and whose title similarity is below `index_corruption_max_title` (0.50, the same bar `doi_consistency_min_title` and `arxiv_consistency_min_title` already use for "this record is a different paper"). Nothing is dropped when a second identifier-anchored source corroborates the divergence, so a genuine hybrid fabrication — real identifier, real authors, invented title — keeps its verdict; and where an identifier-anchored source *confirms* the entry's title, that source wins, which for a `10.48550/arxiv.*` DOI or a bare arXiv ID means arXiv's own title cannot be overridden by an aggregator. `_check_doi_consistency` and `_check_arxiv_id_consistency` are untouched: they run against an authoritative source before the cascade and reach their own verdicts. Disable with `distrust_corrupt_index_records=False`.
+
+### Added
+
+- **`distrusted_records` on `FactCheckResult`, in the JSON report and on every JSONL line.** One readable line per record the cascade declined to score, naming the source, the identifier, the title it served and the similarity. A caller can now see that a verdict was reached without a record the run had in hand, and which index misbehaved. Additive: no existing key changes.
+
 ## [1.10.3] - 2026-09-04
 
 arXiv publishes its rate limit per caller. This release stops a sharded run from spending that budget N times over.

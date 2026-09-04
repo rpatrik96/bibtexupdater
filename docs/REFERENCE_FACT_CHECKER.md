@@ -213,6 +213,7 @@ Per-line fields:
 | `p_valid` | 0–1 probability that the entry **as cited** refers to a real publication with correct metadata — **threshold/rank on this**, not on `confidence`. Verified-polarity statuses map above 0.5, problem-polarity below 0.5, abstentions sit at 0.5, and a clean exhaustive `not_found` at 0.35. Note `preprint_only` is problem-polarity for `p_valid` (the claimed venue is contradicted) even though the verdict itself is confident |
 | `confidence_score` | additive 0–100 numeric confidence (next section) |
 | `sources_failed` | source names whose lookup for this entry did not complete. Non-empty means the cascade was partial: the entry cannot carry `not_found`, and whatever it does carry rests on less evidence than a clean run |
+| `distrusted_records` | records a source returned that the cascade declined to score, one readable line each. A source can serve a work under the correct identifier and the correct author list but a different paper's title; scored as a candidate that record produces a `title_mismatch` against a correctly cited entry. Non-empty means the verdict was reached **without** a record the run had in hand, and names which index misbehaved — a statement about the source, never about the entry |
 | `mismatched_fields`, `api_sources`, `errors` | non-confirmed field names, sources with hits, and per-source error strings |
 
 ## Exit Codes

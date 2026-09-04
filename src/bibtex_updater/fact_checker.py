@@ -473,6 +473,15 @@ class FactCheckResult:
     # miss NOT_FOUND asserts. Recorded per source per entry, because a run can
     # be healthy overall while one entry's every source timed out.
     sources_failed: list[str] = field(default_factory=list)
+    # Source records this entry's cascade DISTRUSTED rather than scored: an
+    # index record carrying the entry's OWN identifier and the entry's authors
+    # under a different paper's title (see
+    # ``FactChecker._split_corrupt_index_records``). One human-readable line per
+    # dropped record, naming the source, the identifier, the title it served and
+    # the similarity -- so a caller can see that a verdict was reached WITHOUT a
+    # record it might otherwise have expected, and which index misbehaved. This
+    # is a statement about the SOURCE, never about the entry.
+    distrusted_records: list[str] = field(default_factory=list)
     # Output contract -- both fields are DERIVED, recomputed in __post_init__
     # from (status, errors, overall_confidence) at EVERY construction site
     # (check_entry's early returns, the cascade assembly, the verifier
@@ -541,6 +550,23 @@ class FactCheckerConfig:
     # of it, escalate to the positive NONEXISTENT_VENUE status. Lookup errors
     # always keep the abstention. Disable with --no-check-venue-existence.
     check_venue_existence: bool = True
+    # Distrust a corrupt index record instead of convicting the entry it
+    # describes. A bibliographic index can serve a work under the CORRECT
+    # identifier and the CORRECT author list but a DIFFERENT paper's title;
+    # OpenAlex did exactly that for ToolLLM (``10.48550/arxiv.2307.16789``),
+    # Constitutional AI (``...2212.08073``) and LoRA (``...2106.09685``) in a
+    # 2026-09 screening run. That shape is indistinguishable from the strongest
+    # available evidence of a hybrid fabrication -- right identifier, wrong
+    # metadata -- so the entries verdicted TITLE_MISMATCH. When the guard is on,
+    # such a record is dropped from the candidate pool unless a SECOND
+    # identifier-anchored source corroborates the divergence; see
+    # ``FactChecker._split_corrupt_index_records``.
+    distrust_corrupt_index_records: bool = True
+    # Below this normalized title score (0-1), an identifier-anchored record is
+    # about a DIFFERENT paper. Mirrors ``doi_consistency_min_title`` and
+    # ``arxiv_consistency_min_title``, which draw the same line for the same
+    # reason; the three measured corrupt records sit at 0.35-0.39.
+    index_corruption_max_title: float = 0.50
     # Identifier-anchored fast paths (speed). After the entry's own DOI/arXiv-ID
     # consistency check found no mismatch, skip the multi-source cascade when
     # the single authoritative record behind that identifier FULLY confirms
@@ -2623,9 +2649,36 @@ class FactChecker:
         # HALLUCINATED/NOT_FOUND from a failed title search.
         candidates.extend(self._query_arxiv_by_id(entry, sources_queried, sources_with_hits, errors, sources_failed))
 
+        # Drop index records that carry the entry's own identifier and authors
+        # under a different paper's title. Such a record is a defect in the
+        # source; scored as a candidate it produces a TITLE_MISMATCH against a
+        # correctly cited paper, and it also poisons the per-source author
+        # intersection and the chimeric-title detector below. Nothing is dropped
+        # when a second identifier-anchored source corroborates the divergence.
+        candidates, distrusted_records = self._split_corrupt_index_records(entry, candidates)
+
         if not candidates:
             # Nothing came back at all. That is a clean exhaustive miss only if
             # every source actually answered; otherwise the run never asked them.
+            # A pool emptied by the distrust guard is neither: a record WAS
+            # returned and we declined to score it, so the entry is unverified,
+            # not missing.
+            if distrusted_records:
+                return FactCheckResult(
+                    entry_key=entry_key,
+                    entry_type=entry_type,
+                    status=FactCheckStatus.UNCONFIRMED,
+                    overall_confidence=0.0,
+                    field_comparisons={},
+                    best_match=None,
+                    api_sources_queried=sources_queried,
+                    api_sources_with_hits=sources_with_hits,
+                    errors=errors,
+                    sources_failed=sources_failed,
+                    author_intersection=None,
+                    source_records={},
+                    distrusted_records=distrusted_records,
+                )
             status = FactCheckStatus.API_ERROR if errors else FactCheckStatus.NOT_FOUND
             status = self._not_found_needs_complete_coverage(status, sources_failed)
             status = self._apply_strict_warn_cnv(status)
@@ -2662,6 +2715,7 @@ class FactChecker:
                 sources_failed=sources_failed,
                 author_intersection=None,
                 source_records={},
+                distrusted_records=distrusted_records,
             )
 
         # Sort candidates by score descending (used below for per-source author
@@ -2775,6 +2829,7 @@ class FactChecker:
             intersection=intersection,
             best_per_source=best_per_source,
             sources_failed=sources_failed,
+            distrusted_records=distrusted_records,
         )
 
     def _assemble_match_result(
@@ -2791,6 +2846,7 @@ class FactChecker:
         intersection: AuthorIntersectionResult,
         best_per_source: dict[str, PublishedRecord | None],
         sources_failed: list[str] | None = None,
+        distrusted_records: list[str] | None = None,
     ) -> FactCheckResult:
         """Assemble the final result for a matched record.
 
@@ -2852,6 +2908,7 @@ class FactChecker:
             api_sources_with_hits=sources_with_hits,
             errors=errors,
             sources_failed=list(sources_failed or []),
+            distrusted_records=list(distrusted_records or []),
             # Per-entry state carried on the result (not stashed on self) so
             # concurrent check_entry calls don't clobber each other.
             author_intersection=intersection,
@@ -4175,6 +4232,142 @@ class FactChecker:
                         return True
 
         return False
+
+    def _split_corrupt_index_records(
+        self,
+        entry: dict[str, Any],
+        candidates: list[tuple[float, PublishedRecord, str]],
+    ) -> tuple[list[tuple[float, PublishedRecord, str]], list[str]]:
+        """Separate candidates that look like a CORRUPT INDEX RECORD.
+
+        The shape: a candidate keyed on the entry's OWN identifier (its DOI or
+        its arXiv ID), whose author list the entry confirms, under a title that
+        belongs to a different paper (below
+        ``config.index_corruption_max_title``). An index that serves the right
+        identifier and the right authors under the wrong title is disagreeing
+        with ITSELF, and the cheapest explanation is a defective record -- not a
+        citation whose author list happens to be perfect while its title is
+        invented. Measured on OpenAlex in a 2026-09 screening run: the signature
+        was produced by a corrupt record three times for every real citation
+        error, and the entries it hit (ToolLLM, Constitutional AI, LoRA) are
+        correctly cited papers.
+
+        Corroboration is what separates the two readings, so distrust is
+        withheld whenever the divergence is genuinely multi-source:
+
+        * If any identifier-anchored source CONFIRMS the entry's title (at
+          ``config.title_threshold``), the sources contradict each other about a
+          record they both key on the entry's own identifier, and the confirming
+          one wins. For a ``10.48550/arxiv.*`` DOI or a bare arXiv ID that
+          confirming source is arXiv itself, which is authoritative for the
+          title it mints -- so no aggregator's title can override it.
+        * Otherwise, distrust only when the divergence rests on a SINGLE source.
+          Two or more identifier-anchored sources independently reporting a
+          different paper for the identifier is evidence about the ENTRY (the
+          shape of a hybrid fabrication: real identifier, real authors, invented
+          title), and it is left to stand.
+
+        A confirming candidate is never itself distrusted, so this can only
+        empty the pool when there was no confirming source to begin with; the
+        caller abstains in that case rather than reading the empty pool as an
+        exhaustive miss. The genuine wrong-identifier findings are unaffected:
+        ``_check_doi_consistency`` and ``_check_arxiv_id_consistency`` both run
+        against an authoritative source BEFORE the cascade and return their own
+        verdicts without consulting this method.
+
+        Returns:
+            ``(kept, distrusted_notes)`` -- the surviving candidates in their
+            original order, and one human-readable line per dropped record for
+            ``FactCheckResult.distrusted_records``.
+        """
+        if not self.config.distrust_corrupt_index_records or not candidates:
+            return candidates, []
+
+        entry_title = normalize_title_for_match(entry.get("title", ""))
+        if not entry_title:
+            return candidates, []
+
+        entry_doi = normalize_doi_for_resolution(entry.get("doi", "")) or None
+        entry_arxiv = self._arxiv_id_from_entry(entry)
+        if not entry_doi and not entry_arxiv:
+            return candidates, []
+
+        def _anchored(rec: PublishedRecord) -> bool:
+            """True when ``rec`` is keyed on the entry's own identifier."""
+            rec_doi = normalize_doi_for_resolution(rec.doi) if rec.doi else None
+            if entry_doi and rec_doi and rec_doi == entry_doi:
+                return True
+            return bool(entry_arxiv and rec.arxiv_id and rec.arxiv_id == entry_arxiv)
+
+        def _title_similarity(rec: PublishedRecord) -> float:
+            return token_sort_ratio(entry_title, normalize_title_for_match(rec.title or "")) / 100.0
+
+        def _authors_confirm(rec: PublishedRecord) -> bool:
+            entry_names = self._entry_surname_keys(entry, rec)
+            api_names = rec.surname_keys(limit=10_000)
+            if not entry_names or not api_names:
+                return False
+            return symmetric_author_match(
+                entry_names,
+                api_names,
+                threshold=self.config.author_threshold,
+                order_reliable=rec.order_reliable,
+            ).is_confirmed
+
+        confirming_sources: set[str] = set()
+        divergent_sources: set[str] = set()
+        suspect: list[int] = []
+        for index, (_score, rec, source) in enumerate(candidates):
+            if not _anchored(rec):
+                continue
+            similarity = _title_similarity(rec)
+            if similarity >= self.config.title_threshold:
+                confirming_sources.add(source)
+                continue
+            if similarity >= self.config.index_corruption_max_title:
+                continue
+            # Corroboration is about the TITLE divergence alone, so a source
+            # counts here whatever its author list looks like; only the records
+            # that could be DROPPED additionally need confirmed authors.
+            divergent_sources.add(source)
+            if _authors_confirm(rec):
+                suspect.append(index)
+
+        if not suspect:
+            return candidates, []
+        # No source vouches for the entry's title AND more than one source
+        # reports a different paper for the identifier: that is corroborated
+        # evidence about the ENTRY, and it stands.
+        if not confirming_sources and len(divergent_sources - confirming_sources) > 1:
+            return candidates, []
+
+        drop = {i for i in suspect if candidates[i][2] not in confirming_sources}
+        if not drop:
+            return candidates, []
+
+        kept: list[tuple[float, PublishedRecord, str]] = []
+        notes: list[str] = []
+        for index, (score, rec, source) in enumerate(candidates):
+            if index not in drop:
+                kept.append((score, rec, source))
+                continue
+            identifier = rec.doi or rec.arxiv_id or entry_doi or entry_arxiv or "?"
+            notes.append(
+                f"{source}: record for {identifier} carries the entry's authors under a "
+                f"different paper's title {rec.title!r} (title similarity "
+                f"{_title_similarity(rec):.2f}); distrusted as a corrupt index record"
+            )
+            self.logger.warning(
+                "Distrusted a %s record for entry %r: identifier %s and authors match, but the "
+                "title %r is a different paper (similarity %.2f). This is a defect in the source, "
+                "not evidence about the entry.",
+                source,
+                entry.get("ID", "?"),
+                identifier,
+                rec.title,
+                _title_similarity(rec),
+            )
+        return kept, notes
 
     @staticmethod
     def _entry_surname_keys(entry: dict[str, Any], record: PublishedRecord, limit: int = 10_000) -> list[str]:
@@ -5840,6 +6033,12 @@ class FactCheckProcessor:
                                 # entry. Non-empty means the cascade was partial,
                                 # so no exhaustive miss can be read off the status.
                                 "sources_failed": result.sources_failed,
+                                # Records a source returned that the cascade
+                                # declined to score: an index record carrying
+                                # this entry's identifier and authors under a
+                                # different paper's title. A statement about the
+                                # source, never about the entry.
+                                "distrusted_records": result.distrusted_records,
                                 "errors": result.errors,
                             },
                             ensure_ascii=False,
@@ -5995,6 +6194,9 @@ class FactCheckProcessor:
                 "api_sources_queried": r.api_sources_queried,
                 "api_sources_with_hits": r.api_sources_with_hits,
                 "sources_failed": r.sources_failed,
+                # Records a source returned that the cascade declined to score
+                # (see FactCheckResult.distrusted_records).
+                "distrusted_records": r.distrusted_records,
                 "errors": r.errors,
             }
             if r.best_match:
@@ -6056,6 +6258,9 @@ class FactCheckProcessor:
                         "api_sources": r.api_sources_with_hits,
                         # Sources whose lookup did not complete (see process_entries).
                         "sources_failed": r.sources_failed,
+                        # Records a source returned that the cascade declined to
+                        # score (see FactCheckResult.distrusted_records).
+                        "distrusted_records": r.distrusted_records,
                         "errors": r.errors,
                     },
                     ensure_ascii=False,
