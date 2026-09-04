@@ -69,7 +69,9 @@ from bibtex_updater.matching import (
     normalize_volume_title,
     symmetric_author_match,
     title_edit_distance,
+    venue_abbreviation_matches,
     venue_acronym_matches,
+    venue_acronyms_are_comparable,
     venue_name_subsumes,
     volume_title_subsumed,
 )
@@ -2014,6 +2016,30 @@ def venues_match(venue_a: str, venue_b: str, threshold: float = 0.70) -> VenueMa
     # declaration depends on.
     if venue_name_subsumes(match_a, match_b) or venue_acronym_matches(venue_a, venue_b):
         return VenueMatchResult(MatchOutcome.MATCH, max(score, threshold))
+    # ISO-4 abbreviations. "ACM Trans. Graph." is the standard short form of
+    # "ACM Transactions on Graphics" and the form a large share of real .bib
+    # files carry, but the alias map covers ML/CS conferences rather than
+    # abbreviated journal titles, so neither side canonicalises and the token
+    # sort scores it below threshold. Measured before this route existed:
+    # ACM Trans. Graph. 0.70, Proc. Natl. Acad. Sci. U.S.A. 0.60, Annu. Rev.
+    # Stat. Appl. 0.55 -- three correct citations of real papers reported as
+    # venue disagreements. The check only ever reports a positive, so it can
+    # clear a false mismatch and never create one.
+    if venue_abbreviation_matches(venue_a, venue_b, threshold):
+        return VenueMatchResult(MatchOutcome.MATCH, max(score, threshold))
+    # Neither side is a venue we recognise and they do not look alike. That is
+    # not evidence they differ -- it is the comparator not knowing either name,
+    # which is what NON_COMPARABLE means. Reserve MISMATCH for positive grounds:
+    # both sides canonicalising to different known venues, or a satellite-event
+    # asymmetry, both of which return above. A thinly indexed but real venue
+    # (COLM before it was aliased, a non-English or workshop venue) lands here,
+    # and calling those a disagreement is how a correct citation gets flagged.
+    # ... unless both sides have STATED an acronym and the acronyms differ. Then
+    # each has declared its own shorthand, so the pair is comparable and the
+    # disagreement is real -- "... Network and Service Management (CNSM)" against
+    # "NOMS" is a genuine wrong venue, not two names we failed to recognise.
+    if not canonical_a and not canonical_b and not venue_acronyms_are_comparable(venue_a, venue_b):
+        return VenueMatchResult(MatchOutcome.NON_COMPARABLE, score)
     return VenueMatchResult(MatchOutcome.MISMATCH, score)
 
 

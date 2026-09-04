@@ -37,6 +37,10 @@ __all__ = [
     "get_canonical_venue",
     "is_preprint_or_series_venue",
     "is_preprint_server_venue",
+    "LTWA_ABBREVIATIONS",
+    "expand_ltwa_abbreviations",
+    "venue_abbreviation_matches",
+    "venue_acronyms_are_comparable",
 ]
 
 
@@ -1175,6 +1179,28 @@ def venue_acronym_matches(venue_a: str, venue_b: str) -> bool:
     return False
 
 
+def venue_acronyms_are_comparable(venue_a: str, venue_b: str) -> bool:
+    """True when both sides name an acronym, so a non-match is real disagreement.
+
+    :func:`venue_acronym_matches` answers "are these the same venue"; this
+    answers the prior question "is this pair even comparable". One side a bare
+    acronym and the other declaring its own acronym parenthetically means both
+    have stated their shorthand -- so if those shorthands differ, they are
+    different venues, and the comparator should say MISMATCH rather than
+    abstain.
+
+    Without this, "... Network and Service Management (CNSM)" against "NOMS"
+    reads as two unrecognised names and abstains, losing a genuine wrong-venue
+    detection. The two are recognised: each declares an acronym, and they differ.
+    """
+    bare_a, bare_b = _bare_acronym(venue_a), _bare_acronym(venue_b)
+    if bare_a and _declared_acronyms(venue_b):
+        return True
+    if bare_b and _declared_acronyms(venue_a):
+        return True
+    return bool(bare_a and bare_b)
+
+
 #: Hosting-*platform* markers. A record whose venue is only the platform name
 #: (OpenReview hosts ICLR, NeurIPS, TMLR, and many workshops) says nothing about
 #: the published venue, exactly like a preprint server -- so a venue comparison
@@ -1202,3 +1228,129 @@ def is_preprint_or_series_venue(venue: str) -> bool:
         or any(m in raw for m in _SERIES_MARKERS)
         or any(m in raw for m in _PLATFORM_MARKERS)
     )
+
+
+#: ISO-4 / LTWA word abbreviations, mapped to the full word.
+#:
+#: ISO-4 is the standard abbreviation scheme for journal titles ("ACM Trans.
+#: Graph."), and it is the form a large share of real ``.bib`` files carry --
+#: publisher templates and reference managers emit it by default. The venue
+#: comparator had no route for it: ``EXPANDED_VENUE_ALIASES`` covers ML and CS
+#: conferences by acronym and full name, so an abbreviated JOURNAL title
+#: canonicalises to nothing and falls through to a token-sort that scores it
+#: below threshold. Measured before this map existed:
+#:
+#:     ACM Trans. Graph.               vs ACM Transactions on Graphics      0.70
+#:     Proc. Natl. Acad. Sci. U.S.A.   vs Proceedings of the National ...   0.60
+#:     Annu. Rev. Stat. Appl.          vs Annual Review of Statistics ...   0.55
+#:
+#: Each is a correct citation of a real paper, reported as a venue disagreement.
+#:
+#: This is the common subset rather than the full LTWA list, which runs to tens
+#: of thousands of stems. Entries are lowercase, without the trailing period,
+#: and are applied per word so word order and the rest of the string are
+#: untouched. Ambiguous stems are deliberately absent: "comput." expands to
+#: Computing, Computer, Computational and Computers depending on the title, so
+#: expanding it would create false matches rather than remove false mismatches.
+LTWA_ABBREVIATIONS: dict[str, str] = {
+    "acad": "academy",
+    "adv": "advances",
+    "am": "american",
+    "ann": "annals",
+    "annu": "annual",
+    "appl": "application",
+    "artif": "artificial",
+    "assoc": "association",
+    "biol": "biology",
+    "bull": "bulletin",
+    "chem": "chemistry",
+    "commun": "communications",
+    "conf": "conference",
+    "eng": "engineering",
+    "environ": "environmental",
+    "eur": "european",
+    "exp": "experimental",
+    "inf": "information",
+    "int": "international",
+    "intell": "intelligence",
+    "j": "journal",
+    "learn": "learning",
+    "lett": "letters",
+    "mach": "machine",
+    "manag": "management",
+    "math": "mathematics",
+    "med": "medicine",
+    "mon": "monthly",
+    "nat": "nature",
+    "natl": "national",
+    "neurosci": "neuroscience",
+    "phys": "physics",
+    "proc": "proceedings",
+    "psychol": "psychology",
+    "publ": "publications",
+    "rep": "reports",
+    "res": "research",
+    "rev": "review",
+    "sci": "sciences",
+    "soc": "society",
+    "stat": "statistics",
+    "syst": "systems",
+    "technol": "technology",
+    "trans": "transactions",
+    "univ": "university",
+}
+
+#: Country/region abbreviations that appear as trailing qualifiers, where the
+#: full form adds nothing to identity ("Proc. Natl. Acad. Sci. U.S.A.").
+_LTWA_DROPPABLE = frozenset({"usa", "us", "uk", "ussr"})
+
+
+def expand_ltwa_abbreviations(venue: str) -> str:
+    """Expand ISO-4 word abbreviations in a venue string.
+
+    Applied per word against :data:`LTWA_ABBREVIATIONS`, so word order and any
+    unabbreviated words are preserved. Words absent from the map pass through
+    unchanged, which is why an incomplete map is safe: it can only turn a
+    non-match into a match, never the reverse.
+
+    Returns the string lowercased with punctuation-only separators collapsed.
+    Idempotent -- expanding an already-expanded string is a no-op, since the
+    full forms are not themselves keys.
+    """
+    if not venue:
+        return ""
+    out: list[str] = []
+    for raw_word in re.split(r"[\s]+", venue.lower()):
+        word = raw_word.strip(".,;:()[]{}")
+        if not word:
+            continue
+        # "u.s.a." -> "usa" before the droppable check.
+        compact = word.replace(".", "")
+        if compact in _LTWA_DROPPABLE:
+            continue
+        out.append(LTWA_ABBREVIATIONS.get(word, LTWA_ABBREVIATIONS.get(compact, word)))
+    return " ".join(out)
+
+
+def venue_abbreviation_matches(venue_a: str, venue_b: str, threshold: float = 0.70) -> bool:
+    """True when two venue strings agree once ISO-4 abbreviations are expanded.
+
+    Only reports a *positive*: it can clear a false venue disagreement but never
+    create one, so a caller can consult it before falling through to a mismatch.
+    """
+    if not venue_a or not venue_b:
+        return False
+    expanded_a = expand_ltwa_abbreviations(venue_a)
+    expanded_b = expand_ltwa_abbreviations(venue_b)
+    if not expanded_a or not expanded_b:
+        return False
+    if expanded_a == expanded_b:
+        return True
+    # Compare through the same normalisation the rest of the comparator uses, so
+    # stop-words and punctuation are handled identically.
+    from rapidfuzz.fuzz import token_sort_ratio
+
+    from bibtex_updater.utils import normalize_title_for_match
+
+    score = token_sort_ratio(normalize_title_for_match(expanded_a), normalize_title_for_match(expanded_b))
+    return score / 100.0 >= threshold
