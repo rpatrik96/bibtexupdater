@@ -49,7 +49,7 @@ from bibtex_updater.sources import (
     openalex_work_to_candidate_record,
     select_top_k_by_title_similarity,
 )
-from bibtex_updater.utils import PublishedRecord
+from bibtex_updater.utils import PublishedRecord, SourceUnavailableError
 
 # ------------- Fixtures -------------
 
@@ -541,13 +541,36 @@ def test_penalty_constants_match_paper():
     assert DEFAULT_TOP_K == 3
 
 
-def test_openalex_client_search_returns_empty_on_http_error():
-    client = OpenAlexClient(http=None)
-    # Calling .search with an HTTPException-prone configuration shouldn't crash.
-    # The bare httpx path will fail (no real network in the unit test
-    # environment), and the client should gracefully return [].
-    out = client.search("nonexistent_query_xyz_12345_zzz")
-    assert out == [] or isinstance(out, list)
+def test_openalex_client_search_raises_on_error_status():
+    """An error status ends the lookup with nothing said about the entry.
+
+    ``[]`` is reserved for the case where OpenAlex answered and reported no
+    works, so a status that carries no answer must raise rather than read as
+    a source that knows nothing (see ``OpenAlexClient._fetch``).
+    """
+    resp = MagicMock()
+    resp.status_code = 429
+    http = MagicMock()
+    http._request.return_value = resp
+    client = OpenAlexClient(http=http)
+
+    with pytest.raises(SourceUnavailableError):
+        client.search("nonexistent_query_xyz_12345_zzz")
+    # The mock answered, so the assertion is about our code and not the network.
+    assert http._request.call_count == 1
+
+
+def test_openalex_client_search_returns_empty_when_openalex_reports_no_works():
+    """The other half of the contract: an answered lookup with zero hits is []."""
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.json.return_value = {"results": []}
+    http = MagicMock()
+    http._request.return_value = resp
+    client = OpenAlexClient(http=http)
+
+    assert client.search("nonexistent_query_xyz_12345_zzz") == []
+    assert http._request.call_count == 1
 
 
 # ===========================================================================
