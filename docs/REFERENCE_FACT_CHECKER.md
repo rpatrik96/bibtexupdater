@@ -198,8 +198,8 @@ Full structured report: a `summary` block (totals, status counts, verified/absta
 One JSON object per line, streamed as entries complete — useful for large bibliographies and incremental processing:
 
 ```jsonl
-{"key": "smith2020", "category": "academic", "status": "verified", "abstained": false, "coverage_incomplete": false, "confidence": 0.89, "p_valid": 0.945, "confidence_score": 96.0, "mismatched_fields": [], "api_sources": ["crossref", "dblp"], "errors": []}
-{"key": "fake2099", "category": "academic", "status": "hallucinated", "abstained": false, "coverage_incomplete": false, "confidence": 0.93, "p_valid": 0.035, "confidence_score": 12.0, "mismatched_fields": ["title", "author"], "api_sources": [], "errors": []}
+{"key": "smith2020", "category": "academic", "status": "verified", "abstained": false, "coverage_incomplete": false, "confidence": 0.89, "p_valid": 0.945, "confidence_score": 96.0, "mismatched_fields": [], "unconfirmed_fields": [], "api_sources": ["crossref", "dblp"], "errors": []}
+{"key": "fake2099", "category": "academic", "status": "hallucinated", "abstained": false, "coverage_incomplete": false, "confidence": 0.93, "p_valid": 0.035, "confidence_score": 12.0, "mismatched_fields": ["title", "author"], "unconfirmed_fields": [], "api_sources": [], "errors": []}
 ```
 
 Per-line fields:
@@ -213,7 +213,9 @@ Per-line fields:
 | `p_valid` | 0–1 probability that the entry **as cited** refers to a real publication with correct metadata — **threshold/rank on this**, not on `confidence`. Verified-polarity statuses map above 0.5, problem-polarity below 0.5, abstentions sit at 0.5, and a clean exhaustive `not_found` at 0.35. Note `preprint_only` is problem-polarity for `p_valid` (the claimed venue is contradicted) even though the verdict itself is confident |
 | `confidence_score` | additive 0–100 numeric confidence (next section) |
 | `sources_failed` | source names whose lookup for this entry did not complete. Non-empty means the cascade was partial: the entry cannot carry `not_found`, and whatever it does carry rests on less evidence than a clean run |
-| `mismatched_fields`, `api_sources`, `errors` | non-confirmed field names, sources with hits, and per-source error strings |
+| `mismatched_fields` | fields the checker found a real CONTRADICTION on (`MISMATCH`). A field it declined to compare is not listed here |
+| `unconfirmed_fields` | fields neither confirmed nor contradicted (`NON_COMPARABLE`/`PARTIAL`): an arXiv record cannot confirm a claimed ICLR venue, and a `journal = {arXiv preprint arXiv:NNNN.NNNNN}` citation claims no published venue to confirm. These are abstentions the checker made deliberately, never findings against the entry |
+| `api_sources`, `errors` | sources with hits, and per-source error strings |
 
 ## Exit Codes
 

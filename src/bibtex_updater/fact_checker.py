@@ -63,6 +63,7 @@ from bibtex_updater.matching import (
     has_explicit_truncation_indicator,
     is_near_miss_title,
     is_preprint_or_series_venue,
+    is_preprint_server_venue,
     is_thesis_entry_type,
     is_volume_entry_type,
     normalize_volume_title,
@@ -4986,6 +4987,22 @@ class FactChecker:
             venue_score = 1.0
             venue_confirmed = True
             venue_note = "No venue claimed"
+        elif is_preprint_server_venue(claimed_venue):
+            # ``journal = {arXiv preprint arXiv:2408.05147}`` is what Google
+            # Scholar's own BibTeX export emits, so the convention is everywhere.
+            # It claims no PUBLISHED venue -- it says the work is a preprint --
+            # and is therefore the same kind of non-claim as an entry with no
+            # journal/booktitle at all. Treating it as an unconfirmable venue
+            # claim sent 764 of 5043 references in one 2026-09 corpus to
+            # UNCONFIRMED with ``venue`` named as the sole disagreeing field,
+            # every one of them found, title-matched and author-matched.
+            # ``entry_venue`` has already preferred a real published venue over
+            # this string wherever the entry carries both, so reaching here
+            # means the preprint string is the entry's ONLY venue claim.
+            venue_outcome = MatchOutcome.MATCH
+            venue_score = 1.0
+            venue_confirmed = True
+            venue_note = "Preprint-server citation; no published venue claimed"
         elif record_is_preprint:
             venue_outcome = MatchOutcome.NON_COMPARABLE
             venue_score = 1.0
@@ -5834,7 +5851,17 @@ class FactCheckProcessor:
                                 "p_valid": result.p_valid,
                                 # Additive: 0-100 numeric confidence (Item 4).
                                 "confidence_score": float(getattr(result, "confidence_score", 0.0)),
-                                "mismatched_fields": [n for n, c in result.field_comparisons.items() if not c.matches],
+                                # MISMATCH only. A NON_COMPARABLE/PARTIAL field
+                                # is an abstention the checker made on purpose
+                                # ("an arXiv record cannot confirm an ICLR
+                                # claim"); listing it here read downstream as a
+                                # contradiction the checker had found.
+                                "mismatched_fields": [n for n, c in result.field_comparisons.items() if c.is_mismatch],
+                                # Fields neither confirmed nor contradicted.
+                                # Additive: this is where the abstentions moved.
+                                "unconfirmed_fields": [
+                                    n for n, c in result.field_comparisons.items() if c.is_non_confirming
+                                ],
                                 "api_sources": result.api_sources_with_hits,
                                 # Sources whose lookup did not complete for this
                                 # entry. Non-empty means the cascade was partial,
@@ -6052,7 +6079,10 @@ class FactCheckProcessor:
                         "p_valid": r.p_valid,
                         # Additive: 0-100 numeric confidence (Item 4).
                         "confidence_score": float(getattr(r, "confidence_score", 0.0)),
-                        "mismatched_fields": [n for n, c in r.field_comparisons.items() if not c.matches],
+                        # MISMATCH only; abstentions go to unconfirmed_fields
+                        # (see process_entries).
+                        "mismatched_fields": [n for n, c in r.field_comparisons.items() if c.is_mismatch],
+                        "unconfirmed_fields": [n for n, c in r.field_comparisons.items() if c.is_non_confirming],
                         "api_sources": r.api_sources_with_hits,
                         # Sources whose lookup did not complete (see process_entries).
                         "sources_failed": r.sources_failed,

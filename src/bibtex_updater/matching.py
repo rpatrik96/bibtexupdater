@@ -16,7 +16,12 @@ from enum import Enum
 
 from rapidfuzz.distance import Levenshtein
 
-from bibtex_updater.utils import jaccard_similarity, normalize_title_for_match
+from bibtex_updater.utils import (
+    is_preprint_server_venue,
+    jaccard_similarity,
+    latex_to_plain,
+    normalize_title_for_match,
+)
 
 __all__ = [
     "title_edit_distance",
@@ -31,6 +36,7 @@ __all__ = [
     "EXPANDED_VENUE_ALIASES",
     "get_canonical_venue",
     "is_preprint_or_series_venue",
+    "is_preprint_server_venue",
 ]
 
 
@@ -527,6 +533,14 @@ EXPANDED_VENUE_ALIASES: dict[str, set[str]] = {
         # OpenReview / Zotero exports often say ``Accepted by TMLR``.
         "accepted by tmlr",
     },
+    # COLM (first edition 2024). Cited overwhelmingly by its full name rather
+    # than the acronym, and with an ordinal edition prefix ("First/Second/Third
+    # Conference on Language Modeling") that the substring pass strips for free.
+    "colm": {
+        "conference on language modeling",
+        "conference on language modelling",
+        "annual conference on language modeling",
+    },
     # Systems/DB (new)
     "sigmod": {
         "acm sigmod",
@@ -740,7 +754,15 @@ def _normalize_venue_for_matching(venue: str) -> str:
     Returns:
         Normalized venue string
     """
-    venue_norm = venue.lower().strip()
+    # Zotero/Better BibTeX brace-protects capitalised words, so a booktitle
+    # reaches us as ``The {{Twelfth International Conference}} on {{Learning
+    # Representations}}``. Without a LaTeX pass the braces stay glued to the
+    # tokens ("conference}}"), no alias matches, and the fuzzy score against
+    # ``ICLR`` collapses to 0.09 -- a hard VENUE MISMATCH on a correctly cited
+    # ICLR paper. ``latex_to_plain`` also decodes accents and drops math and
+    # command wrappers, so ``Kunstliche Intelligenz`` and a ``\href``-wrapped
+    # venue normalize to their plain text too.
+    venue_norm = latex_to_plain(venue).lower().strip()
 
     # FIX A2: OpenReview venueid pre-pass -- ``ICLR.cc/2024/Conference`` ->
     # ``iclr``, ``NeurIPS.cc/2022/Datasets_and_Benchmarks_Track`` -> ``neurips``.
