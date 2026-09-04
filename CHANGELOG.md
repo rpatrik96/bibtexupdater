@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A paper renamed after submission no longer makes its citation wrong. `_check_arxiv_id_consistency` compared the entry only against arXiv's *current* title, so an entry citing a preprint that was retitled for its conference version was reported as `ARXIV_ID_MISMATCH` while being a faithful record of what the work was called when it was cited. Before flagging, the checker now walks the arXiv ID's earlier versions and clears the finding if the cited title is one the paper actually carried, logging which version it matched.
+
+  Measured on the 2026-09 InterpScience screening: of 300 flagged references hand-adjudicated against their arXiv abstract pages, 178 were correct as cited, and preprint-to-publication retitling was the single dominant cause.
+
+  Two details worth knowing. The version check uses its own threshold, `arxiv_version_title_min` (0.78), deliberately stricter than `arxiv_consistency_min_title` (0.50): the latter asks whether two titles might be the same paper, while clearing a finding asserts the paper carried exactly the cited title. On the adjudicated cases real retitlings score 0.82-1.00 and genuine wrong titles top out at 0.710, so at 0.50 both real errors in the fixture set would have been cleared — worse than the bug. And the walk reads `arxiv.org/abs/<id>vN`, not the export API, because the API does not expose historical titles at all; the v1 page carries both its own title and the full version list, so the common v1-to-current retitling costs one fetch. Bounded by `arxiv_max_version_fetches` (5), never fetches the current version, and abstains rather than clearing when the source does not answer.
+
 ## [1.11.0] - 2026-09-04
 
 A preprint citation says the work is a preprint. The checker was reading that as a claim about a published venue it could not confirm, and reporting the resulting abstention as a disagreement.

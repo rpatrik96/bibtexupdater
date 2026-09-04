@@ -525,6 +525,28 @@ class FactCheckerConfig:
     # as pointing to a *different* paper. Deliberately low so only clear
     # different-paper cases trip it, not minor preprint/published title edits.
     arxiv_consistency_min_title: float = 0.50
+    # arXiv titles change. A preprint is cited, the authors retitle it for the
+    # conference version, and the entry now disagrees with the current record
+    # while faithfully recording what the work was called when it was cited.
+    # Before reporting ARXIV_ID_MISMATCH, check the ID's earlier versions.
+    # Measured on the 2026-09 InterpScience corpus: of 300 flagged references
+    # hand-adjudicated, 178 were correct as cited and retitling was the single
+    # dominant cause.
+    check_arxiv_version_history: bool = True
+    # Bound on abs-page fetches per entry. The v1 page carries both its own
+    # title and the full version list, so the common retitling (v1 -> current)
+    # costs one fetch.
+    arxiv_max_version_fetches: int = 5
+    # Deliberately STRICTER than arxiv_consistency_min_title. That threshold asks
+    # "might this be the same paper"; this one asserts "the paper carried exactly
+    # this title", and clearing a finding needs the stronger claim. Measured on
+    # the adjudicated InterpScience cases: real retitlings score 0.82-1.00
+    # (lowest, "Not All Language Model Features Are Linear" against its
+    # "One-Dimensionally Linear" retitling, 0.824) while genuine wrong titles top
+    # out at 0.710 ("Causal abstractions of neural networks with interchange
+    # interventions" against "Causal Abstractions of Neural Networks"). At 0.50
+    # both real errors would be cleared, which is worse than the bug being fixed.
+    arxiv_version_title_min: float = 0.78
     # Verify the entry's own DOI points to the entry's paper. Today _validate_doi
     # only checks the DOI *resolves* (doi.org HEAD); it never checks the DOI
     # points to the CITED paper. A copy-paste DOI that resolves to a different
@@ -1797,6 +1819,43 @@ class ArxivClient:
             return resp.text
         except Exception as exc:
             raise as_source_failure("arxiv", ARXIV_API, exc) from exc
+
+    def fetch_version_title_and_count(self, arxiv_id: str, version: int) -> tuple[str | None, int]:
+        """Title of ``arxiv_id`` at ``version``, plus its total version count.
+
+        ``(None, 0)`` means arXiv answered and has no such version. A lookup
+        that never completes raises, so a dead source can never be mistaken for
+        a version that does not exist.
+        """
+        url = f"{ARXIV_ABS}/{arxiv_id}v{version}"
+        try:
+            resp = self.http._request("GET", url, accept="text/html", service="arxiv")
+            raise_for_failed_lookup("arxiv", url, resp.status_code)
+            if resp.status_code != 200:
+                return None, 0
+            return _parse_abs_page(resp.text)
+        except Exception as exc:
+            raise as_source_failure("arxiv", url, exc) from exc
+
+    def fetch_version_title(self, arxiv_id: str, version: int) -> str | None:
+        return self.fetch_version_title_and_count(arxiv_id, version)[0]
+
+
+ARXIV_ABS = "https://arxiv.org/abs"
+
+# The abstract page states the version's own title and lists the whole version
+# history. The export API does not expose historical titles at all, so the
+# website is the only route to them.
+_CITATION_TITLE_RE = re.compile(r'<meta\s+name="citation_title"\s+content="([^"]*)"', re.IGNORECASE)
+_VERSION_LINK_RE = re.compile(r"\[v(\d+)\]", re.IGNORECASE)
+
+
+def _parse_abs_page(html: str) -> tuple[str | None, int]:
+    """Return this version's title and how many versions the paper has."""
+    m = _CITATION_TITLE_RE.search(html or "")
+    title = m.group(1).strip() if m else None
+    versions = [int(v) for v in _VERSION_LINK_RE.findall(html or "")]
+    return title, (max(versions) if versions else 0)
 
 
 # ------------- Venue Matching -------------
@@ -3223,6 +3282,52 @@ class FactChecker:
                     )
         return None
 
+    def _cited_title_matches_prior_version(self, arxiv_id: str, cited_title: str) -> int | None:
+        """Version number whose title the entry cites, or ``None``.
+
+        A paper renamed after submission leaves the citing entry disagreeing
+        with the current arXiv record while being a correct record of the work
+        as it stood. Before that becomes ARXIV_ID_MISMATCH, walk the earlier
+        versions and see whether the cited title is one the paper actually
+        carried.
+
+        The current version is never fetched: its title is already in hand from
+        the API record, and it is what failed to match.
+        """
+        if not self.config.check_arxiv_version_history or self.arxiv is None:
+            return None
+        cited = normalize_title_for_match(cited_title or "")
+        if not cited:
+            return None
+
+        budget = max(1, self.config.arxiv_max_version_fetches)
+        # v1 first: it carries its own title AND the version list, so the common
+        # v1-to-current retitling resolves in a single fetch.
+        try:
+            title, total = self.arxiv.fetch_version_title_and_count(arxiv_id, 1)
+        except Exception:
+            # The source never answered. Say nothing rather than let silence
+            # read as "no earlier version carried this title".
+            return None
+        if title is None:
+            return None
+        if token_sort_ratio(cited, normalize_title_for_match(title)) / 100.0 >= (self.config.arxiv_version_title_min):
+            return 1
+
+        # Walk forward, stopping before the current version.
+        for version in range(2, min(total, budget + 1)):
+            try:
+                title = self.arxiv.fetch_version_title(arxiv_id, version)
+            except Exception:
+                return None
+            if title is None:
+                continue
+            if token_sort_ratio(cited, normalize_title_for_match(title)) / 100.0 >= (
+                self.config.arxiv_version_title_min
+            ):
+                return version
+        return None
+
     def _check_arxiv_id_consistency(self, entry: dict[str, Any]) -> FactCheckResult | None:
         """Flag entries whose cited arXiv ID resolves to a *different* paper.
 
@@ -3263,6 +3368,19 @@ class FactChecker:
             return self._id_anchored_author_mismatch(
                 entry, rec, source="arxiv", identifier=arxiv_id, id_kind="arXiv ID"
             )
+
+        matched_version = self._cited_title_matches_prior_version(arxiv_id, entry.get("title", ""))
+        if matched_version is not None:
+            self.logger.info(
+                "arXiv ID %s for entry %r cites the title this paper carried at v%d "
+                "(%r); it was retitled to %r since. Not a mismatch.",
+                arxiv_id,
+                entry.get("ID", "?"),
+                matched_version,
+                entry.get("title", ""),
+                rec.title,
+            )
+            return None
 
         self.logger.warning(
             "arXiv ID %s for entry %r points to a different paper: entry title "
