@@ -199,6 +199,47 @@ def is_preprint_venue(venue: str | None) -> bool:
     return bool(_CORR_VENUE_RE.search(v))
 
 
+#: A venue string that names a preprint SERVER and nothing else. Every marker is
+#: word-anchored, because this predicate grants a POSITIVE confirmation rather
+#: than an abstention: a bare ``corr`` substring would otherwise fire inside
+#: ``Corrosion Science``. ``\b`` still holds against the punctuation in
+#: ``arXiv:2408.05147``, ``CoRR abs/2408.05147`` and ``arxiv.org/abs/...``.
+_PREPRINT_SERVER_VENUE_RE = re.compile(
+    r"\b(?:arxiv|biorxiv|medrxiv|chemrxiv|ssrn|corr|preprints?|e-?prints?)\b",
+    re.IGNORECASE,
+)
+
+
+def is_preprint_server_venue(venue: str | None) -> bool:
+    r"""True if ``venue`` names a preprint SERVER and nothing else.
+
+    Wider than :func:`is_preprint_venue` in coverage (chemRxiv, SSRN, and the
+    bare words ``preprint`` / ``e-prints``), and narrower than
+    ``matching.is_preprint_or_series_venue`` in scope: publisher series (PMLR,
+    Lecture Notes) and hosting platforms (OpenReview) are deliberately excluded,
+    because those name a real publication channel that merely cannot pin one
+    venue, whereas a preprint server names no published venue at all.
+
+    Covers every common spelling of the convention, including the one Google
+    Scholar's own BibTeX export emits::
+
+        arXiv preprint arXiv:2408.05147   arXiv preprint      arXiv e-prints
+        arXiv:2408.05147                  arXiv               CoRR
+        CoRR abs/2408.05147               bioRxiv             SSRN
+
+    Old-style identifiers (``arXiv:math.GT/0309136``) and ``\href``-wrapped ones
+    are covered by the same ``arxiv`` marker; the identifier shape is never
+    parsed here.
+
+    Such a string is not a *published-venue* claim. It says "this work is a
+    preprint", which carries exactly as much published-venue information as an
+    entry with no ``journal``/``booktitle`` at all.
+    """
+    if not venue:
+        return False
+    return bool(_PREPRINT_SERVER_VENUE_RE.search(venue))
+
+
 def retry_after_seconds(exc: httpx.HTTPError, fallback: float, cap: float = 60.0) -> float:
     """Retry sleep: honor a server ``Retry-After`` header when present (integer
     seconds, capped at ``cap``), else the exponential ``fallback``. Lets the
@@ -456,15 +497,33 @@ def entry_venue(entry: Mapping[str, Any]) -> str:
     vacuously and the journal name never constrained retrieval.
 
     A URL-valued ``howpublished`` is a web reference and is NOT a venue claim.
+
+    A preprint-server string loses to a real published venue wherever the entry
+    carries both. Authors routinely keep ``journal = {arXiv preprint
+    arXiv:2408.05147}`` beside a ``booktitle`` naming the conference so the entry
+    stays findable by identifier; reading ``journal`` first discarded the
+    published claim, which then matched vacuously and never constrained
+    retrieval. The arXiv string is a lookup aid, not a competing venue claim.
+    Order is otherwise unchanged, and an entry whose ONLY venue field is a
+    preprint string still returns that string.
     """
+    candidates: list[str] = []
     for field_name in ("journal", "booktitle"):
         value = (entry.get(field_name) or "").strip()
         if value:
-            return value
+            candidates.append(value)
     howpublished = (entry.get("howpublished") or "").strip()
     if howpublished and not _NON_VENUE_HOWPUBLISHED_RE.match(howpublished):
-        return howpublished
-    return (entry.get("series") or "").strip()
+        candidates.append(howpublished)
+    series = (entry.get("series") or "").strip()
+    if series:
+        candidates.append(series)
+    if not candidates:
+        return ""
+    for value in candidates:
+        if not is_preprint_server_venue(value):
+            return value
+    return candidates[0]
 
 
 def entry_authors(entry: Mapping[str, Any]) -> str:
