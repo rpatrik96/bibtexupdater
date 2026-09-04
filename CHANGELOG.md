@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.11.0] - 2026-09-04
+
+A preprint citation says the work is a preprint. The checker was reading that as a claim about a published venue it could not confirm, and reporting the resulting abstention as a disagreement.
+
+**Breaking for consumers of `mismatched_fields`:** the key now lists real contradictions only. Anything the checker declined to compare has moved to the new additive `unconfirmed_fields`. Statuses are unchanged and were always correct.
+
 ### Fixed
 
 - **`journal = {arXiv preprint arXiv:2408.05147}` was scored as an unconfirmable venue claim.** It is what Google Scholar's own BibTeX export emits, so the convention is everywhere: 764 of 5,043 references in a 2026-09 corpus carried an arXiv or CoRR journal string and came back `UNCONFIRMED` with `venue` named as the sole disagreeing field, every one of them found by the cascade and confirmed on title, authors and year. The string claims no *published* venue -- it says the work is a preprint, which is exactly what the record confirms -- so it carries the same amount of published-venue information as an entry with no `journal`/`booktitle` at all, and is now treated the same way. `is_preprint_server_venue` recognizes `arXiv preprint arXiv:NNNN.NNNNN`, `arXiv preprint`, `arXiv e-prints`, bare `arXiv:NNNN.NNNNN`, `arXiv`, `CoRR`, `CoRR abs/NNNN.NNNNN`, the old-style `math.GT/0309136` identifier, `\href`-wrapped identifiers, bioRxiv/medRxiv/chemRxiv and SSRN. Each marker is anchored at a word boundary, unlike the substring test in `is_preprint_or_series_venue`, because this predicate grants a positive confirmation: `Corrosion Science` must not read as CoRR. Publisher series (PMLR, Lecture Notes) and hosting platforms (OpenReview) are deliberately excluded and keep abstaining -- they name a real publication channel that merely cannot pin one venue.
