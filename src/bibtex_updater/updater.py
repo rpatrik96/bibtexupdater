@@ -52,20 +52,23 @@ from rapidfuzz.fuzz import token_sort_ratio
 from bibtex_updater.sources import (
     OR_ACCEPTED,
     OpenReviewClient,
-    build_openreview_paperhash,
+    build_openreview_paperhashes,
     openreview_acceptance,
     openreview_note_to_candidate_record,
 )
 
 # Shared utilities
 from bibtex_updater.utils import (
+    ABSENCE_STATUS_CODES,
     ACL_ANTHOLOGY_URL,
     ARXIV_API,
     CROSSREF_API,
     DBLP_API_SEARCH,
     EUROPEPMC_API,
     OPENALEX_API,
-    OPENREVIEW_API,
+    OPENREVIEW_AUTH_REFRESH_STATUS,
+    OPENREVIEW_SEARCH_SERVICE,
+    OPENREVIEW_SERVICE,
     PREPRINT_HOSTS,
     S2_API,
     AsyncHttpClient,
@@ -2021,8 +2024,14 @@ class Resolver:
         first_author = first_author_surname(entry)
         if not first_author:
             return None
+        # RAW author name, as the checker passes it: ``first_author_surname``
+        # ASCII-folds the surname, while OpenReview's paperhash index keeps the
+        # diacritics ("Akyürek" indexes as "akyürek" and the folded "akyurek"
+        # returns nothing). The client runs its own normalization and issues
+        # the folded form as a second hash.
+        or_first_author = (split_authors_bibtex(entry.get("author") or "") or [first_author])[0]
         try:
-            notes = self.openreview.search("", limit=5, title=entry.get("title") or "", first_author=first_author)
+            notes = self.openreview.search("", limit=5, title=entry.get("title") or "", first_author=or_first_author)
         except SourceUnavailableError as exc:
             # The resolver's job is to upgrade a preprint when it can; an
             # OpenReview lookup that never completed leaves the entry alone.
@@ -2360,6 +2369,11 @@ class AsyncResolver:
 
         self.http: AsyncHttpClient = http
         self.logger = logger
+        # OpenReview ``/notes`` endpoints that refused an ANONYMOUS request this
+        # run (latched, as in ``OpenReviewClient``), and the endpoints whose
+        # refusal has already been reported once. See ``_openreview_note_refusal``.
+        self._openreview_refused: set[str] = set()
+        self._openreview_warned: set[str] = set()
 
     # --- Shared helpers (static, same as sync Resolver) ---
     @staticmethod
@@ -2738,40 +2752,178 @@ class AsyncResolver:
         rec.type = "proceedings-article"
         return rec
 
-    async def _openreview_fetch(self, params: dict[str, Any]) -> list[dict[str, Any]]:
-        """Single async OpenReview ``/notes`` request; returns the note list or ``[]``."""
+    #: Host order for every OpenReview ``/notes`` lookup, shared with the sync
+    #: client: v2 first (ICLR 2024+, NeurIPS 2023+, TMLR, COLM), then v1 (the
+    #: pre-2023 venues). The two hold disjoint sets of notes, so a lookup that
+    #: asks one of them can never confirm the other half of a bibliography.
+    OPENREVIEW_NOTES_HOSTS: tuple[str, ...] = OpenReviewClient.NOTES_HOSTS
+
+    async def _openreview_token_for(self, url: str) -> str | None:
+        """The bearer token this run puts on ``url``, or ``None`` if it sends none.
+
+        Mirrors :meth:`OpenReviewClient._token_for`: read off the shared
+        client's credentials, which already hold the token (or the failed-login
+        state) by the time a refusal comes back, so this normally costs no login
+        and no round trip. Offloaded all the same, because the one case where it
+        does log in -- a token the client just invalidated after a persistent
+        401 -- is a blocking POST that must not run on the event loop. A run
+        without credentials answers ``None``.
+        """
+        import asyncio
+
+        auth = getattr(self.http, "openreview_auth", None)
+        if auth is None:
+            return None
+        try:
+            token = await asyncio.to_thread(auth.token_for_url, url)
+        except Exception:  # noqa: BLE001 - diagnosing a refusal must never raise
+            return None
+        return token if isinstance(token, str) and token else None
+
+    async def _openreview_note_refusal(self, url: str, status: int) -> None:
+        """Record a 401/403 from ``url`` the way the sync client settled it (#65).
+
+        An ANONYMOUS refusal is a configuration state -- no credentials, no
+        ``/notes`` -- so the endpoint is latched for the run and later entries
+        skip it without a request; it is reported once, at WARNING, with the
+        fix. A refusal of a request that carried a bearer token is a blip
+        (measured at one 403 per 250 entries against 844 authenticated 200s),
+        so it is reported once and then forgotten: nothing latches, and the
+        next entry asks the same host again.
+        """
+        if await self._openreview_token_for(url):
+            if url in self._openreview_warned:
+                self.logger.debug("OpenReview %s refused an authenticated request (HTTP %s)", url, status)
+                return
+            self._openreview_warned.add(url)
+            self.logger.warning(
+                "OpenReview %s refused an authenticated request (HTTP %s); "
+                "not a configuration state, so later entries will ask it again",
+                url,
+                status,
+            )
+            return
+        self._openreview_refused.add(url)
+        if url in self._openreview_warned:
+            return
+        self._openreview_warned.add(url)
+        self.logger.warning(
+            "OpenReview %s refused an anonymous request (HTTP %s): the exact title+author lookup is "
+            "challenge-gated there and is skipped for the rest of this run. Set OPENREVIEW_USERNAME / "
+            "OPENREVIEW_PASSWORD (or pass --openreview-username) to restore it; the full-text fallback still runs.",
+            url,
+            status,
+        )
+
+    async def _openreview_fetch(
+        self,
+        params: dict[str, Any],
+        url: str,
+        rate_limit_service: str = OPENREVIEW_SERVICE,
+    ) -> list[dict[str, Any]] | None:
+        """Single async OpenReview request against ``url``.
+
+        Returns the note list (possibly empty) when OpenReview answered, and
+        ``None`` when it did not: a 401/403 refusal (recorded through
+        :meth:`_openreview_note_refusal`), any other non-answer status, a
+        transport failure, an exhausted retry budget or an unreadable body. The
+        caller reads ``None`` as "this host is out for this entry" and moves on
+        to the other host, as :meth:`OpenReviewClient.search` does.
+
+        The request is tagged ``service="openreview"`` so an
+        :class:`AsyncHttpClient` built with ``openreview_auth`` attaches the
+        bearer token; ``rate_limit_service`` separates the 5/min
+        ``/notes/search`` pacing from the 180/min ``/notes`` one.
+        """
         try:
             resp = await self.http.get(
-                f"{OPENREVIEW_API}/notes",
-                service="openreview",
+                url,
+                service=OPENREVIEW_SERVICE,
                 params=params,
                 accept="application/json",
+                rate_limit_service=rate_limit_service,
             )
-            if resp.status_code != 200:
-                return []
+        except Exception as e:
+            self.logger.debug("OpenReview async fetch %s failed: %s", url, e)
+            return None
+        status = resp.status_code
+        if status in OPENREVIEW_AUTH_REFRESH_STATUS:
+            await self._openreview_note_refusal(url, status)
+            return None
+        if status in ABSENCE_STATUS_CODES:
+            return []
+        if status != 200:
+            self.logger.debug("OpenReview %s answered HTTP %s", url, status)
+            return None
+        try:
             data = resp.json() or {}
         except Exception as e:
-            self.logger.debug("OpenReview async fetch failed: %s", e)
-            return []
+            self.logger.debug("OpenReview %s returned an unreadable body: %s", url, e)
+            return None
         notes = data.get("notes") or []
         return notes if isinstance(notes, list) else []
 
     async def _openreview_search(self, entry: dict[str, Any], title_norm: str) -> PublishedRecord | None:
-        """Async OpenReview stage 3c: resolve ACCEPTED submissions only."""
+        """Async OpenReview stage 3c: resolve ACCEPTED submissions only.
+
+        Mirrors :meth:`OpenReviewClient.search` host for host (#63): the exact
+        ``paperhash`` lookup goes to v2 and then v1 -- the two hold disjoint
+        sets of notes -- under both index forms of the hash, and the full-text
+        ``/notes/search?term=`` fallback runs on both hosts when every hash
+        missed. Credentials ride on ``self.http`` (an :class:`AsyncHttpClient`
+        built with ``openreview_auth``, the same object ``bibtex-check`` uses),
+        so the requests here are authenticated exactly when the checker's are,
+        and the login they need never runs on the event loop.
+
+        Refusals follow #65: an anonymous 401/403 latches that endpoint for the
+        run and is reported once with the fix; an authenticated one is reported
+        once and forgotten. The one place this diverges from the checker is the
+        fallback after a refusal. The checker skips it, because a refused exact
+        lookup already disqualifies the entry from its exhaustive ``not_found``
+        claim; the resolver has no such claim to protect and is best-effort, so
+        it still runs the anonymous-capable ``/notes/search`` fallback -- which
+        is what an anonymous ``bibtex-update`` always had, and what keeps
+        OpenReview contributing something without credentials.
+        """
         if not title_norm:
             return None
         first_author = first_author_surname(entry)
         if not first_author:
             return None
         raw_title = entry.get("title") or ""
-        paperhash = build_openreview_paperhash(raw_title, first_author)
+        # RAW author name (see ``Resolver._stage3c_openreview``): the folded
+        # surname misses every accented author on both hosts, so both index
+        # forms of the hash are built from the name as the entry wrote it.
+        or_first_author = (split_authors_bibtex(entry.get("author") or "") or [first_author])[0]
+        paperhashes = build_openreview_paperhashes(raw_title, or_first_author)
         notes: list[dict[str, Any]] = []
-        if paperhash:
-            notes = await self._openreview_fetch({"paperhash": paperhash, "limit": 5})
+        for host in self.OPENREVIEW_NOTES_HOSTS:
+            notes_url = f"{host}/notes"
+            if notes_url in self._openreview_refused:
+                # Already gated this run for anonymous callers: no request.
+                continue
+            for paperhash in paperhashes:
+                found = await self._openreview_fetch({"paperhash": paperhash, "limit": 5}, notes_url)
+                if found is None:
+                    # This host is out for this entry; the other one may answer.
+                    break
+                if found:
+                    notes = found
+                    break
+            if notes:
+                break
         if not notes:
             plain_title = latex_to_plain(raw_title).strip()
             if plain_title:
-                notes = await self._openreview_fetch({"term": plain_title, "limit": 5})
+                for host in self.OPENREVIEW_NOTES_HOSTS:
+                    found = await self._openreview_fetch(
+                        {"term": plain_title, "limit": 5},
+                        f"{host}/notes/search",
+                        rate_limit_service=OPENREVIEW_SEARCH_SERVICE,
+                    )
+                    if found:
+                        notes = found
+                        break
         if not notes:
             return None
 

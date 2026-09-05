@@ -22,6 +22,7 @@ All network access is faked; no test here touches a live host.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import logging
@@ -38,6 +39,8 @@ from bibtex_updater.sources import OpenReviewClient
 from bibtex_updater.utils import (
     OPENREVIEW_API,
     OPENREVIEW_API_V2,
+    AsyncHttpClient,
+    AsyncRateLimiterRegistry,
     HttpClient,
     OpenReviewAuth,
     OpenReviewTokenStore,
@@ -964,3 +967,232 @@ class TestConcurrentLoginsAreSerializedPerOrigin:
             t.join(timeout=5)
 
         assert slow_result["token"] == TOKEN_V1
+
+
+# ===========================================================================
+# The async client carries the same token (#67)
+# ===========================================================================
+
+
+class _FakeAsyncTransport:
+    """Stands in for the ``httpx.AsyncClient`` behind :class:`AsyncHttpClient`.
+
+    Answers from a scripted list (the last response repeats) and records every
+    request as ``(url, headers)`` so a header can be tied to its host.
+    """
+
+    def __init__(self, responses):
+        self._responses = list(responses)
+        self.calls: list[tuple[str, dict]] = []
+
+    async def request(self, method, url, params=None, json=None, headers=None):
+        self.calls.append((url, dict(headers or {})))
+        nxt = self._responses.pop(0) if len(self._responses) > 1 else self._responses[0]
+        if isinstance(nxt, Exception):
+            raise nxt
+        return nxt
+
+    async def aclose(self):
+        return None
+
+
+def _async_http(auth=None, responses=()) -> AsyncHttpClient:
+    http = AsyncHttpClient(rate_limiters=AsyncRateLimiterRegistry(), cache=None, timeout=1.0, openreview_auth=auth)
+    http._client = _FakeAsyncTransport(responses)  # type: ignore[assignment]
+    return http
+
+
+def _async_sent(http) -> list[tuple[str, dict]]:
+    return list(http._client.calls)
+
+
+class TestAsyncHttpClientCarriesTheToken:
+    """``bibtex-update``'s resolver runs on :class:`AsyncHttpClient`.
+
+    Until #67 that client had no ``openreview_auth`` at all, so every OpenReview
+    request the updater made was anonymous, took the 403 challenge, and the
+    stage returned nothing -- on a run whose ``bibtex-check`` half was
+    authenticated through the very same credentials. The async client now takes
+    the same :class:`OpenReviewAuth` object and treats it the same way: a
+    bearer token on ``service="openreview"`` requests only, one re-login on a
+    ``401``, no login spent on a ``403``. The login itself is a blocking POST
+    and must never run on the event loop.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _no_pacing(self, monkeypatch):
+        async def _wait(self_, service):
+            return None
+
+        monkeypatch.setattr("bibtex_updater.utils.AsyncRateLimiterRegistry.wait", _wait)
+
+    def test_an_anonymous_client_sends_no_authorization_header(self):
+        """The default is unchanged: no credentials, no header, same request."""
+        http = _async_http(responses=[_notes([])])
+        asyncio.run(http.get(NOTES_V2, service="openreview", params={"paperhash": "x"}))
+        assert "Authorization" not in _async_sent(http)[0][1]
+
+    def test_an_authenticated_client_sends_the_bearer_token(self):
+        auth = OpenReviewAuth("a@b.c", PASSWORD)
+        fake = _FakeLoginClient([_login_ok(TOKEN_V2)])
+        with patch("bibtex_updater.utils.httpx.Client", fake):
+            http = _async_http(auth=auth, responses=[_notes([_note()])])
+            resp = asyncio.run(http.get(NOTES_V2, service="openreview", params={"paperhash": "x"}))
+        assert resp.status_code == 200
+        assert _async_sent(http)[0][1]["Authorization"] == f"Bearer {TOKEN_V2}"
+        assert fake.calls == [(f"{OPENREVIEW_API_V2}/login", {"id": "a@b.c", "password": PASSWORD})]
+
+    def test_the_token_rides_on_openreview_requests_only(self):
+        auth = OpenReviewAuth("a@b.c", PASSWORD)
+        fake = _FakeLoginClient([_login_ok(TOKEN_V2)])
+        with patch("bibtex_updater.utils.httpx.Client", fake):
+            http = _async_http(auth=auth, responses=[_notes([])])
+            asyncio.run(http.get("https://api.crossref.org/works", service="crossref"))
+        assert "Authorization" not in _async_sent(http)[0][1]
+        assert fake.calls == []
+
+    def test_one_login_serves_both_hosts_and_every_later_request(self):
+        """The token is cached for the run: two hosts, three requests, one login."""
+        auth = OpenReviewAuth("a@b.c", PASSWORD)
+        fake = _FakeLoginClient([_login_ok(TOKEN_V2)])
+
+        async def _run(http):
+            await http.get(NOTES_V2, service="openreview", params={"paperhash": "x"})
+            await http.get(NOTES_V1, service="openreview", params={"paperhash": "x"})
+            await http.get(
+                SEARCH_V1, service="openreview", params={"term": "x"}, rate_limit_service="openreview_search"
+            )
+
+        with patch("bibtex_updater.utils.httpx.Client", fake):
+            http = _async_http(auth=auth, responses=[_notes([])])
+            asyncio.run(_run(http))
+        assert len(fake.calls) == 1
+        assert [h["Authorization"] for _, h in _async_sent(http)] == [f"Bearer {TOKEN_V2}"] * 3
+
+    def test_the_login_runs_off_the_event_loop_thread(self):
+        """``OpenReviewAuth._login`` is a synchronous POST; it is offloaded, not awaited in-line."""
+        seen: dict[str, int] = {}
+
+        class _RecordingLogin(_FakeLoginClient):
+            def post(self, url, json=None):
+                seen["thread"] = threading.get_ident()
+                return super().post(url, json)
+
+        auth = OpenReviewAuth("a@b.c", PASSWORD)
+        with patch("bibtex_updater.utils.httpx.Client", _RecordingLogin([_login_ok(TOKEN_V2)])):
+            http = _async_http(auth=auth, responses=[_notes([])])
+            asyncio.run(http.get(NOTES_V2, service="openreview", params={"paperhash": "x"}))
+        assert seen["thread"] != threading.get_ident()
+        assert _async_sent(http)[0][1]["Authorization"] == f"Bearer {TOKEN_V2}"
+
+    def test_a_slow_login_does_not_stall_the_loop(self):
+        """While the login is in flight, an unrelated request still goes out and comes back.
+
+        The login blocks on an ``Event`` the test releases only after the
+        Crossref request has completed on the same loop. An in-line login
+        would hold the loop, the Crossref request would never run, the blocked
+        login would time out and fail, and the OpenReview request would go out
+        without its token.
+        """
+        started, release = threading.Event(), threading.Event()
+        fake = _BlockingLoginClient(
+            {OPENREVIEW_API_V2: TOKEN_V2}, block_origin=OPENREVIEW_API_V2, started=started, release=release
+        )
+        auth = OpenReviewAuth("a@b.c", PASSWORD)
+
+        async def _run(http):
+            pending = asyncio.create_task(http.get(NOTES_V2, service="openreview", params={"paperhash": "x"}))
+            for _ in range(500):
+                if started.is_set():
+                    break
+                await asyncio.sleep(0.01)
+            assert started.is_set(), "the login never started"
+            other = await asyncio.wait_for(http.get("https://api.crossref.org/works", service="crossref"), timeout=5)
+            release.set()
+            resp = await asyncio.wait_for(pending, timeout=5)
+            return other, resp
+
+        with patch("bibtex_updater.utils.httpx.Client", fake):
+            http = _async_http(auth=auth, responses=[_notes([]), _notes([_note()])])
+            other, resp = asyncio.run(_run(http))
+
+        assert other.status_code == 200 and resp.status_code == 200
+        urls = [u for u, _ in _async_sent(http)]
+        assert urls == ["https://api.crossref.org/works", NOTES_V2]
+        assert _async_sent(http)[1][1]["Authorization"] == f"Bearer {TOKEN_V2}"
+
+    def test_a_401_refreshes_the_token_exactly_once(self):
+        auth = OpenReviewAuth("a@b.c", PASSWORD)
+        fake = _FakeLoginClient([_login_ok(TOKEN_V2), _login_ok("fresh-token")])
+        with patch("bibtex_updater.utils.httpx.Client", fake):
+            http = _async_http(auth=auth, responses=[_status(401, "TokenExpiredError"), _notes([_note()])])
+            resp = asyncio.run(http.get(NOTES_V2, service="openreview", params={"paperhash": "x"}))
+        assert resp.status_code == 200
+        assert len(fake.calls) == 2
+        headers = [h for _, h in _async_sent(http)]
+        assert headers[0]["Authorization"] == f"Bearer {TOKEN_V2}"
+        assert headers[1]["Authorization"] == "Bearer fresh-token"
+
+    def test_a_persistent_401_is_reported_not_retried_forever(self):
+        auth = OpenReviewAuth("a@b.c", PASSWORD)
+        fake = _FakeLoginClient([_login_ok(TOKEN_V2), _login_ok("fresh-token")])
+        with patch("bibtex_updater.utils.httpx.Client", fake):
+            http = _async_http(auth=auth, responses=[_status(401, "TokenExpiredError")])
+            resp = asyncio.run(http.get(NOTES_V2, service="openreview", params={"paperhash": "x"}))
+        assert resp.status_code == 401
+        assert len(_async_sent(http)) == 2
+
+    def test_a_403_does_not_spend_a_login(self):
+        """A challenge is not a stale token: it is handed back, and no re-login is bought."""
+        auth = OpenReviewAuth("a@b.c", PASSWORD)
+        fake = _FakeLoginClient([_login_ok(TOKEN_V2)])
+        with patch("bibtex_updater.utils.httpx.Client", fake):
+            http = _async_http(auth=auth, responses=[_status(403)])
+            resp = asyncio.run(http.get(NOTES_V2, service="openreview", params={"paperhash": "x"}))
+        assert resp.status_code == 403
+        assert len(_async_sent(http)) == 1
+        assert len(fake.calls) == 1
+
+    def test_a_failed_login_degrades_to_anonymous_and_is_logged_once(self, caplog):
+        """Bad credentials: the request still goes out, without a token, and the run is told once."""
+        auth = OpenReviewAuth("a@b.c", PASSWORD)
+        fake = _FakeLoginClient([_status(400)])
+
+        async def _run(http):
+            await http.get(NOTES_V2, service="openreview", params={"paperhash": "x"})
+            await http.get(NOTES_V2, service="openreview", params={"paperhash": "y"})
+
+        with caplog.at_level(logging.WARNING, logger="bibtex_updater.utils"):
+            with patch("bibtex_updater.utils.httpx.Client", fake):
+                http = _async_http(auth=auth, responses=[_status(403)])
+                asyncio.run(_run(http))
+        assert all("Authorization" not in h for _, h in _async_sent(http))
+        assert len(fake.calls) == 1
+        assert caplog.text.count("continuing anonymously") == 1
+
+    def test_the_search_endpoint_is_paced_under_its_own_limiter(self, monkeypatch):
+        """``/notes/search`` declares 5/min against 180/min on ``/notes``; one source, two limiters."""
+        waited: list[str] = []
+
+        async def _wait(self_, service):
+            waited.append(service)
+
+        monkeypatch.setattr("bibtex_updater.utils.AsyncRateLimiterRegistry.wait", _wait)
+
+        async def _run(http):
+            await http.get(NOTES_V2, service="openreview", params={"paperhash": "x"})
+            await http.get(
+                SEARCH_V2, service="openreview", params={"term": "x"}, rate_limit_service="openreview_search"
+            )
+
+        http = _async_http(responses=[_notes([])])
+        asyncio.run(_run(http))
+        assert waited == ["openreview", "openreview_search"]
+
+    def test_the_password_never_reaches_the_shared_transport(self):
+        auth = OpenReviewAuth("a@b.c", PASSWORD)
+        with patch("bibtex_updater.utils.httpx.Client", _FakeLoginClient([_login_ok(TOKEN_V2)])):
+            http = _async_http(auth=auth, responses=[_notes([])])
+            asyncio.run(http.get(NOTES_V2, service="openreview", params={"paperhash": "x"}))
+        assert [u for u, _ in _async_sent(http)] == [NOTES_V2]
+        assert PASSWORD not in str(_async_sent(http))

@@ -102,7 +102,7 @@ The tool uses a multi-stage resolution pipeline to find published versions of pr
 2. **Crossref Relations**: Check Crossref's `is-preprint-of` relation links
 3. **DBLP Search**: Search DBLP by title and author
 3b. **ACL Anthology**: For NLP papers with ACL DOI prefix (`10.18653/v1/`) or aclanthology.org URLs
-3c. **OpenReview**: Accepted ICLR/NeurIPS/TMLR submissions (rejected/withdrawn/under-review skipped); resolves DOI-less conference papers to their venue + `openreview.net/forum` URL. Throttle-resilient fallback when DBLP is rate-limited.
+3c. **OpenReview**: Accepted ICLR/NeurIPS/TMLR submissions (rejected/withdrawn/under-review skipped); resolves DOI-less conference papers to their venue + `openreview.net/forum` URL. Throttle-resilient fallback when DBLP is rate-limited. The exact title + first-author lookup runs against both hosts (`api2.openreview.net` for 2023+ venues, then `api.openreview.net`), and it is challenge-gated for anonymous callers: set `OPENREVIEW_USERNAME` / `OPENREVIEW_PASSWORD` (or pass `--openreview-username`) to authenticate it, exactly as for `bibtex-check`. Without credentials the run logs the refusal once per host and falls back to the anonymous full-text search.
 4. **Semantic Scholar**: Query Semantic Scholar's paper database
 5. **Crossref Search**: Bibliographic search in Crossref by title/author
 6. **Google Scholar** (opt-in): Fallback search via scholarly package

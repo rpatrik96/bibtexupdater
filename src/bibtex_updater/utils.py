@@ -3754,6 +3754,16 @@ class AsyncHttpClient:
     - Per-service rate limiting via AsyncRateLimiterRegistry
     - Response caching via DiskCache
     - Automatic retry with exponential backoff for transient failures
+    - Optional OpenReview credentials, carried exactly as :class:`HttpClient`
+      carries them: every request tagged ``service="openreview"`` gets a
+      bearer token, a ``401`` refreshes it once, and a ``403`` spends no login.
+
+    The login behind that token is :meth:`OpenReviewAuth.token_for_url`, a
+    blocking ``POST`` on a bare ``httpx.Client`` that also takes the per-origin
+    login lock. It runs through :func:`asyncio.to_thread` here so a cold token
+    cache never stalls the event loop, and so the async resolver shares the one
+    token (in memory and in the cross-process store) with the sync checker
+    instead of buying logins of its own.
     """
 
     RETRYABLE_STATUS = {429, 500, 502, 503, 504}
@@ -3764,6 +3774,7 @@ class AsyncHttpClient:
         cache: DiskCache | SqliteCache | None = None,
         timeout: float = 20.0,
         user_agent: str = "bibtex-updater/1.0 (async)",
+        openreview_auth: OpenReviewAuth | None = None,
     ) -> None:
         """Initialize the async HTTP client.
 
@@ -3772,11 +3783,17 @@ class AsyncHttpClient:
             cache: Optional DiskCache or SqliteCache for caching responses
             timeout: Request timeout in seconds
             user_agent: User-Agent header value
+            openreview_auth: Optional OpenReview credentials -- the same object
+                :class:`HttpClient` takes, built with
+                :meth:`OpenReviewAuth.from_env`. When supplied, every request
+                tagged ``service="openreview"`` carries a bearer token; without
+                it those requests go out anonymous, as before.
         """
         self.rate_limiters = rate_limiters
         self.cache = cache
         self.timeout = timeout
         self.user_agent = user_agent
+        self.openreview_auth = openreview_auth
         self._client: httpx.AsyncClient | None = None
 
     @property
@@ -3805,6 +3822,25 @@ class AsyncHttpClient:
             headers={"Content-Type": "application/json", "X-From-Cache": "1"},
         )
 
+    async def _openreview_token(self, url: str) -> str | None:
+        """The bearer token to put on an OpenReview request, or ``None`` for anonymous.
+
+        :meth:`OpenReviewAuth.token_for_url` blocks: on a cold cache it takes
+        the per-origin login lock and POSTs to ``/login`` on a synchronous
+        ``httpx.Client``. Running it on a worker thread keeps the event loop
+        free for the other sources' requests. Reusing that method rather than
+        re-implementing the login asynchronously keeps the one-login-per-run
+        guarantee the sync path already has: the lock, the sibling-host token
+        sharing and the cross-process token store all live inside that call,
+        and the token it returns is cached there for the rest of the run.
+        """
+        if self.openreview_auth is None:
+            return None
+        import asyncio
+
+        token = await asyncio.to_thread(self.openreview_auth.token_for_url, url)
+        return token if isinstance(token, str) and token else None
+
     async def request(
         self,
         method: str,
@@ -3814,17 +3850,24 @@ class AsyncHttpClient:
         json_body: dict[str, Any] | list[Any] | None = None,
         headers: dict[str, str] | None = None,
         accept: str = "application/json",
+        rate_limit_service: str | None = None,
     ) -> httpx.Response:
         """Make async HTTP request with rate limiting and retry.
 
         Args:
             method: HTTP method (GET, POST, etc.)
             url: Request URL
-            service: Service name for rate limiting (e.g., 'crossref', 'dblp')
+            service: Service name for rate limiting (e.g., 'crossref', 'dblp').
+                ``"openreview"`` additionally attaches the bearer token when
+                ``openreview_auth`` is configured.
             params: Query parameters
             json_body: JSON body for POST requests
             headers: Additional headers
             accept: Accept header value
+            rate_limit_service: Pace the request under a different limiter than
+                ``service``. OpenReview declares 5/min on ``/notes/search``
+                against 180/min on ``/notes``; the two stay one service for
+                credentials and get separate limiters. Defaults to ``service``.
 
         Returns:
             httpx.Response object
@@ -3845,15 +3888,25 @@ class AsyncHttpClient:
             if cached is not None:
                 return self._mock_response(cached)
 
-        request_headers = {**(headers or {}), "Accept": accept}
+        base_headers = {**(headers or {}), "Accept": accept}
         if json_body is not None:
-            request_headers["Content-Type"] = "application/json"
+            base_headers["Content-Type"] = "application/json"
 
         backoff = 1.0
+        # One re-login is allowed per request, as in ``HttpClient._request``: an
+        # expired OpenReview token is refused exactly like an absent one, and
+        # the only way to tell them apart is to log in again and retry.
+        auth_refreshed = False
 
         for attempt in range(6):
-            await self.rate_limiters.wait(service)
+            await self.rate_limiters.wait(rate_limit_service or service)
             try:
+                request_headers = dict(base_headers)
+                openreview_token: str | None = None
+                if service == OPENREVIEW_SERVICE and self.openreview_auth is not None:
+                    openreview_token = await self._openreview_token(url)
+                    if openreview_token:
+                        request_headers["Authorization"] = f"Bearer {openreview_token}"
                 resp = await self.client.request(
                     method,
                     url,
@@ -3861,6 +3914,19 @@ class AsyncHttpClient:
                     json=json_body,
                     headers=request_headers,
                 )
+                # 401 only. A 403 means the request was never recognized as
+                # authenticated (``ChallengeRequiredError``), which no amount of
+                # logging in again changes, and logins are the scarce resource:
+                # four in two minutes and OpenReview starts refusing them.
+                if (
+                    openreview_token
+                    and not auth_refreshed
+                    and resp.status_code in OPENREVIEW_TOKEN_REFRESH_STATUS
+                    and self.openreview_auth is not None
+                ):
+                    auth_refreshed = True
+                    await asyncio.to_thread(self.openreview_auth.invalidate, url)
+                    continue
                 if resp.status_code in self.RETRYABLE_STATUS:
                     raise httpx.HTTPStatusError(
                         f"Status {resp.status_code}",
@@ -3894,6 +3960,7 @@ class AsyncHttpClient:
         service: str = "default",
         params: dict[str, Any] | None = None,
         accept: str = "application/json",
+        rate_limit_service: str | None = None,
     ) -> httpx.Response:
         """Convenience method for GET requests.
 
@@ -3902,11 +3969,14 @@ class AsyncHttpClient:
             service: Service name for rate limiting
             params: Query parameters
             accept: Accept header value
+            rate_limit_service: Optional separate limiter (see :meth:`request`)
 
         Returns:
             httpx.Response object
         """
-        return await self.request("GET", url, service=service, params=params, accept=accept)
+        return await self.request(
+            "GET", url, service=service, params=params, accept=accept, rate_limit_service=rate_limit_service
+        )
 
     async def post(
         self,
