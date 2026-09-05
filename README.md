@@ -264,7 +264,7 @@ export OPENREVIEW_USERNAME=you@example.org   # or pass --openreview-username
 export OPENREVIEW_PASSWORD=...               # read from the environment only
 ```
 
-Both halves are needed and both are optional: without them the run proceeds anonymously, and a login that fails degrades to anonymous rather than ending the run. The password is never accepted as a flag, never logged, and never written to the response cache.
+Both halves are needed and both are optional: without them the run proceeds anonymously, and a login that fails degrades to anonymous rather than ending the run. The password is never accepted as a flag, never logged, and never written to the response cache. The same two variables (and the same `--openreview-username` flag) authenticate `bibtex-update`'s OpenReview stage, which asks the same two hosts and shares the cached token with the checker.
 
 The bearer token is cached across processes, at `~/.cache/bibtex-updater/openreview-tokens.json` (mode 0600, under `$XDG_CACHE_HOME` when set) and keyed by a hash of the username, so neither the address nor the password lands on disk. One token authenticates both hosts and is valid for 24 hours, while `/login` starts refusing after four logins in about two minutes — which is what degraded a three-shard run to anonymous after OpenReview answered `429` to 60 of its ~45 logins. A `401` refreshes the token once; a `403` is a challenge, not a stale token, and spends no login. Set `BIBTEX_CHECK_OPENREVIEW_TOKEN_CACHE=0` for the previous login-per-process behaviour, or to a path to move the file.
 
