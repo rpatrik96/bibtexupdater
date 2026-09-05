@@ -444,6 +444,133 @@ class FieldComparison:
         return self.resolved_outcome in (MatchOutcome.NON_COMPARABLE, MatchOutcome.PARTIAL)
 
 
+#: Chimeric-title detection thresholds (P2.4). Each of the two sources' best
+#: title must share at least ``CHIMERIC_MIN_SHARED_TOKENS`` non-stopword tokens
+#: with the entry title, and each must contribute at least
+#: ``CHIMERIC_MIN_UNIQUE_TOKENS`` shared tokens the other source does not.
+#: Tested against real preprint/published title variants without false
+#: positives; the values are the rule, not a tuning knob.
+CHIMERIC_MIN_SHARED_TOKENS: int = 4
+CHIMERIC_MIN_UNIQUE_TOKENS: int = 3
+
+#: Confidence band for a chimeric-title HALLUCINATED verdict. A detection that
+#: clears the thresholds by exactly zero reports ``CHIMERIC_CONFIDENCE_FLOOR``;
+#: the confidence rises with the margin and saturates below
+#: ``CHIMERIC_CONFIDENCE_CEILING`` (see :func:`chimeric_confidence`).
+CHIMERIC_CONFIDENCE_FLOOR: float = 0.80
+CHIMERIC_CONFIDENCE_CEILING: float = 0.97
+#: Margin (in tokens over the thresholds) at which the confidence has covered
+#: half the distance from the floor to the ceiling.
+CHIMERIC_CONFIDENCE_HALF_MARGIN: int = 4
+
+
+def chimeric_confidence(min_shared: int, min_unique: int) -> float:
+    """Confidence that a chimeric-title detection is the right call.
+
+    Derived from the margin over the detection thresholds rather than fixed, so
+    a threshold-exact detection and an overwhelming one are distinguishable::
+
+        margin = (min_shared - CHIMERIC_MIN_SHARED_TOKENS)
+               + (min_unique - CHIMERIC_MIN_UNIQUE_TOKENS)
+        confidence = FLOOR + (CEILING - FLOOR) * margin / (margin + HALF_MARGIN)
+
+    where ``min_shared`` is the smaller of the two sources' shared-token counts
+    and ``min_unique`` the smaller of their unique-token counts (the weaker
+    half of the evidence bounds how much the pair proves). The mapping is
+    monotone in both margins, equals ``CHIMERIC_CONFIDENCE_FLOOR`` (0.80) at
+    4 shared / 3 unique, reaches the midpoint of the band at a margin of
+    ``CHIMERIC_CONFIDENCE_HALF_MARGIN`` tokens, and approaches but never
+    reaches ``CHIMERIC_CONFIDENCE_CEILING`` (0.97). For example 4/3 -> 0.80,
+    6/5 -> 0.885, 9/7 -> 0.918. A negative margin (never produced by the
+    detector) is clamped to the floor.
+
+    Args:
+        min_shared: ``min(len(shared_tokens_a), len(shared_tokens_b))``.
+        min_unique: ``min(len(unique_tokens_a), len(unique_tokens_b))``.
+
+    Returns:
+        Confidence in ``[CHIMERIC_CONFIDENCE_FLOOR, CHIMERIC_CONFIDENCE_CEILING)``.
+    """
+    margin = max(0, (min_shared - CHIMERIC_MIN_SHARED_TOKENS) + (min_unique - CHIMERIC_MIN_UNIQUE_TOKENS))
+    span = CHIMERIC_CONFIDENCE_CEILING - CHIMERIC_CONFIDENCE_FLOOR
+    return CHIMERIC_CONFIDENCE_FLOOR + span * margin / (margin + CHIMERIC_CONFIDENCE_HALF_MARGIN)
+
+
+@dataclass
+class ChimericEvidence:
+    """Audit record behind a chimeric-title HALLUCINATED verdict (P2.4).
+
+    Two independent sources each returned a real paper whose title shares at
+    least :data:`CHIMERIC_MIN_SHARED_TOKENS` non-stopword tokens with the entry
+    title, and each contributed at least :data:`CHIMERIC_MIN_UNIQUE_TOKENS` of
+    those tokens that the other did not -- the entry title is stitched from two
+    real papers. Source ``a`` is the higher-scoring of the two candidates
+    (ties keep cascade order), so ``record_a`` is the record that becomes the
+    result's ``best_match``. Token sets are stored sorted for stable output.
+    """
+
+    entry_title: str
+    source_a: str
+    source_b: str
+    title_a: str
+    title_b: str
+    record_a: PublishedRecord
+    record_b: PublishedRecord
+    score_a: float
+    score_b: float
+    shared_tokens_a: tuple[str, ...]
+    shared_tokens_b: tuple[str, ...]
+    unique_tokens_a: tuple[str, ...]
+    unique_tokens_b: tuple[str, ...]
+
+    @property
+    def min_shared(self) -> int:
+        """Smaller of the two shared-token counts (the weaker half of the pair)."""
+        return min(len(self.shared_tokens_a), len(self.shared_tokens_b))
+
+    @property
+    def min_unique(self) -> int:
+        """Smaller of the two unique-token counts."""
+        return min(len(self.unique_tokens_a), len(self.unique_tokens_b))
+
+    @property
+    def confidence(self) -> float:
+        """Margin-derived verdict confidence (see :func:`chimeric_confidence`)."""
+        return chimeric_confidence(self.min_shared, self.min_unique)
+
+    def summary(self) -> str:
+        """One-line, human-readable statement of the evidence."""
+        return (
+            f"Chimeric title detected: {len(self.shared_tokens_a)} tokens shared with {self.source_a} "
+            f"({self.title_a!r}) and {len(self.shared_tokens_b)} with {self.source_b} ({self.title_b!r}); "
+            f"{len(self.unique_tokens_a)} of those appear only in the {self.source_a} title "
+            f"({', '.join(self.unique_tokens_a)}) and {len(self.unique_tokens_b)} only in the "
+            f"{self.source_b} title ({', '.join(self.unique_tokens_b)})"
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        """JSON-serializable form for the JSON/JSONL reports (additive key)."""
+        return {
+            "entry_title": self.entry_title,
+            "source_a": self.source_a,
+            "source_b": self.source_b,
+            "title_a": self.title_a,
+            "title_b": self.title_b,
+            "doi_a": self.record_a.doi,
+            "doi_b": self.record_b.doi,
+            "score_a": self.score_a,
+            "score_b": self.score_b,
+            "shared_tokens_a": list(self.shared_tokens_a),
+            "shared_tokens_b": list(self.shared_tokens_b),
+            "unique_tokens_a": list(self.unique_tokens_a),
+            "unique_tokens_b": list(self.unique_tokens_b),
+            "min_shared": self.min_shared,
+            "min_unique": self.min_unique,
+            "thresholds": {"shared": CHIMERIC_MIN_SHARED_TOKENS, "unique": CHIMERIC_MIN_UNIQUE_TOKENS},
+            "confidence": self.confidence,
+        }
+
+
 @dataclass
 class FactCheckResult:
     """Complete result of fact-checking a single BibTeX entry."""
@@ -469,6 +596,11 @@ class FactCheckResult:
     # without racing on shared mutable state.
     author_intersection: AuthorIntersectionResult | None = None
     source_records: dict[str, PublishedRecord | None] = field(default_factory=dict)
+    # Audit record for a chimeric-title HALLUCINATED verdict: the two sources
+    # that disagreed, the titles they returned and the token sets that drove
+    # the decision. None on every other path. Additive; serialized under
+    # ``chimeric_evidence`` in the JSON/JSONL reports only when present.
+    chimeric_evidence: ChimericEvidence | None = None
     # Sources whose lookup for THIS entry did not complete: DNS/connection/TLS
     # failure, read timeout, an exhausted 429/5xx retry budget, an open circuit,
     # an error status, an unparseable body. A source listed here said nothing
@@ -2734,20 +2866,36 @@ class FactChecker:
             )
 
         # P2.4: Detect chimeric titles before sorting
-        if self._detect_chimeric_title(entry, candidates):
+        chimeric = self._detect_chimeric_title(entry, candidates)
+        if chimeric is not None:
+            # Carry the evidence on the result so the verdict can be audited:
+            # the higher-scoring record is the best match, both records ride
+            # under their source names, and the title comparison spells out
+            # which tokens each source contributed. The confidence is derived
+            # from the margin over the thresholds (see ``chimeric_confidence``).
+            title_comparison = FieldComparison(
+                field_name="title",
+                entry_value=title,
+                api_value=chimeric.record_a.title,
+                similarity_score=token_sort_ratio(title_norm, normalize_title_for_match(chimeric.title_a)) / 100.0,
+                matches=False,
+                note=chimeric.summary(),
+                outcome=MatchOutcome.MISMATCH,
+            )
             return FactCheckResult(
                 entry_key=entry_key,
                 entry_type=entry_type,
                 status=FactCheckStatus.HALLUCINATED,
-                overall_confidence=0.95,
-                field_comparisons={},
-                best_match=None,
+                overall_confidence=chimeric.confidence,
+                field_comparisons={"title": title_comparison},
+                best_match=chimeric.record_a,
                 api_sources_queried=sources_queried,
                 api_sources_with_hits=sources_with_hits,
-                errors=["Chimeric title detected: tokens borrowed from multiple different papers"],
+                errors=[*errors, chimeric.summary()],
                 sources_failed=sources_failed,
                 author_intersection=None,
-                source_records={},
+                source_records={chimeric.source_a: chimeric.record_a, chimeric.source_b: chimeric.record_b},
+                chimeric_evidence=chimeric,
             )
 
         # Sort candidates by score descending (used below for per-source author
@@ -4235,19 +4383,27 @@ class FactChecker:
 
     def _detect_chimeric_title(
         self, entry: dict[str, Any], candidates: list[tuple[float, PublishedRecord, str]]
-    ) -> bool:
+    ) -> ChimericEvidence | None:
         """Detect chimeric titles via multi-source cross-validation.
 
         P2.4: A chimeric title mixes tokens from multiple real papers. Detection:
-        - Group candidates by API source
-        - If different sources return different best-match titles, check if the
-          entry title borrows tokens from multiple real papers.
+        - Group candidates by API source, keeping each source's best-scoring record
+        - Drop stopwords, then intersect each source's title tokens with the entry's
+        - A pair of sources is chimeric evidence when each shares at least
+          :data:`CHIMERIC_MIN_SHARED_TOKENS` tokens with the entry and each
+          contributes at least :data:`CHIMERIC_MIN_UNIQUE_TOKENS` tokens the other
+          does not.
 
         Returns:
-            True if chimeric title detected, False otherwise
+            A :class:`ChimericEvidence` naming the two sources, their titles and
+            the token sets that drove the decision, or None when no pair
+            qualifies. When several pairs qualify the one with the largest
+            margin over the thresholds is returned (ties keep cascade order).
+            The return value is truthy exactly when a chimeric title was
+            detected, so ``if self._detect_chimeric_title(...)`` still works.
         """
         if len(candidates) < 2:
-            return False
+            return None
 
         entry_title = normalize_title_for_match(entry.get("title", ""))
         entry_tokens = set(entry_title.split())
@@ -4291,35 +4447,71 @@ class FactChecker:
         )
         entry_tokens = entry_tokens - _TITLE_STOPWORDS
 
-        # Get best match title per source
-        by_source: dict[str, tuple[float, str]] = {}
+        # Get best match (score, record, normalized title) per source
+        by_source: dict[str, tuple[float, PublishedRecord, str]] = {}
         for score, rec, source in candidates:
             if source not in by_source or score > by_source[source][0]:
-                by_source[source] = (score, normalize_title_for_match(rec.title or ""))
+                by_source[source] = (score, rec, normalize_title_for_match(rec.title or ""))
 
         if len(by_source) < 2:
-            return False
+            return None
 
         # Check if entry tokens are drawn from multiple different source titles
         source_overlaps: dict[str, set[str]] = {}
-        for source, (_score, title) in by_source.items():
+        for source, (_score, _rec, title) in by_source.items():
             api_tokens = set(title.split()) - _TITLE_STOPWORDS
             overlap = entry_tokens & api_tokens
-            if len(overlap) >= 4:  # Require >= 4 overlapping tokens (increased from 3)
+            if len(overlap) >= CHIMERIC_MIN_SHARED_TOKENS:
                 source_overlaps[source] = overlap
 
-        if len(source_overlaps) >= 2:
-            # Check if different sources contribute different tokens
-            all_overlaps = list(source_overlaps.values())
-            for i in range(len(all_overlaps)):
-                for j in range(i + 1, len(all_overlaps)):
-                    unique_i = all_overlaps[i] - all_overlaps[j]
-                    unique_j = all_overlaps[j] - all_overlaps[i]
-                    if len(unique_i) >= 3 and len(unique_j) >= 3:  # Require >= 3 unique tokens (increased from 2)
-                        # Different sources contribute distinct token sets - likely chimeric
-                        return True
+        if len(source_overlaps) < 2:
+            return None
 
-        return False
+        # Check if different sources contribute different tokens. Every
+        # qualifying pair is evidence; keep the one with the largest margin over
+        # the thresholds so the reported confidence reflects the strongest pair.
+        best: ChimericEvidence | None = None
+        best_margin = -1
+        sources = list(source_overlaps)
+        for i in range(len(sources)):
+            for j in range(i + 1, len(sources)):
+                src_i, src_j = sources[i], sources[j]
+                overlap_i, overlap_j = source_overlaps[src_i], source_overlaps[src_j]
+                unique_i = overlap_i - overlap_j
+                unique_j = overlap_j - overlap_i
+                if len(unique_i) < CHIMERIC_MIN_UNIQUE_TOKENS or len(unique_j) < CHIMERIC_MIN_UNIQUE_TOKENS:
+                    continue
+                # Different sources contribute distinct token sets - likely chimeric.
+                # Order the pair so ``a`` is the higher-scoring candidate (it
+                # becomes the result's best_match); ties keep cascade order.
+                if by_source[src_j][0] > by_source[src_i][0]:
+                    src_i, src_j = src_j, src_i
+                    overlap_i, overlap_j = overlap_j, overlap_i
+                    unique_i, unique_j = unique_j, unique_i
+                score_a, rec_a, _ = by_source[src_i]
+                score_b, rec_b, _ = by_source[src_j]
+                evidence = ChimericEvidence(
+                    entry_title=entry_title,
+                    source_a=src_i,
+                    source_b=src_j,
+                    title_a=rec_a.title or "",
+                    title_b=rec_b.title or "",
+                    record_a=rec_a,
+                    record_b=rec_b,
+                    score_a=score_a,
+                    score_b=score_b,
+                    shared_tokens_a=tuple(sorted(overlap_i)),
+                    shared_tokens_b=tuple(sorted(overlap_j)),
+                    unique_tokens_a=tuple(sorted(unique_i)),
+                    unique_tokens_b=tuple(sorted(unique_j)),
+                )
+                margin = (evidence.min_shared - CHIMERIC_MIN_SHARED_TOKENS) + (
+                    evidence.min_unique - CHIMERIC_MIN_UNIQUE_TOKENS
+                )
+                if margin > best_margin:
+                    best, best_margin = evidence, margin
+
+        return best
 
     @staticmethod
     def _entry_surname_keys(entry: dict[str, Any], record: PublishedRecord, limit: int = 10_000) -> list[str]:
@@ -6012,6 +6204,13 @@ class FactCheckProcessor:
                                 # so no exhaustive miss can be read off the status.
                                 "sources_failed": result.sources_failed,
                                 "errors": result.errors,
+                                # Additive, present only on a chimeric-title
+                                # verdict: the audit record behind it.
+                                **(
+                                    {"chimeric_evidence": result.chimeric_evidence.to_dict()}
+                                    if result.chimeric_evidence
+                                    else {}
+                                ),
                             },
                             ensure_ascii=False,
                         )
@@ -6175,6 +6374,10 @@ class FactCheckProcessor:
                     "journal": r.best_match.journal,
                     "year": r.best_match.year,
                 }
+            # Additive: the audit record behind a chimeric-title verdict (the two
+            # sources, their titles and the token sets that drove the decision).
+            if r.chimeric_evidence:
+                entry_data["chimeric_evidence"] = r.chimeric_evidence.to_dict()
             # Add URL check details for web references
             if r.url_check:
                 entry_data["url_check"] = {
@@ -6231,6 +6434,9 @@ class FactCheckProcessor:
                         # Sources whose lookup did not complete (see process_entries).
                         "sources_failed": r.sources_failed,
                         "errors": r.errors,
+                        # Additive, present only on a chimeric-title verdict
+                        # (see process_entries).
+                        **({"chimeric_evidence": r.chimeric_evidence.to_dict()} if r.chimeric_evidence else {}),
                     },
                     ensure_ascii=False,
                 )
