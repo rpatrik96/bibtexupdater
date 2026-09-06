@@ -321,6 +321,7 @@ class TestChallengeGatedNotesEndpoint:
         exc = exc_info.value
         assert exc.status_code == 403
         assert exc.transport_failure is False
+        assert "no credentials configured" in str(exc)
         assert "OPENREVIEW_USERNAME" in str(exc)
 
     def test_a_transient_failure_does_not_latch(self):
@@ -413,8 +414,10 @@ class _FakeLoginClient:
     def __init__(self, responses):
         self._responses = list(responses)
         self.calls: list[tuple[str, dict]] = []
+        self.client_kwargs: list[dict] = []
 
     def __call__(self, *args, **kwargs):
+        self.client_kwargs.append(dict(kwargs))
         return self
 
     def __enter__(self):
@@ -435,6 +438,13 @@ def _login_ok(token: str) -> MagicMock:
     resp = MagicMock()
     resp.status_code = 200
     resp.json.return_value = {"token": token, "user": {"id": "~Test_User1"}}
+    return resp
+
+
+def _login_redirect(location: str, status_code: int = 307) -> MagicMock:
+    resp = MagicMock()
+    resp.status_code = status_code
+    resp.headers = {"Location": location}
     return resp
 
 
@@ -521,6 +531,51 @@ class TestOpenReviewAuthLogin:
             auth.invalidate(NOTES_V1)
             assert auth.token_for_url(NOTES_V1) == "second-token"
         assert len(fake.calls) == 2
+
+    @pytest.mark.parametrize("failure", [429, 503, "transport"])
+    def test_a_transient_login_failure_retries_after_its_cooldown(self, monkeypatch, failure):
+        clock = {"now": 0.0}
+        monkeypatch.setattr("bibtex_updater.utils.time.monotonic", lambda: clock["now"])
+        first = httpx.ConnectError("no route to host") if failure == "transport" else _status(failure)
+        fake = _FakeLoginClient([first, _login_ok(TOKEN_V1)])
+        auth = OpenReviewAuth("a@b.c", PASSWORD)
+
+        with patch("bibtex_updater.utils.httpx.Client", fake):
+            assert auth.token_for_url(NOTES_V1) is None
+            assert auth.token_for_url(NOTES_V1) is None
+            clock["now"] = auth.LOGIN_RETRY_COOLDOWN + 1.0
+            assert auth.token_for_url(NOTES_V1) == TOKEN_V1
+
+        assert len(fake.calls) == 2
+
+    @pytest.mark.parametrize("status_code", [307, 308])
+    def test_login_redirects_are_followed_manually_only_between_shared_origins(self, status_code):
+        fake = _FakeLoginClient(
+            [
+                _login_redirect(f"{OPENREVIEW_API_V2}/login", status_code),
+                _login_ok(TOKEN_V2),
+            ]
+        )
+        auth = OpenReviewAuth("a@b.c", PASSWORD)
+
+        with patch("bibtex_updater.utils.httpx.Client", fake):
+            assert auth.token_for_url(NOTES_V1) == TOKEN_V2
+
+        assert fake.client_kwargs == [{"timeout": 15.0, "follow_redirects": False}]
+        assert fake.calls == [
+            (f"{OPENREVIEW_API}/login", {"id": "a@b.c", "password": PASSWORD}),
+            (f"{OPENREVIEW_API_V2}/login", {"id": "a@b.c", "password": PASSWORD}),
+        ]
+
+    def test_login_redirects_never_replay_credentials_to_an_unshared_origin(self):
+        fake = _FakeLoginClient([_login_redirect("https://example.org/collect")])
+        auth = OpenReviewAuth("a@b.c", PASSWORD)
+
+        with patch("bibtex_updater.utils.httpx.Client", fake):
+            assert auth.token_for_url(NOTES_V1) is None
+
+        assert fake.client_kwargs == [{"timeout": 15.0, "follow_redirects": False}]
+        assert fake.calls == [(f"{OPENREVIEW_API}/login", {"id": "a@b.c", "password": PASSWORD})]
 
 
 class TestCredentialsNeverReachTheLog:
@@ -623,6 +678,7 @@ class TestHttpClientCarriesTheToken:
         The retry happens once per request rather than on every attempt.
         """
         auth = OpenReviewAuth("a@b.c", PASSWORD)
+        auth.invalidate = MagicMock(wraps=auth.invalidate)  # type: ignore[method-assign]
         fake = _FakeLoginClient([_login_ok(TOKEN_V1), _login_ok("fresh-token")])
         with patch("bibtex_updater.utils.httpx.Client", fake):
             http = _http(
@@ -635,6 +691,7 @@ class TestHttpClientCarriesTheToken:
         headers = _sent_headers(http)
         assert headers[0]["Authorization"] == f"Bearer {TOKEN_V1}"
         assert headers[1]["Authorization"] == "Bearer fresh-token"
+        auth.invalidate.assert_called_once_with(NOTES_V1, TOKEN_V1)
 
     def test_a_403_does_not_spend_a_login(self):
         """``403 ChallengeRequiredError`` says the request was never recognized.
@@ -770,6 +827,30 @@ class TestTokenReuseAcrossProcesses:
         auth.invalidate(NOTES_V1)
         assert store.get("a@b.c", OPENREVIEW_API) is None
 
+    def test_a_stale_refusal_does_not_discard_a_newer_token(self, tmp_path):
+        store = OpenReviewTokenStore(tmp_path / "openreview-tokens.json")
+        auth = OpenReviewAuth("a@b.c", PASSWORD, token_store=store)
+        fake = _FakeLoginClient([_login_ok(TOKEN_V1), _login_ok(TOKEN_V2)])
+
+        with patch("bibtex_updater.utils.httpx.Client", fake):
+            stale_token = auth.token_for_url(NOTES_V1)
+            auth.invalidate(NOTES_V1, stale_token)
+            assert auth.token_for_url(NOTES_V1) == TOKEN_V2
+            auth.invalidate(NOTES_V1, stale_token)
+            assert auth.token_for_url(NOTES_V1) == TOKEN_V2
+
+        assert len(fake.calls) == 2
+        assert store.get("a@b.c", OPENREVIEW_API) == TOKEN_V2
+
+    def test_invalidate_compares_the_store_entry_to_the_refused_token(self, tmp_path):
+        store = OpenReviewTokenStore(tmp_path / "openreview-tokens.json")
+        store.put("a@b.c", OPENREVIEW_API, TOKEN_V2)
+        auth = OpenReviewAuth("a@b.c", PASSWORD, token_store=store)
+
+        auth.invalidate(NOTES_V1, TOKEN_V1)
+
+        assert store.get("a@b.c", OPENREVIEW_API) == TOKEN_V2
+
     def test_persistence_can_be_turned_off(self, tmp_path):
         env = {
             "OPENREVIEW_USERNAME": "a@b.c",
@@ -893,6 +974,70 @@ class TestAnAuthenticatedRefusalIsNotLatched:
             out = OpenReviewClient(http=http).search("q", title="Adam: A Method", first_author="kingma")
         assert out == [_note()]
         assert _urls_sent(http) == [NOTES_V2, NOTES_V1]
+
+    def test_a_permanent_login_failure_is_reported_as_configured_credentials(self):
+        auth = OpenReviewAuth("a@b.c", PASSWORD)
+        fake = _FakeLoginClient([_status(400), _status(400)])
+        with patch("bibtex_updater.utils.httpx.Client", fake):
+            http = _http(auth=auth, response=_status(403))
+            client = OpenReviewClient(http=http)
+            with pytest.raises(SourceUnavailableError):
+                client.search("q", title="Adam: A Method", first_author="kingma")
+            with pytest.raises(SourceUnavailableError) as exc_info:
+                client.search("q", title="Another Paper", first_author="hopper")
+
+        message = str(exc_info.value)
+        assert "credentials configured; login failed (HTTP 400)" in message
+        assert "set OPENREVIEW_USERNAME" not in message
+
+    def test_a_transient_login_failure_latches_only_until_its_cooldown_lifts(self, monkeypatch):
+        clock = {"now": 0.0}
+        monkeypatch.setattr("bibtex_updater.utils.time.monotonic", lambda: clock["now"])
+        auth = OpenReviewAuth("a@b.c", PASSWORD)
+        fake = _FakeLoginClient([_status(429), _login_ok(TOKEN_V2)])
+
+        with patch("bibtex_updater.utils.httpx.Client", fake):
+            http = _http(auth=auth, side_effect=[_status(403), _notes([_note()])])
+            client = OpenReviewClient(http=http)
+            client.NOTES_HOSTS = (OPENREVIEW_API_V2,)
+            with pytest.raises(SourceUnavailableError):
+                client.search("q", title="Adam: A Method", first_author="kingma")
+            clock["now"] = auth.LOGIN_RETRY_COOLDOWN + 1.0
+            assert client.search("q", title="Adam: A Method", first_author="kingma") == [_note()]
+
+        assert _urls_sent(http) == [NOTES_V2, NOTES_V2]
+
+    def test_entries_inside_the_login_cooldown_cost_one_refused_request(self, monkeypatch):
+        """The window between the throttled login and its retry is not free.
+
+        Every request issued while the login is cooling down goes out anonymous
+        and comes back refused, so asking once per entry buys a round trip and a
+        limiter slot for an answer that cannot change until the login is retried.
+        At 5,043 references and two hosts that is roughly 10,000 refused round
+        trips. The latch expires with the cooldown, so the retry still happens.
+        """
+        clock = {"now": 0.0}
+        monkeypatch.setattr("bibtex_updater.utils.time.monotonic", lambda: clock["now"])
+        auth = OpenReviewAuth("a@b.c", PASSWORD)
+        fake = _FakeLoginClient([_status(429), _login_ok(TOKEN_V2)])
+
+        with patch("bibtex_updater.utils.httpx.Client", fake):
+            http = _http(auth=auth, side_effect=[_status(403), _notes([_note()])])
+            client = OpenReviewClient(http=http)
+            client.NOTES_HOSTS = (OPENREVIEW_API_V2,)
+
+            for _ in range(5):
+                with pytest.raises(SourceUnavailableError) as exc_info:
+                    client.search("q", title="Adam: A Method", first_author="kingma")
+            # One request for five entries, and the skipped entries say why.
+            assert _urls_sent(http) == [NOTES_V2]
+            assert "login throttled (HTTP 429)" in str(exc_info.value)
+
+            clock["now"] = auth.LOGIN_RETRY_COOLDOWN + 1.0
+            assert client.search("q", title="Adam: A Method", first_author="kingma") == [_note()]
+
+        assert _urls_sent(http) == [NOTES_V2, NOTES_V2]
+        assert _sent(http)[1][1]["Authorization"] == f"Bearer {TOKEN_V2}"
 
 
 class TestOneLoginServesBothHosts:
@@ -1271,6 +1416,7 @@ class TestAsyncHttpClientCarriesTheToken:
 
     def test_a_401_refreshes_the_token_exactly_once(self):
         auth = OpenReviewAuth("a@b.c", PASSWORD)
+        auth.invalidate = MagicMock(wraps=auth.invalidate)  # type: ignore[method-assign]
         fake = _FakeLoginClient([_login_ok(TOKEN_V2), _login_ok("fresh-token")])
         with patch("bibtex_updater.utils.httpx.Client", fake):
             http = _async_http(auth=auth, responses=[_status(401, "TokenExpiredError"), _notes([_note()])])
@@ -1280,6 +1426,7 @@ class TestAsyncHttpClientCarriesTheToken:
         headers = [h for _, h in _async_sent(http)]
         assert headers[0]["Authorization"] == f"Bearer {TOKEN_V2}"
         assert headers[1]["Authorization"] == "Bearer fresh-token"
+        auth.invalidate.assert_called_once_with(NOTES_V2, TOKEN_V2)
 
     def test_a_persistent_401_is_reported_not_retried_forever(self):
         auth = OpenReviewAuth("a@b.c", PASSWORD)

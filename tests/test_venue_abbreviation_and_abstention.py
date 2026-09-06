@@ -38,6 +38,12 @@ class TestIso4Expansion:
         [
             ("ACM Trans. Graph.", "ACM Transactions on Graphics"),
             ("Proc. Natl. Acad. Sci. U.S.A.", "Proceedings of the National Academy of Sciences"),
+            # The same journal with its country suffix written out. The strict
+            # equal-length alignment must not reject it.
+            (
+                "Proc. Natl. Acad. Sci. U.S.A.",
+                "Proceedings of the National Academy of Sciences of the United States of America",
+            ),
             ("Annu. Rev. Stat. Appl.", "Annual Review of Statistics and Its Application"),
             (
                 "IEEE Trans. Pattern Anal. Mach. Intell.",
@@ -46,6 +52,12 @@ class TestIso4Expansion:
             ("J. Mach. Learn. Res.", "Journal of Machine Learning Research"),
             ("Int. J. Comput. Vis.", "International Journal of Computer Vision"),
             ("Nat. Mach. Intell.", "Nature Machine Intelligence"),
+            ("Nat. Commun.", "Nature Communications"),
+            ("Ann. Stat.", "The Annals of Statistics"),
+            ("J. Am. Stat. Assoc.", "Journal of the American Statistical Association"),
+            ("Nat. Rev. Neurosci.", "Nature Reviews Neuroscience"),
+            ("Eur. J. Oper. Res.", "European Journal of Operational Research"),
+            ("Phys. Rev. Lett.", "Physical Review Letters"),
         ],
     )
     def test_abbreviated_journal_matches_its_full_name(self, abbreviated, full):
@@ -102,6 +114,52 @@ class TestDifferentVenuesStillMismatch:
         """Expansion must not collapse distinct journals into a match."""
         result = venues_match("J. Mach. Learn. Res.", "J. Artif. Intell. Res.")
         assert result.outcome is not MatchOutcome.MATCH
+
+    @pytest.mark.parametrize(
+        ("venue_a", "venue_b"),
+        [
+            ("Phys. Rev. E", "Physical Review Letters"),
+            ("Ann. Stat.", "Annual Review of Statistics"),
+            ("IEEE Trans. Inf. Theory", "IEEE Transactions on Information Forensics and Security"),
+            ("Nat. Neurosci.", "Nature Reviews Neuroscience"),
+            ("Am. J. Psychol.", "American Journal of Psychiatry"),
+            ("Phys. Rev. A", "Physical Review B"),
+        ],
+    )
+    def test_abbreviation_expansion_does_not_merge_different_journals(self, venue_a, venue_b):
+        assert venues_match(venue_a, venue_b).outcome is not MatchOutcome.MATCH
+
+    @pytest.mark.parametrize(
+        ("short_name", "family_member"),
+        [
+            ("Nature", "Nature Methods"),
+            ("Science", "Science Advances"),
+            ("Cell", "Cell Reports"),
+            ("Lancet", "Lancet Oncology"),
+            ("BMJ", "BMJ Open"),
+            ("JAMA", "JAMA Oncology"),
+            ("Acta Crystallogr. A", "Acta Crystallographica Section B"),
+        ],
+    )
+    def test_a_journal_does_not_match_a_longer_journal_in_its_family(self, short_name, family_member):
+        """A journal name is a prefix of its own family's other titles.
+
+        Aligning only as far as the shorter title runs leaves the longer one's
+        tail unexamined, so every pair here reports a match and ``wrong_venue``
+        stops being detectable across the family. The comparison now requires
+        both titles to carry the same number of content tokens.
+        """
+        assert venue_abbreviation_matches(short_name, family_member) is False
+        assert venues_match(short_name, family_member).outcome is not MatchOutcome.MATCH
+
+    def test_a_satellite_event_is_not_its_host_journal_under_expansion(self):
+        """``venues_match`` clears this pair through its fuzzy subsumption branch.
+
+        That branch is unchanged and out of scope here, so the assertion is
+        against the abbreviation comparison itself, which is what the tail
+        walk affected.
+        """
+        assert venue_abbreviation_matches("ACM Trans. Graph.", "ACM Trans. Graph. Workshop") is False
 
 
 class TestAbstainOnUnrecognisedNames:
