@@ -30,6 +30,9 @@ from bibtex_updater.fact_checker import (
     EXIT_SOURCE_OUTAGE,
     NETWORK_OUTAGE_ENTRY_FRACTION,
     ArxivClient,
+    BookRecord,
+    BookVerifier,
+    BookVerifierConfig,
     ClassificationResult,
     CrossrefClient,
     DBLPClient,
@@ -42,8 +45,12 @@ from bibtex_updater.fact_checker import (
     SemanticScholarClient,
     WebVerifier,
     WebVerifierConfig,
+    WorkingPaperConfig,
+    WorkingPaperVerifier,
+    _cli_service_rate_limits,
     _report_source_outage,
     build_parser,
+    recover_dropped_entry,
 )
 from bibtex_updater.fact_checker import main as fact_checker_main
 from bibtex_updater.sources import OpenAlexClient, OpenReviewClient
@@ -276,6 +283,328 @@ class TestNotFoundRequiresCompleteCoverage:
         assert record["status"] == "api_error"
         assert record["coverage_incomplete"] is True
         assert record["sources_failed"] == result.sources_failed
+
+
+class TestSpecializedVerifierOutageAccounting:
+    def test_working_paper_failure_names_crossref(self):
+        crossref = MagicMock()
+        crossref.search.side_effect = OSError("offline")
+        verifier = WorkingPaperVerifier(crossref, WorkingPaperConfig(), FactCheckerConfig(), LOGGER)
+        entry = {"ID": "working", "ENTRYTYPE": "techreport", "title": "A Working Paper"}
+        classification = ClassificationResult(category=EntryCategory.WORKING_PAPER, reason="type")
+
+        result = verifier.verify(entry, classification)
+
+        assert result.status is FactCheckStatus.API_ERROR
+        assert result.sources_failed == ["crossref"]
+
+    def test_book_failures_are_not_reported_as_an_exhaustive_miss(self):
+        response = MagicMock(status_code=503)
+        http = MagicMock()
+        http._request.return_value = response
+        verifier = BookVerifier(http, BookVerifierConfig(use_google_books=True), LOGGER)
+        entry = {"ID": "book", "ENTRYTYPE": "book", "title": "A Book"}
+        classification = ClassificationResult(category=EntryCategory.BOOK, reason="type")
+
+        result = verifier.verify(entry, classification)
+
+        assert result.status is FactCheckStatus.API_ERROR
+        assert set(result.sources_failed) == {"openlibrary", "google_books"}
+
+    def test_book_match_preserves_a_failed_source(self, monkeypatch):
+        verifier = BookVerifier(MagicMock(), BookVerifierConfig(use_google_books=True), LOGGER)
+        monkeypatch.setattr(verifier, "_search_open_library", MagicMock(side_effect=OSError("offline")))
+        monkeypatch.setattr(
+            verifier,
+            "_search_google_books",
+            MagicMock(
+                return_value=[
+                    BookRecord(
+                        title="A Book",
+                        authors=["Jane Smith"],
+                        year=2024,
+                        source="google_books",
+                    )
+                ]
+            ),
+        )
+        entry = {
+            "ID": "book",
+            "ENTRYTYPE": "book",
+            "title": "A Book",
+            "author": "Smith, Jane",
+            "year": "2024",
+        }
+
+        result = verifier.verify(
+            entry,
+            ClassificationResult(category=EntryCategory.BOOK, reason="type"),
+        )
+
+        assert result.status is FactCheckStatus.BOOK_VERIFIED
+        assert result.sources_failed == ["openlibrary"]
+        assert result.coverage_incomplete is False
+
+    def test_low_book_match_with_a_failed_source_is_api_error(self, monkeypatch):
+        verifier = BookVerifier(MagicMock(), BookVerifierConfig(use_google_books=True), LOGGER)
+        monkeypatch.setattr(verifier, "_search_open_library", MagicMock(side_effect=OSError("offline")))
+        monkeypatch.setattr(
+            verifier,
+            "_search_google_books",
+            MagicMock(
+                return_value=[
+                    BookRecord(
+                        title="An Unrelated Book",
+                        authors=["Alice Other"],
+                        year=1990,
+                        source="google_books",
+                    )
+                ]
+            ),
+        )
+        entry = {
+            "ID": "book",
+            "ENTRYTYPE": "book",
+            "title": "A Book",
+            "author": "Smith, Jane",
+            "year": "2024",
+        }
+
+        result = verifier.verify(
+            entry,
+            ClassificationResult(category=EntryCategory.BOOK, reason="type"),
+        )
+
+        assert result.status is FactCheckStatus.API_ERROR
+        assert result.sources_failed == ["openlibrary"]
+        assert result.coverage_incomplete is True
+
+    def test_processor_exception_fallback_marks_an_unknown_source_failure(self, monkeypatch):
+        checker = MagicMock()
+        checker.check_entry.side_effect = OSError("offline")
+        processor = FactCheckProcessor(checker, LOGGER)
+        monkeypatch.setattr(processor, "_batch_validate_dois", lambda entries: {})
+        monkeypatch.setattr(processor, "_batch_warm_crossref_records", lambda entries: 0)
+        monkeypatch.setattr(processor, "_batch_prefetch_s2_records", lambda entries: 0)
+
+        (result,) = processor.process_entries([_entry()], max_workers=1)
+
+        assert result.status is FactCheckStatus.API_ERROR
+        assert result.sources_failed == ["unknown"]
+
+
+WRONG_ARXIV_ATOM = """<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <entry>
+    <id>http://arxiv.org/abs/2412.06745v1</id>
+    <published>2024-12-09T18:00:00Z</published>
+    <title>An Unrelated Autonomous Driving Paper</title>
+    <author><name>Alice Other</name></author>
+  </entry>
+</feed>
+"""
+
+
+def _checker_with_arxiv(arxiv) -> FactChecker:
+    crossref = MagicMock()
+    crossref.search.return_value = []
+    crossref.http = None
+    dblp = MagicMock()
+    dblp.search.return_value = []
+    s2 = MagicMock()
+    s2.search.return_value = []
+    return FactChecker(
+        crossref,
+        dblp,
+        s2,
+        FactCheckerConfig(
+            check_dois=False,
+            check_doi_consistency=False,
+            arxiv_fast_path=False,
+        ),
+        LOGGER,
+        arxiv=arxiv,
+    )
+
+
+def _wrong_arxiv_entry() -> dict[str, str]:
+    return {
+        "ID": "wrong-arxiv",
+        "ENTRYTYPE": "article",
+        "title": "The Correct Paper Title",
+        "author": "Smith, Jane",
+        "year": "2024",
+        "eprint": "2412.06745",
+        "archiveprefix": "arXiv",
+    }
+
+
+class _ArxivHistoryHttp:
+    def __init__(self, *, invalid_html: bool = False):
+        self.invalid_html = invalid_html
+
+    def _request(self, method, url, **kwargs):
+        if "export.arxiv.org" in url:
+            return MagicMock(status_code=200, text=WRONG_ARXIV_ATOM)
+        if self.invalid_html:
+            return MagicMock(status_code=200, text="<html><body>changed markup</body></html>")
+        raise OSError("arXiv history unavailable")
+
+
+class TestArxivVersionHistoryNeedsAnAnswer:
+    def test_failed_history_walk_suppresses_id_mismatch_and_marks_arxiv_failed(self):
+        result = _checker_with_arxiv(ArxivClient(_ArxivHistoryHttp())).check_entry(_wrong_arxiv_entry())
+
+        assert result.status is not FactCheckStatus.ARXIV_ID_MISMATCH
+        assert result.sources_failed == ["arxiv"]
+
+    def test_unparseable_200_is_warned_and_treated_as_failed(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            result = _checker_with_arxiv(ArxivClient(_ArxivHistoryHttp(invalid_html=True))).check_entry(
+                _wrong_arxiv_entry()
+            )
+
+        assert result.status is not FactCheckStatus.ARXIV_ID_MISMATCH
+        assert result.sources_failed == ["arxiv"]
+        assert "citation_title" in caplog.text
+
+    def test_history_failure_survives_a_doi_consistency_return(self):
+        checker = _checker_with_arxiv(ArxivClient(_ArxivHistoryHttp()))
+        checker.config.check_doi_consistency = True
+        checker._check_doi_consistency = MagicMock(return_value=_result(FactCheckStatus.DOI_MISMATCH))
+        entry = {**_wrong_arxiv_entry(), "doi": "10.1234/wrong"}
+
+        result = checker.check_entry(entry)
+
+        assert result.status is FactCheckStatus.DOI_MISMATCH
+        assert result.sources_failed == ["arxiv"]
+
+    def test_history_failure_survives_a_doi_fast_path_return(self):
+        checker = _checker_with_arxiv(ArxivClient(_ArxivHistoryHttp()))
+        checker.config.check_doi_consistency = True
+        checker._check_doi_consistency = MagicMock(return_value=None)
+        checker._doi_fast_path_result = MagicMock(return_value=_result(FactCheckStatus.VERIFIED))
+        entry = {**_wrong_arxiv_entry(), "doi": "10.1234/correct"}
+
+        result = checker.check_entry(entry)
+
+        assert result.status is FactCheckStatus.VERIFIED
+        assert result.sources_failed == ["arxiv"]
+
+
+class TestDroppedEntryRepairContract:
+    def test_field_check_rejects_folded_fields_but_accepts_nested_assignment_text(self):
+        folded = """@article{smith2020,
+  title = {Attention Is All {You Need},
+  author = {Smith, Jane},
+  journal = {Journal of Widget Research},
+  year = {2020}
+}
+"""
+        same_line_folded = """@article{same-line,
+  title = {Bad, author = {Jane Smith}, year = {2020}
+}
+"""
+        comment_folded = """@article{comment-folded,
+  title = {Bad, % field comment
+  author = {Jane Smith}
+}
+"""
+        missing_separator_folded = """@article{missing-separator,
+  title = {Bad
+  author = {Jane Smith}
+}
+"""
+        nested_assignment = """@article{nested,
+  title = {A literal {name = value} fragment},
+  year = {2024}
+"""
+        braced_assignment = """@article{braced,
+  title = {A literal, name = value fragment},
+  year = {2024}
+"""
+        quoted_assignment = """@article{quoted,
+  title = "A literal, name = value fragment",
+  year = {2024}
+"""
+
+        assert recover_dropped_entry(folded, "smith2020") is None
+        assert recover_dropped_entry(same_line_folded, "same-line") is None
+        assert recover_dropped_entry(comment_folded, "comment-folded") is None
+        assert recover_dropped_entry(missing_separator_folded, "missing-separator") is None
+        nested_recovered = recover_dropped_entry(nested_assignment, "nested")
+        assert nested_recovered is not None
+        assert nested_recovered.entry["title"] == "A literal {name = value} fragment"
+        assert nested_recovered.entry["year"] == "2024"
+        braced_recovered = recover_dropped_entry(braced_assignment, "braced")
+        assert braced_recovered is not None
+        assert braced_recovered.entry["title"] == "A literal, name = value fragment"
+        assert braced_recovered.entry["year"] == "2024"
+        quoted_recovered = recover_dropped_entry(quoted_assignment, "quoted")
+        assert quoted_recovered is not None
+        assert quoted_recovered.entry["title"] == "A literal, name = value fragment"
+        assert quoted_recovered.entry["year"] == "2024"
+
+    def test_repair_metadata_reaches_json_and_streamed_jsonl(self, tmp_path, monkeypatch):
+        bib = tmp_path / "repaired.bib"
+        report_path = tmp_path / "report.json"
+        jsonl_path = tmp_path / "report.jsonl"
+        bib.write_text("@article{repaired, title = {Recovered}\n", encoding="utf-8")
+
+        checker = MagicMock()
+
+        def check_entry(entry):
+            return FactCheckResult(
+                entry_key=entry["ID"],
+                entry_type=entry["ENTRYTYPE"],
+                status=FactCheckStatus.SKIPPED,
+                overall_confidence=0.0,
+                field_comparisons={},
+                best_match=None,
+                api_sources_queried=[],
+                api_sources_with_hits=[],
+                errors=[],
+            )
+
+        checker.check_entry.side_effect = check_entry
+        processor = FactCheckProcessor(checker, LOGGER)
+        monkeypatch.setattr(processor, "_batch_validate_dois", lambda entries: {})
+        monkeypatch.setattr(processor, "_batch_warm_crossref_records", lambda entries: 0)
+        monkeypatch.setattr(processor, "_batch_prefetch_s2_records", lambda entries: 0)
+        monkeypatch.setattr(
+            "bibtex_updater.fact_checker.build_checker_processor",
+            lambda *args, **kwargs: (processor, MagicMock(unreachable_hosts={})),
+        )
+        monkeypatch.setattr(
+            "bibtex_updater.fact_checker.sys.argv",
+            [
+                "bibtex-check",
+                str(bib),
+                "--report",
+                str(report_path),
+                "--jsonl",
+                str(jsonl_path),
+            ],
+        )
+
+        assert fact_checker_main() == 0
+        report_entry = json.loads(report_path.read_text(encoding="utf-8"))["entries"][0]
+        jsonl_entry = json.loads(jsonl_path.read_text(encoding="utf-8"))
+
+        expected = ["appended 1 missing closing brace(s)"]
+        assert report_entry["repairs"] == expected
+        assert jsonl_entry["repairs"] == expected
+
+
+@pytest.mark.parametrize("value", ["fast", "", "1.5"])
+def test_invalid_arxiv_rate_falls_back_to_default(value, monkeypatch, caplog):
+    monkeypatch.setenv("BIBTEX_ARXIV_RATE", value)
+
+    with caplog.at_level(logging.WARNING):
+        limits = _cli_service_rate_limits(45, None)
+
+    assert limits["arxiv"] == 20
+    assert repr(value) in caplog.text
 
 
 # ===========================================================================
@@ -522,7 +851,7 @@ class TestOutageThresholdFlag:
 UNREACHABLE_TITLE_TOKEN = "Unreachable"
 
 
-def _bib(tmp_path, n_entries: int, failing: set[int]) -> str:
+def _bib(tmp_path, n_entries: int, failing: set[int], future: set[int] | None = None) -> str:
     """A bibliography whose entries at ``failing`` indices carry a title token
     the faked transport refuses to answer for.
 
@@ -532,14 +861,16 @@ def _bib(tmp_path, n_entries: int, failing: set[int]) -> str:
     tests are measuring.
     """
     blocks = []
+    future = future or set()
     for i in range(n_entries):
         marker = f"{UNREACHABLE_TITLE_TOKEN} " if i in failing else ""
+        year = 2099 if i in future else 2023
         blocks.append(
             f"@article{{entry{i},\n"
             f"  title = {{{marker}Sparse Coding Study Number {i}}},\n"
             f"  author = {{Smith, Jane and Doe, John}},\n"
             f"  journal = {{Journal of Widget Research}},\n"
-            f"  year = {{2023}}\n"
+            f"  year = {{{year}}}\n"
             f"}}\n"
         )
     path = tmp_path / "refs.bib"
@@ -604,3 +935,9 @@ class TestOutageThresholdThroughTheCLI:
         bib = _bib(tmp_path, n_entries=4, failing={0, 1, 2, 3})
 
         assert _run_cli(bib) == EXIT_SOURCE_OUTAGE
+
+    def test_outage_exit_wins_over_strict_problem_exit(self, tmp_path, monkeypatch):
+        _install_selective_transport(monkeypatch)
+        bib = _bib(tmp_path, n_entries=4, failing={0, 1, 2, 3}, future={0})
+
+        assert _run_cli(bib, "--strict") == EXIT_SOURCE_OUTAGE

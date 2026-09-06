@@ -19,9 +19,9 @@ each running its own limiter against healthy sources. Health-aware ordering
 stands on its own.
 
 Two invariants carry the risk, and both are pinned below. Ordering must be
-identical to the legacy cascade while every source is healthy, and reordering
-must never change the SET of sources consulted, because ``not_found`` is the
-exhaustive claim that every source answered (the v1.8.0 contract).
+identical to the legacy cascade while every source is healthy. When reordering
+lets a healthy source fully confirm the entry first, the existing short-circuit
+may skip a demoted source; that source is neither queried nor reported failed.
 
 All network access is faked; no test here touches a live host.
 """
@@ -42,6 +42,7 @@ from bibtex_updater.fact_checker import (
     FactChecker,
     FactCheckerConfig,
     FactCheckStatus,
+    PublishedRecord,
     SemanticScholarClient,
 )
 from bibtex_updater.sources import OpenAlexClient, OpenReviewClient
@@ -107,6 +108,31 @@ class _EmptyTransport:
 
     def __call__(self, *args, **kwargs) -> MagicMock:
         return _ok(dict(self.EMPTY))
+
+
+class _ConfirmingOpenAlexTransport(_EmptyTransport):
+    """OpenAlex fully confirms the entry before a demoted source gets a turn."""
+
+    def __call__(self, method, url, **kwargs) -> MagicMock:
+        if "api.openalex.org" in url:
+            return _ok(
+                {
+                    "results": [
+                        {
+                            "doi": "https://doi.org/10.1234/widget",
+                            "title": _entry()["title"],
+                            "authorships": [
+                                {"author": {"display_name": "Jane Smith"}},
+                                {"author": {"display_name": "John Doe"}},
+                            ],
+                            "primary_location": {"source": {"display_name": _entry()["journal"]}},
+                            "publication_year": 2023,
+                            "type": "article",
+                        }
+                    ]
+                }
+            )
+        return super().__call__(method, url, **kwargs)
 
 
 def _http(side_effect=None, s2_api_key: str | None = None) -> HttpClient:
@@ -313,15 +339,14 @@ class TestCascadeOrder:
         result = _checker(_http()).check_entry(_entry())
         assert result.api_sources_queried == DECLARED_ORDER
 
-    def test_an_open_circuit_moves_a_source_last_and_still_consults_it(self):
-        http = _http()
-        _open_circuit(http, "dblp")
+    def test_full_confirmation_skips_a_demoted_source_without_recording_failure(self):
+        http = _http(side_effect=_ConfirmingOpenAlexTransport())
+        _open_circuit(http, "crossref")
+
         result = _checker(http).check_entry(_entry())
 
-        assert result.api_sources_queried.index("dblp") > result.api_sources_queried.index("openreview")
-        assert result.api_sources_queried.index("dblp") > result.api_sources_queried.index("semanticscholar")
-        assert "dblp" in result.api_sources_queried  # demoted, never dropped
-        assert set(result.api_sources_queried) == set(DECLARED_ORDER)
+        assert result.api_sources_queried == ["openalex"]
+        assert result.sources_failed == []
 
     def test_the_semantic_scholar_match_step_moves_with_its_search_step(self):
         """With an API key the cascade gains a second Semantic Scholar step. Both
@@ -338,7 +363,7 @@ class TestCascadeOrder:
 
 class TestReorderingPreservesTheVerdict:
     """``not_found`` means every source answered (the v1.8.0 contract). Ordering
-    may change which source answers first; it may never change who was asked."""
+    may change which source answers first and which later sources are skipped."""
 
     def _dblp_is_down(self):
         empty = _EmptyTransport()
@@ -377,3 +402,26 @@ class TestReorderingPreservesTheVerdict:
         assert result.sources_failed == []
         assert result.coverage_incomplete is False
         assert set(result.api_sources_queried) == set(DECLARED_ORDER)
+
+
+class TestChimericEvidenceNeedsIndependentServices:
+    ENTRY = {"title": "alpha beta gamma delta epsilon zeta eta theta"}
+    FIRST = PublishedRecord(doi=None, title="alpha beta gamma delta")
+    SECOND = PublishedRecord(doi=None, title="epsilon zeta eta theta")
+
+    def test_query_variants_share_a_bucket_but_independent_services_do_not(self):
+        same_service = [
+            (0.8, self.FIRST, "crossref"),
+            (0.7, self.SECOND, "crossref-fallback"),
+        ]
+        independent_services = [
+            (0.8, self.FIRST, "crossref"),
+            (0.7, self.SECOND, "openalex"),
+        ]
+
+        checker = _checker(_http())
+        evidence = checker._detect_chimeric_title(self.ENTRY, independent_services)
+
+        assert checker._detect_chimeric_title(self.ENTRY, same_service) is None
+        assert evidence is not None
+        assert {evidence.source_a, evidence.source_b} == {"crossref", "openalex"}
