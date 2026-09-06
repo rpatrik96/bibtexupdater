@@ -224,6 +224,7 @@ Per-line fields:
 | `sources_failed` | source names whose lookup for this entry did not complete. Non-empty means the cascade was partial: the entry cannot carry `not_found`, and whatever it does carry rests on less evidence than a clean run |
 | `mismatched_fields` | fields the checker found a real CONTRADICTION on (`MISMATCH`). A field it declined to compare is not listed here |
 | `unconfirmed_fields` | fields neither confirmed nor contradicted (`NON_COMPARABLE`/`PARTIAL`): an arXiv record cannot confirm a claimed ICLR venue, and a `journal = {arXiv preprint arXiv:NNNN.NNNNN}` citation claims no published venue to confirm. These are abstentions the checker made deliberately, never findings against the entry |
+| `distrusted_records` | records a source returned that the cascade declined to score, one readable line each. A source can serve a work under the correct identifier and the correct author list but a different paper's title; scored as a candidate that record produces a `title_mismatch` against a correctly cited entry. Non-empty means the verdict was reached **without** a record the run had in hand, and names which index misbehaved — a statement about the source, never about the entry |
 | `api_sources`, `errors` | sources with hits, and per-source error strings |
 
 ## Exit Codes
