@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **OpenReview token invalidation preserves a replacement token minted for another in-flight request.** Refresh retries identify the refused token, and the in-memory and cross-process copies are removed only while they still hold that token.
+
+- **Transient OpenReview login failures pause authentication instead of disabling it for the process.** Throttling, server failures, and transport errors enter a per-origin cooldown and retry afterward, while credential rejections remain disabled. Refusal messages distinguish missing credentials from configured credentials whose login failed.
+
+- **OpenReview login redirects cannot replay credentials to an arbitrary host.** The login client disables automatic redirects and follows a redirect manually only when its destination is a shared OpenReview origin.
+
+- **ISO-4 venue expansion no longer confirms journals that disagree on a title-defining token.** Expanded titles use strict in-order token alignment while retaining established abbreviation matches and trailing qualifiers.
+
+- **Preprint-server venue detection requires the whole field to describe a server citation.** Server markers, identifiers, punctuation, and conventional filler may consume the field, but a remaining venue name prevents the published-venue claim from being waived.
+
+- **A journal name no longer confirms a longer journal from the same family.** The in-order alignment walked only as far as the shorter expanded title, leaving the longer one's tail unread, so `Nature`/`Nature Methods`, `Science`/`Science Advances`, `Cell`/`Cell Reports`, `Lancet`/`Lancet Oncology`, `BMJ`/`BMJ Open`, `JAMA`/`JAMA Oncology` and `Acta Crystallogr. A`/`Acta Crystallographica Section B` all read as one venue and `wrong_venue` went undetected across the family. Both titles must now carry the same number of content tokens, with the country suffix PNAS writes out in full (`... of the United States of America`) dropped from either tail before the lengths are compared, so both PNAS forms and every other established abbreviation pair still match.
+
+- **A preprint venue written as a link is read as a preprint again.** `arxiv.org/abs/2408.05147`, the same string with a scheme, `\url{}` wrapped around it, and `Preprint at arXiv:2408.05147` all failed the whole-field residue test: scheme and host tokens counted as a leftover venue name, and `\url{}` carries its argument away with it when LaTeX commands are flattened, leaving nothing for the marker search to find. Scheme and host tokens are now filler and the `\url{}` argument is unwrapped before flattening, so a link-shaped venue waives the published-venue claim exactly as `arXiv preprint arXiv:2408.05147` does, and `entry_venue` again prefers a real `booktitle` over a URL-valued `journal`.
+
+- **An OpenReview refusal taken while the login is cooling down is latched until that cooldown lifts.** Declining to latch kept the login retry reachable, but every entry in the meantime issued its own anonymous `/notes` request and had it refused -- one per host per entry, roughly 10,000 refused round trips on a 5,043-reference run, each spending a slot of the 30-per-minute OpenReview limiter for an answer that cannot change until the login is retried. The latch now carries the auth object's own retry deadline, so the window costs one request per host and the first entry after it still asks again, with a token.
 - A source outage takes precedence over strict-mode bibliography findings. When both gates fire, `bibtex-check --strict` returns exit 5 for the incomplete run instead of exit 4 for its content.
 
 - Book and working-paper lookup failures contribute to the run-wide source-outage tally. An incomplete book search without a qualifying match produces `API_ERROR`, while a verified match retains the failed-source attribution; an exception escaping per-entry checking records the failed source as `unknown`.
