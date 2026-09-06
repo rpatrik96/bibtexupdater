@@ -220,17 +220,29 @@ _PREPRINT_SERVER_STOPWORDS = frozenset(
         "an",
         "and",
         "archive",
+        "at",
+        "com",
         "electronic",
         "for",
+        "http",
+        "https",
         "in",
         "journal",
         "of",
         "on",
+        "org",
         "repository",
         "the",
         "v",
+        "www",
     }
 )
+
+#: ``\url{...}`` is a command with a braced argument, which LaTeX flattening
+#: removes whole: ``latex_to_plain(r"\url{https://arxiv.org/abs/2408.05147}")``
+#: is the empty string. Unwrapping the argument first keeps the URL text, which
+#: is where the server marker lives when the venue field is nothing but a link.
+_LATEX_URL_MACRO_RE = re.compile(r"\\url\s*\{([^{}]*)\}", re.IGNORECASE)
 
 
 def is_preprint_server_venue(venue: str | None) -> bool:
@@ -251,7 +263,10 @@ def is_preprint_server_venue(venue: str | None) -> bool:
         CoRR abs/2408.05147               bioRxiv             SSRN
 
     Old-style identifiers (``arXiv:math.GT/0309136``) and ``\href``-wrapped ones
-    are covered as identifier noise after the server marker is removed.
+    are covered as identifier noise after the server marker is removed. A venue
+    written as a link -- ``arxiv.org/abs/2408.05147``, the same with a scheme, or
+    wrapped in ``\url{}`` -- is the same claim in URL form, so the scheme and host
+    tokens are filler here rather than a venue name.
 
     Such a string is not a *published-venue* claim. It says "this work is a
     preprint", which carries exactly as much published-venue information as an
@@ -259,7 +274,7 @@ def is_preprint_server_venue(venue: str | None) -> bool:
     """
     if not venue:
         return False
-    plain = latex_to_plain(venue).lower()
+    plain = latex_to_plain(_LATEX_URL_MACRO_RE.sub(r" \1 ", venue)).lower()
     if not _PREPRINT_SERVER_VENUE_RE.search(plain):
         return False
     remainder = _PREPRINT_SERVER_VENUE_RE.sub(" ", plain)
@@ -2429,6 +2444,19 @@ class OpenReviewAuth:
         origin = self._origin(url)
         with self._lock:
             return self._login_failure_status.get(origin)
+
+    def login_retry_deadline_for_url(self, url: str) -> float | None:
+        """The ``time.monotonic()`` reading before which ``url``'s origin will not log in again.
+
+        ``None`` when no cooldown is in force, which is the answer both for an
+        origin that has never failed and for one whose credentials were
+        rejected outright (that origin is disabled, not cooling down). A caller
+        that wants to skip work until authentication can be retried reads the
+        deadline here rather than re-deriving the cooldown.
+        """
+        origin = self._origin(url)
+        with self._lock:
+            return self._next_login_attempt.get(origin)
 
     def _login(self, origin: str) -> tuple[str | None, int | None]:
         """POST the credentials to ``<origin>/login`` and return token and status.

@@ -92,6 +92,14 @@ PREPRINT_VENUE_FORMS = [
     "bioRxiv",
     "SSRN Electronic Journal",
     "Preprint",
+    # The same claim written as a link. Scheme and host are filler rather than a
+    # venue name, and ``\url{}`` takes its whole argument with it when LaTeX
+    # commands are flattened, so the marker has to be read before that happens.
+    "arxiv.org/abs/2408.05147",
+    "https://arxiv.org/abs/2408.05147",
+    "http://arxiv.org/abs/2408.05147",
+    "\\url{https://arxiv.org/abs/2408.05147}",
+    "Preprint at arXiv:2408.05147",
 ]
 
 
@@ -118,6 +126,10 @@ def test_preprint_server_venue_recognized(venue):
         "Proceedings of Machine Learning Research",
         "Lecture Notes in Computer Science",
         "OpenReview",
+        # A link to the preprint next to the venue that published it: the
+        # display text names a real journal, so the field still claims one.
+        "\\href{https://arxiv.org/abs/2408.05147}{Nature Methods}",
+        "Preprint at Nature",
     ],
 )
 def test_real_venue_is_not_a_preprint_server(venue):
@@ -210,8 +222,23 @@ def test_published_venue_wins_over_a_preprint_journal_string():
     assert entry_venue(entry) == "Advances in Neural Information Processing Systems"
 
 
+def test_published_venue_wins_over_a_url_valued_journal():
+    """The same entry shape with the preprint written as a link.
+
+    ``journal = {\\url{https://arxiv.org/abs/...}}`` is the identifier again, in
+    the form that survives copy-paste from the abstract page. It must lose to the
+    ``booktitle`` exactly as the ``arXiv preprint`` spelling does.
+    """
+    entry = {
+        "journal": "\\url{https://arxiv.org/abs/1706.03762}",
+        "booktitle": "Advances in Neural Information Processing Systems",
+    }
+    assert entry_venue(entry) == "Advances in Neural Information Processing Systems"
+
+
 def test_preprint_journal_is_still_returned_when_it_is_the_only_venue_field():
     assert entry_venue({"journal": "arXiv preprint arXiv:1706.03762"}) == "arXiv preprint arXiv:1706.03762"
+    assert entry_venue({"journal": "https://arxiv.org/abs/1706.03762"}) == "https://arxiv.org/abs/1706.03762"
 
 
 def test_venue_field_precedence_is_otherwise_unchanged():

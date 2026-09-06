@@ -1308,6 +1308,12 @@ _LTWA_DROPPABLE = frozenset({"usa", "us", "uk", "ussr"})
 #: post-expansion alignment. Content-bearing venue words remain in place.
 _LTWA_ALIGNMENT_STOPWORDS = frozenset({"a", "an", "and", "at", "for", "in", "its", "of", "on", "the", "to"})
 
+#: The spelled-out country suffix ``U.S.A.`` expands to. Dropped from the tail of
+#: either title before the lengths are compared, so PNAS's two forms
+#: ("Proc. Natl. Acad. Sci. U.S.A." and "... Sciences of the United States of
+#: America") still align while a genuine extra word does not.
+_LTWA_TRAILING_COUNTRY_TOKENS = frozenset({"united", "states", "america", "usa"})
+
 
 def expand_ltwa_abbreviations(venue: str) -> str:
     """Expand ISO-4 word abbreviations in a venue string.
@@ -1336,6 +1342,20 @@ def expand_ltwa_abbreviations(venue: str) -> str:
     return " ".join(out)
 
 
+def _drop_trailing_country_tokens(tokens: list[str]) -> list[str]:
+    """Strip a trailing country qualifier from an expanded venue's tokens.
+
+    ``U.S.A.`` is dropped during expansion, but the same qualifier written out
+    ("... of the United States of America") survives as content tokens. Popping
+    it from the tail lets the two PNAS forms have the same length, without
+    letting a qualifier in the middle of a title disappear.
+    """
+    end = len(tokens)
+    while end > 0 and tokens[end - 1] in _LTWA_TRAILING_COUNTRY_TOKENS:
+        end -= 1
+    return tokens[:end]
+
+
 def venue_abbreviation_matches(venue_a: str, venue_b: str, threshold: float = 0.70) -> bool:
     """True when two venue strings agree once ISO-4 abbreviations are expanded.
 
@@ -1352,9 +1372,15 @@ def venue_abbreviation_matches(venue_a: str, venue_b: str, threshold: float = 0.
         return True
     # Keep ``threshold`` in the public signature for compatibility. A fuzzy
     # aggregate is unsafe here: shared boilerplate can outweigh one journal-
-    # defining disagreement. Instead, the shorter expanded title must align in
-    # order with no unmatched token inside the span; only a trailing qualifier
-    # on the longer title is allowed (for example PNAS's country suffix).
+    # defining disagreement. Instead the two expanded titles must carry the same
+    # number of content tokens and align in order, once the country suffix PNAS
+    # writes out in full is dropped from either tail.
+    #
+    # The lengths must be equal because a journal name is a prefix of its own
+    # family: "Nature" is the head of "Nature Methods", "Science" of "Science
+    # Advances", "Lancet" of "Lancet Oncology". Walking only the shorter list
+    # leaves the longer title's tail unexamined, so every such pair reports a
+    # match and ``wrong_venue`` becomes undetectable across a journal family.
     del threshold
     tokens_a = [
         token for token in normalize_title_for_match(expanded_a).split() if token not in _LTWA_ALIGNMENT_STOPWORDS
@@ -1362,13 +1388,16 @@ def venue_abbreviation_matches(venue_a: str, venue_b: str, threshold: float = 0.
     tokens_b = [
         token for token in normalize_title_for_match(expanded_b).split() if token not in _LTWA_ALIGNMENT_STOPWORDS
     ]
+    tokens_a = _drop_trailing_country_tokens(tokens_a)
+    tokens_b = _drop_trailing_country_tokens(tokens_b)
     if not tokens_a or not tokens_b:
         return False
-    shorter, longer = (tokens_a, tokens_b) if len(tokens_a) <= len(tokens_b) else (tokens_b, tokens_a)
+    if len(tokens_a) != len(tokens_b):
+        return False
 
     def tokens_match(left: str, right: str) -> bool:
         return (
             left == right or left.startswith(right) or right.startswith(left) or Levenshtein.distance(left, right) <= 2
         )
 
-    return all(tokens_match(left, right) for left, right in zip(shorter, longer))
+    return all(tokens_match(left, right) for left, right in zip(tokens_a, tokens_b, strict=True))

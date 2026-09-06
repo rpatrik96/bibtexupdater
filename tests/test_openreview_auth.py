@@ -842,7 +842,7 @@ class TestAnAuthenticatedRefusalIsNotLatched:
         assert "credentials configured; login failed (HTTP 400)" in message
         assert "set OPENREVIEW_USERNAME" not in message
 
-    def test_a_transient_login_failure_does_not_latch_the_notes_endpoint(self, monkeypatch):
+    def test_a_transient_login_failure_latches_only_until_its_cooldown_lifts(self, monkeypatch):
         clock = {"now": 0.0}
         monkeypatch.setattr("bibtex_updater.utils.time.monotonic", lambda: clock["now"])
         auth = OpenReviewAuth("a@b.c", PASSWORD)
@@ -858,6 +858,38 @@ class TestAnAuthenticatedRefusalIsNotLatched:
             assert client.search("q", title="Adam: A Method", first_author="kingma") == [_note()]
 
         assert _urls_sent(http) == [NOTES_V2, NOTES_V2]
+
+    def test_entries_inside_the_login_cooldown_cost_one_refused_request(self, monkeypatch):
+        """The window between the throttled login and its retry is not free.
+
+        Every request issued while the login is cooling down goes out anonymous
+        and comes back refused, so asking once per entry buys a round trip and a
+        limiter slot for an answer that cannot change until the login is retried.
+        At 5,043 references and two hosts that is roughly 10,000 refused round
+        trips. The latch expires with the cooldown, so the retry still happens.
+        """
+        clock = {"now": 0.0}
+        monkeypatch.setattr("bibtex_updater.utils.time.monotonic", lambda: clock["now"])
+        auth = OpenReviewAuth("a@b.c", PASSWORD)
+        fake = _FakeLoginClient([_status(429), _login_ok(TOKEN_V2)])
+
+        with patch("bibtex_updater.utils.httpx.Client", fake):
+            http = _http(auth=auth, side_effect=[_status(403), _notes([_note()])])
+            client = OpenReviewClient(http=http)
+            client.NOTES_HOSTS = (OPENREVIEW_API_V2,)
+
+            for _ in range(5):
+                with pytest.raises(SourceUnavailableError) as exc_info:
+                    client.search("q", title="Adam: A Method", first_author="kingma")
+            # One request for five entries, and the skipped entries say why.
+            assert _urls_sent(http) == [NOTES_V2]
+            assert "login throttled (HTTP 429)" in str(exc_info.value)
+
+            clock["now"] = auth.LOGIN_RETRY_COOLDOWN + 1.0
+            assert client.search("q", title="Adam: A Method", first_author="kingma") == [_note()]
+
+        assert _urls_sent(http) == [NOTES_V2, NOTES_V2]
+        assert _sent(http)[1][1]["Authorization"] == f"Bearer {TOKEN_V2}"
 
 
 class TestOneLoginServesBothHosts:
