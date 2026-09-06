@@ -24,6 +24,7 @@ from __future__ import annotations
 import pytest
 
 from bibtex_updater.calibration import (
+    _STATUS_CONFIDENCE_ANCHORS,
     P_VALID_ABSTAIN_STATUSES,
     P_VALID_NEUTRAL,
     P_VALID_PROBLEM_STATUSES,
@@ -32,16 +33,20 @@ from bibtex_updater.calibration import (
     p_valid_from_result,
 )
 
-#: The anchor reserved for "we could not decide". A PROBLEM or VALID status
-#: drawing this is asserting something with don't-know confidence.
-_ABSTAIN_ANCHOR = 0.45
-
 
 def _statuses(bucket) -> list[str]:
     return sorted(s for s in bucket if s in STATUS_BASE_CONFIDENCE)
 
 
-@pytest.mark.parametrize("status", _statuses(P_VALID_PROBLEM_STATUSES))
+_PROBLEM_STATUSES = _statuses(P_VALID_PROBLEM_STATUSES)
+_VALID_STATUSES = _statuses(P_VALID_VALID_STATUSES)
+_ABSTAIN_STATUSES = _statuses(P_VALID_ABSTAIN_STATUSES)
+assert _PROBLEM_STATUSES
+assert _VALID_STATUSES
+assert _ABSTAIN_STATUSES
+
+
+@pytest.mark.parametrize("status", _PROBLEM_STATUSES)
 def test_problem_statuses_yield_p_valid_below_one_half(status):
     conf = STATUS_BASE_CONFIDENCE[status]
     assert (
@@ -49,7 +54,7 @@ def test_problem_statuses_yield_p_valid_below_one_half(status):
     ), f"{status} is PROBLEM-polarity but P(valid) is {p_valid_from_result(status, conf)}"
 
 
-@pytest.mark.parametrize("status", _statuses(P_VALID_VALID_STATUSES))
+@pytest.mark.parametrize("status", _VALID_STATUSES)
 def test_valid_statuses_yield_p_valid_above_one_half(status):
     conf = STATUS_BASE_CONFIDENCE[status]
     assert p_valid_from_result(status, conf) > 0.5
@@ -88,7 +93,7 @@ def test_a_problem_status_is_never_more_extreme_than_the_strongest_evidence():
 
 
 def test_abstentions_stay_neutral():
-    for status in _statuses(P_VALID_ABSTAIN_STATUSES):
+    for status in _ABSTAIN_STATUSES:
         assert p_valid_from_result(status, STATUS_BASE_CONFIDENCE[status]) == P_VALID_NEUTRAL
 
 
@@ -108,15 +113,14 @@ def test_asserting_statuses_document_why_they_sit_at_the_weak_value():
     _CORRECT_WEAK, so the constant states the intent and a new status cannot
     reach that value by accident.
     """
-    asserting = set(_statuses(P_VALID_PROBLEM_STATUSES)) | set(_statuses(P_VALID_VALID_STATUSES))
-    offenders = sorted(
-        s for s in asserting if STATUS_BASE_CONFIDENCE[s] == _ABSTAIN_ANCHOR and s not in _DELIBERATELY_WEAK
-    )
+    asserting = set(_PROBLEM_STATUSES) | set(_VALID_STATUSES)
+    offenders = sorted(s for s in asserting if _STATUS_CONFIDENCE_ANCHORS.get(s) == "_ABSTAIN")
     assert not offenders, (
-        f"{offenders} assert a polarity at the abstention anchor ({_ABSTAIN_ANCHOR}) "
+        f"{offenders} assert a polarity at the abstention anchor "
         "without being declared weak evidence. Either give them a real tier or add "
         "them to _DELIBERATELY_WEAK with a reason."
     )
+    assert {_STATUS_CONFIDENCE_ANCHORS[s] for s in _DELIBERATELY_WEAK} == {"_PROB_WEAK", "_CORRECT_WEAK"}
 
 
 def test_preprint_only_is_not_the_systems_most_confident_invalid():

@@ -28,6 +28,7 @@ import httpx
 import pytest
 
 import bibtex_updater.fact_checker as fact_checker_module
+import bibtex_updater.utils as utils_module
 from bibtex_updater.fact_checker import (
     DEFAULT_MAILTO_PLACEHOLDER,
     _cli_service_rate_limits,
@@ -43,6 +44,27 @@ from bibtex_updater.utils import (
     RateLimiterRegistry,
     SqliteCache,
 )
+
+
+@pytest.mark.parametrize(
+    "endpoint_name",
+    [
+        "CROSSREF_API",
+        "ARXIV_API",
+        "DBLP_API_SEARCH",
+        "DBLP_API_VENUE_SEARCH",
+        "S2_API",
+        "ACL_ANTHOLOGY_URL",
+        "OPENALEX_API",
+        "EUROPEPMC_API",
+        "OPENREVIEW_API",
+        "OPENREVIEW_API_V2",
+    ],
+)
+def test_api_endpoints_use_https(endpoint_name):
+    """A redirect must not expose a lookup to a plaintext first hop."""
+    assert getattr(utils_module, endpoint_name).startswith("https://")
+
 
 # ===========================================================================
 # Per-service CLI rate limits

@@ -38,9 +38,11 @@ from bibtex_updater.fact_checker import (
     FactCheckProcessor,
     FactCheckResult,
     FactCheckStatus,
+    FieldComparison,
     _compute_coverage_incomplete,
     build_verification_result,
 )
+from bibtex_updater.matching import MatchOutcome
 
 LOGGER = logging.getLogger("test_output_contract")
 
@@ -363,6 +365,49 @@ def _contract_results() -> tuple[list[dict[str, str]], list[FactCheckResult]]:
 
 
 class TestSerialization:
+    def test_jsonl_reports_only_real_contradictions_as_mismatches(self, tmp_path):
+        comparisons = {
+            outcome.value: FieldComparison(
+                field_name=outcome.value,
+                entry_value="claimed",
+                api_value="observed",
+                similarity_score=0.0,
+                matches=False,
+                outcome=outcome,
+            )
+            for outcome in (MatchOutcome.MISMATCH, MatchOutcome.NON_COMPARABLE, MatchOutcome.PARTIAL)
+        }
+        result = FactCheckResult(
+            entry_key="mixed",
+            entry_type="article",
+            status=FactCheckStatus.PARTIAL_MATCH,
+            overall_confidence=0.78,
+            field_comparisons=comparisons,
+            best_match=None,
+            api_sources_queried=["crossref"],
+            api_sources_with_hits=["crossref"],
+            errors=[],
+        )
+        checker = _FakeChecker({result.entry_key: result})
+        processor = FactCheckProcessor(checker, LOGGER)
+        batch_record = json.loads(processor.generate_jsonl([result])[0])
+        jsonl_path = tmp_path / "out.jsonl"
+
+        processor.process_entries(
+            [{"ID": result.entry_key, "ENTRYTYPE": "article", "title": "Mixed outcomes"}],
+            jsonl_path=str(jsonl_path),
+            max_workers=1,
+        )
+        streamed_record = json.loads(jsonl_path.read_text())
+
+        assert batch_record["mismatched_fields"] == [MatchOutcome.MISMATCH.value]
+        assert batch_record["unconfirmed_fields"] == [
+            MatchOutcome.NON_COMPARABLE.value,
+            MatchOutcome.PARTIAL.value,
+        ]
+        assert streamed_record["mismatched_fields"] == batch_record["mismatched_fields"]
+        assert streamed_record["unconfirmed_fields"] == batch_record["unconfirmed_fields"]
+
     def test_streamed_jsonl_carries_the_contract_keys(self, tmp_path):
         entries, results = _contract_results()
         checker = _FakeChecker({r.entry_key: r for r in results})

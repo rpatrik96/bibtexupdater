@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import socket
 from typing import Any
 
 import pytest
@@ -21,7 +22,62 @@ from bibtex_updater.utils import HttpClient, PublishedRecord
 @pytest.fixture(autouse=True)
 def _isolated_openreview_token_cache(tmp_path, monkeypatch):
     """No test may read or write the developer's real OpenReview token cache."""
-    monkeypatch.setenv("BIBTEX_CHECK_OPENREVIEW_TOKEN_CACHE", str(tmp_path / "openreview-tokens.json"))
+    path = tmp_path / "openreview-tokens.json"
+    monkeypatch.setenv("BIBTEX_CHECK_OPENREVIEW_TOKEN_CACHE", str(path))
+    # OpenReviewAuth.from_env(env={...}) treats that mapping as authoritative
+    # and therefore does not read the process environment override above.
+    monkeypatch.setattr("bibtex_updater.utils._default_openreview_token_cache_path", lambda: path)
+
+
+@pytest.fixture(autouse=True)
+def _isolated_service_environment(monkeypatch):
+    """Keep developer credentials and local rate overrides out of tests."""
+    monkeypatch.delenv("OPENREVIEW_USERNAME", raising=False)
+    monkeypatch.delenv("OPENREVIEW_PASSWORD", raising=False)
+    monkeypatch.delenv("BIBTEX_ARXIV_RATE", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _no_live_network(request, monkeypatch):
+    """Block and report every socket connection unless a test opts in."""
+    if request.node.get_closest_marker("network") is not None:
+        yield
+        return
+
+    attempts: list[object] = []
+    real_connect = socket.socket.connect
+    real_connect_ex = socket.socket.connect_ex
+    real_create_connection = socket.create_connection
+
+    def is_loopback(address) -> bool:
+        host = address[0] if isinstance(address, tuple) else address
+        return host in {"127.0.0.1", "::1", "localhost"}
+
+    def blocked_connect(sock, address):
+        if sock.family == socket.AF_UNIX or is_loopback(address):
+            return real_connect(sock, address)
+        attempts.append(address)
+        raise OSError(f"Live network access is disabled during tests: {address!r}")
+
+    def blocked_connect_ex(sock, address):
+        if sock.family == socket.AF_UNIX or is_loopback(address):
+            return real_connect_ex(sock, address)
+        attempts.append(address)
+        raise OSError(f"Live network access is disabled during tests: {address!r}")
+
+    def blocked_create_connection(address, *args, **kwargs):
+        if is_loopback(address):
+            return real_create_connection(address, *args, **kwargs)
+        attempts.append(address)
+        raise OSError(f"Live network access is disabled during tests: {address!r}")
+
+    monkeypatch.setattr(socket.socket, "connect", blocked_connect)
+    monkeypatch.setattr(socket.socket, "connect_ex", blocked_connect_ex)
+    monkeypatch.setattr(socket, "create_connection", blocked_create_connection)
+
+    yield
+
+    assert not attempts, f"Test attempted live network connections: {attempts!r}"
 
 
 @pytest.fixture

@@ -26,7 +26,11 @@ import asyncio
 import base64
 import json
 import logging
+import os
+import socket
 import stat
+import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -105,6 +109,74 @@ def _note(title="Adam: A Method", ident="note1"):
 def _urls(http_mock) -> list[str]:
     """The URLs a mocked ``HttpClient._request`` was asked for, in order."""
     return [call.args[1] if len(call.args) > 1 else call.kwargs["url"] for call in http_mock._request.call_args_list]
+
+
+class TestNetworkGuard:
+    def test_allows_loopback_connections(self):
+        """The suite guard must leave hermetic local servers usable."""
+        assert socket.socket.connect.__name__ == "blocked_connect"
+        address = ("127.0.0.1", 1)
+        for connect in (
+            lambda: socket.socket().connect(address),
+            lambda: socket.create_connection(address, timeout=0.01),
+        ):
+            with pytest.raises(OSError) as exc_info:
+                connect()
+            assert "Live network access is disabled" not in str(exc_info.value)
+
+        client = socket.socket()
+        try:
+            assert isinstance(client.connect_ex(address), int)
+        finally:
+            client.close()
+
+    def test_fails_when_a_non_loopback_attempt_is_swallowed(self, tmp_path):
+        """Blocking alone is insufficient because OpenReview login catches OSError."""
+        source_conftest = Path(__file__).with_name("conftest.py")
+        (tmp_path / "conftest.py").write_text(
+            "\n".join(
+                [
+                    "import importlib.util",
+                    f"spec = importlib.util.spec_from_file_location('suite_guard', {str(source_conftest)!r})",
+                    "suite_guard = importlib.util.module_from_spec(spec)",
+                    "spec.loader.exec_module(suite_guard)",
+                    "_no_live_network = suite_guard._no_live_network",
+                ]
+            )
+        )
+        test_path = tmp_path / "test_swallowed_connection.py"
+        test_path.write_text(
+            "\n".join(
+                [
+                    "import socket",
+                    "",
+                    "def test_swallowed_connection_attempt():",
+                    "    attempts = (",
+                    "        lambda: socket.socket().connect(('example.com', 443)),",
+                    "        lambda: socket.socket().connect_ex(('example.com', 443)),",
+                    "        lambda: socket.create_connection(('example.com', 443)),",
+                    "    )",
+                    "    for attempt in attempts:",
+                    "        try:",
+                    "            attempt()",
+                    "        except OSError:",
+                    "            pass",
+                ]
+            )
+        )
+        root = Path(__file__).parents[1]
+        env = os.environ | {"PYTHONPATH": str(root / "src")}
+        completed = subprocess.run(
+            [sys.executable, "-m", "pytest", "-q", str(test_path)],
+            cwd=root,
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        assert completed.returncode == 1
+        assert "Test attempted live network connections" in completed.stdout
 
 
 # ===========================================================================
@@ -618,8 +690,16 @@ class TestTokenReuseAcrossProcesses:
         assert len(fake.calls) == 1
 
     def test_an_expired_cached_token_is_not_served(self, tmp_path):
-        store = OpenReviewTokenStore(tmp_path / "openreview-tokens.json")
-        store.put("a@b.c", OPENREVIEW_API, _jwt(time.time() - 60))
+        path = tmp_path / "openreview-tokens.json"
+        store = OpenReviewTokenStore(path)
+        store.put("a@b.c", OPENREVIEW_API, _jwt(time.time() + 3600))
+        assert store.get("a@b.c", OPENREVIEW_API) is not None
+
+        raw = json.loads(path.read_text())
+        for token in raw["tokens"].values():
+            token["expires"] = time.time() - 1
+        path.write_text(json.dumps(raw))
+
         assert store.get("a@b.c", OPENREVIEW_API) is None
 
     def test_a_refusal_drops_the_shared_copy(self, tmp_path):
@@ -662,6 +742,16 @@ class TestTokenReuseAcrossProcesses:
             auth.token_for_url(NOTES_V1)
         assert path.exists()
 
+    def test_explicit_env_mapping_uses_the_isolated_default_cache(self, tmp_path):
+        auth = OpenReviewAuth.from_env(
+            env={
+                "OPENREVIEW_USERNAME": "a@b.c",
+                "OPENREVIEW_PASSWORD": PASSWORD,
+            }
+        )
+        assert auth is not None and auth._store is not None
+        assert auth._store.path == tmp_path / "openreview-tokens.json"
+
     def test_the_default_path_is_the_user_cache_never_the_repo(self):
         path = _default_openreview_token_cache_path()
         assert path.name == "openreview-tokens.json"
@@ -677,6 +767,7 @@ class TestTokenReuseAcrossProcesses:
 
     def test_expiry_comes_from_the_token_itself(self):
         assert _jwt_expiry(_jwt(1800000000)) == 1800000000.0
+        assert _jwt_expiry(_jwt(1800000000 * 1000)) == 1800000000.0
         assert _jwt_expiry("not-a-jwt") is None
 
 

@@ -64,19 +64,29 @@ _PROB_SOFT = 0.78  # CLEARLY-PROBLEM, single fuzzy-compared field disagrees
 _PROB_WEAK = 0.45  # CLEARLY-PROBLEM, real but weak evidence (see doi_not_found)
 _CORRECT_WEAK = 0.45  # CLEARLY-CORRECT, real but weak evidence (see url_accessible)
 _ABSTAIN = 0.45  # DON'T-KNOW, near-neutral, strictly below both above
-STATUS_BASE_CONFIDENCE = {
+_SKIPPED = 0.0
+_CONFIDENCE_ANCHOR_VALUES = {
+    "_CONF_CORRECT": _CONF_CORRECT,
+    "_PROB_STRONG": _PROB_STRONG,
+    "_PROB_SOFT": _PROB_SOFT,
+    "_PROB_WEAK": _PROB_WEAK,
+    "_CORRECT_WEAK": _CORRECT_WEAK,
+    "_ABSTAIN": _ABSTAIN,
+    "_SKIPPED": _SKIPPED,
+}
+_STATUS_CONFIDENCE_ANCHORS = {
     # --- CLEARLY-CORRECT: a positive record confirms the entry ---
-    "verified": _CONF_CORRECT,
-    "published_version_exists": _CONF_CORRECT,
-    "url_verified": _CONF_CORRECT,
-    "book_verified": _CONF_CORRECT,
-    "working_paper_verified": _CONF_CORRECT,
+    "verified": "_CONF_CORRECT",
+    "published_version_exists": "_CONF_CORRECT",
+    "url_verified": "_CONF_CORRECT",
+    "book_verified": "_CONF_CORRECT",
+    "working_paper_verified": "_CONF_CORRECT",
     # --- CLEARLY-PROBLEM (strong): self-contained positive evidence ---
-    "hallucinated": _PROB_STRONG,  # no real paper / chimeric title
-    "future_date": _PROB_STRONG,  # arithmetic, not a fuzzy match
-    "invalid_year": _PROB_STRONG,  # arithmetic, not a fuzzy match
-    "doi_mismatch": _PROB_STRONG,  # cited DOI resolves to a different paper
-    "arxiv_id_mismatch": _PROB_STRONG,  # cited arXiv ID resolves elsewhere
+    "hallucinated": "_PROB_STRONG",  # no real paper / chimeric title
+    "future_date": "_PROB_STRONG",  # arithmetic, not a fuzzy match
+    "invalid_year": "_PROB_STRONG",  # arithmetic, not a fuzzy match
+    "doi_mismatch": "_PROB_STRONG",  # cited DOI resolves to a different paper
+    "arxiv_id_mismatch": "_PROB_STRONG",  # cited arXiv ID resolves elsewhere
     # --- CLEARLY-PROBLEM (soft): one disagreeing field, rest match ---
     # A preprint cited as published: the claimed venue is unconfirmed and the
     # record is preprint-only. It sat at _CONF_CORRECT while carrying PROBLEM
@@ -85,37 +95,40 @@ STATUS_BASE_CONFIDENCE = {
     # nearly as extreme as a DOI resolving to a different paper (0.035). A
     # preprint-as-published is weaker evidence than either, so the ordering was
     # inverted. Soft-problem is where the other unconfirmed-venue verdicts live.
-    "preprint_only": _PROB_SOFT,
-    "title_mismatch": _PROB_SOFT,
-    "author_mismatch": _PROB_SOFT,
-    "given_name_substitution": _PROB_SOFT,  # surnames match, a given name is a different person
-    "author_truncated": _PROB_SOFT,  # silent author-list truncation (one disagreeing field)
-    "year_mismatch": _PROB_SOFT,
-    "venue_mismatch": _PROB_SOFT,
+    "preprint_only": "_PROB_SOFT",
+    "title_mismatch": "_PROB_SOFT",
+    "author_mismatch": "_PROB_SOFT",
+    "given_name_substitution": "_PROB_SOFT",  # surnames match, a given name is a different person
+    "author_truncated": "_PROB_SOFT",  # silent author-list truncation (one disagreeing field)
+    "year_mismatch": "_PROB_SOFT",
+    "venue_mismatch": "_PROB_SOFT",
     # Claimed venue unknown to the DBLP/OpenAlex venue registries while the
     # paper itself is real: positive (registry-backed) evidence, but the
     # registries are fuzzy-matched name lookups -> soft tier, not strong.
-    "nonexistent_venue": _PROB_SOFT,
-    "partial_match": _PROB_SOFT,
-    "url_content_mismatch": _PROB_SOFT,
+    "nonexistent_venue": "_PROB_SOFT",
+    "partial_match": "_PROB_SOFT",
+    "url_content_mismatch": "_PROB_SOFT",
     # --- DON'T-KNOW / abstention: could not adjudicate, near-neutral ---
-    "not_found": _ABSTAIN,
-    "unconfirmed": _ABSTAIN,
-    "api_error": _ABSTAIN,
+    "not_found": "_ABSTAIN",
+    "unconfirmed": "_ABSTAIN",
+    "api_error": "_ABSTAIN",
     # Weak but real evidence, so PROBLEM polarity is right -- but it was drawing
     # _ABSTAIN, documented as "DON'T-KNOW, near-neutral". Same number, now from
     # a constant that means what the polarity says. p_valid is unchanged at 0.275.
-    "doi_not_found": _PROB_WEAK,
-    "url_not_found": _ABSTAIN,
-    "book_not_found": _ABSTAIN,
-    "working_paper_not_found": _ABSTAIN,
+    "doi_not_found": "_PROB_WEAK",
+    "url_not_found": "_ABSTAIN",
+    "book_not_found": "_ABSTAIN",
+    "working_paper_not_found": "_ABSTAIN",
     # HTTP 200 with no content check: the page is reachable, which weakly
     # supports the entry but confirms nothing about the paper. VALID polarity is
     # right; drawing _ABSTAIN was borrowing the don't-know anchor to assert
     # something. Same number, now from a constant that says so.
-    "url_accessible": _CORRECT_WEAK,  # 200 only, no content check -> weak signal
+    "url_accessible": "_CORRECT_WEAK",  # 200 only, no content check -> weak signal
     # --- not verifiable ---
-    "skipped": 0.0,
+    "skipped": "_SKIPPED",
+}
+STATUS_BASE_CONFIDENCE = {
+    status: _CONFIDENCE_ANCHOR_VALUES[anchor] for status, anchor in _STATUS_CONFIDENCE_ANCHORS.items()
 }
 
 # Abstention ("don't-know") statuses. These must stay near-neutral: their
