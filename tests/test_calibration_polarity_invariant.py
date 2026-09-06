@@ -49,9 +49,8 @@ assert _ABSTAIN_STATUSES
 @pytest.mark.parametrize("status", _PROBLEM_STATUSES)
 def test_problem_statuses_yield_p_valid_below_one_half(status):
     conf = STATUS_BASE_CONFIDENCE[status]
-    assert (
-        p_valid_from_result(status, conf) < 0.5
-    ), f"{status} is PROBLEM-polarity but P(valid) is {p_valid_from_result(status, conf)}"
+    p_valid = p_valid_from_result(status, conf)
+    assert p_valid < 0.5, f"{status} is PROBLEM-polarity but P(valid) is {p_valid}"
 
 
 @pytest.mark.parametrize("status", _VALID_STATUSES)
@@ -97,12 +96,6 @@ def test_abstentions_stay_neutral():
         assert p_valid_from_result(status, STATUS_BASE_CONFIDENCE[status]) == P_VALID_NEUTRAL
 
 
-#: Statuses that deliberately assert at the weak-evidence value. Each draws
-#: _PROB_WEAK or _CORRECT_WEAK, which share the abstention anchor's NUMBER but
-#: not its meaning: the evidence is real and thin, rather than absent.
-_DELIBERATELY_WEAK = {"doi_not_found", "url_accessible"}
-
-
 def test_asserting_statuses_document_why_they_sit_at_the_weak_value():
     """A verdict asserting something must not silently borrow the don't-know anchor.
 
@@ -117,10 +110,15 @@ def test_asserting_statuses_document_why_they_sit_at_the_weak_value():
     offenders = sorted(s for s in asserting if _STATUS_CONFIDENCE_ANCHORS.get(s) == "_ABSTAIN")
     assert not offenders, (
         f"{offenders} assert a polarity at the abstention anchor "
-        "without being declared weak evidence. Either give them a real tier or add "
-        "them to _DELIBERATELY_WEAK with a reason."
+        "without a weak-evidence anchor. Give them a real tier or a named weak-evidence anchor."
     )
-    assert {_STATUS_CONFIDENCE_ANCHORS[s] for s in _DELIBERATELY_WEAK} == {"_PROB_WEAK", "_CORRECT_WEAK"}
+    assert {
+        "doi_not_found": _STATUS_CONFIDENCE_ANCHORS["doi_not_found"],
+        "url_accessible": _STATUS_CONFIDENCE_ANCHORS["url_accessible"],
+    } == {
+        "doi_not_found": "_PROB_WEAK",
+        "url_accessible": "_CORRECT_WEAK",
+    }
 
 
 def test_preprint_only_is_not_the_systems_most_confident_invalid():
