@@ -545,6 +545,38 @@ class TestDroppedEntryRepairContract:
         assert quoted_recovered.entry["title"] == "A literal, name = value fragment"
         assert quoted_recovered.entry["year"] == "2024"
 
+    def test_field_check_accepts_equals_and_percent_inside_completed_values(self):
+        """A completed value may hold ``=`` and ``%`` without losing the entry."""
+        query_string_url = """@article{openreview,
+  title = {A Study of Widgets},
+  author = {Smith, Jane},
+  url = {https://openreview.net/forum?id=abc123},
+  year = {2020}
+"""
+        percent_escaped_url = """@article{percent-url,
+  title = {A Study of Widgets},
+  url = {https://example.com/a%20b}, year = {2020}, note = {x}
+"""
+        equals_in_title = """@article{alpha,
+  title = {On the Choice of alpha = 0.5, and Its Consequences},
+  author = {Smith, Jane},
+  year = {2020}
+"""
+
+        url_recovered = recover_dropped_entry(query_string_url, "openreview")
+        assert url_recovered is not None
+        assert url_recovered.entry["url"] == "https://openreview.net/forum?id=abc123"
+        assert url_recovered.entry["year"] == "2020"
+        percent_recovered = recover_dropped_entry(percent_escaped_url, "percent-url")
+        assert percent_recovered is not None
+        assert percent_recovered.entry["url"] == "https://example.com/a%20b"
+        assert percent_recovered.entry["note"] == "x"
+        assert percent_recovered.entry["year"] == "2020"
+        equals_recovered = recover_dropped_entry(equals_in_title, "alpha")
+        assert equals_recovered is not None
+        assert equals_recovered.entry["title"] == "On the Choice of alpha = 0.5, and Its Consequences"
+        assert equals_recovered.entry["year"] == "2020"
+
     def test_repair_metadata_reaches_json_and_streamed_jsonl(self, tmp_path, monkeypatch):
         bib = tmp_path / "repaired.bib"
         report_path = tmp_path / "report.json"
