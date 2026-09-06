@@ -26,7 +26,10 @@ import asyncio
 import base64
 import json
 import logging
+import os
 import stat
+import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -105,6 +108,132 @@ def _note(title="Adam: A Method", ident="note1"):
 def _urls(http_mock) -> list[str]:
     """The URLs a mocked ``HttpClient._request`` was asked for, in order."""
     return [call.args[1] if len(call.args) > 1 else call.kwargs["url"] for call in http_mock._request.call_args_list]
+
+
+class TestNetworkGuard:
+    def _write_harness(self, tmp_path) -> Path:
+        """Install harmless originals before the guard captures them.
+
+        This makes a missing wrapper observable without allowing a socket call
+        to leave the subprocess.
+        """
+        source_conftest = Path(__file__).with_name("conftest.py")
+        (tmp_path / "conftest.py").write_text(
+            "\n".join(
+                [
+                    "import importlib.util",
+                    "import socket",
+                    "",
+                    "def _safe_connect(sock, address):",
+                    "    return 'connect'",
+                    "",
+                    "def _safe_connect_ex(sock, address):",
+                    "    return 0",
+                    "",
+                    "def _safe_create_connection(address, *args, **kwargs):",
+                    "    return 'create_connection'",
+                    "",
+                    "socket.socket.connect = _safe_connect",
+                    "socket.socket.connect_ex = _safe_connect_ex",
+                    "socket.create_connection = _safe_create_connection",
+                    "",
+                    f"spec = importlib.util.spec_from_file_location('suite_guard', {str(source_conftest)!r})",
+                    "suite_guard = importlib.util.module_from_spec(spec)",
+                    "spec.loader.exec_module(suite_guard)",
+                    "_no_live_network = suite_guard._no_live_network",
+                ]
+            )
+        )
+        test_path = tmp_path / "test_socket_guard.py"
+        test_path.write_text(
+            "\n".join(
+                [
+                    "import socket",
+                    "import pytest",
+                    "",
+                    "def test_connect_is_recorded_when_swallowed():",
+                    "    try:",
+                    "        socket.socket().connect(('outside.invalid', 443))",
+                    "    except OSError:",
+                    "        pass",
+                    "",
+                    "def test_connect_ex_is_recorded_when_swallowed():",
+                    "    try:",
+                    "        socket.socket().connect_ex(('outside.invalid', 443))",
+                    "    except OSError:",
+                    "        pass",
+                    "",
+                    "def test_create_connection_is_recorded_when_swallowed():",
+                    "    try:",
+                    "        socket.create_connection(('outside.invalid', 443))",
+                    "    except OSError:",
+                    "        pass",
+                    "",
+                    "@pytest.mark.network",
+                    "def test_network_marker_leaves_all_wrappers_unpatched():",
+                    "    assert socket.socket().connect(('outside.invalid', 443)) == 'connect'",
+                    "    assert socket.socket().connect_ex(('outside.invalid', 443)) == 0",
+                    "    assert socket.create_connection(('outside.invalid', 443)) == 'create_connection'",
+                    "",
+                    "def test_loopback_sockets_remain_available():",
+                    "    for host in ('127.0.0.1', '::1', 'localhost'):",
+                    "        address = (host, 443)",
+                    "        client = socket.socket()",
+                    "        try:",
+                    "            assert client.connect(address) == 'connect'",
+                    "            assert client.connect_ex(address) == 0",
+                    "        finally:",
+                    "            client.close()",
+                    "        assert socket.create_connection(address) == 'create_connection'",
+                    "",
+                    "def test_unix_sockets_remain_available():",
+                    "    client = socket.socket(socket.AF_UNIX)",
+                    "    try:",
+                    "        assert client.connect('/tmp/bu3-guard.sock') == 'connect'",
+                    "        assert client.connect_ex('/tmp/bu3-guard.sock') == 0",
+                    "    finally:",
+                    "        client.close()",
+                ]
+            )
+        )
+        return test_path
+
+    def _run_case(self, test_path: Path, case: str) -> subprocess.CompletedProcess[str]:
+        root = Path(__file__).parents[1]
+        env = os.environ | {"PYTHONPATH": str(root / "src")}
+        return subprocess.run(
+            [sys.executable, "-m", "pytest", "-q", f"{test_path}::{case}"],
+            cwd=root,
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=10,
+        )
+
+    def test_fails_when_each_non_loopback_attempt_is_swallowed(self, tmp_path):
+        """OpenReview login catches OSError, so teardown must still fail each path."""
+        test_path = self._write_harness(tmp_path)
+        for case in (
+            "test_connect_is_recorded_when_swallowed",
+            "test_connect_ex_is_recorded_when_swallowed",
+            "test_create_connection_is_recorded_when_swallowed",
+        ):
+            completed = self._run_case(test_path, case)
+            assert completed.returncode == 1, completed.stdout + completed.stderr
+            assert "Test attempted live network connections" in completed.stdout
+            assert "('outside.invalid', 443)" in completed.stdout
+
+    def test_network_marker_loopback_and_unix_socket_opt_outs(self, tmp_path):
+        """Intentional network tests and local transports stay usable."""
+        test_path = self._write_harness(tmp_path)
+        for case in (
+            "test_network_marker_leaves_all_wrappers_unpatched",
+            "test_loopback_sockets_remain_available",
+            "test_unix_sockets_remain_available",
+        ):
+            completed = self._run_case(test_path, case)
+            assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
 # ===========================================================================
@@ -618,8 +747,16 @@ class TestTokenReuseAcrossProcesses:
         assert len(fake.calls) == 1
 
     def test_an_expired_cached_token_is_not_served(self, tmp_path):
-        store = OpenReviewTokenStore(tmp_path / "openreview-tokens.json")
-        store.put("a@b.c", OPENREVIEW_API, _jwt(time.time() - 60))
+        path = tmp_path / "openreview-tokens.json"
+        store = OpenReviewTokenStore(path)
+        store.put("a@b.c", OPENREVIEW_API, _jwt(time.time() + 3600))
+        assert store.get("a@b.c", OPENREVIEW_API) is not None
+
+        raw = json.loads(path.read_text())
+        for token in raw["tokens"].values():
+            token["expires"] = time.time() - 1
+        path.write_text(json.dumps(raw))
+
         assert store.get("a@b.c", OPENREVIEW_API) is None
 
     def test_a_refusal_drops_the_shared_copy(self, tmp_path):
@@ -662,6 +799,16 @@ class TestTokenReuseAcrossProcesses:
             auth.token_for_url(NOTES_V1)
         assert path.exists()
 
+    def test_explicit_env_mapping_uses_the_isolated_default_cache(self, tmp_path):
+        auth = OpenReviewAuth.from_env(
+            env={
+                "OPENREVIEW_USERNAME": "a@b.c",
+                "OPENREVIEW_PASSWORD": PASSWORD,
+            }
+        )
+        assert auth is not None and auth._store is not None
+        assert auth._store.path == tmp_path / "openreview-tokens.json"
+
     def test_the_default_path_is_the_user_cache_never_the_repo(self):
         path = _default_openreview_token_cache_path()
         assert path.name == "openreview-tokens.json"
@@ -677,6 +824,7 @@ class TestTokenReuseAcrossProcesses:
 
     def test_expiry_comes_from_the_token_itself(self):
         assert _jwt_expiry(_jwt(1800000000)) == 1800000000.0
+        assert _jwt_expiry(_jwt(1800000000 * 1000)) == 1800000000.0
         assert _jwt_expiry("not-a-jwt") is None
 
 
