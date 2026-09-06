@@ -26,7 +26,7 @@ stamps times, not dates) dblp answers 201 times, 40.1%, with 2 × 429 among the 
 failures. Availability tracks the clock, not our load: 0–27% between 12:00 and 17:00 local
 against 42–75% between 00:00 and 04:00, with failures no more frequent at one request per
 eight seconds than at one per five minutes. In the HALLMARK pre-screening ablation of
-2026-09-04/05, dblp is 86% to 95% of every incomplete-lookup column: 275 of 285, 230 of
+2026-09-04/05, dblp is 92% to 96% of every incomplete-lookup column: 275 of 285, 230 of
 244, 205 of 223, 155 of 163 (source-availability-is-a-measurement-condition.md). A single
 probe on 2026-09-06 at 07:55 UTC (a Sunday morning) answered in 6.25 s while every other
 source answered under 0.6 s; Semantic Scholar keyless returned 429.
@@ -95,11 +95,11 @@ lookups, public pool 1 req/s, effective 1 December 2025
 (`src/bibtex_updater/fact_checker.py`'s `_cli_service_rate_limits`); its docstring still says
 the polite pool advertises about 50 req/second, which the December 2025 change made wrong.
 
-**hallmark.** The wrapper passes neither `--mailto` nor `--openalex-mailto`
-(`hallmark/baselines/bibtexupdater.py`'s `_run_bibtex_check_subprocess`), so a run sits in
-the public pool at 1 req/s while its default `--rate-limit 120` scales CrossRef to 600/min,
-about 10 req/s. Exporting `BIBTEX_CHECK_MAILTO` closes that without a code change
-(`src/bibtex_updater/fact_checker.py`'s `_resolve_polite_mailto`).
+**hallmark.** `hallmark/baselines/bibtexupdater.py`'s `_run_bibtex_check_subprocess` passes
+`--workers 8` and `--outage-threshold 0.10` on every call, and `--mailto` whenever
+`BIBTEX_CHECK_MAILTO` is exported, which is what puts the run in the polite pool. It never
+passes `--openalex-mailto`, which defaults to the `--mailto` value
+(`src/bibtex_updater/fact_checker.py`'s `_effective_openalex_mailto`).
 
 **Recommended and open.** 180/min aggregate (60/min per shard at N=3), contact address
 always set. The ceiling was never reached at the 60/min test cap.
@@ -168,10 +168,10 @@ ChallengeRequiredError`; anonymous `/notes/search` answers and advertises
 lookups failed with 403 (CHANGELOG 1.9.0). The two hosts are disjoint: v1 holds pre-2023
 venues and v2 everything from 2023 on, so `ICLR.cc/2024/Conference` has 0 notes on
 `api.openreview.net` and 2,260 on `api2`, while `ICLR.cc/2021/Conference` has 860 on v1
-and 0 on v2 (CHANGELOG 1.10.0). Logins are the scarce resource: three shards drew 60 × 429
-across about 45 logins (1.10.0), and a cold cache without a per-origin lock produced 44 ×
-429 against 3 successes, because OpenReview refuses roughly the fourth login in two
-minutes (1.10.2). A single authenticated 403 silenced the source for the 160 to 173
+and 0 on v2 (CHANGELOG 1.10.0). Logins are the scarce resource: sharded runs spent repeated
+logins and OpenReview refused enough of them with 429 to degrade those runs to anonymous
+(1.10.0), and a cold cache without a per-origin lock produced 44 × 429 against 3 successes
+(1.10.2). A single authenticated 403 silenced the source for the 160 to 173
 entries behind it on runs where 844 authenticated `/notes` calls returned 200, which
 1.10.1 fixes.
 
@@ -269,7 +269,7 @@ Export `OPENALEX_API_KEY`; a keyless probe measures a per-IP budget the run will
 Leave `S2_API_KEY` unset until a working key exists. Set `OPENREVIEW_USERNAME` and
 `OPENREVIEW_PASSWORD` and keep the cross-process token cache on, so a sharded fleet spends
 one login. Export `BIBTEX_CHECK_MAILTO` with a real address: worth a factor of three on
-CrossRef, and HALLMARK's wrapper passes no flag for it.
+CrossRef, and HALLMARK's wrapper forwards it as `--mailto`.
 
 Set the rate from `_cli_service_rate_limits` (`src/bibtex_updater/fact_checker.py`), whose
 scale factor is `--rate-limit / 45`. At N=3, `--rate-limit 9` with `BIBTEX_ARXIV_RATE=6`
@@ -295,10 +295,13 @@ upgrades: it holds upstream API responses, which do not change when scoring logi
    dblp's FAQ suggests.
 2. **Semantic Scholar key.** A new one needs the account dashboard or their support; until
    then the source is zero and a keyed HaRC comparison cannot be reproduced.
-3. **Whether HALLMARK's wrapper passes `--mailto` and `--workers`.** InterpScience's
-   `stage1` function in `run_screening.py` passes both; the wrapper passes neither, so its
-   CrossRef traffic is public-pool at ten times that pool's rate. `BIBTEX_CHECK_MAILTO` fixes
-   the pool without a code change; `--workers` changes a published run condition.
+3. **Whether HALLMARK's wrapper should set a contact address by default, and whether
+   `--workers 8` is the right default.** InterpScience's `stage1` function in
+   `run_screening.py` passes an address outright; the wrapper passes `--mailto` only when
+   `BIBTEX_CHECK_MAILTO` is exported, so a run without that variable stays in the public
+   pool. The wrapper reads `--workers`, `--rate-limit` and the presence of a contact address
+   back off the command it ran and stamps them into the source condition, so a different
+   `--workers` default changes a recorded run condition.
 4. **Whether the recommended rates become `bibtex-check` defaults.** The defaults (CrossRef
    300/min at scale 1.0, cap 600) sit above CrossRef's post-December-2025 polite allowance
    for any sharded caller, and the docstring in `src/bibtex_updater/fact_checker.py`'s
