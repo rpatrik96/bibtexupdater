@@ -608,6 +608,10 @@ class FactCheckResult:
     # miss NOT_FOUND asserts. Recorded per source per entry, because a run can
     # be healthy overall while one entry's every source timed out.
     sources_failed: list[str] = field(default_factory=list)
+    # Structural repairs applied before fact-checking. Empty for entries the
+    # parser accepted unchanged; emitted so downstream consumers can audit a
+    # result that rests on recovered input.
+    repairs: tuple[str, ...] = ()
     # Output contract -- both fields are DERIVED, recomputed in __post_init__
     # from (status, errors, overall_confidence) at EVERY construction site
     # (check_entry's early returns, the cascade assembly, the verifier
@@ -1434,6 +1438,7 @@ class BookVerifier(BaseVerifier):
         sources_queried: list[str] = []
         sources_with_hits: list[str] = []
         errors: list[str] = []
+        sources_failed: list[str] = []
 
         # Try Open Library
         sources_queried.append("openlibrary")
@@ -1446,6 +1451,7 @@ class BookVerifier(BaseVerifier):
                     candidates.append((score, book, "openlibrary"))
         except Exception as e:
             errors.append(f"Open Library: {e}")
+            sources_failed.append("openlibrary")
 
         # Try Google Books if enabled
         if self.config.use_google_books:
@@ -1459,6 +1465,7 @@ class BookVerifier(BaseVerifier):
                         candidates.append((score, book, "google_books"))
             except Exception as e:
                 errors.append(f"Google Books: {e}")
+                sources_failed.append("google_books")
 
         if not candidates:
             # BOOK_NOT_FOUND is an exhaustive claim over the book databases, so
@@ -1471,6 +1478,7 @@ class BookVerifier(BaseVerifier):
                 api_sources_queried=sources_queried,
                 api_sources_with_hits=sources_with_hits,
                 errors=errors,
+                sources_failed=sources_failed,
             )
 
         # Find best match
@@ -1486,16 +1494,20 @@ class BookVerifier(BaseVerifier):
                 book_match=best_match,
                 api_sources_queried=sources_queried,
                 api_sources_with_hits=sources_with_hits,
+                errors=errors,
+                sources_failed=sources_failed,
             )
 
         return self._make_result(
             entry,
-            FactCheckStatus.BOOK_NOT_FOUND,
+            FactCheckStatus.API_ERROR if errors else FactCheckStatus.BOOK_NOT_FOUND,
             EntryCategory.BOOK,
             confidence=best_score,
             book_match=best_match,
             api_sources_queried=sources_queried,
             api_sources_with_hits=sources_with_hits,
+            errors=errors,
+            sources_failed=sources_failed,
         )
 
     def _search_open_library(self, title: str, author: str, isbn: str | None) -> list[BookRecord]:
@@ -1522,6 +1534,7 @@ class BookVerifier(BaseVerifier):
             resp = self.http._request(
                 "GET", self.OPEN_LIBRARY_API, params=params, accept="application/json", service="openlibrary"
             )
+            raise_for_failed_lookup("openlibrary", self.OPEN_LIBRARY_API, resp.status_code)
             if resp.status_code != 200:
                 return []
 
@@ -1537,9 +1550,8 @@ class BookVerifier(BaseVerifier):
                     url=f"https://openlibrary.org{doc.get('key', '')}" if doc.get("key") else None,
                 )
                 results.append(book)
-
-        except Exception as e:
-            self.logger.debug("Open Library search failed: %s", e)
+        except Exception as exc:
+            raise as_source_failure("openlibrary", self.OPEN_LIBRARY_API, exc) from exc
 
         return results
 
@@ -1572,6 +1584,7 @@ class BookVerifier(BaseVerifier):
             resp = self.http._request(
                 "GET", self.GOOGLE_BOOKS_API, params=params, accept="application/json", service="google_books"
             )
+            raise_for_failed_lookup("google_books", self.GOOGLE_BOOKS_API, resp.status_code)
             if resp.status_code != 200:
                 return []
 
@@ -1596,9 +1609,8 @@ class BookVerifier(BaseVerifier):
                     url=vol.get("infoLink"),
                 )
                 results.append(book)
-
-        except Exception as e:
-            self.logger.debug("Google Books search failed: %s", e)
+        except Exception as exc:
+            raise as_source_failure("google_books", self.GOOGLE_BOOKS_API, exc) from exc
 
         return results
 
@@ -1657,6 +1669,7 @@ class WorkingPaperVerifier(BaseVerifier):
         sources_queried: list[str] = []
         sources_with_hits: list[str] = []
         errors: list[str] = []
+        sources_failed: list[str] = []
         candidates: list[tuple[float, PublishedRecord]] = []
 
         # Search Crossref (often indexes working papers)
@@ -1675,6 +1688,7 @@ class WorkingPaperVerifier(BaseVerifier):
                             candidates.append((score, rec))
             except Exception as e:
                 errors.append(f"Crossref: {e}")
+                sources_failed.append("crossref")
 
         if not candidates:
             status = FactCheckStatus.API_ERROR if errors else FactCheckStatus.WORKING_PAPER_NOT_FOUND
@@ -1685,6 +1699,7 @@ class WorkingPaperVerifier(BaseVerifier):
                 api_sources_queried=sources_queried,
                 api_sources_with_hits=sources_with_hits,
                 errors=errors,
+                sources_failed=sources_failed,
             )
 
         # Find best match with relaxed thresholds
@@ -1987,9 +2002,20 @@ _VERSION_LINK_RE = re.compile(r"\[v(\d+)\]", re.IGNORECASE)
 def _parse_abs_page(html: str) -> tuple[str | None, int]:
     """Return this version's title and how many versions the paper has."""
     m = _CITATION_TITLE_RE.search(html or "")
+    if m is None:
+        logging.getLogger(__name__).warning("arXiv abstract page returned HTTP 200 without a citation_title meta tag")
+        raise ValueError("arXiv abstract page has no citation_title meta tag")
     title = m.group(1).strip() if m else None
     versions = [int(v) for v in _VERSION_LINK_RE.findall(html or "")]
     return title, (max(versions) if versions else 0)
+
+
+@dataclass(frozen=True)
+class _PriorVersionTitleResult:
+    """Outcome of checking whether an earlier arXiv version had a cited title."""
+
+    version: int | None = None
+    error: str | None = None
 
 
 # ------------- Venue Matching -------------
@@ -2753,6 +2779,13 @@ class FactChecker:
         # FactCheckResult field and _not_found_needs_complete_coverage).
         sources_failed: list[str] = []
 
+        def _with_precheck_failures(result: FactCheckResult) -> FactCheckResult:
+            """Carry source failures through identifier-based early returns."""
+            result.errors = list(dict.fromkeys([*errors, *result.errors]))
+            result.sources_failed = list(dict.fromkeys([*sources_failed, *result.sources_failed]))
+            result.__post_init__()
+            return result
+
         title = entry.get("title", "")
         title_norm = normalize_title_for_match(title)
         first_author = first_author_surname(entry)
@@ -2807,16 +2840,16 @@ class FactChecker:
         # VERIFIES the entry against the real paper from Crossref/DBLP/S2,
         # silently leaving the misattributed identifier in place.
         if self.config.check_arxiv_consistency:
-            arxiv_status = self._check_arxiv_id_consistency(entry)
+            arxiv_status = self._check_arxiv_id_consistency(entry, errors, sources_failed)
             if arxiv_status is not None:
-                return arxiv_status
+                return _with_precheck_failures(arxiv_status)
             # Speed: the consistency check found no mismatch and memoized the
             # arXiv record. When that record fully confirms a venue-less,
             # DOI-less preprint citation (exact author sequence), skip the
             # cascade. Clean-VERIFIED only; inert in strict / --no-fast-path.
             arxiv_fast = self._arxiv_fast_path_result(entry)
             if arxiv_fast is not None:
-                return arxiv_fast
+                return _with_precheck_failures(arxiv_fast)
 
         # Pre-search consistency: the entry's own DOI must point to *this* paper.
         # A copy-paste DOI that resolves to a different work otherwise survives
@@ -2824,13 +2857,13 @@ class FactChecker:
         if self.config.check_doi_consistency:
             doi_consistency_status = self._check_doi_consistency(entry)
             if doi_consistency_status is not None:
-                return doi_consistency_status
+                return _with_precheck_failures(doi_consistency_status)
             # Speed: no mismatch and the DOI's cached Crossref record is at
             # hand. When it fully confirms every claimed field, skip the
             # cascade. Clean-VERIFIED only; inert in strict / --no-fast-path.
             doi_fast = self._doi_fast_path_result(entry)
             if doi_fast is not None:
-                return doi_fast
+                return _with_precheck_failures(doi_fast)
 
         query = f"{title_norm} {first_author}".strip()
         # Item 1: cascading source order (CrossRef -> OpenAlex -> DBLP -> S2).
@@ -3456,8 +3489,8 @@ class FactChecker:
                     )
         return None
 
-    def _cited_title_matches_prior_version(self, arxiv_id: str, cited_title: str) -> int | None:
-        """Version number whose title the entry cites, or ``None``.
+    def _prior_version_title_result(self, arxiv_id: str, cited_title: str) -> _PriorVersionTitleResult:
+        """Return a match, a completed miss, or an incomplete arXiv lookup.
 
         A paper renamed after submission leaves the citing entry disagreeing
         with the current arXiv record while being a correct record of the work
@@ -3465,44 +3498,56 @@ class FactChecker:
         versions and see whether the cited title is one the paper actually
         carried.
 
-        The current version is never fetched: its title is already in hand from
-        the API record, and it is what failed to match.
+        The current version's title is never compared: it is already in hand
+        from the API record, and it is what failed to match.
         """
         if not self.config.check_arxiv_version_history or self.arxiv is None:
-            return None
+            return _PriorVersionTitleResult()
+        fetch_first = getattr(self.arxiv, "fetch_version_title_and_count", None)
+        if not callable(fetch_first):
+            return _PriorVersionTitleResult()
         cited = normalize_title_for_match(cited_title or "")
         if not cited:
-            return None
+            return _PriorVersionTitleResult()
 
         budget = max(1, self.config.arxiv_max_version_fetches)
         # v1 first: it carries its own title AND the version list, so the common
         # v1-to-current retitling resolves in a single fetch.
         try:
-            title, total = self.arxiv.fetch_version_title_and_count(arxiv_id, 1)
-        except Exception:
-            # The source never answered. Say nothing rather than let silence
-            # read as "no earlier version carried this title".
-            return None
+            title, total = fetch_first(arxiv_id, 1)
+        except Exception as exc:
+            return _PriorVersionTitleResult(error=str(exc))
         if title is None:
-            return None
+            return _PriorVersionTitleResult()
         if token_sort_ratio(cited, normalize_title_for_match(title)) / 100.0 >= (self.config.arxiv_version_title_min):
-            return 1
+            return _PriorVersionTitleResult(version=1)
+        if total == 1:
+            return _PriorVersionTitleResult()
 
         # Walk forward, stopping before the current version.
         for version in range(2, min(total, budget + 1)):
             try:
                 title = self.arxiv.fetch_version_title(arxiv_id, version)
-            except Exception:
-                return None
+            except Exception as exc:
+                return _PriorVersionTitleResult(error=str(exc))
             if title is None:
                 continue
             if token_sort_ratio(cited, normalize_title_for_match(title)) / 100.0 >= (
                 self.config.arxiv_version_title_min
             ):
-                return version
-        return None
+                return _PriorVersionTitleResult(version=version)
+        return _PriorVersionTitleResult()
 
-    def _check_arxiv_id_consistency(self, entry: dict[str, Any]) -> FactCheckResult | None:
+    def _cited_title_matches_prior_version(self, arxiv_id: str, cited_title: str) -> int | None:
+        """Version number whose title the entry cites, or ``None``."""
+        return self._prior_version_title_result(arxiv_id, cited_title).version
+
+    def _check_arxiv_id_consistency(
+        self,
+        entry: dict[str, Any],
+        errors: list[str] | None = None,
+        sources_failed: list[str] | None = None,
+    ) -> FactCheckResult | None:
         """Flag entries whose cited arXiv ID resolves to a *different* paper.
 
         Title/author search happily VERIFIES a misattributed entry against the
@@ -3543,22 +3588,32 @@ class FactChecker:
                 entry, rec, source="arxiv", identifier=arxiv_id, id_kind="arXiv ID"
             )
 
-        matched_version = self._cited_title_matches_prior_version(arxiv_id, entry.get("title", ""))
-        if matched_version is not None:
+        version_result = self._prior_version_title_result(arxiv_id, entry.get("title", ""))
+        if version_result.error is not None:
+            if errors is not None:
+                errors.append(f"arXiv version history: {version_result.error}")
+            if sources_failed is not None and "arxiv" not in sources_failed:
+                sources_failed.append("arxiv")
+            self.logger.warning(
+                "Could not complete the arXiv version-history lookup for entry %r: %s",
+                entry.get("ID", "?"),
+                version_result.error,
+            )
+            return None
+        if version_result.version is not None:
             self.logger.info(
                 "arXiv ID %s for entry %r cites the title this paper carried at v%d "
                 "(%r); it was retitled to %r since. Not a mismatch.",
                 arxiv_id,
                 entry.get("ID", "?"),
-                matched_version,
+                version_result.version,
                 entry.get("title", ""),
                 rec.title,
             )
             return None
 
         self.logger.warning(
-            "arXiv ID %s for entry %r points to a different paper: entry title "
-            "%r vs arXiv title %r (title score %.2f)",
+            "arXiv ID %s for entry %r points to a different paper: entry title %r vs arXiv title %r (title score %.2f)",
             arxiv_id,
             entry.get("ID", "?"),
             entry.get("title", ""),
@@ -3648,7 +3703,7 @@ class FactChecker:
             return self._id_anchored_field_mismatch(entry, rec, source="crossref", identifier=raw_doi, id_kind="DOI")
 
         self.logger.warning(
-            "DOI %s for entry %r points to a different paper: entry title " "%r vs DOI title %r (title score %.2f)",
+            "DOI %s for entry %r points to a different paper: entry title %r vs DOI title %r (title score %.2f)",
             raw_doi,
             entry.get("ID", "?"),
             entry.get("title", ""),
@@ -3665,8 +3720,7 @@ class FactChecker:
             api_sources_queried=["crossref"],
             api_sources_with_hits=["crossref"],
             errors=[
-                f"DOI {raw_doi} resolves to {rec.title!r}, which does not "
-                f"match entry title {entry.get('title', '')!r}"
+                f"DOI {raw_doi} resolves to {rec.title!r}, which does not match entry title {entry.get('title', '')!r}"
             ],
         )
 
@@ -3843,12 +3897,10 @@ class FactChecker:
         Semantic Scholar match and search steps) keep their relative order in
         every case.
 
-        Reordering changes the order alone. No step is dropped for being
-        unhealthy: an unreachable source still gets its turn, still raises, and
-        still lands in ``sources_failed``, which is what the v1.8.0 ``not_found``
-        contract reads. Demoting it only means a healthy source gets the first
-        chance to answer, and the cascade's existing short-circuit can then end
-        the entry before the dead source costs it a timeout.
+        A demoted source may be skipped when an earlier healthy source triggers
+        the cascade's existing full-confirmation short-circuit. A source skipped
+        this way is absent from both ``api_sources_queried`` and the run's
+        ``sources_failed`` tally.
 
         Measured motivation: over a two-day screening run of 5,043 references, a
         five-minute reachability probe found dblp unreachable in 32 of 36
@@ -3891,7 +3943,8 @@ class FactChecker:
         Item 1 (CheckIfExist Algorithm 1, Abbonato 2026). Each step retrieves
         ``config.top_k`` candidates and re-ranks them by Levenshtein title
         similarity (Item 2). The cascade short-circuits as soon as a source
-        returns a candidate at or above ``cascade_high_confidence``.
+        returns a candidate at or above 0.95 that positively confirms every
+        claimed field.
 
         Retrieval (this fix): Crossref and OpenAlex are queried with *fielded
         title* searches (``query.title`` / ``filter=title.search:``) using the
@@ -3918,8 +3971,9 @@ class FactChecker:
         is what runs while every source is answering. When a source's circuit is
         open or it has been failing consistently, ``_health_ordered_steps`` moves
         its step behind the healthy ones so a reachable source gets the first
-        chance to answer. The set of sources consulted is unchanged: a demoted
-        source still runs, still fails, and still lands in ``sources_failed``.
+        chance to answer. If that source fully confirms every claimed field, the
+        existing short-circuit skips later demoted sources; a skipped source is
+        absent from both ``api_sources_queried`` and ``sources_failed``.
 
         Returns:
             List of ``(score, record, source_name)`` tuples, possibly from
@@ -4178,7 +4232,13 @@ class FactChecker:
         usable = [c for c in all_candidates if c[0] >= self.config.abstention_below]
         if not usable and raw_title.strip():
             self._relaxed_author_retrieval(
-                entry, raw_title, top_k, all_candidates, sources_queried, sources_with_hits, errors, failed
+                entry,
+                raw_title,
+                top_k,
+                all_candidates,
+                sources_queried,
+                sources_with_hits,
+                _record_failure,
             )
         return all_candidates
 
@@ -4190,8 +4250,7 @@ class FactChecker:
         all_candidates: list[tuple[float, PublishedRecord, str]],
         sources_queried: list[str],
         sources_with_hits: list[str],
-        errors: list[str],
-        sources_failed: list[str] | None = None,
+        record_failure: Callable[[str, str, BaseException], None],
     ) -> None:
         """Title-only retry on Crossref + OpenAlex when the strict cascade
         returned nothing usable. Tags fallback candidates with the
@@ -4202,13 +4261,6 @@ class FactChecker:
         wrong-paper candidate that passes the title gate but fails the
         author gate routes to AUTHOR_MISMATCH, not VERIFIED.
         """
-        failed = sources_failed if sources_failed is not None else []
-
-        def _record_failure(source_name: str, label: str, exc: BaseException) -> None:
-            errors.append(f"{label}: {exc}")
-            if source_name not in failed:
-                failed.append(source_name)
-
         # Retrieval-only LaTeX strip (mirrors ``_query_cascade``); scoring below
         # still normalizes the ORIGINAL title.
         retrieval_title = latex_to_plain(raw_title or "")
@@ -4227,7 +4279,7 @@ class FactChecker:
             cr_items = self.crossref.search(retrieval_title, rows=top_k, title=retrieval_title)
         except Exception as exc:
             cr_items = []
-            _record_failure("crossref", "Crossref (fallback)", exc)
+            record_failure("crossref", "Crossref (fallback)", exc)
         cr_records: list[PublishedRecord] = []
         for item in cr_items or []:
             rec = crossref_message_to_record(item)
@@ -4244,7 +4296,7 @@ class FactChecker:
                 oa_items = self.openalex.search(retrieval_title, limit=top_k, title=retrieval_title)
             except Exception as exc:
                 oa_items = []
-                _record_failure("openalex", "OpenAlex (fallback)", exc)
+                record_failure("openalex", "OpenAlex (fallback)", exc)
             oa_records: list[PublishedRecord] = []
             for item in oa_items or []:
                 rec = openalex_work_to_candidate_record(item)
@@ -4448,17 +4500,18 @@ class FactChecker:
         entry_tokens = entry_tokens - _TITLE_STOPWORDS
 
         # Get best match (score, record, normalized title) per source
-        by_source: dict[str, tuple[float, PublishedRecord, str]] = {}
+        by_source: dict[str, tuple[float, PublishedRecord, str, str]] = {}
         for score, rec, source in candidates:
-            if source not in by_source or score > by_source[source][0]:
-                by_source[source] = (score, rec, normalize_title_for_match(rec.title or ""))
+            key = source.removesuffix("-fallback")
+            if key not in by_source or score > by_source[key][0]:
+                by_source[key] = (score, rec, normalize_title_for_match(rec.title or ""), source)
 
         if len(by_source) < 2:
             return None
 
         # Check if entry tokens are drawn from multiple different source titles
         source_overlaps: dict[str, set[str]] = {}
-        for source, (_score, _rec, title) in by_source.items():
+        for source, (_score, _rec, title, _original_source) in by_source.items():
             api_tokens = set(title.split()) - _TITLE_STOPWORDS
             overlap = entry_tokens & api_tokens
             if len(overlap) >= CHIMERIC_MIN_SHARED_TOKENS:
@@ -4488,12 +4541,12 @@ class FactChecker:
                     src_i, src_j = src_j, src_i
                     overlap_i, overlap_j = overlap_j, overlap_i
                     unique_i, unique_j = unique_j, unique_i
-                score_a, rec_a, _ = by_source[src_i]
-                score_b, rec_b, _ = by_source[src_j]
+                score_a, rec_a, _, original_src_a = by_source[src_i]
+                score_b, rec_b, _, original_src_b = by_source[src_j]
                 evidence = ChimericEvidence(
                     entry_title=entry_title,
-                    source_a=src_i,
-                    source_b=src_j,
+                    source_a=original_src_a,
+                    source_b=original_src_b,
                     title_a=rec_a.title or "",
                     title_b=rec_b.title or "",
                     record_a=rec_a,
@@ -4997,8 +5050,7 @@ class FactChecker:
                     comparisons["author"].outcome = MatchOutcome.PARTIAL
                     comparisons["author"].matches = False
                     comparisons["author"].note = (
-                        "2-author order swap not corroborated "
-                        "(single source; possible record-side ordering artifact)"
+                        "2-author order swap not corroborated (single source; possible record-side ordering artifact)"
                     )
             # Same-multiset (>= 3 authors) reordering against a record whose
             # author list is sorted by its full DISPLAY string. The matcher's
@@ -5786,6 +5838,110 @@ def _unescaped_brace_balance(text: str) -> int | None:
     return balance
 
 
+_FIELD_ASSIGNMENT_RE = re.compile(r"[A-Za-z][\w-]*\s*=")
+
+
+def _source_field_names(text: str) -> set[str]:
+    """Collect top-level and comma-separated folded field assignments."""
+
+    def _escaped(index: int) -> bool:
+        backslashes = 0
+        cursor = index - 1
+        while cursor >= 0 and text[cursor] == "\\":
+            backslashes += 1
+            cursor -= 1
+        return bool(backslashes % 2)
+
+    def _skip_layout(index: int) -> int:
+        while index < len(text):
+            if text[index].isspace():
+                index += 1
+                continue
+            if text[index] == "%" and not _escaped(index):
+                newline = text.find("\n", index + 1)
+                index = len(text) if newline < 0 else newline + 1
+                continue
+            break
+        return index
+
+    def _skip_value_term(index: int) -> int | None:
+        """Skip one delimited value term, or return ``None`` when there is none.
+
+        Only a braced group or a quoted string counts as a term. A bare token
+        does not: inside a value that is already open, ``id=abc123`` in a URL
+        and ``alpha = 0.5`` in a title read as assignments with a bare
+        right-hand side, and accepting them costs the whole entry.
+        """
+        index = _skip_layout(index)
+        if index >= len(text):
+            return None
+        opening = text[index]
+        if opening == "{":
+            depth = 1
+            index += 1
+            while index < len(text) and depth:
+                if text[index] in "{}" and not _escaped(index):
+                    depth += 1 if text[index] == "{" else -1
+                index += 1
+            return index if depth == 0 else None
+        if opening == '"':
+            index += 1
+            while index < len(text):
+                if text[index] == '"' and not _escaped(index):
+                    return index + 1
+                index += 1
+            return None
+        return None
+
+    def _looks_like_field_value(index: int) -> bool:
+        index = _skip_value_term(index)
+        if index is None:
+            return False
+        index = _skip_layout(index)
+        while index < len(text) and text[index] == "#":
+            index = _skip_value_term(index + 1)
+            if index is None:
+                return False
+            index = _skip_layout(index)
+        return index < len(text) and text[index] in ",}"
+
+    names: set[str] = set()
+    balance = 0
+    in_quote = False
+    in_comment = False
+    for index, char in enumerate(text):
+        if in_comment:
+            if char == "\n":
+                in_comment = False
+            continue
+        escaped = _escaped(index)
+        if char == '"' and balance == 1 and not escaped:
+            in_quote = not in_quote
+            continue
+        if in_quote:
+            continue
+        # A ``%`` inside an open value is data, not a comment: skipping the
+        # rest of that line swallows the value's own closing brace and
+        # desynchronises ``balance`` from ``_unescaped_brace_balance``.
+        if char == "%" and not escaped and balance <= 1:
+            in_comment = True
+            continue
+        if char in "{}" and not escaped:
+            balance += 1 if char == "{" else -1
+            continue
+        if not (char.isalpha() and (index == 0 or not (text[index - 1].isalnum() or text[index - 1] in "_-"))):
+            continue
+        match = _FIELD_ASSIGNMENT_RE.match(text, index)
+        if match is None:
+            continue
+        name = match.group(0).split("=", 1)[0].strip().lower()
+        if balance == 1:
+            names.add(name)
+        elif balance == 2 and _looks_like_field_value(match.end()):
+            names.add(name)
+    return names
+
+
 def recover_dropped_entry(raw_text: str, key: str) -> RecoveredBibEntry | None:
     """Conservatively repair and reparse one dropped entry's source block.
 
@@ -5822,6 +5978,9 @@ def recover_dropped_entry(raw_text: str, key: str) -> RecoveredBibEntry | None:
     except Exception:
         return None
     if len(recovered) != 1 or recovered[0].get("ID") != key:
+        return None
+    recovered_fields = set(recovered[0]) - {"ID", "ENTRYTYPE"}
+    if _source_field_names(repaired) != recovered_fields:
         return None
     return RecoveredBibEntry(entry=recovered[0], repairs=tuple(repairs))
 
@@ -6084,7 +6243,7 @@ class FactCheckProcessor:
 
     def process_entries(
         self,
-        entries: list[dict[str, Any] | FactCheckResult],
+        entries: list[dict[str, Any] | FactCheckResult | RecoveredBibEntry],
         jsonl_path: str | None = None,
         max_workers: int = 8,
     ) -> list[FactCheckResult]:
@@ -6094,12 +6253,16 @@ class FactCheckProcessor:
         so partial results survive timeouts and crashes.
 
         Args:
-            entries: BibTeX entries to check and precomputed report rows to retain
+            entries: BibTeX entries to check and precomputed or recovered rows to retain
             jsonl_path: Optional path to write JSONL results as they complete
             max_workers: Number of concurrent workers (default: 8)
         """
 
-        parsed_entries = [entry for entry in entries if isinstance(entry, dict)]
+        parsed_entries = [
+            entry.entry if isinstance(entry, RecoveredBibEntry) else entry
+            for entry in entries
+            if isinstance(entry, dict | RecoveredBibEntry)
+        ]
 
         # P1.3: Batch DOI pre-resolution before main processing loop
         self.logger.info("Pre-validating DOIs for %d entries...", len(parsed_entries))
@@ -6135,26 +6298,30 @@ class FactCheckProcessor:
             if jsonl_path:
                 jsonl_file = open(jsonl_path, "a")  # noqa: SIM115
 
-            def _process_one(index: int, entry: dict[str, Any] | FactCheckResult) -> FactCheckResult:
+            def _process_one(
+                index: int, entry: dict[str, Any] | FactCheckResult | RecoveredBibEntry
+            ) -> FactCheckResult:
                 """Process a single entry and write to JSONL if configured."""
                 if isinstance(entry, FactCheckResult):
                     self.logger.info("Recording %d/%d: %s", index + 1, len(entries), entry.entry_key)
                     result = entry
                 else:
-                    self.logger.info("Checking %d/%d: %s", index + 1, len(entries), entry.get("ID", "?"))
+                    repairs = entry.repairs if isinstance(entry, RecoveredBibEntry) else ()
+                    bib_entry = entry.entry if isinstance(entry, RecoveredBibEntry) else entry
+                    self.logger.info("Checking %d/%d: %s", index + 1, len(entries), bib_entry.get("ID", "?"))
                     try:
                         # Pass the batch DOI pre-validation results to both checker
                         # types (UnifiedFactChecker forwards them to its academic
                         # verifier). Duck-typed stand-ins keep the bare call.
                         if isinstance(self.checker, FactChecker | UnifiedFactChecker):
-                            result = self.checker.check_entry(entry, pre_validated_dois=pre_validated_dois)
+                            result = self.checker.check_entry(bib_entry, pre_validated_dois=pre_validated_dois)
                         else:
-                            result = self.checker.check_entry(entry)
+                            result = self.checker.check_entry(bib_entry)
                     except Exception as exc:
-                        self.logger.error("Exception checking entry %s: %s", entry.get("ID", "?"), exc)
+                        self.logger.error("Exception checking entry %s: %s", bib_entry.get("ID", "?"), exc)
                         result = FactCheckResult(
-                            entry_key=entry.get("ID", "unknown"),
-                            entry_type=entry.get("ENTRYTYPE", "misc").lower(),
+                            entry_key=bib_entry.get("ID", "unknown"),
+                            entry_type=bib_entry.get("ENTRYTYPE", "misc").lower(),
                             status=FactCheckStatus.API_ERROR,
                             overall_confidence=0.0,
                             field_comparisons={},
@@ -6162,7 +6329,9 @@ class FactCheckProcessor:
                             api_sources_queried=[],
                             api_sources_with_hits=[],
                             errors=[f"Exception: {exc}"],
+                            sources_failed=["unknown"],
                         )
+                    result.repairs = repairs
                 results[index] = result
 
                 if jsonl_file:
@@ -6204,6 +6373,7 @@ class FactCheckProcessor:
                                 # so no exhaustive miss can be read off the status.
                                 "sources_failed": result.sources_failed,
                                 "errors": result.errors,
+                                **({"repairs": list(result.repairs)} if result.repairs else {}),
                                 # Additive, present only on a chimeric-title
                                 # verdict: the audit record behind it.
                                 **(
@@ -6366,6 +6536,7 @@ class FactCheckProcessor:
                 "api_sources_with_hits": r.api_sources_with_hits,
                 "sources_failed": r.sources_failed,
                 "errors": r.errors,
+                **({"repairs": list(r.repairs)} if r.repairs else {}),
             }
             if r.best_match:
                 entry_data["best_match"] = {
@@ -6434,6 +6605,7 @@ class FactCheckProcessor:
                         # Sources whose lookup did not complete (see process_entries).
                         "sources_failed": r.sources_failed,
                         "errors": r.errors,
+                        **({"repairs": list(r.repairs)} if r.repairs else {}),
                         # Additive, present only on a chimeric-title verdict
                         # (see process_entries).
                         **({"chimeric_evidence": r.chimeric_evidence.to_dict()} if r.chimeric_evidence else {}),
@@ -6509,6 +6681,15 @@ def _cli_service_rate_limits(rate_limit: int, s2_api_key: str | None) -> dict[st
     * openlibrary / google_books keep their historical scaling unchanged.
     """
     rate_scale = rate_limit / 45.0  # 45 is the --rate-limit default
+    raw_arxiv_rate = os.environ.get("BIBTEX_ARXIV_RATE", "20")
+    try:
+        arxiv_rate = int(raw_arxiv_rate)
+    except (TypeError, ValueError):
+        logging.getLogger(__name__).warning(
+            "Invalid BIBTEX_ARXIV_RATE value %r; using the default 20 requests/min",
+            raw_arxiv_rate,
+        )
+        arxiv_rate = 20
     return {
         "crossref": min(600, max(10, int(300 * rate_scale))),
         "openalex": min(300, max(10, int(150 * rate_scale))),
@@ -6521,7 +6702,7 @@ def _cli_service_rate_limits(rate_limit: int, s2_api_key: str | None) -> dict[st
         # across N processes multiplies the offered load by N, which buys 429s and
         # an open circuit rather than throughput. A launcher that shards divides
         # the caller budget by setting BIBTEX_ARXIV_RATE.
-        "arxiv": max(1, int(os.environ.get("BIBTEX_ARXIV_RATE", "20"))),
+        "arxiv": max(1, arxiv_rate),
         "semanticscholar": 60 if s2_api_key else max(5, int(10 * rate_scale)),
         "openlibrary": max(10, int(30 * rate_scale)),
         "google_books": max(10, int(30 * rate_scale)),
@@ -6598,7 +6779,7 @@ Examples:
     p.add_argument(
         "--resolved-out",
         metavar="FILE",
-        help=("Where to write the cleaned bib when using --resolve-first " "(default: <input>.resolved.bib)."),
+        help=("Where to write the cleaned bib when using --resolve-first (default: <input>.resolved.bib)."),
     )
     p.add_argument(
         "--strict",
@@ -6628,7 +6809,7 @@ Examples:
         default=NETWORK_OUTAGE_ENTRY_FRACTION,
         metavar="FLOAT",
         help=(
-            f"Fraction of entries (0-1) with a failed source lookup above which the run "
+            f"Fraction of entries (0-1) with a failed source lookup at or above which the run "
             f"exits {EXIT_SOURCE_OUTAGE} as a source outage, in every mode "
             f"(default: {NETWORK_OUTAGE_ENTRY_FRACTION:g}). 0 fails on a single failed "
             f"lookup; 1 fails only when every entry was affected. Failed lookups are "
@@ -7057,12 +7238,13 @@ def main() -> int:
         return run_check_resolve_first(args, logger)
 
     # Load entries from all BibTeX files
-    entries: list[dict[str, Any] | FactCheckResult] = []
+    entries: list[dict[str, Any] | FactCheckResult | RecoveredBibEntry] = []
     for path in args.bibfiles:
         try:
             with open(path, encoding="utf-8") as f:
                 raw_text = f.read()
             db = BibLoader().loads(raw_text)
+            file_entries: list[dict[str, Any] | RecoveredBibEntry] = list(db.entries)
             parsed_ids = {entry.get("ID") for entry in db.entries if entry.get("ID")}
             for key in detect_dropped_keys(raw_text, parsed_ids):
                 recovered = recover_dropped_entry(raw_text, key)
@@ -7073,12 +7255,12 @@ def main() -> int:
                         path,
                         "; ".join(recovered.repairs),
                     )
-                    db.entries.append(recovered.entry)
+                    file_entries.append(recovered)
                     continue
                 logger.error("Could not safely recover declared entry '%s' from %s", key, path)
                 entries.append(_parse_error_result(path, key, raw_text))
-            entries.extend(db.entries)
-            logger.info("Loaded %d entries from %s", len(db.entries), path)
+            entries.extend(file_entries)
+            logger.info("Loaded %d entries from %s", len(file_entries), path)
         except FileNotFoundError:
             logger.error("File not found: %s", path)
             return 1
@@ -7198,6 +7380,8 @@ def main() -> int:
     # Say so loudly: the failure this guards against is a silent exit 0 over
     # thousands of entries whose lookups never left the machine.
     outage_code = _report_source_outage(summary, http_client, logger, args.outage_threshold)
+    if outage_code:
+        return outage_code
 
     # Exit code
     if strict_mode:
