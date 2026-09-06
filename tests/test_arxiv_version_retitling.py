@@ -18,10 +18,12 @@ cited title no version ever carried.
 
 from __future__ import annotations
 
+import threading
+
 import pytest
 
-from bibtex_updater.fact_checker import ArxivClient, FactChecker, FactCheckerConfig
-from bibtex_updater.utils import SourceUnavailableError
+from bibtex_updater.fact_checker import ArxivClient, FactChecker, FactCheckerConfig, FactCheckStatus
+from bibtex_updater.utils import PublishedRecord, SourceUnavailableError
 
 
 def abs_page(title: str, versions: int, arxiv_id: str = "2308.10248") -> str:
@@ -71,10 +73,12 @@ class FakeHttp:
         return R()
 
 
-def make_checker(http, **cfg) -> FactChecker:
+def make_checker(http, *, arxiv_records=None, **cfg) -> FactChecker:
     checker = FactChecker.__new__(FactChecker)
     checker.config = FactCheckerConfig(**cfg)
     checker.arxiv = ArxivClient(http)
+    checker._arxiv_cache_lock = threading.Lock()
+    checker._arxiv_record_cache = dict(arxiv_records or {})
     import logging
 
     checker.logger = logging.getLogger("test")
@@ -97,6 +101,32 @@ class TestVersionTitleFetch:
 
 
 class TestRetitlingIsNotAMismatch:
+    @pytest.mark.parametrize(
+        "arxiv_id,cited_title,current_title,expected",
+        [
+            ("2308.10248", ACTIVATION_ADDITION_V1, ACTIVATION_ADDITION_NOW, None),
+            ("2304.14767", DISSECTING_CITED, DISSECTING_ALL, FactCheckStatus.ARXIV_ID_MISMATCH),
+        ],
+    )
+    def test_consistency_check_uses_version_history(self, arxiv_id, cited_title, current_title, expected):
+        http = FakeHttp({1: ACTIVATION_ADDITION_V1 if arxiv_id == "2308.10248" else DISSECTING_ALL}, versions=3)
+        checker = make_checker(
+            http,
+            arxiv_records={arxiv_id: PublishedRecord(doi="", title=current_title)},
+            arxiv_consistency_min_title=0.8,
+        )
+        entry = {
+            "ID": "cited",
+            "ENTRYTYPE": "article",
+            "title": cited_title,
+            "eprint": arxiv_id,
+            "archiveprefix": "arXiv",
+        }
+
+        result = checker._check_arxiv_id_consistency(entry)
+
+        assert (result.status if result is not None else None) is expected
+
     def test_cited_title_matching_v1_clears_the_finding(self):
         http = FakeHttp({1: ACTIVATION_ADDITION_V1}, versions=5)
         checker = make_checker(http)

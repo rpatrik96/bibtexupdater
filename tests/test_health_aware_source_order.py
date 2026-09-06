@@ -425,3 +425,15 @@ class TestChimericEvidenceNeedsIndependentServices:
         assert checker._detect_chimeric_title(self.ENTRY, same_service) is None
         assert evidence is not None
         assert {evidence.source_a, evidence.source_b} == {"crossref", "openalex"}
+
+    def test_bucket_key_groups_the_candidate_without_renaming_the_audit_record(self):
+        """A fallback query is grouped under its service but reported by name."""
+        fallback_and_independent = [
+            (0.7, self.SECOND, "crossref-fallback"),
+            (0.8, self.FIRST, "openalex"),
+        ]
+
+        evidence = _checker(_http())._detect_chimeric_title(self.ENTRY, fallback_and_independent)
+
+        assert evidence is not None
+        assert {evidence.source_a, evidence.source_b} == {"crossref-fallback", "openalex"}
