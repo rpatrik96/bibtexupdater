@@ -361,6 +361,17 @@ def _is_abstained_status(status: FactCheckStatus) -> bool:
     return status.value in ABSTAINED_STATUS_VALUES
 
 
+def _queried_sources(api_sources_queried: list[str]) -> list[str]:
+    """Sources queried for one entry, in query order, with repeats collapsed.
+
+    ``api_sources`` in the reports names the sources that returned a candidate,
+    which is a hit count and not a call count: a source queried to no effect is
+    absent from it. Consumers deriving per-entry API cost need the full list,
+    so every report shape carries this one alongside it.
+    """
+    return list(dict.fromkeys(api_sources_queried))
+
+
 def _compute_coverage_incomplete(
     status: FactCheckStatus,
     errors: list[str],
@@ -6591,6 +6602,11 @@ class FactCheckProcessor:
                                     n for n, c in result.field_comparisons.items() if c.is_non_confirming
                                 ],
                                 "api_sources": result.api_sources_with_hits,
+                                # Every source the cascade asked, hit or no
+                                # hit. ``api_sources`` above is the subset that
+                                # answered with a candidate, so reading a call
+                                # count off it undercounts the run.
+                                "api_sources_queried": _queried_sources(result.api_sources_queried),
                                 # Sources whose lookup did not complete for this
                                 # entry. Non-empty means the cascade was partial,
                                 # so no exhaustive miss can be read off the status.
@@ -6761,7 +6777,7 @@ class FactCheckProcessor:
                     for name, c in r.field_comparisons.items()
                 },
                 "best_match": None,
-                "api_sources_queried": r.api_sources_queried,
+                "api_sources_queried": _queried_sources(r.api_sources_queried),
                 "api_sources_with_hits": r.api_sources_with_hits,
                 "sources_failed": r.sources_failed,
                 # Records a source returned that the cascade declined to score
@@ -6834,6 +6850,8 @@ class FactCheckProcessor:
                         "mismatched_fields": [n for n, c in r.field_comparisons.items() if c.is_mismatch],
                         "unconfirmed_fields": [n for n, c in r.field_comparisons.items() if c.is_non_confirming],
                         "api_sources": r.api_sources_with_hits,
+                        # Every source asked (see process_entries).
+                        "api_sources_queried": _queried_sources(r.api_sources_queried),
                         # Sources whose lookup did not complete (see process_entries).
                         "sources_failed": r.sources_failed,
                         # Records a source returned that the cascade declined to

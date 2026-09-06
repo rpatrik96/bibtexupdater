@@ -54,6 +54,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`api_sources_queried` on every JSONL line, next to the `api_sources` key that lists only the sources with hits.** A consumer counting API calls per entry had nothing but `api_sources` to count, so a downstream cost metric reported hits as calls: a source queried to no effect was invisible. The new key names every source the cascade queried for the entry, in query order with repeats collapsed, and is present on every JSONL line and every JSON report entry (empty when nothing was queried); `api_sources` is unchanged and remains the subset that returned a candidate.
+
 - **`distrusted_records` on `FactCheckResult`, in the JSON report and on every JSONL line.** One readable line per record the cascade declined to score, naming the source, the identifier, the title it served and the similarity. A caller can now see that a verdict was reached without a record the run had in hand, and which index misbehaved. Additive: no existing key changes.
 
 ### Changed

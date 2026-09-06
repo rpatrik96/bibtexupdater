@@ -464,3 +464,104 @@ class TestSerialization:
             _result(FactCheckStatus.NOT_FOUND),
         ]
         assert processor.generate_summary(results)["coverage_incomplete_count"] == 0
+
+
+# ===========================================================================
+# api_sources_queried: the call count, next to api_sources' hit count
+# ===========================================================================
+
+
+def _sources_result(key: str, queried: list[str], hits: list[str]) -> FactCheckResult:
+    return FactCheckResult(
+        entry_key=key,
+        entry_type="article",
+        status=FactCheckStatus.VERIFIED if hits else FactCheckStatus.NOT_FOUND,
+        overall_confidence=0.9 if hits else 0.4,
+        field_comparisons={},
+        best_match=None,
+        api_sources_queried=list(queried),
+        api_sources_with_hits=list(hits),
+        errors=[],
+    )
+
+
+def _every_shape(
+    processor: FactCheckProcessor, results: list[FactCheckResult], jsonl_path
+) -> dict[str, dict[str, dict]]:
+    """The same results rendered through all three report shapes, keyed by
+    entry key: the streamed JSONL, the batch JSONL and the JSON report."""
+    entries = [{"ID": r.entry_key, "ENTRYTYPE": "article", "title": r.entry_key} for r in results]
+    processor.process_entries(entries, jsonl_path=str(jsonl_path), max_workers=1)
+    streamed = [json.loads(line) for line in jsonl_path.read_text().splitlines() if line]
+    batch = [json.loads(line) for line in processor.generate_jsonl(results)]
+    report = processor.generate_json_report(results)["entries"]
+    return {
+        "streamed": {rec["key"]: rec for rec in streamed},
+        "batch": {rec["key"]: rec for rec in batch},
+        "report": {rec["key"]: rec for rec in report},
+    }
+
+
+class TestApiSourcesQueried:
+    """``api_sources`` lists the sources that returned a candidate. A consumer
+    deriving a per-entry API-call count from it counts hits, so every report
+    shape also carries the sources that were actually queried."""
+
+    def test_present_on_every_shape_and_equal_across_them(self, tmp_path):
+        results = [
+            _sources_result("hit", ["crossref", "dblp", "openalex"], ["crossref"]),
+            _sources_result("miss", ["crossref", "dblp", "openalex"], []),
+        ]
+        processor = FactCheckProcessor(_FakeChecker({r.entry_key: r for r in results}), LOGGER)
+        shapes = _every_shape(processor, results, tmp_path / "out.jsonl")
+
+        for key in ("hit", "miss"):
+            queried = shapes["streamed"][key]["api_sources_queried"]
+            assert queried == ["crossref", "dblp", "openalex"]
+            assert shapes["batch"][key]["api_sources_queried"] == queried
+            assert shapes["report"][key]["api_sources_queried"] == queried
+
+    def test_hits_are_a_subset_of_queried(self, tmp_path):
+        results = [
+            _sources_result("hit", ["crossref", "dblp", "openalex"], ["crossref"]),
+            _sources_result("miss", ["crossref", "dblp", "openalex"], []),
+        ]
+        processor = FactCheckProcessor(_FakeChecker({r.entry_key: r for r in results}), LOGGER)
+        shapes = _every_shape(processor, results, tmp_path / "out.jsonl")
+
+        for shape in ("streamed", "batch"):
+            for key in ("hit", "miss"):
+                rec = shapes[shape][key]
+                assert set(rec["api_sources"]) <= set(rec["api_sources_queried"])
+
+    def test_a_queried_source_with_no_hit_shows_only_in_queried(self, tmp_path):
+        """DBLP and OpenAlex were asked and returned nothing: they cost a call
+        each, and only the queried list says so."""
+        results = [_sources_result("hit", ["crossref", "dblp", "openalex"], ["crossref"])]
+        processor = FactCheckProcessor(_FakeChecker({r.entry_key: r for r in results}), LOGGER)
+        shapes = _every_shape(processor, results, tmp_path / "out.jsonl")
+
+        for shape in ("streamed", "batch"):
+            rec = shapes[shape]["hit"]
+            assert rec["api_sources"] == ["crossref"]
+            assert set(rec["api_sources_queried"]) - set(rec["api_sources"]) == {"dblp", "openalex"}
+
+    def test_key_is_present_even_when_nothing_was_queried(self, tmp_path):
+        """Consumers can rely on the key existing, so it is emitted empty
+        rather than omitted."""
+        results = [_sources_result("nothing", [], [])]
+        processor = FactCheckProcessor(_FakeChecker({r.entry_key: r for r in results}), LOGGER)
+        shapes = _every_shape(processor, results, tmp_path / "out.jsonl")
+
+        for shape in ("streamed", "batch", "report"):
+            rec = shapes[shape]["nothing"]
+            assert "api_sources_queried" in rec
+            assert rec["api_sources_queried"] == []
+
+    def test_repeated_queries_collapse_in_query_order(self, tmp_path):
+        results = [_sources_result("repeat", ["crossref", "openalex", "crossref", "arxiv"], ["arxiv"])]
+        processor = FactCheckProcessor(_FakeChecker({r.entry_key: r for r in results}), LOGGER)
+        shapes = _every_shape(processor, results, tmp_path / "out.jsonl")
+
+        for shape in ("streamed", "batch", "report"):
+            assert shapes[shape]["repeat"]["api_sources_queried"] == ["crossref", "openalex", "arxiv"]
