@@ -207,8 +207,8 @@ Full structured report: a `summary` block (totals, status counts, verified/absta
 One JSON object per line, streamed as entries complete — useful for large bibliographies and incremental processing:
 
 ```jsonl
-{"key": "smith2020", "category": "academic", "status": "verified", "abstained": false, "coverage_incomplete": false, "confidence": 0.89, "p_valid": 0.945, "confidence_score": 96.0, "mismatched_fields": [], "unconfirmed_fields": [], "api_sources": ["crossref", "dblp"], "errors": []}
-{"key": "fake2099", "category": "academic", "status": "hallucinated", "abstained": false, "coverage_incomplete": false, "confidence": 0.93, "p_valid": 0.035, "confidence_score": 12.0, "mismatched_fields": ["title", "author"], "unconfirmed_fields": [], "api_sources": [], "errors": []}
+{"key": "smith2020", "category": "academic", "status": "verified", "abstained": false, "coverage_incomplete": false, "confidence": 0.89, "p_valid": 0.945, "confidence_score": 96.0, "mismatched_fields": [], "unconfirmed_fields": [], "api_sources": ["crossref", "dblp"], "api_sources_queried": ["crossref", "dblp"], "errors": []}
+{"key": "fake2099", "category": "academic", "status": "hallucinated", "abstained": false, "coverage_incomplete": false, "confidence": 0.93, "p_valid": 0.035, "confidence_score": 12.0, "mismatched_fields": ["title", "author"], "unconfirmed_fields": [], "api_sources": [], "api_sources_queried": ["crossref", "semanticscholar", "openalex", "dblp"], "errors": []}
 ```
 
 Per-line fields:
@@ -226,6 +226,7 @@ Per-line fields:
 | `unconfirmed_fields` | fields neither confirmed nor contradicted (`NON_COMPARABLE`/`PARTIAL`): an arXiv record cannot confirm a claimed ICLR venue, and a `journal = {arXiv preprint arXiv:NNNN.NNNNN}` citation claims no published venue to confirm. These are abstentions the checker made deliberately, never findings against the entry |
 | `distrusted_records` | records a source returned that the cascade declined to score, one readable line each. A source can serve a work under the correct identifier and the correct author list but a different paper's title; scored as a candidate that record produces a `title_mismatch` against a correctly cited entry. Non-empty means the verdict was reached **without** a record the run had in hand, and names which index misbehaved — a statement about the source, never about the entry |
 | `api_sources`, `errors` | sources with hits, and per-source error strings |
+| `api_sources_queried` | sources the cascade queried for this entry, whether or not they returned a candidate; `api_sources` is the subset that did |
 
 ## Exit Codes
 
