@@ -1304,6 +1304,10 @@ LTWA_ABBREVIATIONS: dict[str, str] = {
 #: full form adds nothing to identity ("Proc. Natl. Acad. Sci. U.S.A.").
 _LTWA_DROPPABLE = frozenset({"usa", "us", "uk", "ussr"})
 
+#: Function words that do not distinguish journal titles during the strict
+#: post-expansion alignment. Content-bearing venue words remain in place.
+_LTWA_ALIGNMENT_STOPWORDS = frozenset({"a", "an", "and", "at", "for", "in", "its", "of", "on", "the", "to"})
+
 
 def expand_ltwa_abbreviations(venue: str) -> str:
     """Expand ISO-4 word abbreviations in a venue string.
@@ -1346,11 +1350,25 @@ def venue_abbreviation_matches(venue_a: str, venue_b: str, threshold: float = 0.
         return False
     if expanded_a == expanded_b:
         return True
-    # Compare through the same normalisation the rest of the comparator uses, so
-    # stop-words and punctuation are handled identically.
-    from rapidfuzz.fuzz import token_sort_ratio
+    # Keep ``threshold`` in the public signature for compatibility. A fuzzy
+    # aggregate is unsafe here: shared boilerplate can outweigh one journal-
+    # defining disagreement. Instead, the shorter expanded title must align in
+    # order with no unmatched token inside the span; only a trailing qualifier
+    # on the longer title is allowed (for example PNAS's country suffix).
+    del threshold
+    tokens_a = [
+        token for token in normalize_title_for_match(expanded_a).split() if token not in _LTWA_ALIGNMENT_STOPWORDS
+    ]
+    tokens_b = [
+        token for token in normalize_title_for_match(expanded_b).split() if token not in _LTWA_ALIGNMENT_STOPWORDS
+    ]
+    if not tokens_a or not tokens_b:
+        return False
+    shorter, longer = (tokens_a, tokens_b) if len(tokens_a) <= len(tokens_b) else (tokens_b, tokens_a)
 
-    from bibtex_updater.utils import normalize_title_for_match
+    def tokens_match(left: str, right: str) -> bool:
+        return (
+            left == right or left.startswith(right) or right.startswith(left) or Levenshtein.distance(left, right) <= 2
+        )
 
-    score = token_sort_ratio(normalize_title_for_match(expanded_a), normalize_title_for_match(expanded_b))
-    return score / 100.0 >= threshold
+    return all(tokens_match(left, right) for left, right in zip(shorter, longer))

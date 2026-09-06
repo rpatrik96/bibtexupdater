@@ -107,6 +107,9 @@ def test_preprint_server_venue_recognized(venue):
         "Advances in Neural Information Processing Systems",
         "Journal of Machine Learning Research",
         "Nature",
+        "Preprints of the 21st IFAC World Congress",
+        "Proceedings of the Workshop on e-Print Archives",
+        "The Preprint Journal of Medicine",
         # ``corr`` is anchored at a word boundary precisely so these do not fire.
         "Corrosion Science",
         "Recording Industry Journal",

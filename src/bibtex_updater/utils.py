@@ -33,7 +33,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
 
 import httpx
 from rapidfuzz.distance import Levenshtein
@@ -209,6 +209,29 @@ _PREPRINT_SERVER_VENUE_RE = re.compile(
     re.IGNORECASE,
 )
 
+_PREPRINT_IDENTIFIER_RE = re.compile(
+    r"\b(?:abs/\d{4}\.\d{4,5}|(?:[a-z-]+(?:\.[a-z]{2})?/)?\d{7}|\d{4}\.\d{4,5})(?:v\d+)?\b",
+    re.IGNORECASE,
+)
+
+_PREPRINT_SERVER_STOPWORDS = frozenset(
+    {
+        "a",
+        "an",
+        "and",
+        "archive",
+        "electronic",
+        "for",
+        "in",
+        "journal",
+        "of",
+        "on",
+        "repository",
+        "the",
+        "v",
+    }
+)
+
 
 def is_preprint_server_venue(venue: str | None) -> bool:
     r"""True if ``venue`` names a preprint SERVER and nothing else.
@@ -228,8 +251,7 @@ def is_preprint_server_venue(venue: str | None) -> bool:
         CoRR abs/2408.05147               bioRxiv             SSRN
 
     Old-style identifiers (``arXiv:math.GT/0309136``) and ``\href``-wrapped ones
-    are covered by the same ``arxiv`` marker; the identifier shape is never
-    parsed here.
+    are covered as identifier noise after the server marker is removed.
 
     Such a string is not a *published-venue* claim. It says "this work is a
     preprint", which carries exactly as much published-venue information as an
@@ -237,7 +259,14 @@ def is_preprint_server_venue(venue: str | None) -> bool:
     """
     if not venue:
         return False
-    return bool(_PREPRINT_SERVER_VENUE_RE.search(venue))
+    plain = latex_to_plain(venue).lower()
+    if not _PREPRINT_SERVER_VENUE_RE.search(plain):
+        return False
+    remainder = _PREPRINT_SERVER_VENUE_RE.sub(" ", plain)
+    remainder = _PREPRINT_IDENTIFIER_RE.sub(" ", remainder)
+    remainder = re.sub(r"\bv\d+\b|\b\d+\b|[^a-z0-9]+", " ", remainder)
+    tokens = [token for token in remainder.split() if token not in _PREPRINT_SERVER_STOPWORDS]
+    return not tokens
 
 
 def retry_after_seconds(exc: httpx.HTTPError, fallback: float, cap: float = 60.0) -> float:
@@ -2053,10 +2082,11 @@ class OpenReviewTokenStore:
 
     The file holds tokens only, never the password, keyed by the SHA-256 of the
     username so a second account cannot pick up the first one's token and the
-    address itself never lands on disk. It is written atomically at mode 0600
-    inside a 0700 directory, under the user cache dir rather than anywhere near
-    a repository. Every failure is non-fatal: an unreadable or unwritable cache
-    degrades to the login-per-process behaviour it replaced.
+    address itself never lands on disk. It is written atomically at mode 0600,
+    in a cache directory this run creates at 0700 when it does not already
+    exist, under the user cache dir rather than anywhere near a repository.
+    Every failure is non-fatal: an unreadable or unwritable cache degrades to
+    the login-per-process behaviour it replaced.
     """
 
     VERSION = 1
@@ -2171,6 +2201,10 @@ class OpenReviewAuth:
     ``429`` on 60 of its 45 logins. Set
     ``BIBTEX_CHECK_OPENREVIEW_TOKEN_CACHE=0`` to keep the old
     login-per-process behaviour, or to a path to move the file.
+
+    Login redirects are followed manually only when their target is another
+    origin in :attr:`SHARED_ORIGINS`; the password is never replayed to an
+    unshared redirect target.
     """
 
     LOGIN_PATH = "/login"
@@ -2179,6 +2213,10 @@ class OpenReviewAuth:
     #: token held for any of these is presented at all of them, and a token
     #: invalidated at one is dropped at every origin that held the same string.
     SHARED_ORIGINS: tuple[str, ...] = (OPENREVIEW_API_V2, OPENREVIEW_API)
+
+    LOGIN_RETRY_COOLDOWN = 60.0
+
+    PERMANENT_LOGIN_FAILURES = frozenset({400, 401, 403})
 
     def __init__(
         self,
@@ -2193,10 +2231,16 @@ class OpenReviewAuth:
         self._store = token_store
         self._lock = threading.Lock()
         self._tokens: dict[str, str] = {}
-        # Origins whose login failed. A bad password fails identically for every
-        # entry, so one attempt per origin per run is enough; the rest of the run
-        # proceeds anonymously.
+        # Origins whose credentials were rejected. A bad password fails
+        # identically for every entry, so one attempt per origin per run is
+        # enough; the rest of the run proceeds anonymously.
         self._disabled: set[str] = set()
+        # Transient login failures pause retries per origin rather than
+        # disabling authentication for the rest of the process.
+        self._next_login_attempt: dict[str, float] = {}
+        # Retained so the source-level refusal message can distinguish absent
+        # credentials from credentials that OpenReview rejected.
+        self._login_failure_status: dict[str, int | None] = {}
         # One lock per origin, created lazily under ``_lock`` and then held for
         # the duration of that origin's login. A cold token cache under a
         # ThreadPoolExecutor otherwise lets every worker that wants the same
@@ -2283,8 +2327,7 @@ class OpenReviewAuth:
         A token already held for the sibling host is adopted instead of buying a
         second login, in memory and from the shared cache alike. ``None`` means
         the caller should proceed anonymously: the URL had no recoverable
-        origin, or no host has a token and the login to this one already failed
-        in this run.
+        origin, or no host has a token and login is disabled or cooling down.
         """
         origin = self._origin(url)
         if not origin:
@@ -2297,6 +2340,7 @@ class OpenReviewAuth:
                     self._tokens[origin] = token
                     return token
             disabled = origin in self._disabled
+            next_login_attempt = self._next_login_attempt.get(origin, 0.0)
         if self._store is not None:
             for cached_at in (origin, *siblings):
                 cached = self._store.get(self._username, cached_at)
@@ -2308,6 +2352,8 @@ class OpenReviewAuth:
         # sibling lookups so a host whose own ``/login`` was throttled still
         # rides on the other one's token instead of falling back to anonymous.
         if disabled:
+            return None
+        if time.monotonic() < next_login_attempt:
             return None
         # Serialize the login itself per origin. Everything above this point
         # only reads shared state, so several threads reach here together with
@@ -2327,78 +2373,105 @@ class OpenReviewAuth:
                     return token
                 if origin in self._disabled:
                     return None
-            token = self._login(origin)
+                if time.monotonic() < self._next_login_attempt.get(origin, 0.0):
+                    return None
+            token, status = self._login(origin)
             with self._lock:
                 if token:
                     self._tokens[origin] = token
-                else:
+                    self._next_login_attempt.pop(origin, None)
+                    self._login_failure_status.pop(origin, None)
+                elif status in self.PERMANENT_LOGIN_FAILURES:
                     self._disabled.add(origin)
+                    self._login_failure_status[origin] = status
+                else:
+                    self._next_login_attempt[origin] = time.monotonic() + self.LOGIN_RETRY_COOLDOWN
+                    self._login_failure_status[origin] = status
             if token and self._store is not None:
                 self._store.put(self._username, origin, token)
             return token
 
-    def invalidate(self, url: str) -> None:
+    def invalidate(self, url: str, token: str | None = None) -> None:
         """Drop the cached token for ``url``'s host so the next call logs in again.
 
-        Called when a request that carried a token was refused, which is what an
-        expired token looks like from the client side. The same string held for
-        the sibling host goes with it: both hosts accept the token, so both
-        refuse it once it expires, and leaving one copy behind would hand the
-        next lookup the token that was just rejected.
+        Called when a request that carried ``token`` was refused, which is what
+        an expired token looks like from the client side. A supplied token makes
+        the removal compare-and-swap: a stale refusal cannot discard a newer
+        token installed by another thread. ``None`` keeps the unconditional
+        public behavior. The same refused string held for the sibling host goes
+        with it because both hosts accept the token.
         """
         origin = self._origin(url)
         if not origin:
             return
         with self._lock:
-            stale = self._tokens.pop(origin, None)
+            held = self._tokens.get(origin)
+            if token is None or held == token:
+                stale = self._tokens.pop(origin, None)
+            else:
+                stale = token
             for other in self._siblings(origin):
                 if stale is not None and self._tokens.get(other) == stale:
                     self._tokens.pop(other, None)
         # Drop the shared copies too: another process presenting the same expired
         # token would be refused identically.
         if self._store is not None:
-            shared = stale if stale is not None else self._store.get(self._username, origin)
-            self._store.drop(self._username, origin)
+            stored = self._store.get(self._username, origin)
+            shared = stale if stale is not None else stored
+            if token is None or stored == token:
+                self._store.drop(self._username, origin)
             for other in self._siblings(origin):
                 if shared is not None and self._store.get(self._username, other) == shared:
                     self._store.drop(self._username, other)
 
-    def _login(self, origin: str) -> str | None:
-        """POST the credentials to ``<origin>/login`` and return the token.
+    def login_failure_status_for_url(self, url: str) -> int | None:
+        """Return the most recent failed login status for ``url``'s origin."""
+        origin = self._origin(url)
+        with self._lock:
+            return self._login_failure_status.get(origin)
 
-        Never raises: every failure returns ``None`` and is logged with the
-        status alone. The response body is not logged, because it carries the
-        token on success.
+    def _login(self, origin: str) -> tuple[str | None, int | None]:
+        """POST the credentials to ``<origin>/login`` and return token and status.
+
+        Never raises: every failure returns ``(None, status)`` and is logged with
+        the status alone. Transport failures have no status. The response body
+        is not logged because it carries the token on success.
         """
         url = f"{origin}{self.LOGIN_PATH}"
+        credentials = {"id": self._username, "password": self._password}
         try:
-            with httpx.Client(timeout=self._timeout, follow_redirects=True) as client:
-                resp = client.post(url, json={"id": self._username, "password": self._password})
+            with httpx.Client(timeout=self._timeout, follow_redirects=False) as client:
+                resp = client.post(url, json=credentials)
+                if 300 <= resp.status_code < 400:
+                    location = resp.headers.get("Location")
+                    target = urljoin(url, location) if isinstance(location, str) else ""
+                    if self._origin(target) in self.SHARED_ORIGINS:
+                        resp = client.post(target, json=credentials)
         except Exception as exc:  # noqa: BLE001 - a failed login must not end the run
             logger.warning(
                 "OpenReview login to %s did not complete (%s); continuing anonymously",
                 origin,
                 type(exc).__name__,
             )
-            return None
+            return None, None
         if resp.status_code != 200:
             logger.warning(
                 "OpenReview login to %s failed (HTTP %s); continuing anonymously",
                 origin,
                 resp.status_code,
             )
-            return None
+            return None, resp.status_code
         try:
             data = resp.json() or {}
         except Exception:  # noqa: BLE001 - an unparseable body is a failed login
             logger.warning("OpenReview login to %s returned an unreadable body; continuing anonymously", origin)
-            return None
+            return None, resp.status_code
         token = data.get("token") or data.get("access_token")
         if not isinstance(token, str) or not token.strip():
             logger.warning("OpenReview login to %s returned no token; continuing anonymously", origin)
-            return None
+            return None, resp.status_code
         logger.info("OpenReview authenticated against %s", origin)
-        return token.strip()
+        return token.strip(), resp.status_code
 
 
 class HttpClient:
@@ -2826,7 +2899,7 @@ class HttpClient:
                     and self.openreview_auth is not None
                 ):
                     auth_refreshed = True
-                    self.openreview_auth.invalidate(url)
+                    self.openreview_auth.invalidate(url, openreview_token)
                     continue
                 if resp.status_code in self.RETRYABLE_STATUS:
                     raise httpx.HTTPStatusError("Retryable status", request=resp.request, response=resp)
@@ -3925,7 +3998,7 @@ class AsyncHttpClient:
                     and self.openreview_auth is not None
                 ):
                     auth_refreshed = True
-                    await asyncio.to_thread(self.openreview_auth.invalidate, url)
+                    await asyncio.to_thread(self.openreview_auth.invalidate, url, openreview_token)
                     continue
                 if resp.status_code in self.RETRYABLE_STATUS:
                     raise httpx.HTTPStatusError(

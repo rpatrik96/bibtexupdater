@@ -46,6 +46,12 @@ class TestIso4Expansion:
             ("J. Mach. Learn. Res.", "Journal of Machine Learning Research"),
             ("Int. J. Comput. Vis.", "International Journal of Computer Vision"),
             ("Nat. Mach. Intell.", "Nature Machine Intelligence"),
+            ("Nat. Commun.", "Nature Communications"),
+            ("Ann. Stat.", "The Annals of Statistics"),
+            ("J. Am. Stat. Assoc.", "Journal of the American Statistical Association"),
+            ("Nat. Rev. Neurosci.", "Nature Reviews Neuroscience"),
+            ("Eur. J. Oper. Res.", "European Journal of Operational Research"),
+            ("Phys. Rev. Lett.", "Physical Review Letters"),
         ],
     )
     def test_abbreviated_journal_matches_its_full_name(self, abbreviated, full):
@@ -102,6 +108,19 @@ class TestDifferentVenuesStillMismatch:
         """Expansion must not collapse distinct journals into a match."""
         result = venues_match("J. Mach. Learn. Res.", "J. Artif. Intell. Res.")
         assert result.outcome is not MatchOutcome.MATCH
+
+    @pytest.mark.parametrize(
+        ("venue_a", "venue_b"),
+        [
+            ("Phys. Rev. E", "Physical Review Letters"),
+            ("Ann. Stat.", "Annual Review of Statistics"),
+            ("IEEE Trans. Inf. Theory", "IEEE Transactions on Information Forensics and Security"),
+            ("Nat. Neurosci.", "Nature Reviews Neuroscience"),
+            ("Am. J. Psychol.", "American Journal of Psychiatry"),
+        ],
+    )
+    def test_abbreviation_expansion_does_not_merge_different_journals(self, venue_a, venue_b):
+        assert venues_match(venue_a, venue_b).outcome is not MatchOutcome.MATCH
 
 
 class TestAbstainOnUnrecognisedNames:

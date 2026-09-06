@@ -566,6 +566,7 @@ class OpenReviewClient:
         # and so the source's circuit stays free to describe what the transport
         # is actually doing.
         self._refused_urls: set[str] = set()
+        self._refusal_reasons: dict[str, str] = {}
         self._refused_lock = threading.Lock()
 
     def _is_refused(self, url: str) -> bool:
@@ -604,17 +605,30 @@ class OpenReviewClient:
         OPENREVIEW_PASSWORD`` for the 160 to 173 entries that followed it, on a
         run where both were set. v2 holds ICLR 2024+, NeurIPS 2023+, TMLR and
         COLM, so the source stopped contributing to the modern half of the
-        bibliography. A genuinely revoked token converges on the latch anyway:
-        OpenReview answers 401, the client re-logs in once, and a login that
-        fails leaves the origin disabled, so the next request goes out anonymous
-        and its 403 latches here.
+        bibliography. A genuinely revoked token converges on the latch when
+        OpenReview rejects the replacement login: the next request goes out
+        anonymous and its 403 latches here. A transient login failure instead
+        enters a cooldown and never latches this endpoint.
         """
         if exc.status_code not in OPENREVIEW_AUTH_REFRESH_STATUS:
             return
-        if self._token_for(url):
-            return
+        auth = getattr(self.http, "openreview_auth", None)
+        if auth is None:
+            reason = "challenge-gated; no credentials configured; set OPENREVIEW_USERNAME / OPENREVIEW_PASSWORD"
+        else:
+            if self._token_for(url):
+                return
+            status_for_url = getattr(auth, "login_failure_status_for_url", None)
+            login_status = status_for_url(url) if callable(status_for_url) else None
+            # A throttled, failed, or interrupted login is retried after the
+            # auth object's cooldown. Latching this anonymous request would
+            # prevent that retry from ever being reached.
+            if login_status not in {400, 401, 403}:
+                return
+            reason = f"challenge-gated; credentials configured; login failed (HTTP {login_status})"
         with self._refused_lock:
             self._refused_urls.add(url)
+            self._refusal_reasons[url] = reason
 
     #: Host order for every ``/notes`` lookup. v2 first: it holds the 2023+
     #: venues (ICLR 2024 alone has 2,260 notes there and 0 on v1), which is the
@@ -697,10 +711,15 @@ class OpenReviewClient:
             notes_url = f"{host}/notes"
             if self._is_refused(notes_url):
                 # Already gated this run: record the failure without a request.
+                with self._refused_lock:
+                    reason = self._refusal_reasons.get(
+                        notes_url,
+                        "challenge-gated; no credentials configured; set OPENREVIEW_USERNAME / OPENREVIEW_PASSWORD",
+                    )
                 failure = failure or SourceUnavailableError(
                     "openreview",
                     notes_url,
-                    "challenge-gated for anonymous callers; set OPENREVIEW_USERNAME / OPENREVIEW_PASSWORD",
+                    reason,
                     transport_failure=False,
                     status_code=403,
                 )
