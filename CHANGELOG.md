@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - An incomplete arXiv version-history walk cannot support `ARXIV_ID_MISMATCH`. The checker leaves the entry to the normal cascade, records arXiv in `sources_failed`, and warns when an HTTP 200 abstract page lacks the expected `citation_title` metadata.
 
 - Dropped-entry recovery rejects a closing-brace repair when later fields would be folded into an earlier value. Accepted repairs are attached to `FactCheckResult` and emitted in JSON and JSONL output.
+- The folded-field check reads `=` and `%` inside a completed field value as data rather than as structure. A URL carrying a query string (`url = {https://openreview.net/forum?id=abc123}`), a percent-encoded URL sharing its line with later fields, and a title such as `On the Choice of alpha = 0.5, and Its Consequences` were all counted as folded assignments, so `recover_dropped_entry` returned `None`, the entry was reported as `PARSE_ERROR` instead of being fact-checked, and `--strict` exited 4 over it. An assignment inside an open value now counts only when its own value is a braced group or a quoted string, and the `%` comment skip is confined to the top level, so the brace accounting matches `_unescaped_brace_balance`.
 
 - Chimeric-title detection counts independent services rather than query variants. Strict and relaxed candidates from Crossref share one evidence bucket while reports retain the original query source name.
 

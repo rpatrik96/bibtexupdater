@@ -6088,6 +6088,13 @@ def _source_field_names(text: str) -> set[str]:
         return index
 
     def _skip_value_term(index: int) -> int | None:
+        """Skip one delimited value term, or return ``None`` when there is none.
+
+        Only a braced group or a quoted string counts as a term. A bare token
+        does not: inside a value that is already open, ``id=abc123`` in a URL
+        and ``alpha = 0.5`` in a title read as assignments with a bare
+        right-hand side, and accepting them costs the whole entry.
+        """
         index = _skip_layout(index)
         if index >= len(text):
             return None
@@ -6107,8 +6114,7 @@ def _source_field_names(text: str) -> set[str]:
                     return index + 1
                 index += 1
             return None
-        match = re.match(r"[A-Za-z0-9_.:+/-]+", text[index:])
-        return index + len(match.group(0)) if match else None
+        return None
 
     def _looks_like_field_value(index: int) -> bool:
         index = _skip_value_term(index)
@@ -6137,7 +6143,10 @@ def _source_field_names(text: str) -> set[str]:
             continue
         if in_quote:
             continue
-        if char == "%" and not escaped:
+        # A ``%`` inside an open value is data, not a comment: skipping the
+        # rest of that line swallows the value's own closing brace and
+        # desynchronises ``balance`` from ``_unescaped_brace_balance``.
+        if char == "%" and not escaped and balance <= 1:
             in_comment = True
             continue
         if char in "{}" and not escaped:
@@ -7035,7 +7044,7 @@ Examples:
         default=NETWORK_OUTAGE_ENTRY_FRACTION,
         metavar="FLOAT",
         help=(
-            f"Fraction of entries (0-1) with a failed source lookup above which the run "
+            f"Fraction of entries (0-1) with a failed source lookup at or above which the run "
             f"exits {EXIT_SOURCE_OUTAGE} as a source outage, in every mode "
             f"(default: {NETWORK_OUTAGE_ENTRY_FRACTION:g}). 0 fails on a single failed "
             f"lookup; 1 fails only when every entry was affected. Failed lookups are "
