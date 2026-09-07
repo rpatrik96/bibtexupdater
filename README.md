@@ -72,7 +72,7 @@ bibtex-update references.bib --dry-run --verbose
 # Check if references exist and have correct metadata
 bibtex-check references.bib --report report.json
 
-# Strict mode: exit with error if hallucinated/not-found entries
+# Strict mode: exit 4 on problematic entries, 5 if the sources went down mid-run
 bibtex-check references.bib --strict
 ```
 
@@ -236,10 +236,10 @@ python scripts/eval_hallmark.py --split /path/to/hallmark/data/v1.0/test_public.
 
 - **Multi-source validation**: Crossref, OpenAlex, DBLP, OpenReview, Semantic Scholar
 - **Detailed mismatch detection**: Title, author, year, venue comparisons
-- **Integrity checks**: DOI- and arXiv-ID-target consistency, ID-anchored author fabrication, chimeric-title detection
+- **Integrity checks**: DOI- and arXiv-ID-target consistency, ID-anchored author fabrication, chimeric-title detection, corrupt-index-record distrust
 - **Hallucination detection**: Reserves `hallucinated` for positive evidence (fabricated DOI, future/invalid year, ID misattribution); abstains (`not_found`) on weak matches. `not_found` means "the sources queried do not know this reference", not "this reference is fabricated" — but it carries negative polarity (`p_valid` 0.35) and integrations commonly map it to a hallucination label, so decide that policy deliberately ([what `not_found` does and does not assert](docs/REFERENCE_FACT_CHECKER.md#what-not_found-does-and-does-not-assert)). `--strict` fails on the whole problematic bucket, which makes it stricter than the NeurIPS 2026 criteria for hallucinated references: those treat a real venue that is wrong for the reference, a wrong arXiv ID and small author or title errors as errors to report to the authors rather than hallucinations ([verdicts](docs/REFERENCE_FACT_CHECKER.md#verdicts-verified-vs-could-not-verify-vs-problematic))
-- **Structured reports**: JSON and JSONL output formats
-- **CI/CD integration**: Strict mode with exit codes for automation
+- **Structured reports**: JSON and JSONL output. Every JSONL line and every JSON report entry names the sources the cascade queried (`api_sources_queried`) alongside the subset that returned a candidate (`api_sources`), and any record it declined to score (`distrusted_records`) ([per-line fields](docs/REFERENCE_FACT_CHECKER.md#jsonl-report---jsonl))
+- **CI/CD integration**: `--strict` exits 4 on problematic entries; a run whose sources did not answer exits 5 instead, in every mode ([exit codes](docs/REFERENCE_FACT_CHECKER.md#exit-codes))
 
 #### Cascading verification
 
@@ -282,9 +282,15 @@ A 0–100 numeric `confidence_score` (additive in the JSONL output) summarizes p
 - Penalties: title-mismatch `-20`, author-mismatch `-20`, journal-mismatch `-15`, fabricated-author `-10` each (capped at `-20`)
 - Asymmetric formula for the high-title-low-author chimeric case: `confidence = S_title − 0.5 × (100 − S_author)`
 
+#### Corrupt index records
+
+An index can serve a work under the entry's own identifier and its real author list but a different paper's title — OpenAlex does this today for ToolLLM, Constitutional AI and LoRA. Scored as a candidate, such a record produces a `title_mismatch` against a correctly cited entry, and downstream that reads as a fabricated citation; over a 267-submission screening run the signature came from a corrupt record three times for every real citation error. The cascade therefore drops an identifier-anchored candidate whose authors the entry confirms and whose title similarity is below 0.50, and only once the identifier's own authority has answered: arXiv for a `10.48550/arxiv.*` DOI or a bare arXiv ID, Crossref for every other DOI. A source that confirms the entry's title wins outright, and a divergence that two identifier-anchored sources report independently is left to stand, so a hybrid fabrication — real identifier, real authors, invented title — keeps its verdict. Each dropped record is reported in `distrusted_records`, which is a statement about the source and never about the entry. Disable with `--no-distrust-corrupt-index-records`.
+
 #### Verdicts: verified vs. could-not-verify vs. problematic
 
 `VERIFIED` requires every claimed field to be *positively confirmed* against the matched record — not merely "not contradicted". When a record is found but a claimed field can't be confirmed (e.g. a published venue backed only by a preprint, or an incomplete author list), the entry is reported as **could-not-verify** (`UNCONFIRMED`/`NOT_FOUND`), distinct from a **problematic** flag (`*_mismatch`, `doi_mismatch`, chimeric, …) which is positive evidence of a defect. A "could-not-verify" is *not* a clean pass: it means the tool couldn't decide, and such entries warrant review.
+
+Venue comparison is three-valued for the same reason. Common ISO-4 journal abbreviations (`ACM Trans. Graph.`, `Proc. Natl. Acad. Sci. U.S.A.`) are expanded before the comparison, and a pair that neither canonicalizes to a known venue nor looks alike returns `NON_COMPARABLE`, which lands in `unconfirmed_fields` rather than `mismatched_fields`. `MISMATCH` is reserved for positive grounds: both sides canonicalizing to different known venues, a satellite event on exactly one side, or two venues that each state an acronym and state different ones.
 
 For full transparency, every residual `VERIFIED`-on-a-real-leak case against the corrected HALLMARK v1.0 gold is enumerated in [`docs/KNOWN_LEAKS.md`](docs/KNOWN_LEAKS.md), with the perturbation, the default verdict, and the `--strict` rule that catches it.
 
@@ -305,6 +311,8 @@ For high-stakes submissions where the asymmetric cost is leak ≫ FP — [arXiv 
 - **Truncated author list without an `and others`/`et al` sentinel** flags `AUTHOR_TRUNCATED` (silent truncation is a misrepresentation; an explicit sentinel discloses it).
 
 The companion `--strict-warn-cnv` subflag (requires `--strict`) promotes `unconfirmed`/`not_found` to a fourth visible category `STRICT_WARN_CNV`, so CI integrations can fail on entries the tool couldn't anchor. Default mode keeps the principled three-way verdict unchanged.
+
+`--strict` exits 4 when problematic or unreadable entries remain; abstentions do not fail it unless `--strict-warn-cnv` is set. A run in which the fraction of entries with an incomplete source lookup reached `--outage-threshold` (default 10%) exits 5 instead, in strict and default mode alike — an incomplete run outranks its own content findings, because verdicts reached without a complete cascade are not the findings they look like.
 
 ```bash
 # Strict pass for an arXiv submission

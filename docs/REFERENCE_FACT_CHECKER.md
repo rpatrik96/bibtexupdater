@@ -22,7 +22,7 @@ bibtex-check references.bib --report report.json
 # Stream per-entry results to JSONL
 bibtex-check references.bib --jsonl results.jsonl
 
-# CI/CD mode: fail if not-found / hallucinated entries
+# CI/CD mode: fail on problematic or unreadable entries
 bibtex-check references.bib --strict
 ```
 
@@ -59,6 +59,8 @@ Title/author search runs a single cascade — there is no parallel "query every 
 The order is throughput-aware: fast, broad sources first so the slow keyless Semantic Scholar fallback is only reached on hard entries. It is also **health-aware**: a source whose circuit is open, or which has been failing consistently during the run, is moved behind the sources that are still answering, so a reachable source gets the first chance at every entry. Reordering changes the order alone — a demoted source is still consulted, still records its failure, and still blocks the exhaustive `not_found` claim. OpenReview is consulted before Semantic Scholar because it owns the submission record for most ML conferences and can *positively confirm* ICLR/NeurIPS/TMLR papers that the DOI/CS-index sources can only leave unconfirmed. Set a Semantic Scholar API key (`--s2-api-key` or `S2_API_KEY`) to lift S2 to ~60 req/min — with a key, a single-best-title `/paper/search/match` step additionally runs right after CrossRef and the final S2 relevance-search step is skipped whenever it contributed, so per-entry S2 spend stays at one call.
 
 **Retrieval** uses fielded title search (CrossRef `query.title`, OpenAlex `title.search`) against the raw, author-free title rather than a free-text `title + surname` blob — the blob returned unrelated papers for DOI-less ML-conference titles. Each step retrieves `--top-k` candidates (default 3, max 10) and re-ranks them by title similarity.
+
+**Corrupt index records** are dropped before the candidates are scored. An index can serve a work under the entry's own identifier and its real author list but a different paper's title (OpenAlex does this today for ToolLLM, Constitutional AI and LoRA), and scored as a candidate that record produces a `title_mismatch` against a correctly cited entry — three times per real citation error over a 267-submission screening run. A candidate is dropped when it is anchored on the entry's own DOI or arXiv ID, the entry confirms its authors, and its title similarity is below `index_corruption_max_title` (0.50), and only once the identifier's own authority has answered: arXiv for a `10.48550/arxiv.*` DOI or a bare arXiv ID, Crossref for every other DOI. An identifier-anchored source that *confirms* the entry's title wins outright, and a divergence two identifier-anchored sources report independently is left to stand, so a hybrid fabrication (real identifier, real authors, invented title) keeps its verdict. `_check_doi_consistency` and `_check_arxiv_id_consistency` run against an authoritative source before the cascade and are untouched. Each dropped record is reported in `distrusted_records`; disable the whole guard with `--no-distrust-corrupt-index-records`.
 
 ### Scoring and verdict
 
@@ -166,9 +168,10 @@ usage: bibtex-check [-h] [--report FILE] [--jsonl FILE] [--resolve-first]
                     [--title-threshold FLOAT] [--author-threshold FLOAT]
                     [--year-tolerance INT] [--venue-threshold FLOAT]
                     [--cache-file FILE] [--rate-limit INT] [--s2-api-key KEY]
-                    [--openalex-api-key KEY]
+                    [--openreview-username USER] [--openalex-api-key KEY]
                     [--mailto EMAIL] [--no-cache] [--no-check-dois]
                     [--no-check-years] [--no-check-venue-existence]
+                    [--no-distrust-corrupt-index-records]
                     [--no-fast-path] [--workers N] [--skip-web] [--skip-books]
                     [--skip-working-papers] [--academic-only]
                     [--verify-url-content] [--url-timeout FLOAT]
@@ -182,13 +185,13 @@ usage: bibtex-check [-h] [--report FILE] [--jsonl FILE] [--resolve-first]
 | `bibfiles` | — | One or more BibTeX files to check |
 | `--report`, `-r FILE` | — | Write full JSON report to FILE |
 | `--jsonl FILE` | — | Write one JSON object per line (streamed) |
-| `--strict` | off | Exit code 4 if not-found / hallucinated entries found |
+| `--strict` | off | Exit code 4 if problematic or unreadable entries remain; abstentions do not fail it without `--strict-warn-cnv` |
 | `--outage-threshold FLOAT` | 0.10 | Fraction of entries (0–1) with a failed source lookup at or above which the run exits 5, in every mode. `0` fails on a single failed lookup; `1` fails only when every entry was affected |
 | `--verbose`, `-v` | off | Enable debug logging |
 
 **Thresholds:** `--title-threshold` (0.90), `--author-threshold` (0.80), `--year-tolerance` (1), `--venue-threshold` (0.70).
 
-**API options:** `--cache-file` (`.cache.fact_checker.json`), `--rate-limit` (45 req/min, scales per-service limits), `--s2-api-key KEY` (or `S2_API_KEY` env var), `--openalex-api-key KEY` (or `OPENALEX_API_KEY`; bypasses the keyless shared daily credit budget), `--openreview-username USER` (or `OPENREVIEW_USERNAME`; the password comes from `OPENREVIEW_PASSWORD` only, and both are optional — without them OpenReview's `/notes` endpoints answer 403 and only its full-text search contributes; the token is cached across processes at `~/.cache/bibtex-updater/openreview-tokens.json`, disabled with `BIBTEX_CHECK_OPENREVIEW_TOKEN_CACHE=0`), `--mailto EMAIL` (or `BIBTEX_CHECK_MAILTO`; polite-pool contact for Crossref/OpenAlex, feeds the User-Agent and the `--openalex-mailto` default), `BIBTEX_ARXIV_RATE` (divide the per-caller arXiv budget when sharding a run across processes; default 20), `BIBTEX_CHECK_OR_UNPUBLISHED_FLAG=1` (report an OpenReview submission that was not accepted at its claimed venue; default off), `--resolve-first` (run the preprint resolver first, fact-check only entries it did not upgrade, and always write the cleaned bibliography), `--resolved-out FILE` (set that bibliography's path; default `<input>.resolved.bib`), `--no-cache`, `--no-check-dois`, `--no-check-years`, `--no-check-venue-existence` (disable the DBLP/OpenAlex venue-registry existence check behind `nonexistent_venue`), `--no-fast-path` (always run the full cascade; disables the DOI/arXiv identifier-anchored fast paths), `--workers N` (8).
+**API options:** `--cache-file` (`.cache.fact_checker.json`), `--rate-limit` (45 req/min, scales per-service limits), `--s2-api-key KEY` (or `S2_API_KEY` env var), `--openalex-api-key KEY` (or `OPENALEX_API_KEY`; bypasses the keyless shared daily credit budget), `--openreview-username USER` (or `OPENREVIEW_USERNAME`; the password comes from `OPENREVIEW_PASSWORD` only, and both are optional — without them OpenReview's `/notes` endpoints answer 403 and only its full-text search contributes; the token is cached across processes at `~/.cache/bibtex-updater/openreview-tokens.json`, disabled with `BIBTEX_CHECK_OPENREVIEW_TOKEN_CACHE=0`), `--mailto EMAIL` (or `BIBTEX_CHECK_MAILTO`; polite-pool contact for Crossref/OpenAlex, feeds the User-Agent and the `--openalex-mailto` default), `BIBTEX_ARXIV_RATE` (divide the per-caller arXiv budget when sharding a run across processes; default 20, and a value that is not an integer is logged and replaced by that default rather than aborting the run), `BIBTEX_CHECK_OR_UNPUBLISHED_FLAG=1` (report an OpenReview submission that was not accepted at its claimed venue; default off), `--resolve-first` (run the preprint resolver first, fact-check only entries it did not upgrade, and always write the cleaned bibliography), `--resolved-out FILE` (set that bibliography's path; default `<input>.resolved.bib`), `--no-cache`, `--no-check-dois`, `--no-check-years`, `--no-check-venue-existence` (disable the DBLP/OpenAlex venue-registry existence check behind `nonexistent_venue`), `--no-distrust-corrupt-index-records` (score identifier-anchored records even when they carry the entry's authors under a different title), `--no-fast-path` (always run the full cascade; disables the DOI/arXiv identifier-anchored fast paths), `--workers N` (8).
 
 **Cascade (CheckIfExist):** `--top-k N` (3, max 10) candidates per source; `--openalex-mailto EMAIL` for the OpenAlex polite pool.
 
@@ -236,8 +239,11 @@ Per-line fields:
 |------|---------|
 | 0 | Success (or non-strict mode) |
 | 1 | Input error (file not found, parse error) |
-| 4 | Strict mode: not-found or hallucinated entries found |
+| 2 | `--strict-warn-cnv` was passed without `--strict` |
+| 4 | Strict mode: problematic entries, unreadable entries, or (with `--strict-warn-cnv`) could-not-verify entries remain. Abstentions alone do not reach it |
 | 5 | Source outage: the fraction of entries with a source lookup that did not complete is at or above `--outage-threshold` (default 10%), in any mode. The run checked less than it appears to have checked — discard its could-not-verify verdicts and re-run once the sources are reachable |
+
+The outage code outranks the strict one: when both gates fire the run exits 5, because a bibliography finding drawn from an incomplete cascade is not the finding it looks like.
 
 Below the threshold the affected entries are still logged (with the sources and the unreachable hosts named) and still report `api_error`; only the run-wide verdict stands. `--outage-threshold` tunes where that line sits but cannot switch the check off: a silent exit 0 over a run whose lookups never left the machine is what the code exists to prevent, so it fires in default mode as well as under `--strict`.
 
