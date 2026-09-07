@@ -19,18 +19,19 @@ ARROW_LIT_COLOR = "#58a6ff"
 
 STAGES = [
     ("1", "arXiv API", "#f47b20"),
-    ("1b", "OpenAlex", "#a855f7"),  # NEW
-    ("1c", "Europe PMC", "#22c55e"),  # NEW
+    ("1b", "OpenAlex", "#a855f7"),
+    ("1c", "Europe PMC", "#22c55e"),
     ("2", "Crossref\nRelations", "#f59e0b"),
     ("3", "DBLP", "#3b82f6"),
-    ("3b", "ACL\nAnthology", "#ec4899"),  # NEW
-    ("3c", "OpenReview", "#14b8a6"),  # NEW
+    ("3b", "ACL\nAnthology", "#ec4899"),
+    ("3c", "OpenReview", "#14b8a6"),
     ("4", "Semantic\nScholar", "#06b6d4"),
     ("5", "Crossref\nSearch", "#f59e0b"),
     ("6", "Google\nScholar", "#ef4444"),
 ]
 
-NEW_STAGES = {"1b", "1c", "3b", "3c"}
+# Badges the stages added in a given release; empty once they are no longer new.
+NEW_STAGES: set[str] = set()
 
 
 def draw_frame(fig, ax, n_lit):
