@@ -746,7 +746,26 @@ Policy-adjusted leak rates exclude hyphen-only title differences — see [`docs/
 - Comprehensive test suite with pytest fixtures
 - MIT License
 
-[Unreleased]: https://github.com/rpatrik96/bibtexupdater/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/rpatrik96/bibtexupdater/compare/v1.12.0...HEAD
+[1.12.0]: https://github.com/rpatrik96/bibtexupdater/compare/v1.11.0...v1.12.0
+[1.11.0]: https://github.com/rpatrik96/bibtexupdater/compare/v1.10.3...v1.11.0
+[1.10.3]: https://github.com/rpatrik96/bibtexupdater/compare/v1.10.2...v1.10.3
+[1.10.2]: https://github.com/rpatrik96/bibtexupdater/compare/v1.10.1...v1.10.2
+[1.10.1]: https://github.com/rpatrik96/bibtexupdater/compare/v1.10.0...v1.10.1
+[1.10.0]: https://github.com/rpatrik96/bibtexupdater/compare/v1.9.0...v1.10.0
+[1.9.0]: https://github.com/rpatrik96/bibtexupdater/compare/v1.8.1...v1.9.0
+[1.8.1]: https://github.com/rpatrik96/bibtexupdater/compare/v1.8.0...v1.8.1
+[1.8.0]: https://github.com/rpatrik96/bibtexupdater/compare/v1.7.0...v1.8.0
+[1.7.0]: https://github.com/rpatrik96/bibtexupdater/compare/v1.6.1...v1.7.0
+[1.6.1]: https://github.com/rpatrik96/bibtexupdater/compare/v1.6.0...v1.6.1
+[1.6.0]: https://github.com/rpatrik96/bibtexupdater/compare/v1.5.1...v1.6.0
+[1.5.1]: https://github.com/rpatrik96/bibtexupdater/compare/v1.5.0...v1.5.1
+[1.5.0]: https://github.com/rpatrik96/bibtexupdater/compare/v1.4.0...v1.5.0
+[1.4.0]: https://github.com/rpatrik96/bibtexupdater/compare/v1.3.0...v1.4.0
+[1.3.0]: https://github.com/rpatrik96/bibtexupdater/compare/v1.2.0...v1.3.0
+[1.2.0]: https://github.com/rpatrik96/bibtexupdater/compare/v1.1.0...v1.2.0
+[1.1.0]: https://github.com/rpatrik96/bibtexupdater/compare/v1.0.0...v1.1.0
+[1.0.0]: https://github.com/rpatrik96/bibtexupdater/compare/v0.10.0...v1.0.0
 [0.10.0]: https://github.com/rpatrik96/bibtexupdater/compare/v0.9.2...v0.10.0
 [0.9.2]: https://github.com/rpatrik96/bibtexupdater/compare/v0.9.1...v0.9.2
 [0.9.1]: https://github.com/rpatrik96/bibtexupdater/compare/v0.9.0...v0.9.1
