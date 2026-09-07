@@ -83,6 +83,8 @@ Author handling: sources return authors in as-published order, so author-order d
 
 `hallucinated` is reserved for positive-evidence signals; a merely weak title-search match **abstains** as `not_found` rather than asserting fabrication.
 
+The NeurIPS 2026 criteria for hallucinated references, adopted from the ICLR and ICML 2026 guidance, treat an unfindable title, a badly wrong author list and a venue with no evidence of existing as hallucination, and treat a real-but-wrong venue, a wrong arXiv ID and small author or title errors as errors to report to the authors. Of the problematic statuses only `hallucinated`, `nonexistent_venue`, `title_mismatch` and the fabrication side of `author_mismatch` land in their hallucinated class, so a gate that fails on the whole bucket is stricter than that policy. The source is the NeurIPS 2026 program chairs' message to authors of 5 September 2026, which carries no public URL.
+
 ### What `not_found` does and does not assert
 
 `not_found` and `unconfirmed` share the could-not-verify bucket, but they are **not interchangeable**, and integrations must not treat them as such.
