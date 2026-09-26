@@ -107,7 +107,7 @@ class TestArxivIdMonthValidation:
         assert extract_arxiv_id_from_text("2602.01031") == "2602.01031"
 
     def test_arxiv_doi_still_extracted(self):
-        assert extract_arxiv_id_from_text("10.48550/arXiv.2406.14302") == "2406.14302"
+        assert extract_arxiv_id_from_text("10.48550/arXiv.1711.05101") == "1711.05101"
 
     def test_first_valid_id_when_invalid_precedes(self):
         # An invalid-month number followed by a real arXiv ID -> return the real one.
