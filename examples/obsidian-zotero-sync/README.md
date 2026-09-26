@@ -106,7 +106,7 @@ For papers without tags (or to add more keywords), use the AI enrichment script:
 
 **Prerequisites:**
 ```bash
-pip install bibtex-updater[organizer-claude]  # or organizer-openai
+pip install ".[organizer-claude]"  # from the unpacked repository; or organizer-openai
 export ANTHROPIC_API_KEY="your-key"           # or OPENAI_API_KEY
 ```
 

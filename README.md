@@ -6,41 +6,33 @@ Tools for managing BibTeX bibliographies: automatically update preprints to publ
 
 ## Installation
 
-### From PyPI (Recommended)
+Download the repository as a ZIP from https://anonymous.4open.science/r/bibtexupdater/ and unzip it, then install from the unpacked directory:
 
 ```bash
-pip install bibtex-updater
+cd bibtexupdater
+
+pip install .
 
 # With Google Scholar support
-pip install bibtex-updater[scholarly]
+pip install ".[scholarly]"
 
 # With Zotero support
-pip install bibtex-updater[zotero]
+pip install ".[zotero]"
 
 # All optional dependencies
-pip install bibtex-updater[all]
+pip install ".[all]"
 ```
 
-### From Source (Recommended)
+### Using uv
+
+With [uv](https://docs.astral.sh/uv/), run the tools from the unpacked directory without a separate install step:
 
 ```bash
-git clone https://anonymous.4open.science/r/bibtexupdater
 cd bibtexupdater
-uv sync --extra dev --extra all
-```
-
-### Using uv (No Installation)
-
-Run directly without cloning using [uv](https://docs.astral.sh/uv/):
-
-```bash
-# Run any command directly
-uv run --with "bibtex-updater[all]" bibtex-update references.bib -o updated.bib
-
-# Or use the provided wrapper script
-./scripts/bibtex-x update references.bib -o updated.bib
-./scripts/bibtex-x check references.bib
-./scripts/bibtex-x filter paper.tex -b references.bib -o filtered.bib
+uv sync --extra all
+uv run bibtex-update references.bib -o updated.bib
+uv run bibtex-check references.bib
+uv run bibtex-filter paper.tex -b references.bib -o filtered.bib
 ```
 
 ## CLI Commands
@@ -371,8 +363,7 @@ if detection.is_preprint:
 ## Development
 
 ```bash
-# Clone and install in development mode
-git clone https://anonymous.4open.science/r/bibtexupdater
+# Install in development mode from the unpacked repository
 cd bibtexupdater
 uv sync --extra dev --extra all
 

@@ -108,6 +108,8 @@ source = "vcs"
 [tool.hatch.version.raw-options]
 version_scheme = "guess-next-dev"
 local_scheme = "no-local-version"
+# the anonymized ZIP download carries no .git; this lets it install
+fallback_version = "1.12.0"
 
 [tool.hatch.build.hooks.vcs]
 version-file = "src/bibtex_updater/_version.py"

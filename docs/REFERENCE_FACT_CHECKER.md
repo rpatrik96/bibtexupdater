@@ -4,10 +4,12 @@ Validate that bibliographic entries in BibTeX files exist in external databases 
 
 ## Installation
 
+From the unpacked repository (see the main README):
+
 ```bash
-pip install bibtex-updater
-# or run without installing
-uv run --with bibtex-updater bibtex-check references.bib
+pip install .
+# or, with uv
+uv run bibtex-check references.bib
 ```
 
 ## Quick Start
@@ -254,7 +256,7 @@ Below the threshold the affected entries are still logged (with the sources and 
 ```yaml
 - name: Validate references
   run: |
-    pip install bibtex-updater
+    pip install ./bibtex-updater  # the unpacked repository, vendored into your project
     bibtex-check references.bib --strict --report report.json
 - name: Upload report
   if: always()

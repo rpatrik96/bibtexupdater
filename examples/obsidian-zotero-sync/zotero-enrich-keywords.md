@@ -11,7 +11,7 @@ description: Enrich paper notes with AI-generated [[wikilink]] keywords
  * are insufficient.
  *
  * REQUIREMENTS:
- * - bibtex-updater installed with: pip install bibtex-updater
+ * - bibtex-updater installed from the unpacked repository: pip install .
  * - ANTHROPIC_API_KEY or OPENAI_API_KEY environment variable set
  * - Templater plugin with shell command execution enabled
  *
