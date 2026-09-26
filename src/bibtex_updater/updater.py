@@ -49,24 +49,39 @@ from typing import Any
 
 from rapidfuzz.fuzz import token_sort_ratio
 
+from bibtex_updater.sources import (
+    OR_ACCEPTED,
+    OpenReviewClient,
+    build_openreview_paperhashes,
+    openreview_acceptance,
+    openreview_note_to_candidate_record,
+)
+
 # Shared utilities
 from bibtex_updater.utils import (
+    ABSENCE_STATUS_CODES,
     ACL_ANTHOLOGY_URL,
     ARXIV_API,
     CROSSREF_API,
     DBLP_API_SEARCH,
     EUROPEPMC_API,
     OPENALEX_API,
+    OPENREVIEW_AUTH_REFRESH_STATUS,
+    OPENREVIEW_SEARCH_SERVICE,
+    OPENREVIEW_SERVICE,
     PREPRINT_HOSTS,
     S2_API,
     AsyncHttpClient,
     HttpClient,
+    OpenReviewAuth,
     PublishedRecord,
     RateLimiterRegistry,
     ResolutionCache,
     ResolutionCacheEntry,
+    SourceUnavailableError,
     SqliteCache,
     acl_anthology_bib_to_record,
+    atomic_replace,
     authors_last_names,
     crossref_message_to_record,
     dblp_hit_to_record,
@@ -76,6 +91,7 @@ from bibtex_updater.utils import (
     extract_acl_anthology_id,
     extract_arxiv_id_from_text,
     first_author_surname,
+    is_preprint_venue,
     jaccard_similarity,
     last_name_from_person,
     latex_to_plain,
@@ -83,7 +99,6 @@ from bibtex_updater.utils import (
     openalex_work_to_record,
     safe_lower,
     split_authors_bibtex,
-    strip_diacritics,
 )
 
 # External library: bibtexparser
@@ -101,7 +116,15 @@ except Exception:  # pragma: no cover
 # ------------- IO Helpers -------------
 class BibLoader:
     def __init__(self) -> None:
-        self.parser = BibTexParser(common_strings=True)
+        # ignore_nonstandard_types defaults to True in bibtexparser, which
+        # SILENTLY DROPS biblatex entry types such as @online, @software,
+        # @dataset, @patent, @electronic, @thesis at parse time. Disabling it
+        # keeps these entries so they are resolved, written, and reported.
+        # Trade-off: disabling the filter also retains typo'd/unknown entry
+        # types (e.g. @junk) instead of dropping them; we accept that over
+        # silent data loss, since a stray bad type is visible and fixable
+        # whereas a vanished entry is not.
+        self.parser = BibTexParser(common_strings=True, ignore_nonstandard_types=False)
         self.parser.customization = None
 
     def load_file(self, path: str) -> bibtexparser.bibdatabase.BibDatabase:
@@ -130,7 +153,7 @@ class BibWriter:
             os.fsync(tmp.fileno())
         finally:
             tmp.close()
-        os.replace(tmp.name, path)
+        atomic_replace(tmp.name, path)
 
 
 # ------------- Google Scholar Client (optional) -------------
@@ -530,7 +553,7 @@ class FieldFiller:
             title_b = normalize_title_for_match(rec.title or "")
             title_score = token_sort_ratio(title_a, title_b)
 
-            authors_b = [a.get("family", "").lower() for a in rec.authors[:3]]
+            authors_b = rec.surname_keys(limit=3)
             auth_score = jaccard_similarity(authors_a, authors_b)
 
             combined = 0.7 * (title_score / 100.0) + 0.3 * auth_score
@@ -795,6 +818,36 @@ class Detector:
         return PreprintDetection(False)
 
 
+def _s2_record_is_still_preprint(msg: dict[str, Any], doi: str | None) -> bool:
+    """Detect S2-from-arXiv payloads that only tag a preprint with a published venue.
+
+    Semantic Scholar's arXiv-keyed lookup can return a record whose
+    ``publicationVenue.name`` is the *published* venue (e.g. an ICLR
+    conference) while the rest of the payload is still the arXiv preprint:
+    ``externalIds.DOI`` is an arXiv DOI (``10.48550/arXiv...``), ``year`` /
+    ``publicationDate`` are the preprint's, and ``journal.name`` is "ArXiv".
+    Building a ``PublishedRecord`` from such a payload yields an internally
+    inconsistent upgrade (published venue + arXiv DOI + preprint year), and
+    also breaks ``--force-recheck`` idempotency because the retained arXiv DOI
+    re-triggers preprint detection.
+
+    Returns ``True`` when the resolved record is fundamentally still the arXiv
+    version and must be rejected so the resolution cascade falls through to a
+    source carrying the real published record (DBLP).
+
+    The preprint-DOI prefix check mirrors ``Detector.detect`` exactly: both
+    ``10.48550/arxiv`` (arXiv) and ``10.1101`` (bioRxiv/medRxiv) count as
+    preprint DOIs. The journal-name preprint-host check reuses
+    ``PREPRINT_HOSTS`` exactly as ``Resolver._credible_journal_article`` does.
+    """
+    if doi and doi.lower().startswith(("10.48550/arxiv", "10.1101")):
+        return True
+    journal_name = ((msg.get("journal") or {}).get("name") or "").lower()
+    if journal_name and any(host in journal_name for host in PREPRINT_HOSTS):
+        return True
+    return False
+
+
 # ------------- Resolver & Matching -------------
 class Resolver:
     # Accepted publication types for upgrades (includes ML conference papers)
@@ -824,6 +877,8 @@ class Resolver:
         self.logger = logger
         self.scholarly_client = scholarly_client
         self.resolution_cache = resolution_cache
+        # OpenReview submission registry (stage 3c). No network until ``.search``.
+        self.openreview = OpenReviewClient(http=http)
 
     # --- arXiv ---
     def arxiv_candidate_doi(self, arxiv_id: str) -> str | None:
@@ -1021,7 +1076,9 @@ class Resolver:
         Returns:
             PublishedRecord if a published version is found, None otherwise
         """
-        url = f"{OPENALEX_API}/works/arxiv:{arxiv_id}"
+        # OpenAlex dropped the bare ``arxiv:<id>`` route (now 404); resolve the
+        # work by its arXiv DOI instead.
+        url = f"{OPENALEX_API}/works/doi:10.48550/arXiv.{arxiv_id}"
         try:
             resp = self.http._request("GET", url, accept="application/json", service="openalex")
             if resp.status_code != 200:
@@ -1179,7 +1236,7 @@ class Resolver:
 
     # --- Semantic Scholar (safe alternative to Google Scholar scraping) ---
     def s2_from_arxiv(self, arxiv_id: str) -> PublishedRecord | None:
-        fields = "externalIds,title,year,authors,venue,publicationTypes,publicationVenue,url"
+        fields = "externalIds,title,year,authors,venue,publicationTypes,publicationVenue,journal,url"
         url = f"{S2_API}/paper/arXiv:{arxiv_id}"
         try:
             resp = self.http._request(
@@ -1195,6 +1252,17 @@ class Resolver:
         pub_types = msg.get("publicationTypes") or []
         is_journal = any(pt.lower() == "journalarticle" for pt in pub_types)
         if not (doi and is_journal):
+            return None
+        # Reject records that are still the arXiv preprint under a published
+        # venue label (arXiv DOI/year mixed with a published venue): fall
+        # through to DBLP for the real published record.
+        if _s2_record_is_still_preprint(msg, doi):
+            self.logger.debug(
+                "S2 arXiv record for %s still a preprint (doi=%s, journal=%s); rejecting",
+                arxiv_id,
+                doi,
+                (msg.get("journal") or {}).get("name"),
+            )
             return None
         title = msg.get("title")
         year = msg.get("year")
@@ -1244,7 +1312,7 @@ class Resolver:
             return {}
 
         S2_BATCH_URL = f"{S2_API}/paper/batch"
-        fields = "externalIds,title,year,authors,venue,publicationTypes,publicationVenue,url,paperId"
+        fields = "externalIds,title,year,authors,venue,publicationTypes,publicationVenue,journal,url,paperId"
 
         try:
             resp = self.http._request(
@@ -1283,6 +1351,19 @@ class Resolver:
 
             # Only include journal articles with DOIs
             if not (doi and is_journal):
+                results[input_id] = None
+                continue
+
+            # Reject records that are still the arXiv preprint under a
+            # published venue label (arXiv DOI/year mixed with a published
+            # venue): fall through to DBLP for the real published record.
+            if _s2_record_is_still_preprint(paper, doi):
+                self.logger.debug(
+                    "S2 batch record %s still a preprint (doi=%s, journal=%s); rejecting",
+                    input_id,
+                    doi,
+                    (paper.get("journal") or {}).get("name"),
+                )
                 results[input_id] = None
                 continue
 
@@ -1431,7 +1512,7 @@ class Resolver:
             return False
         # Reject if venue looks like a preprint venue (ensures idempotency)
         j_lower = rec.journal.lower()
-        if any(host in j_lower for host in PREPRINT_HOSTS):
+        if is_preprint_venue(rec.journal):
             return False
         if not rec.year:
             return False
@@ -1612,6 +1693,7 @@ class Resolver:
         2. Crossref relations: is-preprint-of links
         3. DBLP bibliographic search
         3b. ACL Anthology lookup (DOI/URL-based)
+        3c. OpenReview submission registry (accepted ICLR/NeurIPS/TMLR)
         4. Semantic Scholar search
         5. Crossref bibliographic search
         6. Google Scholar fallback (opt-in)
@@ -1622,11 +1704,13 @@ class Resolver:
 
         # Stage 1: Direct lookup (arXiv -> S2 -> Crossref)
         result, candidate_doi = self._stage1_direct_lookup(detection)
+        result = self._verify_arxiv_match(result, entry, title_norm)
         if result:
             return result
 
         # Stage 1b: OpenAlex lookup (preprint-to-published version tracking)
         result = self._stage1b_openalex(detection, candidate_doi)
+        result = self._verify_arxiv_match(result, entry, title_norm)
         if result:
             return result
 
@@ -1650,6 +1734,11 @@ class Resolver:
         if result:
             return result
 
+        # Stage 3c: OpenReview submission registry (accepted ICLR/NeurIPS/TMLR)
+        result = self._stage3c_openreview(entry, title_norm)
+        if result:
+            return result
+
         # Stage 4: Semantic Scholar search
         result = self._stage4_s2_search(entry, title_norm)
         if result:
@@ -1665,6 +1754,40 @@ class Resolver:
         if result:
             return result
 
+        return None
+
+    def _verify_arxiv_match(
+        self, result: PublishedRecord | None, entry: dict[str, Any], title_norm: str
+    ) -> PublishedRecord | None:
+        """Reject an arXiv-ID-keyed record whose title/author do not match the entry.
+
+        Stages 1 and 1b resolve purely from ``detection.arxiv_id`` and assign
+        ``confidence = 1.0`` to whatever that ID maps to. If the entry's cited
+        arXiv ID is wrong, those stages would silently rewrite the entry into an
+        unrelated paper. Gate them on the same combined title/author match score
+        the search-based stages (1c, 3-5) already require, so a misattributed
+        identifier falls through to title-based resolution instead of corrupting
+        the entry.
+
+        Returns ``result`` unchanged when it is ``None`` or when the entry has no
+        title to verify against (we then trust the direct ID lookup as before).
+        """
+        if result is None:
+            return None
+        if not title_norm:
+            return result
+        authors_ref = authors_last_names(entry.get("author", ""))
+        score = self._compute_match_score(title_norm, result, authors_ref)
+        if score >= self.MATCH_THRESHOLD:
+            return result
+        self.logger.warning(
+            "Rejecting %s: arXiv-keyed record title %r does not match entry %r (score %.2f < %.2f)",
+            result.method,
+            result.title,
+            entry.get("title", ""),
+            score,
+            self.MATCH_THRESHOLD,
+        )
         return None
 
     def _stage1_direct_lookup(self, detection: PreprintDetection) -> tuple[PublishedRecord | None, str | None]:
@@ -1885,6 +2008,72 @@ class Resolver:
 
         return None
 
+    def _stage3c_openreview(self, entry: dict[str, Any], title_norm: str) -> PublishedRecord | None:
+        """Stage 3c: OpenReview submission-registry search (ICLR/NeurIPS/TMLR).
+
+        OpenReview owns the authoritative submission record for most ML
+        conferences. Only ACCEPTED submissions resolve -- rejected / withdrawn /
+        under-review / CoRR notes are skipped (``openreview_acceptance``). Mirrors
+        the DBLP stage: an exact ``paperhash`` (title + first author) lookup, then
+        title/author scoring; a match becomes a credible ``proceedings-article``
+        upgrade via :meth:`_openreview_record_for_upgrade`. For these venues a
+        DOI-less venue + forum-URL record is the canonical published form.
+        """
+        if not title_norm:
+            return None
+        first_author = first_author_surname(entry)
+        if not first_author:
+            return None
+        # RAW author name, as the checker passes it: ``first_author_surname``
+        # ASCII-folds the surname, while OpenReview's paperhash index keeps the
+        # diacritics ("Akyürek" indexes as "akyürek" and the folded "akyurek"
+        # returns nothing). The client runs its own normalization and issues
+        # the folded form as a second hash.
+        or_first_author = (split_authors_bibtex(entry.get("author") or "") or [first_author])[0]
+        try:
+            notes = self.openreview.search("", limit=5, title=entry.get("title") or "", first_author=or_first_author)
+        except SourceUnavailableError as exc:
+            # The resolver's job is to upgrade a preprint when it can; an
+            # OpenReview lookup that never completed leaves the entry alone.
+            self.logger.debug("OpenReview stage skipped: %s", exc)
+            return None
+        if not notes:
+            return None
+
+        authors_ref = authors_last_names(entry.get("author", ""))
+        best: tuple[float, PublishedRecord] | None = None
+        for note in notes:
+            if openreview_acceptance(note) != OR_ACCEPTED:
+                continue
+            rec = openreview_note_to_candidate_record(note)
+            if not rec:
+                continue
+            rec = self._openreview_record_for_upgrade(rec, note)
+            if rec is None:
+                continue
+            combined = self._compute_match_score(title_norm, rec, authors_ref)
+            if combined >= self.MATCH_THRESHOLD and self._credible_journal_article(rec):
+                rec.method = "OpenReview(search)"
+                rec.confidence = combined
+                if self._is_better_candidate(combined, rec, best):
+                    best = (combined, rec)
+        if best:
+            self.logger.debug("Stage 3c: Found via OpenReview(search) with score %.2f", best[0])
+            return best[1]
+        return None
+
+    @staticmethod
+    def _openreview_record_for_upgrade(rec: PublishedRecord, note: dict[str, Any]) -> PublishedRecord | None:
+        """Attach the canonical forum URL + ``proceedings-article`` type so an
+        accepted OpenReview record (DOI-less by venue) clears the credibility
+        gate. Returns ``None`` when the note carries no ``forum``/``id``."""
+        forum = note.get("forum") or note.get("id")
+        if not forum:
+            return None
+        rec.url = f"https://openreview.net/forum?id={forum}"
+        rec.type = "proceedings-article"
+        return rec
+
     def _compute_match_score(self, title_norm: str, rec: PublishedRecord, authors_ref: list[str]) -> float:
         """Compute combined title and author match score.
 
@@ -1898,7 +2087,7 @@ class Resolver:
         """
         tb = normalize_title_for_match(rec.title or "")
         title_score = token_sort_ratio(title_norm, tb)  # 0..100
-        blns = [strip_diacritics(a.get("family") or "").lower() for a in rec.authors][:3]
+        blns = rec.surname_keys(limit=3)
         auth_score = jaccard_similarity(authors_ref[:3], blns)
         return 0.7 * (title_score / 100.0) + 0.3 * auth_score
 
@@ -2180,6 +2369,11 @@ class AsyncResolver:
 
         self.http: AsyncHttpClient = http
         self.logger = logger
+        # OpenReview ``/notes`` endpoints that refused an ANONYMOUS request this
+        # run (latched, as in ``OpenReviewClient``), and the endpoints whose
+        # refusal has already been reported once. See ``_openreview_note_refusal``.
+        self._openreview_refused: set[str] = set()
+        self._openreview_warned: set[str] = set()
 
     # --- Shared helpers (static, same as sync Resolver) ---
     @staticmethod
@@ -2202,8 +2396,7 @@ class AsyncResolver:
             return False
         if not rec.journal:
             return False
-        j_lower = rec.journal.lower()
-        if any(host in j_lower for host in PREPRINT_HOSTS):
+        if is_preprint_venue(rec.journal):
             return False
         if not rec.year:
             return False
@@ -2392,7 +2585,7 @@ class AsyncResolver:
         Returns:
             PublishedRecord if a journal article is found, None otherwise
         """
-        fields = "externalIds,title,year,authors,venue,publicationTypes,publicationVenue,url"
+        fields = "externalIds,title,year,authors,venue,publicationTypes,publicationVenue,journal,url"
         url = f"{S2_API}/paper/arXiv:{arxiv_id}"
         try:
             resp = await self.http.get(
@@ -2412,6 +2605,18 @@ class AsyncResolver:
         pub_types = msg.get("publicationTypes") or []
         is_journal = any(pt.lower() == "journalarticle" for pt in pub_types)
         if not (doi and is_journal):
+            return None
+
+        # Reject records that are still the arXiv preprint under a published
+        # venue label (arXiv DOI/year mixed with a published venue): fall
+        # through to DBLP for the real published record.
+        if _s2_record_is_still_preprint(msg, doi):
+            self.logger.debug(
+                "S2 arXiv record for %s still a preprint (doi=%s, journal=%s); rejecting",
+                arxiv_id,
+                doi,
+                (msg.get("journal") or {}).get("name"),
+            )
             return None
 
         title = msg.get("title")
@@ -2446,7 +2651,9 @@ class AsyncResolver:
         Returns:
             PublishedRecord if a published version is found, None otherwise
         """
-        url = f"{OPENALEX_API}/works/arxiv:{arxiv_id}"
+        # OpenAlex dropped the bare ``arxiv:<id>`` route (now 404); resolve the
+        # work by its arXiv DOI instead.
+        url = f"{OPENALEX_API}/works/doi:10.48550/arXiv.{arxiv_id}"
         try:
             resp = await self.http.get(url, service="openalex", accept="application/json")
             if resp.status_code != 200:
@@ -2534,6 +2741,218 @@ class AsyncResolver:
         return False
 
     # --- Parallel search ---
+    @staticmethod
+    def _openreview_record_for_upgrade(rec: PublishedRecord, note: dict[str, Any]) -> PublishedRecord | None:
+        """Attach a forum URL + ``proceedings-article`` type (see
+        :meth:`Resolver._openreview_record_for_upgrade`)."""
+        forum = note.get("forum") or note.get("id")
+        if not forum:
+            return None
+        rec.url = f"https://openreview.net/forum?id={forum}"
+        rec.type = "proceedings-article"
+        return rec
+
+    #: Host order for every OpenReview ``/notes`` lookup, shared with the sync
+    #: client: v2 first (ICLR 2024+, NeurIPS 2023+, TMLR, COLM), then v1 (the
+    #: pre-2023 venues). The two hold disjoint sets of notes, so a lookup that
+    #: asks one of them can never confirm the other half of a bibliography.
+    OPENREVIEW_NOTES_HOSTS: tuple[str, ...] = OpenReviewClient.NOTES_HOSTS
+
+    async def _openreview_token_for(self, url: str) -> str | None:
+        """The bearer token this run puts on ``url``, or ``None`` if it sends none.
+
+        Mirrors :meth:`OpenReviewClient._token_for`: read off the shared
+        client's credentials, which already hold the token (or the failed-login
+        state) by the time a refusal comes back, so this normally costs no login
+        and no round trip. Offloaded all the same, because the one case where it
+        does log in -- a token the client just invalidated after a persistent
+        401 -- is a blocking POST that must not run on the event loop. A run
+        without credentials answers ``None``.
+        """
+        import asyncio
+
+        auth = getattr(self.http, "openreview_auth", None)
+        if auth is None:
+            return None
+        try:
+            token = await asyncio.to_thread(auth.token_for_url, url)
+        except Exception:  # noqa: BLE001 - diagnosing a refusal must never raise
+            return None
+        return token if isinstance(token, str) and token else None
+
+    async def _openreview_note_refusal(self, url: str, status: int) -> None:
+        """Record a 401/403 from ``url`` the way the sync client settled it (#65).
+
+        An ANONYMOUS refusal is a configuration state -- no credentials, no
+        ``/notes`` -- so the endpoint is latched for the run and later entries
+        skip it without a request; it is reported once, at WARNING, with the
+        fix. A refusal of a request that carried a bearer token is a blip
+        (measured at one 403 per 250 entries against 844 authenticated 200s),
+        so it is reported once and then forgotten: nothing latches, and the
+        next entry asks the same host again.
+        """
+        if await self._openreview_token_for(url):
+            if url in self._openreview_warned:
+                self.logger.debug("OpenReview %s refused an authenticated request (HTTP %s)", url, status)
+                return
+            self._openreview_warned.add(url)
+            self.logger.warning(
+                "OpenReview %s refused an authenticated request (HTTP %s); "
+                "not a configuration state, so later entries will ask it again",
+                url,
+                status,
+            )
+            return
+        self._openreview_refused.add(url)
+        if url in self._openreview_warned:
+            return
+        self._openreview_warned.add(url)
+        self.logger.warning(
+            "OpenReview %s refused an anonymous request (HTTP %s): the exact title+author lookup is "
+            "challenge-gated there and is skipped for the rest of this run. Set OPENREVIEW_USERNAME / "
+            "OPENREVIEW_PASSWORD (or pass --openreview-username) to restore it; the full-text fallback still runs.",
+            url,
+            status,
+        )
+
+    async def _openreview_fetch(
+        self,
+        params: dict[str, Any],
+        url: str,
+        rate_limit_service: str = OPENREVIEW_SERVICE,
+    ) -> list[dict[str, Any]] | None:
+        """Single async OpenReview request against ``url``.
+
+        Returns the note list (possibly empty) when OpenReview answered, and
+        ``None`` when it did not: a 401/403 refusal (recorded through
+        :meth:`_openreview_note_refusal`), any other non-answer status, a
+        transport failure, an exhausted retry budget or an unreadable body. The
+        caller reads ``None`` as "this host is out for this entry" and moves on
+        to the other host, as :meth:`OpenReviewClient.search` does.
+
+        The request is tagged ``service="openreview"`` so an
+        :class:`AsyncHttpClient` built with ``openreview_auth`` attaches the
+        bearer token; ``rate_limit_service`` separates the 5/min
+        ``/notes/search`` pacing from the 180/min ``/notes`` one.
+        """
+        try:
+            resp = await self.http.get(
+                url,
+                service=OPENREVIEW_SERVICE,
+                params=params,
+                accept="application/json",
+                rate_limit_service=rate_limit_service,
+            )
+        except Exception as e:
+            self.logger.debug("OpenReview async fetch %s failed: %s", url, e)
+            return None
+        status = resp.status_code
+        if status in OPENREVIEW_AUTH_REFRESH_STATUS:
+            await self._openreview_note_refusal(url, status)
+            return None
+        if status in ABSENCE_STATUS_CODES:
+            return []
+        if status != 200:
+            self.logger.debug("OpenReview %s answered HTTP %s", url, status)
+            return None
+        try:
+            data = resp.json() or {}
+        except Exception as e:
+            self.logger.debug("OpenReview %s returned an unreadable body: %s", url, e)
+            return None
+        notes = data.get("notes") or []
+        return notes if isinstance(notes, list) else []
+
+    async def _openreview_search(self, entry: dict[str, Any], title_norm: str) -> PublishedRecord | None:
+        """Async OpenReview stage 3c: resolve ACCEPTED submissions only.
+
+        Mirrors :meth:`OpenReviewClient.search` host for host (#63): the exact
+        ``paperhash`` lookup goes to v2 and then v1 -- the two hold disjoint
+        sets of notes -- under both index forms of the hash, and the full-text
+        ``/notes/search?term=`` fallback runs on both hosts when every hash
+        missed. Credentials ride on ``self.http`` (an :class:`AsyncHttpClient`
+        built with ``openreview_auth``, the same object ``bibtex-check`` uses),
+        so the requests here are authenticated exactly when the checker's are,
+        and the login they need never runs on the event loop.
+
+        Refusals follow #65: an anonymous 401/403 latches that endpoint for the
+        run and is reported once with the fix; an authenticated one is reported
+        once and forgotten. The one place this diverges from the checker is the
+        fallback after a refusal. The checker skips it, because a refused exact
+        lookup already disqualifies the entry from its exhaustive ``not_found``
+        claim; the resolver has no such claim to protect and is best-effort, so
+        it still runs the anonymous-capable ``/notes/search`` fallback -- which
+        is what an anonymous ``bibtex-update`` always had, and what keeps
+        OpenReview contributing something without credentials.
+        """
+        if not title_norm:
+            return None
+        first_author = first_author_surname(entry)
+        if not first_author:
+            return None
+        raw_title = entry.get("title") or ""
+        # RAW author name (see ``Resolver._stage3c_openreview``): the folded
+        # surname misses every accented author on both hosts, so both index
+        # forms of the hash are built from the name as the entry wrote it.
+        or_first_author = (split_authors_bibtex(entry.get("author") or "") or [first_author])[0]
+        paperhashes = build_openreview_paperhashes(raw_title, or_first_author)
+        notes: list[dict[str, Any]] = []
+        for host in self.OPENREVIEW_NOTES_HOSTS:
+            notes_url = f"{host}/notes"
+            if notes_url in self._openreview_refused:
+                # Already gated this run for anonymous callers: no request.
+                continue
+            for paperhash in paperhashes:
+                found = await self._openreview_fetch({"paperhash": paperhash, "limit": 5}, notes_url)
+                if found is None:
+                    # This host is out for this entry; the other one may answer.
+                    break
+                if found:
+                    notes = found
+                    break
+            if notes:
+                break
+        if not notes:
+            plain_title = latex_to_plain(raw_title).strip()
+            if plain_title:
+                for host in self.OPENREVIEW_NOTES_HOSTS:
+                    found = await self._openreview_fetch(
+                        {"term": plain_title, "limit": 5},
+                        f"{host}/notes/search",
+                        rate_limit_service=OPENREVIEW_SEARCH_SERVICE,
+                    )
+                    if found:
+                        notes = found
+                        break
+        if not notes:
+            return None
+
+        authors_ref = authors_last_names(entry.get("author", ""))
+        best: tuple[float, PublishedRecord] | None = None
+        for note in notes:
+            if openreview_acceptance(note) != OR_ACCEPTED:
+                continue
+            rec = openreview_note_to_candidate_record(note)
+            if not rec:
+                continue
+            rec = self._openreview_record_for_upgrade(rec, note)
+            if rec is None:
+                continue
+            tb = normalize_title_for_match(rec.title or "")
+            title_score = token_sort_ratio(title_norm, tb)
+            blns = rec.surname_keys(limit=3)
+            auth_score = jaccard_similarity(authors_ref[:3], blns)
+            combined = 0.7 * (title_score / 100.0) + 0.3 * auth_score
+            if combined >= self.MATCH_THRESHOLD and self._credible_journal_article(rec):
+                rec.method = "OpenReview(search,parallel)"
+                rec.confidence = combined
+                if best is None or combined > best[0]:
+                    best = (combined, rec)
+        if best:
+            self.logger.debug("OpenReview(async): match score %.2f", best[0])
+            return best[1]
+        return None
+
     async def parallel_bibliographic_search(
         self,
         title: str,
@@ -2571,7 +2990,7 @@ class AsyncResolver:
                         continue
                     tb = normalize_title_for_match(rec.title or "")
                     title_score = token_sort_ratio(title_norm, tb)
-                    blns = [strip_diacritics(a.get("family") or "").lower() for a in rec.authors][:3]
+                    blns = rec.surname_keys(limit=3)
                     auth_score = jaccard_similarity(authors[:3], blns)
                     combined = 0.7 * (title_score / 100.0) + 0.3 * auth_score
                     if combined >= self.MATCH_THRESHOLD and self._credible_journal_article(rec):
@@ -2610,7 +3029,7 @@ class AsyncResolver:
                     )
                     tb = normalize_title_for_match(rec.title or "")
                     title_score = token_sort_ratio(title_norm, tb)
-                    blns = [strip_diacritics(a.get("family") or "").lower() for a in rec.authors][:3]
+                    blns = rec.surname_keys(limit=3)
                     auth_score = jaccard_similarity(authors[:3], blns)
                     combined = 0.7 * (title_score / 100.0) + 0.3 * auth_score
                     if combined >= self.MATCH_THRESHOLD and self._credible_journal_article(rec):
@@ -2632,7 +3051,7 @@ class AsyncResolver:
                         continue
                     tb = normalize_title_for_match(rec.title or "")
                     title_score = token_sort_ratio(title_norm, tb)
-                    blns = [strip_diacritics(a.get("family") or "").lower() for a in rec.authors][:3]
+                    blns = rec.surname_keys(limit=3)
                     auth_score = jaccard_similarity(authors[:3], blns)
                     combined = 0.7 * (title_score / 100.0) + 0.3 * auth_score
                     if combined >= self.MATCH_THRESHOLD and self._credible_journal_article(rec):
@@ -2748,7 +3167,7 @@ class AsyncResolver:
                     authors_ref = authors_last_names(entry.get("author", ""))
                     tb = normalize_title_for_match(rec.title or "")
                     title_score = token_sort_ratio(title_norm, tb)
-                    blns = [strip_diacritics(a.get("family") or "").lower() for a in rec.authors][:3]
+                    blns = rec.surname_keys(limit=3)
                     auth_score = jaccard_similarity(authors_ref[:3], blns)
                     combined = 0.7 * (title_score / 100.0) + 0.3 * auth_score
                     if combined >= self.MATCH_THRESHOLD and self._credible_journal_article(rec):
@@ -2797,6 +3216,11 @@ class AsyncResolver:
                     rec.confidence = 1.0
                     return rec
 
+        # OpenReview submission registry (accepted ICLR/NeurIPS/TMLR), before the fan-out
+        rec = await self._openreview_search(entry, normalize_title_for_match(entry.get("title") or ""))
+        if rec:
+            return rec
+
         # 3) Parallel bibliographic search (DBLP, S2, Crossref)
         title = entry.get("title") or ""
         title_norm = normalize_title_for_match(title)
@@ -2811,20 +3235,21 @@ class AsyncResolver:
 
 # ------------- Updater -------------
 class Updater:
-    PREPRINT_ONLY_FIELDS = {
-        "eprint",
-        "archiveprefix",
-        "archivePrefix",
-        "primaryClass",
-        "primaryclass",
-        "eprinttype",
-        "eprintclass",
-    }
-
-    def __init__(self, keep_preprint_note: bool = False, rekey: bool = False, mark_resolved: bool = False) -> None:
+    def __init__(
+        self,
+        keep_preprint_note: bool = False,
+        rekey: bool = False,
+        mark_resolved: bool = False,
+        preserve_fields: tuple[str, ...] = (),
+    ) -> None:
         self.keep_preprint_note = keep_preprint_note
         self.rekey = rekey
         self.mark_resolved = mark_resolved
+        # User-owned fields (e.g. ``file``, ``keywords``, ``annote``) to carry over
+        # from the original entry. Empty by default: an upgrade rebuilds the entry
+        # atomically from the resolved record, keeping only the citekey, so no stale
+        # preprint metadata can survive. Opt specific fields back in via this list.
+        self.preserve_fields = tuple(preserve_fields)
 
     @staticmethod
     def _author_bibtex_from_record(rec: PublishedRecord) -> str:
@@ -2850,21 +3275,25 @@ class Updater:
         return key or (entry.get("ID") or "key")
 
     def update_entry(self, entry: dict[str, Any], rec: PublishedRecord, detection: PreprintDetection) -> dict[str, Any]:
-        new_entry = dict(entry)
-        # Set entry type based on publication type (conference → inproceedings, else article)
+        # Build the upgraded entry atomically from the resolved record rather than
+        # overlaying record fields onto a copy of the original. Overlaying leaves
+        # stale preprint metadata behind whenever the record omits a field (an
+        # ``arXiv preprint`` journal or an arXiv ``url`` would survive), producing an
+        # internally inconsistent entry. Constructing from the record guarantees the
+        # result corresponds to a single real publication; only the citekey (and the
+        # opt-in ``preserve_fields`` / deliberate provenance below) carries over, so
+        # existing ``\cite`` commands keep resolving.
         is_conference = rec.type == "proceedings-article"
-        new_entry["ENTRYTYPE"] = "inproceedings" if is_conference else "article"
+        new_entry: dict[str, Any] = {
+            "ENTRYTYPE": "inproceedings" if is_conference else "article",
+            "ID": self._generate_key(entry, rec) if self.rekey else entry.get("ID"),
+        }
         if rec.title:
             new_entry["title"] = rec.title
         if rec.authors:
             new_entry["author"] = self._author_bibtex_from_record(rec)
         if rec.journal:
-            if is_conference:
-                new_entry["booktitle"] = rec.journal
-                new_entry.pop("journal", None)  # Remove journal field for inproceedings
-            else:
-                new_entry["journal"] = rec.journal
-                new_entry.pop("booktitle", None)  # Remove booktitle field for articles
+            new_entry["booktitle" if is_conference else "journal"] = rec.journal
         if rec.publisher:
             new_entry["publisher"] = rec.publisher
         if rec.year:
@@ -2881,24 +3310,22 @@ class Updater:
         elif rec.url:
             new_entry["url"] = rec.url
 
-        for f in list(self.PREPRINT_ONLY_FIELDS):
-            if f in new_entry:
-                new_entry.pop(f, None)
+        # Carry over explicitly opted-in user-owned fields (none by default).
+        for f in self.preserve_fields:
+            value = entry.get(f)
+            if value:
+                new_entry[f] = value
 
         if self.keep_preprint_note:
+            note = entry.get("note", "")
             arx = detection.arxiv_id or extract_arxiv_id_from_text(entry.get("url", "") or entry.get("note", "") or "")
-            if arx:
-                note = new_entry.get("note", "")
+            if arx and "also available as arxiv:" not in safe_lower(note):
                 msg = f"Also available as arXiv:{arx}"
-                if "also available as arxiv:" not in safe_lower(note):
-                    new_entry["note"] = (note + (" " if note else "") + msg).strip()
+                note = (note + (" " if note else "") + msg).strip()
+            if note:
+                new_entry["note"] = note
 
-        if self.rekey:
-            new_entry["ID"] = self._generate_key(entry, rec)
-        else:
-            new_entry["ID"] = entry.get("ID")
-
-        # Add marker for resolved entries to skip in future runs
+        # Add marker for resolved entries to skip in future runs.
         if self.mark_resolved:
             if detection.arxiv_id:
                 new_entry["_resolved_from"] = f"arXiv:{detection.arxiv_id}"
@@ -3356,6 +3783,26 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--keep-preprint-note", action="store_true", help="Keep a note pointing to arXiv id")
     p.add_argument("--rekey", action="store_true", help="Regenerate BibTeX keys as authorYearTitle")
     p.add_argument(
+        "--preserve-fields",
+        default="",
+        metavar="f1,f2,...",
+        help=(
+            "Comma-separated original fields to carry over when upgrading an entry "
+            "(e.g. 'file,keywords,annote'). By default an upgrade rebuilds the entry "
+            "atomically from the resolved record, keeping only the citekey."
+        ),
+    )
+    p.add_argument(
+        "--then-check",
+        action="store_true",
+        help=(
+            "After upgrading, fact-check the entries that were NOT upgraded "
+            "(upgraded entries are already clean database records). Shares one "
+            "cache/HTTP client with the checker. Writes the cleaned bib (-o/--in-place) "
+            "plus a verification summary."
+        ),
+    )
+    p.add_argument(
         "--mark-resolved",
         action="store_true",
         help="Add '_resolved_from' field to updated entries to skip them in future runs",
@@ -3394,6 +3841,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--s2-api-key",
         metavar="KEY",
         help="Semantic Scholar API key (or set S2_API_KEY env var)",
+    )
+    p.add_argument(
+        "--openreview-username",
+        metavar="USER",
+        help="OpenReview account (email or ~profile id) for authenticated OpenReview lookups "
+        "(or set OPENREVIEW_USERNAME). The password is read from OPENREVIEW_PASSWORD only.",
     )
     p.add_argument(
         "--user-agent",
@@ -3644,6 +4097,71 @@ def write_report_line(fh, res: ProcessResult, src_file: str | None = None) -> No
     fh.write(json.dumps(line, ensure_ascii=False) + "\n")
 
 
+# Matches a BibTeX entry header and captures the citation key. The separator may
+# be the required comma or whitespace followed by an unambiguous field assignment;
+# the latter lets the checker report and repair a missing key comma.
+# Anchored to the start of a logical line (optional leading whitespace only) so
+# the scan does not false-positive on (a) full-line ``%`` comments — the comment
+# marker precedes ``@`` on the line — or (b) a ``@type{key,`` substring sitting
+# inside a field value, which is never at column ~0. Empty-key entries and
+# @string/@preamble declarations do not match.
+_ENTRY_KEY_RE = re.compile(r"(?m)^[ \t]*@\w+\s*\{\s*([^,\s{}=]+)(?:\s*,|\s+(?=[A-Za-z][\w-]*\s*=))")
+
+
+def detect_dropped_keys(raw_text: str, parsed_ids: set[str]) -> list[str]:
+    """Find entry keys declared in raw BibTeX text but missing from the parsed DB.
+
+    Defense-in-depth against silent data loss: even with
+    ``ignore_nonstandard_types=False`` the parser still skips genuinely
+    malformed entries without naming them. This compares the citation keys
+    declared in the source text against the IDs that actually made it into the
+    database.
+
+    Args:
+        raw_text: The raw BibTeX file contents.
+        parsed_ids: The set of entry IDs present in the parsed database.
+
+    Returns:
+        Declared keys absent from ``parsed_ids``, in declaration order, deduped.
+    """
+    dropped: list[str] = []
+    seen: set[str] = set()
+    for match in _ENTRY_KEY_RE.finditer(raw_text):
+        key = match.group(1)
+        if key in parsed_ids or key in seen:
+            continue
+        seen.add(key)
+        dropped.append(key)
+    return dropped
+
+
+def write_dropped_report_line(fh, key: str, src_file: str | None = None) -> None:
+    """Write a JSONL report row for a dropped (unparseable) entry.
+
+    Emits exactly the same schema as :func:`write_report_line` so the report
+    stays consistent for downstream consumers, with ``action="dropped"`` and
+    only the original key populated.
+
+    Args:
+        fh: Open writable file handle.
+        key: The dropped citation key.
+        src_file: Source file the entry was declared in.
+    """
+    line = {
+        "file": src_file,
+        "key_old": key,
+        "key_new": None,
+        "doi_old": None,
+        "doi_new": None,
+        "action": "dropped",
+        "method": None,
+        "confidence": None,
+        "title_old": "",
+        "title_new": None,
+    }
+    fh.write(json.dumps(line, ensure_ascii=False) + "\n")
+
+
 # ------------- Main function helper components -------------
 
 
@@ -3709,7 +4227,7 @@ def setup_http_client(args: argparse.Namespace) -> HttpClient:
     user_agent = (
         getattr(args, "user_agent", None)
         or os.environ.get("BIBTEX_UPDATER_USER_AGENT")
-        or "bib-preprint-upgrader/1.1 (mailto:you@example.com)"
+        or "bibtex-updater (+https://anonymous.4open.science/r/bibtexupdater)"
     )
     return HttpClient(
         timeout=args.timeout,
@@ -3718,6 +4236,9 @@ def setup_http_client(args: argparse.Namespace) -> HttpClient:
         cache=cache,
         verbose=args.verbose,
         s2_api_key=s2_api_key,
+        # Optional: without it OpenReview's exact title+author endpoint answers
+        # 403 and only its full-text search contributes.
+        openreview_auth=OpenReviewAuth.from_env(getattr(args, "openreview_username", None)),
     )
 
 
@@ -3794,10 +4315,28 @@ def load_databases(
         List of (path, database) tuples, or None if loading fails.
     """
     databases: list[tuple[str, bibtexparser.bibdatabase.BibDatabase]] = []
+    dropped: list[tuple[str, str]] = []  # (src_file, dropped_key)
     try:
         for path in args.inputs:
             db = loader.load_file(path)
             databases.append((path, db))
+
+            # Defense-in-depth: detect entries declared in the source file but
+            # missing from the parsed DB (genuinely malformed entries the parser
+            # skips silently). Name every dropped citation key so the loss is
+            # never silent again.
+            try:
+                with open(path, encoding="utf-8") as f:
+                    raw_text = f.read()
+            except OSError:
+                raw_text = ""
+            parsed_ids = {e.get("ID") for e in db.entries if e.get("ID")}
+            for key in detect_dropped_keys(raw_text, parsed_ids):
+                logger.warning("Dropped unparseable entry '%s' from %s (not added to database)", key, path)
+                dropped.append((path, key))
+
+        # Thread dropped keys to the report writer (consumed when --report set).
+        args._dropped_entries = dropped
         return databases
     except Exception as e:
         logger.error("Failed to read inputs: %s", e)
@@ -3919,6 +4458,14 @@ def write_output_and_report(
             for idx, res in enumerate(results):
                 src_file = src_for_entry[idx] if src_for_entry and idx < len(src_for_entry) else None
                 write_report_line(fh, res, src_file=src_file)
+
+            # Append an audit row per dropped (unparseable) entry so the loss is
+            # recorded, not just logged. Emit once even across multi-file
+            # in-place runs to avoid duplicate rows.
+            if not getattr(args, "_dropped_reported", False):
+                for src_file, key in getattr(args, "_dropped_entries", []) or []:
+                    write_dropped_report_line(fh, key, src_file=src_file)
+                args._dropped_reported = True
 
     return 0
 
@@ -4191,7 +4738,9 @@ def process_to_output_mode(
     return 0
 
 
-def build_main_components(args: argparse.Namespace, logger: logging.Logger) -> MainComponents:
+def build_main_components(
+    args: argparse.Namespace, logger: logging.Logger, http: HttpClient | None = None
+) -> MainComponents:
     """Build all main function components from parsed arguments.
 
     Args:
@@ -4201,8 +4750,9 @@ def build_main_components(args: argparse.Namespace, logger: logging.Logger) -> M
     Returns:
         MainComponents containing all initialized components.
     """
-    # Build HTTP client
-    http = setup_http_client(args)
+    # Build HTTP client (or reuse a shared one, e.g. when chaining with the checker)
+    if http is None:
+        http = setup_http_client(args)
 
     # Handle --clear-cache: remove existing cache files
     if getattr(args, "clear_cache", False):
@@ -4244,6 +4794,7 @@ def build_main_components(args: argparse.Namespace, logger: logging.Logger) -> M
             keep_preprint_note=args.keep_preprint_note,
             rekey=args.rekey,
             mark_resolved=getattr(args, "mark_resolved", False),
+            preserve_fields=tuple(f.strip() for f in getattr(args, "preserve_fields", "").split(",") if f.strip()),
         ),
         loader=BibLoader(),
         writer=BibWriter(),
@@ -4329,6 +4880,12 @@ def main(argv: list[str] | None = None) -> int:
     if validation_error:
         logger.error(validation_error)
         return 1
+
+    # Chain into the fact-checker: upgrade, then verify only the non-upgraded entries.
+    if getattr(args, "then_check", False):
+        from .chain import run_update_then_check
+
+        return run_update_then_check(args, logger)
 
     # Build all components
     components = build_main_components(args, logger)

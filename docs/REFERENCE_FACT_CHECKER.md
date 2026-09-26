@@ -1,150 +1,237 @@
 # Reference Fact-Checker
 
-Validate that bibliographic entries in BibTeX files exist in external databases and have correct metadata. Useful for detecting hallucinated or incorrectly cited references.
+Validate that bibliographic entries in BibTeX files exist in external databases and have correct metadata. Useful for detecting hallucinated or incorrectly cited references before submission.
 
 ## Installation
 
 ```bash
-pip install bibtexparser httpx rapidfuzz
+pip install bibtex-updater
+# or run without installing
+uv run --with bibtex-updater bibtex-check references.bib
 ```
 
 ## Quick Start
 
 ```bash
 # Basic validation
-python reference_fact_checker.py references.bib
+bibtex-check references.bib
 
 # Generate detailed JSON report
-python reference_fact_checker.py references.bib --report report.json
+bibtex-check references.bib --report report.json
 
-# CI/CD mode: fail if problematic entries found
-python reference_fact_checker.py references.bib --strict
+# Stream per-entry results to JSONL
+bibtex-check references.bib --jsonl results.jsonl
+
+# CI/CD mode: fail on problematic or unreadable entries
+bibtex-check references.bib --strict
 ```
 
 ## How It Works
 
-The fact-checker runs a multi-stage verification pipeline:
+The fact-checker runs a multi-stage verification pipeline.
 
-### Pre-API Validation (zero cost)
-1. **Year validation** — Flags future dates (`year > current_year`), implausible years (`< 1800`), and non-numeric years before making any API calls
-2. **DOI resolution** — HEAD request to `doi.org` catches fabricated DOIs (HTTP 404)
+### Pre-API validation (zero cost)
 
-### API Verification
-3. **Crossref** — Primary source for journal articles with DOIs
-4. **DBLP** — Computer science publications
-5. **Semantic Scholar** — Broad coverage across disciplines
+1. **Year validation** — flags future dates (`year > current_year`), implausible years (`< 1800`), and non-numeric/missing years before making any API call (`--no-check-years` disables).
+2. **DOI resolution** — checks the entry's DOI resolves; only HTTP 404/410 from `doi.org` counts as a fabricated DOI. Publisher blocks (403, 418 IEEE bot-detection, 429) are *not* treated as invalid (`--no-check-dois` disables).
 
-### Post-Match Analysis
-6. **Venue verification** — Alias-aware matching for 17 ML/AI venues (NeurIPS/NIPS, ICML, ICLR, CVPR, etc.); known-different venues always flagged
-7. **Preprint detection** — Queries S2 to detect entries claiming a venue when only an arXiv preprint exists
+### Identity-anchored integrity checks
 
-For each entry, it:
-1. Runs pre-API checks (year, DOI) to catch obvious issues cheaply
-2. Searches all sources using title + first author
-3. Scores candidates using fuzzy title matching (70%) + author Jaccard similarity (30%)
-4. Compares fields against the best match with alias-aware venue matching
-5. Checks preprint-vs-published status via Semantic Scholar
-6. Assigns a status based on match quality
+These run before the title/author search and fire only on *positive evidence*, so they keep the false-positive rate low (they abstain whenever the determination is uncertain — e.g. an IEEE bot-block or a DOI Crossref doesn't index).
+
+3. **DOI-target consistency** — fetches the Crossref record the entry's DOI actually resolves to. If that record's title clearly differs from the entry's title, the DOI points to a *different paper* → `doi_mismatch`. A copy-paste DOI that would otherwise be silently verified against the entry's real paper is caught here.
+4. **arXiv-ID consistency** — the same check for the entry's cited arXiv ID; a mismatch → `arxiv_id_mismatch`. arXiv DOIs are version-normalized (`…v2` stripped) so a versioned/unversioned mismatch is not falsely flagged.
+5. **ID-anchored author fabrication** — when a valid DOI/arXiv ID *does* resolve to the cited paper (title confirms) but the author list is swapped or contains placeholder names, the entry is flagged `author_mismatch`: the identifier is the entry's own, so a real author divergence on it is positive evidence of fabrication.
+6. **Identifier fast paths** — when the entry's own DOI/arXiv ID passed the consistency checks *and* the single authoritative record behind that identifier fully confirms every claimed field at the full thresholds, the multi-source cascade is skipped. The fast paths can only short-circuit a clean `verified` — anything less falls through to the normal cascade. Disable with `--no-fast-path`; automatically inert in `--strict` mode.
+
+### Cascading source verification
+
+Title/author search runs a single cascade — there is no parallel "query every source" mode. Sources are queried in order and the cascade short-circuits as soon as a source returns a candidate at or above 0.95 that positively confirms every claimed field:
+
+| Step | Source | Role | Rate (default) |
+|------|--------|------|------|
+| 1 | **CrossRef** | DOI-backed literature; fielded `query.title` + `query.author` | ~300/min |
+| 2 | **OpenAlex** | high-rate aggregator (polite pool), broad coverage; fielded `title.search` | ~150/min |
+| 3 | **DBLP** | authoritative CS/ML-conference index (token-AND search) | ~30/min |
+| 4 | **OpenReview** | authoritative ICLR/NeurIPS/TMLR submission registry; the `paperhash` lookup runs against **both** hosts (v2 first for 2023+ venues, then v1 for the pre-2023 ones — they hold disjoint sets of notes) | ~30/min |
+| 5 | **Semantic Scholar** | preprint coverage; slowest without a key | ~10/min keyless |
+
+The order is throughput-aware: fast, broad sources first so the slow keyless Semantic Scholar fallback is only reached on hard entries. It is also **health-aware**: a source whose circuit is open, or which has been failing consistently during the run, is moved behind the sources that are still answering, so a reachable source gets the first chance at every entry. Reordering changes the order alone — a demoted source is still consulted, still records its failure, and still blocks the exhaustive `not_found` claim. OpenReview is consulted before Semantic Scholar because it owns the submission record for most ML conferences and can *positively confirm* ICLR/NeurIPS/TMLR papers that the DOI/CS-index sources can only leave unconfirmed. Set a Semantic Scholar API key (`--s2-api-key` or `S2_API_KEY`) to lift S2 to ~60 req/min — with a key, a single-best-title `/paper/search/match` step additionally runs right after CrossRef and the final S2 relevance-search step is skipped whenever it contributed, so per-entry S2 spend stays at one call.
+
+**Retrieval** uses fielded title search (CrossRef `query.title`, OpenAlex `title.search`) against the raw, author-free title rather than a free-text `title + surname` blob — the blob returned unrelated papers for DOI-less ML-conference titles. Each step retrieves `--top-k` candidates (default 3, max 10) and re-ranks them by title similarity.
+
+**Corrupt index records** are dropped before the candidates are scored. An index can serve a work under the entry's own identifier and its real author list but a different paper's title (OpenAlex does this today for ToolLLM, Constitutional AI and LoRA), and scored as a candidate that record produces a `title_mismatch` against a correctly cited entry — three times per real citation error over a 267-submission screening run. A candidate is dropped when it is anchored on the entry's own DOI or arXiv ID, the entry confirms its authors, and its title similarity is below `index_corruption_max_title` (0.50), and only once the identifier's own authority has answered: arXiv for a `10.48550/arxiv.*` DOI or a bare arXiv ID, Crossref for every other DOI. An identifier-anchored source that *confirms* the entry's title wins outright, and a divergence two identifier-anchored sources report independently is left to stand, so a hybrid fabrication (real identifier, real authors, invented title) keeps its verdict. `_check_doi_consistency` and `_check_arxiv_id_consistency` run against an authoritative source before the cascade and are untouched. Each dropped record is reported in `distrusted_records`; disable the whole guard with `--no-distrust-corrupt-index-records`.
+
+### Scoring and verdict
+
+For each entry the tool:
+
+1. Runs pre-API checks and identity-anchored integrity checks (cheap, high-precision).
+2. Walks the cascade, scoring candidates with fuzzy title matching plus author Jaccard similarity.
+3. Detects **chimeric titles** (a citation whose title splices two real papers) before picking a best match.
+4. Compares fields against the best match with alias-aware venue matching.
+5. Runs a **cross-source author intersection** — authors confirmed by ≥2 sources earn a multi-source bonus; authors no source confirms are flagged suspect.
+6. Assigns a three-way verdict (below).
+
+Author handling: sources return authors in as-published order, so author-order differences are real citation errors and are flagged, not smoothed over. Surname comparison uses each source's structured `family` field where available (Crossref, OpenAlex, OpenReview `~Given_Family` handles), so family-first/CJK names like "Chen Xing" ↔ "Xing Chen" are not falsely flagged. When the matched source has only flat names (Semantic Scholar, DBLP), a Crossref structured-name lookup vets a potential author mismatch before it is reported.
+
+## Verdicts: verified vs. could-not-verify vs. problematic
+
+`VERIFIED` requires *every* claimed field to be **positively confirmed** against the matched record — not merely "not contradicted".
+
+- **Verified** (`verified`) — clean pass; all claimed fields confirmed.
+- **Could-not-verify** (`unconfirmed`, `not_found`) — **abstention**, *not* a clean pass. A record was found and nothing was contradicted, but at least one claimed field could not be positively confirmed (e.g. a published venue backed only by a preprint, or a consistent-but-incomplete author list), or no matching record was found at all. These entries warrant review. The per-entry `coverage_incomplete` flag distinguishes a *clean* exhaustive miss from an abstention reached while sources errored or were throttled (re-run the latter after a cooldown).
+- **Problematic** — positive evidence of a defect: `title_mismatch`, `author_mismatch`, `year_mismatch`, `venue_mismatch`, `nonexistent_venue`, `partial_match`, `doi_mismatch`, `arxiv_id_mismatch`, `author_truncated`, `hallucinated` (chimeric title, fabricated DOI, future/invalid year, ID misattribution).
+
+`hallucinated` is reserved for positive-evidence signals; a merely weak title-search match **abstains** as `not_found` rather than asserting fabrication.
+
+The NeurIPS 2026 criteria for hallucinated references, adopted from the ICLR and ICML 2026 guidance, treat an unfindable title, a badly wrong author list and a venue with no evidence of existing as hallucination, and treat a real-but-wrong venue, a wrong arXiv ID and small author or title errors as errors to report to the authors. Of the problematic statuses only `hallucinated`, `nonexistent_venue`, `title_mismatch` and the fabrication side of `author_mismatch` land in their hallucinated class, so a gate that fails on the whole bucket is stricter than that policy. The source is the NeurIPS 2026 program chairs' message to authors of 5 September 2026, which carries no public URL.
+
+### What `not_found` does and does not assert
+
+`not_found` and `unconfirmed` share the could-not-verify bucket, but they are **not interchangeable**, and integrations must not treat them as such.
+
+| | `unconfirmed` | `not_found` |
+|---|---|---|
+| meaning | a record was found; some claimed field could not be confirmed | no matching record was found |
+| `p_valid` | 0.50 — neutral | **0.35 — negative polarity** |
+| how integrations read it | abstention | **commonly mapped to "hallucinated"** |
+
+`not_found` is an **exhaustive** claim: every source consulted for the entry completed its lookup, and none holds a matching record. A lookup that ends without an answer — DNS failure, connection refused, TLS error, connection reset, read/connect timeout, an exhausted 429/5xx retry budget, an open circuit, an error status — cannot support that claim, so the entry reports `api_error` instead, and it does so even when the other sources answered cleanly and found nothing. A partial cascade establishes no exhaustive miss. The `sources_failed` field names the sources behind the demotion.
+
+The same rule governs web references. `url_not_found` means the host answered that the page is not there, which only HTTP 404 and 410 do. Every other way of not getting an answer reports `api_error` with `sources_failed: ["url_check"]`: an unreachable host (DNS failure, refused connection, TLS error, timeout), a refusal (401, 403), a deferral (429), and a failure (5xx). A host that is up and talking has proved nothing about the page, so a bot-blocking 403 on an academic URL no longer reads as a dead citation.
+
+`not_found` says *this tool searched its sources and found nothing*. It does **not** say the reference is fabricated. But because it carries negative polarity, downstream consumers routinely collapse it into a hallucination label — the HALLMARK harness, for instance, maps `not_found` → `HALLUCINATED` unless `coverage_incomplete` is set. Anything scoring or gating on this output inherits that reading, so state your own policy deliberately rather than letting the default decide it for you.
+
+The distinction bites hardest on **document classes the databases structurally never index**: dissertations, journal front matter (editorials, guest columns), and national-language work. A miss there carries no information about whether the work exists. Two concrete cases:
+
+- Enumerating every DOI under one journal's ISSN returns 300 records, all `type: journal-article` — its editorials are published but never deposited, so no lookup can ever confirm them.
+- Crossref/OpenAlex/DBLP/S2 do not index PhD theses; dissertations live in institutional and national repositories.
+
+For that reason `@phdthesis`/`@mastersthesis` abstain as `unconfirmed` (neutral) rather than `not_found` when the title does not confirm. Positive evidence still flags: DOI, year and arXiv-ID validation all run before this point.
+
+**Opting into the stricter policy.** If you *want* a clean exhaustive miss to count against an entry, use the existing strict flags rather than reinterpreting the status yourself:
+
+```bash
+bibtex-check refs.bib --strict --strict-warn-cnv    # exit 4 on could-not-verify too
+```
+
+`--strict-warn-cnv` promotes both `not_found` and `unconfirmed` to the visible fourth category `strict_warn_cnv`, so CI fails on entries the tool could not anchor. Default mode leaves the three-way verdict unchanged.
+
+Always check `coverage_incomplete` first: a `not_found` carrying that flag was reached while a source errored or was throttled, so it is not an exhaustive miss at all — re-run after a cooldown before drawing any conclusion.
 
 ## Status Codes
 
-| Status | Description |
-|--------|-------------|
-| `verified` | Entry matches an external record within thresholds |
-| `not_found` | No matching record found in any database |
-| `hallucinated` | Very low match score (<50%), likely fabricated |
-| `title_mismatch` | Title differs significantly from best match |
-| `author_mismatch` | Author list differs from best match |
-| `year_mismatch` | Publication year differs beyond tolerance |
-| `venue_mismatch` | Journal/venue differs from best match |
-| `partial_match` | Multiple fields differ from best match |
-| `api_error` | Errors occurred during API queries |
+| Status | Bucket | Description |
+|--------|--------|-------------|
+| `verified` | verified | Every claimed field positively confirmed |
+| `unconfirmed` | could-not-verify | Record found, a claimed field unconfirmable (abstention) |
+| `not_found` | could-not-verify | No matching record found |
+| `hallucinated` | problematic | Positive evidence of fabrication (chimeric/fabricated DOI/etc.) |
+| `title_mismatch` | problematic | Title differs significantly from best match |
+| `author_mismatch` | problematic | Author list differs (incl. ID-anchored fabrication) |
+| `year_mismatch` | problematic | Publication year differs beyond tolerance (exact-year for same-conference citations) |
+| `venue_mismatch` | problematic | Journal/venue differs |
+| `nonexistent_venue` | problematic | Claimed venue unknown to the DBLP/OpenAlex venue registries and reported by no source for this (otherwise real) paper |
+| `author_truncated` | problematic | Author list silently truncated (co-authors dropped without `et al.`/`and others`); corroborated by ≥ 2 sources |
+| `partial_match` | problematic | Multiple fields differ |
+| `doi_mismatch` | problematic | Cited DOI resolves to a different paper |
+| `arxiv_id_mismatch` | problematic | Cited arXiv ID resolves to a different paper |
+| `future_date` / `invalid_year` | problematic | Year in the future / missing / implausible |
+| `doi_not_found` | problematic | DOI returns HTTP 404/410 |
+| `preprint_only` | problematic | Paper found only as a preprint, not at the claimed venue |
+| `given_name_substitution` | problematic | Surnames align, but a co-author's given name identifies a different person |
+| `title_near_miss` | problematic (strict mode only) | Title differs by a strict-mode near miss |
+| `strict_warn_preprint_year` | could-not-verify (strict mode only) | Published year cannot be anchored from the matched preprint |
+| `strict_warn_cnv` | strict warning (strict mode only) | Opt-in promotion of `not_found` or `unconfirmed` for CI |
+| `published_version_exists` | informational (verified polarity) | Published version found |
+| `unpublished_at_claimed_venue` | problematic | OpenReview records the paper as not accepted at the claimed venue; enabled by `BIBTEX_CHECK_OR_UNPUBLISHED_FLAG`, default off |
+| `api_error` | — | At least one source lookup did not complete, so the check was not technically successful. Also emitted in place of `not_found` in that case — see `sources_failed` |
+| `skipped` / `parse_error` | — | Entry type not verifiable / declared entry could not be read safely |
+
+Web references (`url_*`), books (`book_*`), and working papers (`working_paper_*`) have their own status families; see `--skip-web`, `--skip-books`, `--skip-working-papers`. `url_not_found` requires an answer, meaning HTTP 404 or 410; an unreachable host, a 401/403 refusal, a 429 or a 5xx all report `api_error` instead, and the `url_check.lookup_failed` field in the JSON report says which of the two happened.
+
+## Numeric confidence score
+
+The JSONL output carries an additive 0–100 `confidence_score` summarizing per-field similarity with explicit penalty/bonus contributions (constants from CheckIfExist, not auto-fit):
+
+- Multi-source bonus: `+10` when ≥2 sources confirm the same authors
+- Penalties: title-mismatch `−20`, author-mismatch `−20`, journal/venue-mismatch `−15`, fabricated-author `−10` each (capped at `−20`)
+- Asymmetric formula for the high-title / low-author chimeric case: `confidence = S_title − 0.5 × (100 − S_author)`
 
 ## Command Line Options
 
 ```
-usage: reference_fact_checker.py [-h] [--report FILE] [--jsonl FILE]
-                                  [--strict] [--verbose]
-                                  [--title-threshold FLOAT]
-                                  [--author-threshold FLOAT]
-                                  [--year-tolerance INT]
-                                  [--venue-threshold FLOAT]
-                                  [--cache-file FILE]
-                                  [--rate-limit INT]
-                                  bibfiles [bibfiles ...]
-
-positional arguments:
-  bibfiles              BibTeX files to check
-
-options:
-  --report, -r FILE     Write JSON report to FILE
-  --jsonl FILE          Write JSONL report to FILE
-  --strict              Exit with code 4 if NOT_FOUND or HALLUCINATED found
-  --verbose, -v         Enable debug logging
-
-thresholds:
-  --title-threshold     Title similarity threshold (default: 0.90)
-  --author-threshold    Author similarity threshold (default: 0.80)
-  --year-tolerance      Year tolerance in years (default: 1)
-  --venue-threshold     Venue similarity threshold (default: 0.70)
-
-API options:
-  --cache-file          Cache file path (default: .cache.fact_checker.json)
-  --rate-limit          Requests per minute limit (default: 45)
+usage: bibtex-check [-h] [--report FILE] [--jsonl FILE] [--resolve-first]
+                    [--resolved-out FILE] [--strict]
+                    [--strict-warn-cnv] [--verbose] [--outage-threshold FLOAT]
+                    [--title-threshold FLOAT] [--author-threshold FLOAT]
+                    [--year-tolerance INT] [--venue-threshold FLOAT]
+                    [--cache-file FILE] [--rate-limit INT] [--s2-api-key KEY]
+                    [--openreview-username USER] [--openalex-api-key KEY]
+                    [--mailto EMAIL] [--no-cache] [--no-check-dois]
+                    [--no-check-years] [--no-check-venue-existence]
+                    [--no-distrust-corrupt-index-records]
+                    [--no-fast-path] [--workers N] [--skip-web] [--skip-books]
+                    [--skip-working-papers] [--academic-only]
+                    [--verify-url-content] [--url-timeout FLOAT]
+                    [--google-books-api-key KEY] [--no-google-books]
+                    [--top-k N] [--openalex-mailto EMAIL] [--non-generative]
+                    bibfiles [bibfiles ...]
 ```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `bibfiles` | — | One or more BibTeX files to check |
+| `--report`, `-r FILE` | — | Write full JSON report to FILE |
+| `--jsonl FILE` | — | Write one JSON object per line (streamed) |
+| `--strict` | off | Exit code 4 if problematic or unreadable entries remain; abstentions do not fail it without `--strict-warn-cnv` |
+| `--outage-threshold FLOAT` | 0.10 | Fraction of entries (0–1) with a failed source lookup at or above which the run exits 5, in every mode. `0` fails on a single failed lookup; `1` fails only when every entry was affected |
+| `--verbose`, `-v` | off | Enable debug logging |
+
+**Thresholds:** `--title-threshold` (0.90), `--author-threshold` (0.80), `--year-tolerance` (1), `--venue-threshold` (0.70).
+
+**API options:** `--cache-file` (`.cache.fact_checker.json`), `--rate-limit` (45 req/min, scales per-service limits), `--s2-api-key KEY` (or `S2_API_KEY` env var), `--openalex-api-key KEY` (or `OPENALEX_API_KEY`; bypasses the keyless shared daily credit budget), `--openreview-username USER` (or `OPENREVIEW_USERNAME`; the password comes from `OPENREVIEW_PASSWORD` only, and both are optional — without them OpenReview's `/notes` endpoints answer 403 and only its full-text search contributes; the token is cached across processes at `~/.cache/bibtex-updater/openreview-tokens.json`, disabled with `BIBTEX_CHECK_OPENREVIEW_TOKEN_CACHE=0`), `--mailto EMAIL` (or `BIBTEX_CHECK_MAILTO`; polite-pool contact for Crossref/OpenAlex, feeds the User-Agent and the `--openalex-mailto` default), `BIBTEX_ARXIV_RATE` (divide the per-caller arXiv budget when sharding a run across processes; default 20, and a value that is not an integer is logged and replaced by that default rather than aborting the run), `BIBTEX_CHECK_OR_UNPUBLISHED_FLAG=1` (report an OpenReview submission that was not accepted at its claimed venue; default off), `--resolve-first` (run the preprint resolver first, fact-check only entries it did not upgrade, and always write the cleaned bibliography), `--resolved-out FILE` (set that bibliography's path; default `<input>.resolved.bib`), `--no-cache`, `--no-check-dois`, `--no-check-years`, `--no-check-venue-existence` (disable the DBLP/OpenAlex venue-registry existence check behind `nonexistent_venue`), `--no-distrust-corrupt-index-records` (score identifier-anchored records even when they carry the entry's authors under a different title), `--no-fast-path` (always run the full cascade; disables the DOI/arXiv identifier-anchored fast paths), `--workers N` (8).
+
+**Cascade (CheckIfExist):** `--top-k N` (3, max 10) candidates per source; `--openalex-mailto EMAIL` for the OpenAlex polite pool.
+
+**Entry-type filtering:** `--skip-web`, `--skip-books`, `--skip-working-papers`, `--academic-only`.
+
+**Web/book options:** `--verify-url-content`, `--url-timeout` (10s), `--google-books-api-key KEY`, `--no-google-books`.
+
+**Policy:** `--non-generative` (or `BIBTEX_CHECK_NON_GENERATIVE=1`) refuses to load any LLM backend at runtime, for ACL ARR / ICML 2026 LLM-in-review policy compliance. The package ships no LLM backends today, so this is a forward-compat guard plus a startup banner.
 
 ## Output Formats
 
 ### JSON Report (`--report`)
 
-Full structured report with all details:
-
-```json
-{
-  "summary": {
-    "total": 10,
-    "status_counts": {
-      "verified": 8,
-      "not_found": 1,
-      "hallucinated": 1
-    },
-    "verified_rate": 0.8,
-    "problematic_count": 2,
-    "timestamp": "2024-01-15T10:30:00"
-  },
-  "entries": [
-    {
-      "key": "smith2020",
-      "type": "article",
-      "status": "verified",
-      "confidence": 0.95,
-      "field_comparisons": {
-        "title": {
-          "entry_value": "Deep Learning for NLP",
-          "api_value": "Deep Learning for NLP",
-          "similarity_score": 1.0,
-          "matches": true
-        }
-      },
-      "best_match": {
-        "doi": "10.1234/jml.2020.001",
-        "title": "Deep Learning for NLP",
-        "journal": "Journal of ML",
-        "year": 2020
-      }
-    }
-  ]
-}
-```
+Full structured report: a `summary` block (totals, status counts, verified/abstained/problematic counts, `coverage_incomplete_count`, timestamp) plus per-entry records with field comparisons, the best-matching record, the sources consulted/confirmed, and the same `p_valid`/`coverage_incomplete` contract fields as the JSONL output.
 
 ### JSONL Report (`--jsonl`)
 
-One JSON object per line, useful for streaming/processing:
+One JSON object per line, streamed as entries complete — useful for large bibliographies and incremental processing:
 
 ```jsonl
-{"key": "smith2020", "status": "verified", "confidence": 0.95, "mismatched_fields": [], "api_sources": ["crossref"]}
-{"key": "fake2099", "status": "hallucinated", "confidence": 0.3, "mismatched_fields": ["title", "author"], "api_sources": []}
+{"key": "smith2020", "category": "academic", "status": "verified", "abstained": false, "coverage_incomplete": false, "confidence": 0.89, "p_valid": 0.945, "confidence_score": 96.0, "mismatched_fields": [], "unconfirmed_fields": [], "api_sources": ["crossref", "dblp"], "api_sources_queried": ["crossref", "dblp"], "errors": []}
+{"key": "fake2099", "category": "academic", "status": "hallucinated", "abstained": false, "coverage_incomplete": false, "confidence": 0.93, "p_valid": 0.035, "confidence_score": 12.0, "mismatched_fields": ["title", "author"], "unconfirmed_fields": [], "api_sources": [], "api_sources_queried": ["crossref", "semanticscholar", "openalex", "dblp"], "errors": []}
 ```
+
+Per-line fields:
+
+| Field | Meaning |
+|-------|---------|
+| `key`, `category`, `status` | BibTeX key, entry category, and the status code (table above) |
+| `abstained` | `true` for could-not-verify verdicts — abstentions must never be read as confirmed hallucinations |
+| `coverage_incomplete` | `true` when an abstention (or `api_error`) was reached while ≥ 1 source errored / was throttled / circuit-broken. A `not_found` with this flag is **not** a clean exhaustive miss — re-run after a cooldown before treating it as evidence of fabrication |
+| `confidence` | 0–1 confidence that the **assigned status is the right call**. Direction-free: a confident `hallucinated` and a confident `verified` both carry high `confidence` |
+| `p_valid` | 0–1 probability that the entry **as cited** refers to a real publication with correct metadata — **threshold/rank on this**, not on `confidence`. Verified-polarity statuses map above 0.5, problem-polarity below 0.5, abstentions sit at 0.5, and a clean exhaustive `not_found` at 0.35. Note `preprint_only` is problem-polarity for `p_valid` (the claimed venue is contradicted) |
+| `confidence_score` | additive 0–100 numeric confidence (next section) |
+| `sources_failed` | source names whose lookup for this entry did not complete. Non-empty means the cascade was partial: the entry cannot carry `not_found`, and whatever it does carry rests on less evidence than a clean run |
+| `mismatched_fields` | fields the checker found a real CONTRADICTION on (`MISMATCH`). A field it declined to compare is not listed here |
+| `unconfirmed_fields` | fields neither confirmed nor contradicted (`NON_COMPARABLE`/`PARTIAL`): an arXiv record cannot confirm a claimed ICLR venue, and a `journal = {arXiv preprint arXiv:NNNN.NNNNN}` citation claims no published venue to confirm. These are abstentions the checker made deliberately, never findings against the entry |
+| `distrusted_records` | records a source returned that the cascade declined to score, one readable line each. A source can serve a work under the correct identifier and the correct author list but a different paper's title; scored as a candidate that record produces a `title_mismatch` against a correctly cited entry. Non-empty means the verdict was reached **without** a record the run had in hand, and names which index misbehaved — a statement about the source, never about the entry |
+| `api_sources`, `errors` | sources with hits, and per-source error strings |
+| `api_sources_queried` | sources the cascade queried for this entry, whether or not they returned a candidate; `api_sources` is the subset that did |
 
 ## Exit Codes
 
@@ -152,19 +239,13 @@ One JSON object per line, useful for streaming/processing:
 |------|---------|
 | 0 | Success (or non-strict mode) |
 | 1 | Input error (file not found, parse error) |
-| 4 | Strict mode: NOT_FOUND or HALLUCINATED entries found |
+| 2 | `--strict-warn-cnv` was passed without `--strict` |
+| 4 | Strict mode: problematic entries, unreadable entries, or (with `--strict-warn-cnv`) could-not-verify entries remain. Abstentions alone do not reach it |
+| 5 | Source outage: the fraction of entries with a source lookup that did not complete is at or above `--outage-threshold` (default 10%), in any mode. The run checked less than it appears to have checked — discard its could-not-verify verdicts and re-run once the sources are reachable |
 
-## Thresholds
+The outage code outranks the strict one: when both gates fire the run exits 5, because a bibliography finding drawn from an incomplete cascade is not the finding it looks like.
 
-The fact-checker uses configurable similarity thresholds:
-
-| Field | Default | Description |
-|-------|---------|-------------|
-| Title | 0.90 | Token-sort ratio (fuzzy string matching) |
-| Author | 0.80 | Jaccard similarity on last names |
-| Year | ±1 | Absolute difference tolerance |
-| Venue | 0.70 | Token-sort ratio on journal/booktitle |
-| Hallucination | 0.50 | Below this combined score = likely fake |
+Below the threshold the affected entries are still logged (with the sources and the unreachable hosts named) and still report `api_error`; only the run-wide verdict stands. `--outage-threshold` tunes where that line sits but cannot switch the check off: a silent exit 0 over a run whose lookups never left the machine is what the code exists to prevent, so it fires in default mode as well as under `--strict`.
 
 ## CI/CD Integration
 
@@ -173,12 +254,11 @@ The fact-checker uses configurable similarity thresholds:
 ```yaml
 - name: Validate references
   run: |
-    pip install bibtexparser httpx rapidfuzz
-    python reference_fact_checker.py references.bib --strict --report report.json
-
+    pip install bibtex-updater
+    bibtex-check references.bib --strict --report report.json
 - name: Upload report
   if: always()
-  uses: actions/upload-artifact@v3
+  uses: actions/upload-artifact@v4
   with:
     name: fact-check-report
     path: report.json
@@ -193,34 +273,28 @@ repos:
     hooks:
       - id: check-references
         name: Validate BibTeX references
-        entry: python reference_fact_checker.py --strict
+        entry: bibtex-check --strict
         language: python
         files: \.bib$
-        additional_dependencies: [bibtexparser, httpx, rapidfuzz]
+        additional_dependencies: [bibtex-updater]
 ```
 
-## Caching
+## Caching and Rate Limiting
 
-API responses are cached to `.cache.fact_checker.json` by default. This:
-- Speeds up repeated runs
-- Reduces API rate limit issues
-- Persists across sessions
+API responses are cached to `.cache.fact_checker.json` by default (SQLite-backed, WAL mode, thread-safe). This speeds up repeated runs and reduces rate-limit pressure. Clear it by deleting the file or pointing `--cache-file` elsewhere; `--no-cache` disables caching entirely.
 
-To clear the cache, delete the file or use a different `--cache-file`.
+Rate limits are enforced **per service** (Crossref, OpenAlex, DBLP, OpenReview, Semantic Scholar, …), scaled by `--rate-limit` (default 45 = scale 1.0) with per-service caps below each service's documented ceiling; arXiv stays flat at 20 req/min per its politeness ask and is not scaled by `--rate-limit`. Set `BIBTEX_ARXIV_RATE` to divide the per-caller budget when sharding a run across processes (default 20). In the measured 1.10.3 failure, arXiv answered 90 of 750 lookups while the circuit cooldown escalated to 1800 seconds. The limiter is **adaptive**: `Retry-After` and rate-limit response headers (including on retryable 429/5xx responses) drive automatic backoff. Set `--mailto` (or `BIBTEX_CHECK_MAILTO`) so Crossref/OpenAlex serve you from their polite pools. With `--workers` concurrent entries and the cascade short-circuiting on easy entries (~1.4 API calls/entry), most bibliographies finish quickly; a Semantic Scholar key further lifts the slowest source.
 
-## Rate Limiting
+Measured availability of each source, the limits they publish, and the settings that stay inside them are collected in [`docs/SOURCE_BOTTLENECKS.md`](SOURCE_BOTTLENECKS.md).
 
-The tool respects API rate limits (default: 45 requests/minute). For large bibliographies:
-- The cache helps avoid redundant requests
-- Progress is logged for each entry
-- Consider running overnight for very large files
+A **per-service circuit breaker** sits under the limiter: four consecutive failed lookups pause that service for 90 seconds. Each further reopening doubles the pause, capped at 30 minutes, so a brief blip still recovers in 90 seconds while a service that is down for hours settles into a handful of probes per hour instead of ~40. The escalation is per service and lives for the life of the process; only the current cooldown is persisted to the cache for cross-run pacing.
 
-## Comparison with bibtex_updater.py
+## Comparison with `bibtex-update`
 
-| Feature | bibtex_updater.py | reference_fact_checker.py |
-|---------|-------------------|---------------------------|
-| Purpose | Transform preprints to published | Validate entries exist |
+| Feature | `bibtex-update` | `bibtex-check` |
+|---------|-----------------|----------------|
+| Purpose | Transform preprints to published | Validate entries exist & match |
 | Modifies files | Yes | No (read-only) |
-| Target entries | Preprints only | All entries |
-| Output | Updated .bib file | Validation report |
-| Use case | Bibliography cleanup | Quality assurance |
+| Target entries | Preprints | All entries |
+| Output | Updated `.bib` file | Validation report (JSON/JSONL) |
+| Use case | Bibliography cleanup | Quality assurance / CI |

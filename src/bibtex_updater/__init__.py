@@ -24,6 +24,20 @@ Example usage:
 
 from bibtex_updater._version import __version__
 
+# Cascading-source helpers and verification primitives (CheckIfExist, Abbonato 2026)
+from bibtex_updater.sources import (
+    CASCADE_HIGH_CONFIDENCE,
+    CASCADE_LOW_CONFIDENCE,
+    DEFAULT_OPENALEX_MAILTO,
+    DEFAULT_TOP_K,
+    MAX_TOP_K,
+    AuthorIntersectionResult,
+    OpenAlexClient,
+    cross_source_author_intersection,
+    openalex_work_to_candidate_record,
+    select_top_k_by_title_similarity,
+)
+
 # Core updater classes and functions
 from bibtex_updater.updater import (
     AsyncResolver,
@@ -62,6 +76,7 @@ from bibtex_updater.utils import (
     AsyncRateLimiterRegistry,
     DiskCache,
     HttpClient,
+    OpenReviewAuth,
     PublishedRecord,
     RateLimiter,
     RateLimiterRegistry,
@@ -74,6 +89,7 @@ from bibtex_updater.utils import (
     authors_last_names,
     # API converters
     crossref_message_to_record,
+    dblp_hit_to_candidate_record,
     dblp_hit_to_record,
     # DOI/arXiv utilities
     doi_normalize,
@@ -87,6 +103,7 @@ from bibtex_updater.utils import (
     last_name_from_person,
     # Text normalization
     latex_to_plain,
+    normalize_doi_for_resolution,
     normalize_title_for_match,
     openalex_work_to_record,
     s2_data_to_record,
@@ -98,6 +115,17 @@ from bibtex_updater.utils import (
 __all__ = [
     # Version
     "__version__",
+    # Cascading-source primitives (CheckIfExist, Abbonato 2026)
+    "AuthorIntersectionResult",
+    "CASCADE_HIGH_CONFIDENCE",
+    "CASCADE_LOW_CONFIDENCE",
+    "DEFAULT_OPENALEX_MAILTO",
+    "DEFAULT_TOP_K",
+    "MAX_TOP_K",
+    "OpenAlexClient",
+    "cross_source_author_intersection",
+    "openalex_work_to_candidate_record",
+    "select_top_k_by_title_similarity",
     # Core classes
     "AsyncResolver",
     "BibLoader",
@@ -128,6 +156,7 @@ __all__ = [
     "AsyncRateLimiterRegistry",
     "DiskCache",
     "HttpClient",
+    "OpenReviewAuth",
     "PublishedRecord",
     "RateLimiter",
     "RateLimiterRegistry",
@@ -136,6 +165,7 @@ __all__ = [
     "SqliteCache",
     # Text normalization
     "latex_to_plain",
+    "normalize_doi_for_resolution",
     "normalize_title_for_match",
     "safe_lower",
     "strip_diacritics",
@@ -155,6 +185,7 @@ __all__ = [
     "extract_acl_anthology_id",
     # API converters
     "crossref_message_to_record",
+    "dblp_hit_to_candidate_record",
     "dblp_hit_to_record",
     "europepmc_result_to_record",
     "openalex_work_to_record",

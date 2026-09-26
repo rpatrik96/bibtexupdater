@@ -40,7 +40,6 @@ classifiers = [
 ]
 dependencies = [
     "bibtexparser>=1.4.0",
-    "requests>=2.28.0",
     "crossref-commons>=0.0.7",
     "httpx>=0.24.0",
     "rapidfuzz>=3.0.0",
@@ -164,6 +163,9 @@ testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_functions = ["test_*"]
 addopts = "-v --tb=short"
+markers = [
+    "network: allow a test to access the live network",
+]
 
 [tool.coverage.run]
 source = ["src/bibtex_updater"]

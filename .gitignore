@@ -22,7 +22,10 @@ htmlcov/
 
 # Cache files
 .cache.replace_preprints.json
+.cache.resolution.json
 *.cache
+.cache.*.db
+.smoke-cache.json
 
 # Build
 dist/
@@ -39,3 +42,7 @@ Thumbs.db
 CLAUDE.md
 .claude/
 uv.lock
+eval_runs/
+.omc/
+scripts/_run_eval_detached.py
+scripts/_watch_eval.py

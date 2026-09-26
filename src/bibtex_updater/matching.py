@@ -11,10 +11,17 @@ These functions are standalone and can be used by fact_checker.py or other modul
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
+from enum import Enum
 
 from rapidfuzz.distance import Levenshtein
 
-from bibtex_updater.utils import jaccard_similarity, normalize_title_for_match
+from bibtex_updater.utils import (
+    is_preprint_server_venue,
+    jaccard_similarity,
+    latex_to_plain,
+    normalize_title_for_match,
+)
 
 __all__ = [
     "title_edit_distance",
@@ -22,9 +29,57 @@ __all__ = [
     "word_level_diff",
     "author_sequence_similarity",
     "combined_author_score",
+    "MatchOutcome",
+    "AuthorMatchResult",
+    "symmetric_author_match",
+    "has_explicit_truncation_indicator",
     "EXPANDED_VENUE_ALIASES",
     "get_canonical_venue",
+    "is_preprint_or_series_venue",
+    "is_preprint_server_venue",
+    "LTWA_ABBREVIATIONS",
+    "expand_ltwa_abbreviations",
+    "venue_abbreviation_matches",
+    "venue_acronyms_are_comparable",
 ]
+
+
+class MatchOutcome(Enum):
+    """Three-valued result of a field comparison.
+
+    The verifier distinguishes positive confirmation from mere absence of
+    contradiction. A field is only allowed to contribute to a VERIFIED verdict
+    when it is CONFIRMED (MATCH); a real contradiction is a MISMATCH; and
+    "I had nothing comparable / could not positively confirm" is NON_COMPARABLE
+    (no data either side) or PARTIAL (consistent-but-incomplete confirmation).
+    """
+
+    MATCH = "match"  # both sides populated and positively agree
+    MISMATCH = "mismatch"  # both sides populated real values that conflict
+    NON_COMPARABLE = "non_comparable"  # empty/blank, or a preprint/series record
+    PARTIAL = "partial"  # consistent but incomplete (e.g. dropped authors)
+
+
+@dataclass(frozen=True)
+class AuthorMatchResult:
+    """Trichotomy result of :func:`symmetric_author_match`.
+
+    ``outcome`` carries the three-valued verdict; ``score`` is the legacy
+    0-1 similarity for confidence/reporting. ``is_confirmed`` is true only for
+    a full positive confirmation (exact match or a leading subset explicitly
+    elided with an "and others"/"et al" sentinel).
+    """
+
+    outcome: MatchOutcome
+    score: float
+
+    @property
+    def is_confirmed(self) -> bool:
+        return self.outcome is MatchOutcome.MATCH
+
+    @property
+    def is_mismatch(self) -> bool:
+        return self.outcome is MatchOutcome.MISMATCH
 
 
 # ------------- P2.2: Near-Miss Title Detection -------------
@@ -173,6 +228,197 @@ def combined_author_score(
     return jaccard_weight * jaccard_score + sequence_weight * sequence_score
 
 
+#: Sentinel surnames that BibTeX/citation tooling inserts for elided author
+#: lists ("and others" -> "others"; "et al."). They are not real authors and
+#: must be stripped before any author-set comparison, otherwise a correctly
+#: cited paper that uses "and others" is punished for a phantom mismatch.
+_AUTHOR_SENTINELS: frozenset[str] = frozenset({"others", "et al", "etal", "al"})
+
+
+def _has_author_sentinel(names: list[str]) -> bool:
+    """True if a surname list contains an elision sentinel ("others"/"et al")."""
+    return any(n and n.lower() in _AUTHOR_SENTINELS for n in names)
+
+
+#: Explicit truncation indicators that a citation may use OUTSIDE the structured
+#: author field to disclose that the author list is incomplete. ``--strict``'s
+#: "silent truncation" rule (rule 5) does NOT flag entries that disclose their
+#: truncation: a citation that says "..." or ``\ldots`` or a trailing
+#: ``, et al.`` outside the author field has *already announced* the omission.
+#: That is the cited author's responsibility, not a hallucination signal.
+_EXPLICIT_TRUNCATION_MARKERS: tuple[str, ...] = (
+    "...",
+    "\\ldots",
+    "\\dots",
+    "et al",
+    "et al.",
+)
+
+
+def has_explicit_truncation_indicator(*fields: str | None) -> bool:
+    """True if any of ``fields`` carries a disclosed-truncation marker.
+
+    Catches the cases the structured ``and others`` / ``et al`` sentinel inside
+    the BibTeX ``author`` field does not: a trailing ``...`` / ``\\ldots`` in
+    the rendered citation, or a trailing ``, et al.`` placed in a sibling
+    field (``note``, ``howpublished``, even the title) rather than as a proper
+    author token. Used by ``--strict`` to refuse to escalate a leading-prefix
+    author list to AUTHOR_TRUNCATED when the citation already discloses that
+    its author list is truncated.
+    """
+    for raw in fields:
+        if not raw:
+            continue
+        text = raw.lower()
+        # Cheap substring check; the markers are short and distinctive enough
+        # that a false positive on real prose is exceedingly unlikely.
+        if any(marker in text for marker in _EXPLICIT_TRUNCATION_MARKERS):
+            return True
+    return False
+
+
+def _strip_author_sentinels(names: list[str]) -> list[str]:
+    """Drop "others"/"et al" sentinels from a surname list."""
+    return [n for n in names if n and n.lower() not in _AUTHOR_SENTINELS]
+
+
+def _is_ordered_subsequence(short: list[str], long: list[str]) -> bool:
+    """True if ``short`` appears in ``long`` in order (not necessarily contiguous)."""
+    if not short:
+        return True
+    it = iter(long)
+    return all(name in it for name in short)
+
+
+def _is_leading_prefix(short: list[str], long: list[str]) -> bool:
+    """True if ``short`` is a contiguous *leading* prefix of ``long``."""
+    return len(short) <= len(long) and short == long[: len(short)]
+
+
+def _looks_alphabetized(names: list[str]) -> bool:
+    """True if surname keys are sorted A-Z over >=3 names.
+
+    A record whose authors are in alphabetical order has very likely *sorted*
+    its contributor list (Crossref NeurIPS/ICML proceedings deposits do this,
+    e.g. the 10.52202 prefix) rather than preserving title-page order, so its
+    author *order* cannot be trusted to detect a publication-order swap. Require
+    >=3 names: with one or two authors, alphabetical order coincides too often to
+    carry any signal.
+    """
+    return len(names) >= 3 and names == sorted(names)
+
+
+def symmetric_author_match(
+    entry_names: list[str],
+    api_names: list[str],
+    threshold: float = 0.80,
+    prefix_n: int = 5,
+    order_reliable: bool = False,
+    strict: bool = False,
+) -> AuthorMatchResult:
+    """Compare entry vs API author surnames on a *symmetric* basis (trichotomy).
+
+    Containment proves the cited authors are *consistent with* the real list, not
+    that the citation is *complete*. We therefore distinguish a full positive
+    confirmation from a consistent-but-incomplete one:
+
+    1. Strip "others"/"et al" sentinels from both sides (but remember whether a
+       sentinel was present -- it signals a deliberate elision).
+    2. NON_COMPARABLE: either side has no usable surnames -- nothing to confirm
+       or refute.
+    3. MISMATCH: first-author surnames differ (a swapped/wrong lead author).
+    4. MATCH (CONFIRMED): the sentinel-stripped surname lists are EQUAL, OR one
+       side is a *leading prefix* of the other AND the shorter side carried an
+       explicit elision sentinel ("and others"/"et al"). The author claim is then
+       positively confirmed (exactly, or as an explicitly-truncated head).
+    5. PARTIAL: the shorter side is an in-order subsequence (or leading prefix)
+       of the longer WITHOUT a sentinel -- authors are consistent but the claim
+       silently drops interior/trailing authors, so it is not a full confirmation.
+    6. Otherwise score a symmetric slice (Jaccard + LCS): >= threshold is a MATCH,
+       below is a MISMATCH (real conflict beyond the shared lead author).
+
+    ``strict`` (arXiv 2026 / hallucination-leak mode): the cost is asymmetric --
+    a leaked wrong/swapped author is far worse than an FP. Two relaxations are
+    removed:
+      * The alphabetization guard (a same-multiset record sorted A-Z is treated
+        as a record-side sort artifact) is DISABLED. An order-reliable source
+        with the same multiset but a different lead is a real swap.
+      * The hard first-author guard no longer requires a differing multiset:
+        a different lead author against an order-reliable source is a MISMATCH
+        even if the multiset matches.
+    Returns an :class:`AuthorMatchResult` carrying the trichotomy and a 0-1 score.
+    """
+    a_has_sentinel = _has_author_sentinel(entry_names)
+    b_has_sentinel = _has_author_sentinel(api_names)
+    a = _strip_author_sentinels(entry_names)
+    b = _strip_author_sentinels(api_names)
+
+    # If either side has no usable names, there is nothing to confirm or refute.
+    if not a or not b:
+        return AuthorMatchResult(MatchOutcome.NON_COMPARABLE, 1.0)
+
+    # Hard first-author signal: a different lead author whose author multiset
+    # also DIFFERS is a real mismatch (a genuinely wrong/extra lead author).
+    # When the multisets are identical the lead difference is pure reordering --
+    # deferred to the same-multiset block below, which decides swap vs artifact.
+    # In strict mode, a same-multiset lead difference against an order-reliable
+    # source is also a real swap (the alphabetization escape clause is dropped).
+    if a[0] != b[0] and sorted(a) != sorted(b):
+        return AuthorMatchResult(MatchOutcome.MISMATCH, 0.0)
+    if strict and a[0] != b[0] and order_reliable:
+        return AuthorMatchResult(MatchOutcome.MISMATCH, 0.0)
+
+    # Exact (sentinel-stripped) equality: full positive confirmation.
+    if a == b:
+        return AuthorMatchResult(MatchOutcome.MATCH, 1.0)
+
+    # Leading-prefix containment: one side is a contiguous head of the other.
+    # An explicit elision sentinel on the SHORTER side means the citation
+    # deliberately truncated a leading run ("first k authors, and others") --
+    # that is a confirmation, not a silent drop.
+    if _is_leading_prefix(a, b):  # entry is a head of the (longer) api list
+        if a_has_sentinel:
+            return AuthorMatchResult(MatchOutcome.MATCH, 1.0)
+        return AuthorMatchResult(MatchOutcome.PARTIAL, 1.0)
+    if _is_leading_prefix(b, a):  # api is a head of the (longer) entry list
+        if b_has_sentinel:
+            return AuthorMatchResult(MatchOutcome.MATCH, 1.0)
+        return AuthorMatchResult(MatchOutcome.PARTIAL, 1.0)
+
+    # In-order subsequence (but not a contiguous leading prefix): interior or
+    # trailing authors are dropped. Consistent, never a full confirmation, even
+    # with a sentinel -- the elision is not a simple leading truncation.
+    if _is_ordered_subsequence(a, b) or _is_ordered_subsequence(b, a):
+        return AuthorMatchResult(MatchOutcome.PARTIAL, 1.0)
+
+    # Same author multiset, different order (a genuine reordering; requires full
+    # multiset equality, not mere overlap -- a single differing author such as a
+    # record-side typo 'Ren'/'Rent' is NOT a reordering and falls through to the
+    # order-agnostic score below). Against an order-preserving source this is a
+    # real swapped-authors defect -> MISMATCH. Two exclusions, where the order
+    # carries no signal so the shared author set is a positive confirmation:
+    #   * Semantic Scholar (order_reliable=False) -- flat, unordered names.
+    #   * An alphabetized API order (sorted A-Z) -- a record-side sort artifact
+    #     (e.g. Crossref NeurIPS/ICML proceedings deposits), not a publication
+    #     swap. This was a false-positive source on valid multi-author papers.
+    if sorted(a) == sorted(b):
+        # ``strict`` disables the alphabetization escape: against an order-
+        # reliable source a same-multiset reordering is a real swap even if
+        # the record looks alphabetized (the arXiv-2026 policy treats the
+        # asymmetric leak cost as far worse than the FP it introduces).
+        if order_reliable and (strict or not _looks_alphabetized(b)):
+            return AuthorMatchResult(MatchOutcome.MISMATCH, 0.0)
+        return AuthorMatchResult(MatchOutcome.MATCH, 1.0)
+
+    # Symmetric slice + combined (Jaccard + LCS) score.
+    n = min(len(a), len(b), prefix_n)
+    a_slice, b_slice = a[:n], b[:n]
+    score = combined_author_score(a_slice, b_slice, jaccard_weight=0.5, sequence_weight=0.5)
+    if score >= threshold:
+        return AuthorMatchResult(MatchOutcome.MATCH, score)
+    return AuthorMatchResult(MatchOutcome.MISMATCH, score)
+
+
 # ------------- P2.5: Expanded Venue Aliases -------------
 
 EXPANDED_VENUE_ALIASES: dict[str, set[str]] = {
@@ -181,42 +427,124 @@ EXPANDED_VENUE_ALIASES: dict[str, set[str]] = {
         "nips",
         "advances in neural information processing systems",
         "neural information processing systems",
+        "conference on neural information processing systems",
+        "annual conference on neural information processing systems",
+        # Numbered proceedings, e.g. "The 36th Conference on Neural ..." -- the
+        # ordinal/year is stripped during normalization, leaving these forms.
+        "th conference on neural information processing systems",
+        "th annual conference on neural information processing systems",
     },
     "icml": {
         "international conference on machine learning",
         "proceedings of the international conference on machine learning",
+        # "Proceedings of the Nth International Conference on Machine Learning":
+        # the ordinal year is removed by normalization, leaving "th ...".
+        "proceedings of the th international conference on machine learning",
+        "th international conference on machine learning",
     },
-    "iclr": {"international conference on learning representations"},
+    "iclr": {
+        "international conference on learning representations",
+        "proceedings of the international conference on learning representations",
+    },
     "aaai": {
         "association for the advancement of artificial intelligence",
+        "aaai conference on artificial intelligence",
         "proceedings of the aaai conference on artificial intelligence",
     },
     "cvpr": {
         "computer vision and pattern recognition",
         "ieee conference on computer vision and pattern recognition",
         "ieee/cvf conference on computer vision and pattern recognition",
+        "conference on computer vision and pattern recognition",
     },
     "iccv": {
         "international conference on computer vision",
         "ieee international conference on computer vision",
         "ieee/cvf international conference on computer vision",
     },
-    "eccv": {"european conference on computer vision"},
+    "eccv": {
+        "european conference on computer vision",
+    },
     "acl": {
         "association for computational linguistics",
         "annual meeting of the association for computational linguistics",
+        # Findings track of ACL -- a distinct track of the SAME venue.
+        "findings of acl",
+        "findings of the association for computational linguistics: acl",
     },
     "emnlp": {
         "empirical methods in natural language processing",
         "conference on empirical methods in natural language processing",
+        # Findings track of EMNLP. The exact-match pass resolves these before
+        # the substring fallback would otherwise collapse them into "acl".
+        "findings of emnlp",
+        "findings of the association for computational linguistics: emnlp",
     },
-    "naacl": {"north american chapter of the association for computational linguistics"},
-    "kdd": {"knowledge discovery and data mining"},
-    "ijcai": {"international joint conference on artificial intelligence"},
-    "uai": {"uncertainty in artificial intelligence"},
-    "aistats": {"artificial intelligence and statistics"},
-    "jmlr": {"journal of machine learning research"},
-    "tmlr": {"transactions on machine learning research"},
+    "naacl": {
+        "north american chapter of the association for computational linguistics",
+        "annual conference of the north american chapter of the association for computational linguistics",
+        "naacl-hlt",
+        "naacl hlt",
+        "findings of naacl",
+        "findings of the association for computational linguistics: naacl",
+    },
+    "kdd": {
+        "knowledge discovery and data mining",
+        "sigkdd",
+        "acm sigkdd",
+        "acm sigkdd conference on knowledge discovery and data mining",
+        "acm sigkdd international conference on knowledge discovery and data mining",
+    },
+    "ijcai": {
+        "international joint conference on artificial intelligence",
+    },
+    "uai": {
+        "uncertainty in artificial intelligence",
+        "conference on uncertainty in artificial intelligence",
+    },
+    "aistats": {
+        "artificial intelligence and statistics",
+        "international conference on artificial intelligence and statistics",
+    },
+    "colt": {
+        "conference on learning theory",
+        "annual conference on learning theory",
+        "annual conference on computational learning theory",
+    },
+    "interspeech": {
+        "conference of the international speech communication association",
+        "annual conference of the international speech communication association",
+    },
+    "icassp": {
+        "international conference on acoustics, speech and signal processing",
+        "ieee international conference on acoustics, speech and signal processing",
+        "ieee international conference on acoustics, speech, and signal processing",
+    },
+    "jmlr": {
+        "journal of machine learning research",
+        # ISO-4 abbreviated form. Period-stripping in
+        # ``_normalize_venue_for_matching`` turns ``J. Mach. Learn. Res.`` into
+        # ``j mach learn res`` before lookup.
+        "j mach learn res",
+        # ``jmlr workshop and conference proceedings`` is intentionally NOT here:
+        # it is caught by ``_SERIES_MARKERS`` as PMLR-style umbrella series.
+    },
+    "tmlr": {
+        "transactions on machine learning research",
+        # ISO-4 abbreviated form. ``Trans. Mach. Learn. Res.`` -> ``trans mach
+        # learn res`` after the period-strip in ``_normalize_venue_for_matching``.
+        "trans mach learn res",
+        # OpenReview / Zotero exports often say ``Accepted by TMLR``.
+        "accepted by tmlr",
+    },
+    # COLM (first edition 2024). Cited overwhelmingly by its full name rather
+    # than the acronym, and with an ordinal edition prefix ("First/Second/Third
+    # Conference on Language Modeling") that the substring pass strips for free.
+    "colm": {
+        "conference on language modeling",
+        "conference on language modelling",
+        "annual conference on language modeling",
+    },
     # Systems/DB (new)
     "sigmod": {
         "acm sigmod",
@@ -251,10 +579,12 @@ EXPANDED_VENUE_ALIASES: dict[str, set[str]] = {
     },
     "www": {
         "the web conference",
+        "thewebconf",
         "world wide web",
         "international world wide web conference",
         "international conference on world wide web",
         "proceedings of the web conference",
+        "acm web conference",
     },
     "wsdm": {
         "web search and data mining",
@@ -298,6 +628,9 @@ EXPANDED_VENUE_ALIASES: dict[str, set[str]] = {
     "eacl": {
         "european chapter of the association for computational linguistics",
         "proceedings of the european chapter of the association for computational linguistics",
+        "conference of the european chapter of the association for computational linguistics",
+        "findings of eacl",
+        "findings of the association for computational linguistics: eacl",
     },
     "conll": {
         "conference on computational natural language learning",
@@ -338,6 +671,84 @@ EXPANDED_VENUE_ALIASES: dict[str, set[str]] = {
 }
 
 
+#: Canonical venues whose name is a common English word that is also a prefix of
+#: distinct sibling journals (Nature Physics, Science Robotics). For these,
+#: substring matching is unsafe, so they only match on exact equality.
+GENERIC_SINGLE_WORD_VENUES: frozenset[str] = frozenset({"nature", "science", "pnas"})
+
+
+#: Canonical keys in :data:`EXPANDED_VENUE_ALIASES` that name a JOURNAL rather
+#: than a conference. Journal articles legitimately drift a year between
+#: online-first and issue publication, so the conference exact-year rule
+#: (same canonical venue on both sides => proceedings year must match exactly)
+#: exempts these.
+JOURNAL_CANONICAL_VENUES: frozenset[str] = frozenset(
+    {
+        "jmlr",
+        "tmlr",
+        "tpami",
+        "ijcv",
+        "tacl",
+        "nature",
+        "science",
+        "pnas",
+        "nature_mi",
+        "nature_comm",
+    }
+)
+
+
+#: OpenReview ``venueid`` shape: ``Acronym.cc/YYYY/<Track>``. Unique to
+#: OpenReview-hosted submissions (no real venue string uses ``.cc/YYYY/``), so a
+#: prefix-strip to the bare acronym is leak-safe: a hallucinated entry's venue
+#: would not match this shape at all.
+_OPENREVIEW_VENUEID_RE = re.compile(
+    r"^([a-z]+)\.cc/\d{4}/[a-z0-9_\-/]+$",
+    re.IGNORECASE,
+)
+
+#: Track / decoration tokens that ML conferences attach to a base venue string
+#: (``ICLR 2023 poster``, ``NeurIPS 2022 oral``, ``ICML 2023 spotlight``,
+#: ``ICLR 2023 Notable top-5%``). Every token is a generic ML-conference
+#: qualifier with NO standalone venue identity, so stripping it from a
+#: fabricated entry (``FakeConf 2023 poster`` -> ``fakeconf 2023``) still does
+#: not canonicalize to any real venue. ``workshop`` is intentionally excluded
+#: -- workshops are distinct venues from their host conference's main track and
+#: must not be conflated (``ICLR 2023 Workshop on X`` should NOT match the
+#: ICLR proceedings).
+_TRACK_DECORATION_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\bnotable\s+top[\s\-]*\d+%?", re.IGNORECASE),
+    re.compile(r"\btop[\s\-]*\d+%?", re.IGNORECASE),
+    re.compile(r"\bdatasets\s+and\s+benchmarks(?:\s+track)?\b", re.IGNORECASE),
+    re.compile(r"\bconference\s+track\b", re.IGNORECASE),
+    re.compile(r"\bmain\s+track\b", re.IGNORECASE),
+    re.compile(r"\blong\s+paper\b", re.IGNORECASE),
+    re.compile(r"\bshort\s+paper\b", re.IGNORECASE),
+    # NOTE: "findings" deliberately NOT stripped here -- "ACL Findings" / "EMNLP
+    # Findings" are distinct sub-venues with their own canonical aliases above.
+    re.compile(r"\b(poster|oral|spotlight|highlight|demo|demonstration|tutorial)\b", re.IGNORECASE),
+)
+
+
+def _strip_track_decorations(venue_norm: str) -> str:
+    """Strip well-known track / decoration suffixes from a lowercased venue.
+
+    Conference records (especially OpenReview) routinely tag the venue string
+    with a track or decoration (``ICLR 2023 poster``, ``NeurIPS 2022 Datasets
+    and Benchmarks Track``, ``ICML 2023 spotlight``, ``ICLR 2023 Notable
+    top-5%``). These tokens are generic ML-conference qualifiers -- not
+    standalone venues -- so stripping them lifts the bare acronym to the
+    surface for alias lookup. A fabricated venue (``FakeConf 2023 poster``)
+    still does not canonicalize after stripping, so no new false-MATCH path is
+    opened. ``workshop`` is intentionally NOT stripped: workshops are distinct
+    venues from their host conference's main proceedings.
+    """
+    out = venue_norm
+    for pat in _TRACK_DECORATION_PATTERNS:
+        out = pat.sub(" ", out)
+    return " ".join(out.split()).strip()
+
+
 def _normalize_venue_for_matching(venue: str) -> str:
     """Normalize venue string for matching.
 
@@ -347,16 +758,42 @@ def _normalize_venue_for_matching(venue: str) -> str:
     Returns:
         Normalized venue string
     """
-    venue_norm = venue.lower().strip()
+    # Zotero/Better BibTeX brace-protects capitalised words, so a booktitle
+    # reaches us as ``The {{Twelfth International Conference}} on {{Learning
+    # Representations}}``. Without a LaTeX pass the braces stay glued to the
+    # tokens ("conference}}"), no alias matches, and the fuzzy score against
+    # ``ICLR`` collapses to 0.09 -- a hard VENUE MISMATCH on a correctly cited
+    # ICLR paper. ``latex_to_plain`` also decodes accents and drops math and
+    # command wrappers, so ``Kunstliche Intelligenz`` and a ``\href``-wrapped
+    # venue normalize to their plain text too.
+    venue_norm = latex_to_plain(venue).lower().strip()
+
+    # FIX A2: OpenReview venueid pre-pass -- ``ICLR.cc/2024/Conference`` ->
+    # ``iclr``, ``NeurIPS.cc/2022/Datasets_and_Benchmarks_Track`` -> ``neurips``.
+    # The ``.cc/YYYY/...`` shape is unique to OpenReview venueids, so leak risk
+    # is zero (no real venue string uses it).
+    m = _OPENREVIEW_VENUEID_RE.match(venue_norm)
+    if m:
+        venue_norm = m.group(1).lower()
+
+    # FIX C1: ISO-4 abbreviated journal forms use period-separated tokens
+    # (``Trans. Mach. Learn. Res.``). Drop the trailing periods so the bare
+    # tokens line up with the alias map ("trans mach learn res").
+    venue_norm = venue_norm.replace(".", " ")
 
     # Remove common prefixes
-    for prefix in ["proceedings of the ", "proceedings of ", "proc. ", "in "]:
+    for prefix in ["proceedings of the ", "proceedings of ", "proc. ", "proc ", "in "]:
         if venue_norm.startswith(prefix):
             venue_norm = venue_norm[len(prefix) :]
 
     # Remove years
     venue_norm = re.sub(r"\b\d{4}\b", "", venue_norm)
     venue_norm = " ".join(venue_norm.split()).strip()
+
+    # FIX A3: strip track / decoration suffixes (``ICLR 2023 poster`` ->
+    # ``iclr``, ``NeurIPS 2022 Datasets and Benchmarks Track`` -> ``neurips``)
+    # AFTER year removal so the year-strip fires first.
+    venue_norm = _strip_track_decorations(venue_norm)
 
     return venue_norm
 
@@ -378,16 +815,589 @@ def get_canonical_venue(venue: str, aliases: dict[str, set[str]] | None = None) 
     if not venue_norm:
         return None
 
+    # Pass 1: exact equality against every canonical key and alias, including
+    # short acronyms (len <= 3). This must run before any substring matching so
+    # that a bare acronym ("ACL", "KDD", "UAI") maps to its own canonical venue
+    # instead of substring-colliding with a *different* acronym that merely
+    # contains it ("acl" is a substring of "naacl"). Exact match is always safe.
+    for canonical, alias_set in aliases.items():
+        if venue_norm == canonical or venue_norm in alias_set:
+            return canonical
+
+    # Pass 2: substring matching for spelled-out / decorated forms. Skip names
+    # <= 3 chars here: short acronyms are substrings of longer venue names and of
+    # each other, so substring-matching them produces false collisions (handled
+    # exactly by Pass 1 above).
     for canonical, alias_set in aliases.items():
         all_names = alias_set | {canonical}
         for name in all_names:
             if len(name) <= 3:
                 continue
+            # Generic single-word *journal* names ("nature"/"science") are
+            # prefixes of distinct sibling journals ("Nature Physics", "Science
+            # Robotics"), so substring matching would wrongly collapse them and
+            # mask a genuine venue mismatch -- require an exact match for those.
+            # Single-token acronyms ("iclr", "neurips") are NOT generic words and
+            # still substring-match so a track/poster suffix ("ICLR (Poster)")
+            # canonicalizes to the same venue.
+            if canonical in GENERIC_SINGLE_WORD_VENUES and " " not in name:
+                continue
             # Require substantial overlap for substring matching
             shorter, longer = sorted([name, venue_norm], key=len)
             if len(shorter) / len(longer) < 0.4:
+                # FIX A1: the 0.4 ratio gate rejects a clean substring match like
+                # ``len('iclr') / len('iclr poster') = 0.36`` even though ``iclr``
+                # appears at a word boundary. For 4-7 char single-token acronyms
+                # we accept a word-boundary match instead. This is strictly more
+                # conservative than the substring branch below: every word-boundary
+                # match is also a substring match, but ``acl`` does NOT word-
+                # boundary-match inside ``naacl`` (no boundary between ``na`` and
+                # ``acl``), so the historical naacl/acl collision stays excluded.
+                if (
+                    4 <= len(name) <= 7
+                    and " " not in name
+                    and name == canonical
+                    and re.search(rf"\b{re.escape(name)}\b", venue_norm)
+                ):
+                    return canonical
                 continue  # Too different in length for substring match
-            if name == venue_norm or name in venue_norm or venue_norm in name:
+            if name in venue_norm or venue_norm in name:
                 return canonical
 
     return None
+
+
+#: Substrings that mark a venue as a preprint server or a publisher *series*
+#: rather than a specific published venue. An arXiv-indexed record often carries
+#: a blank or preprint venue while the entry cites the real conference, so a
+#: preprint venue on EITHER side must never produce a hard mismatch. "PMLR" /
+#: "proceedings of machine learning research" is the umbrella series for many
+#: distinct conferences (ICML, AISTATS, CoRL, ...), so it cannot pin a single
+#: venue and is likewise treated as non-comparable.
+#: Preprint-server markers, matched as substrings of the lowercased raw venue.
+_PREPRINT_SERVER_MARKERS: tuple[str, ...] = (
+    "arxiv",
+    "biorxiv",
+    "medrxiv",
+    "chemrxiv",
+    "preprint",
+    "corr",  # arXiv's "Computing Research Repository" DBLP label
+    # FIX C3: SSRN is a working-paper / preprint server. CrossRef returns
+    # ``SSRN Electronic Journal`` for SSRN copies of papers later published at
+    # JMLR / conference venues, so an SSRN-side venue must be non-comparable
+    # (not a hard mismatch) and let another source confirm the venue. Unique
+    # acronym -- no real journal name contains ``ssrn``.
+    "ssrn",
+)
+
+#: Publisher-*series* markers (matched against the lowercased raw venue). These
+#: name an umbrella series that spans many distinct conferences, so they cannot
+#: pin a single venue. Matched on the RAW venue (not the prefix-stripped form)
+#: so "Proceedings of Machine Learning Research" (PMLR) is caught while the
+#: distinct journal "Journal of Machine Learning Research" (JMLR) is NOT.
+_SERIES_MARKERS: tuple[str, ...] = (
+    "proceedings of machine learning research",
+    "pmlr",
+    "jmlr workshop and conference proceedings",
+    "w&cp",
+    # Springer/IFIP book series. Crossref and OpenAlex return the SERIES as the
+    # container-title for proceedings published in them, so an entry citing the
+    # actual conference ("International Conference on Entertainment Computing")
+    # was compared against "Lecture Notes in Computer Science" and reported as a
+    # venue MISMATCH -- on entries whose title matched the record exactly. Each
+    # of these spans many distinct conferences, so it cannot pin one venue.
+    # "lecture notes" covers LNCS/LNNS/LNEE/LNBIP/LNICST and the spelled-out
+    # "Lecture Notes of the Institute for Computer Sciences..."; no single real
+    # venue is named "Lecture Notes ...".
+    "lecture notes",
+    "studies in computational intelligence",
+    "communications in computer and information science",
+    "advances in intelligent systems and computing",
+    "smart innovation, systems and technologies",
+    "ifip international federation for information processing",
+    "ifip advances in information and communication technology",
+    "springerbriefs",
+    "springer proceedings in",
+)
+
+#: Tokens naming a SEPARATE co-located event with its own proceedings. When one
+#: venue name carries such a token and the other does not, they are different
+#: venues (a workshop is not its parent conference), so neither subsumption nor
+#: a high fuzzy score may merge them.
+#:
+#: Deliberately excludes presentation-format words -- ``poster``, ``oral``,
+#: ``spotlight``, ``demo``, ``abstract``. Those name a TRACK within one venue,
+#: not a venue, and :func:`_strip_track_decorations` already removes them so
+#: ``ICML 2023 poster`` still confirms a claimed ``ICML 2023``.
+#: Tokens naming a SEPARATE VOLUME of the same event (the companion/adjunct
+#: proceedings). These never name a venue on their own, so their presence on one
+#: side alone always means two different publications.
+_DISTINCT_VOLUME_TOKENS: frozenset[str] = frozenset({"companion", "adjunct", "supplement"})
+
+#: Tokens naming a satellite EVENT. Unlike the volume markers above, a workshop
+#: or tutorial is a venue in its own right and is routinely cited as one, so
+#: these need the added-topic test in :func:`adds_satellite_marker` rather than
+#: an unconditional block.
+_SATELLITE_EVENT_TOKENS: frozenset[str] = frozenset(
+    {
+        "workshop",
+        "workshops",
+        "tutorial",
+        "tutorials",
+        "doctoral",
+        "consortium",
+        "satellite",
+        "colocated",
+    }
+)
+
+_SUBSUMPTION_BLOCKING_TOKENS: frozenset[str] = _DISTINCT_VOLUME_TOKENS | _SATELLITE_EVENT_TOKENS
+
+#: Fewer tokens than this cannot establish venue identity on their own
+#: ("Automation" must not subsume "International Conference on Robotics and
+#: Automation").
+_MIN_SUBSUMPTION_TOKENS = 3
+
+
+#: Entry types whose ``title`` names a whole volume rather than a paper. Their
+#: title IS the conference name, so it carries venue boilerplate and must be
+#: normalized as a venue -- not compared verbatim like a paper title.
+_VOLUME_ENTRY_TYPES: frozenset[str] = frozenset({"proceedings"})
+
+#: A trailing acronym parenthetical, with or without the repeated year:
+#: ``(CNSM 2024)`` and ``(CNSM)`` must reduce to the same thing.
+_VOLUME_ACRONYM_YEAR_RE = re.compile(r"\(([^)]*?)\s*\b(?:19|20)\d{2}\b\s*([^)]*?)\)")
+
+#: Ordinal edition markers ("18th", "20th", "8th") -- boilerplate in a
+#: conference name, and the commonest source of a spurious near-miss.
+_VOLUME_ORDINAL_RE = re.compile(r"\b\d+(?:st|nd|rd|th)\b")
+
+
+#: Entry types that the paper databases in the cascade (Crossref, OpenAlex,
+#: DBLP, Semantic Scholar) do not index. Dissertations are deposited in
+#: institutional and national repositories instead, so a cascade miss carries no
+#: information about whether the thesis exists.
+_THESIS_ENTRY_TYPES: frozenset[str] = frozenset({"phdthesis", "mastersthesis"})
+
+
+def is_volume_entry_type(entry_type: str) -> bool:
+    """True for entry types whose title names a volume, not a paper."""
+    return (entry_type or "").strip().lower() in _VOLUME_ENTRY_TYPES
+
+
+def is_thesis_entry_type(entry_type: str) -> bool:
+    """True for thesis types, which paper databases do not index."""
+    return (entry_type or "").strip().lower() in _THESIS_ENTRY_TYPES
+
+
+def normalize_volume_title(title: str) -> str:
+    """Normalize a volume title the way a venue name is normalized.
+
+    ``@proceedings`` titles differ from their indexed form only by conference
+    boilerplate -- a ``Proceedings of the`` prefix, a leading year, an ordinal,
+    and a trailing ``(ACRONYM YEAR)`` whose year the index drops. Comparing them
+    verbatim produced TITLE_MISMATCH at similarities as high as 0.97.
+    """
+    if not title:
+        return ""
+    # Collapse "(CNSM 2024)" -> "(CNSM)" before the generic year strip so the
+    # parenthetical survives as an acronym rather than an empty pair of parens.
+    normalized = _VOLUME_ACRONYM_YEAR_RE.sub(lambda m: f"({m.group(1)}{m.group(2)})".replace("()", ""), title)
+    normalized = _VOLUME_ORDINAL_RE.sub(" ", normalized)
+    # Reuse the venue normalizer: it already drops "Proceedings of the", bare
+    # years and track decorations, which is exactly this boilerplate. Finish
+    # with the title normalizer so LaTeX braces, diacritics and punctuation go
+    # too -- "Computer Vision -- {ECCV}" and "Computer Vision - ECCV" must
+    # reduce to the same tokens for the containment test to see them.
+    return normalize_title_for_match(_normalize_venue_for_matching(normalized))
+
+
+#: Generic venue-name scaffolding. Present in most conference names and
+#: therefore carrying no topical information -- what remains after removing
+#: these is what actually distinguishes one event from another.
+_VENUE_BOILERPLATE_TOKENS: frozenset[str] = frozenset(
+    {
+        "international",
+        "national",
+        "annual",
+        "joint",
+        "ieee",
+        "acm",
+        "ifip",
+        "usenix",
+        "european",
+        "asian",
+        "conference",
+        "symposium",
+        "congress",
+        "meeting",
+        "proceedings",
+        "on",
+        "the",
+        "of",
+        "in",
+        "and",
+        "for",
+        "at",
+        "st",
+        "nd",
+        "rd",
+        "th",
+    }
+)
+
+
+def volume_title_subsumed(entry_title: str, record_title: str) -> bool:
+    """True when a volume's cited title is the record's title minus a suffix.
+
+    Indexes store a proceedings volume under its full descriptive title -- the
+    meeting's place and dates ("..., ACL 2020, Online, July 5-10, 2020") or its
+    part number ("..., Proceedings, Part I") -- while bibliographies cite the
+    short form. They are the same volume, and the length gap alone drops the
+    fuzzy score below the title threshold.
+
+    Containment is only meaningful because the entry side is a VOLUME title:
+    for a paper title, a record title that merely *contains* it would be a
+    different (longer-titled) work.
+    """
+    cited = normalize_volume_title(entry_title)
+    indexed = normalize_volume_title(record_title)
+    if not cited or not indexed:
+        return False
+    return cited in indexed
+
+
+def adds_satellite_marker(venue_a: str, venue_b: str) -> bool:
+    """True when one side is a SATELLITE of the other, not merely longer.
+
+    A workshop shares almost every token with its parent conference, so fuzzy
+    similarity alone rates them a match ("ICML Workshop on Foundation Models" vs
+    "ICML"). But a workshop is also a venue in its own right, and indexes
+    routinely shorten ITS name too ("International Workshop on IP Operations and
+    Management" stored as "IP Operations and Management") -- treating that as a
+    different venue is the same false positive in reverse.
+
+    The discriminator is whether the longer side adds substantive TOPIC words
+    beyond the marker and generic scaffolding. "Foundation Models" is a distinct
+    event; "International ... on" is boilerplate around the same one. When both
+    sides carry the marker it says nothing either way.
+    """
+    tokens_a, tokens_b = set(venue_a.split()), set(venue_b.split())
+    # A companion/adjunct volume is a different publication of the same event,
+    # whatever else the names share -- no topic test applies.
+    if bool(tokens_a & _DISTINCT_VOLUME_TOKENS) != bool(tokens_b & _DISTINCT_VOLUME_TOKENS):
+        return True
+    marked_a = bool(tokens_a & _SATELLITE_EVENT_TOKENS)
+    marked_b = bool(tokens_b & _SATELLITE_EVENT_TOKENS)
+    if marked_a == marked_b:
+        return False
+    longer, shorter = (tokens_a, tokens_b) if marked_a else (tokens_b, tokens_a)
+    added_topic = (longer - shorter) - _SUBSUMPTION_BLOCKING_TOKENS - _VENUE_BOILERPLATE_TOKENS
+    return bool(added_topic)
+
+
+def venue_name_subsumes(venue_a: str, venue_b: str) -> bool:
+    """True when one venue name contains the other, i.e. they name one venue.
+
+    Indexes routinely store a shortened container name: the organizer prefix and
+    trailing acronym dropped ("2021 IFIP/IEEE International Symposium on
+    Integrated Network Management (IM)" indexed as "Integrated Network
+    Management"), or the subtitle omitted. Treating that as a venue MISMATCH is
+    a false positive; treating it as identity is not, PROVIDED the extra words
+    are boilerplate rather than a satellite-event marker.
+    """
+    tokens_a = venue_a.split()
+    tokens_b = venue_b.split()
+    if not tokens_a or not tokens_b:
+        return False
+    shorter, longer = (tokens_a, tokens_b) if len(tokens_a) <= len(tokens_b) else (tokens_b, tokens_a)
+    # Equal length means neither adds anything: that is a plain comparison, not
+    # subsumption, and must stay with the fuzzy verdict.
+    if len(shorter) < _MIN_SUBSUMPTION_TOKENS or len(shorter) == len(longer):
+        return False
+    if " ".join(shorter) not in " ".join(longer):
+        return False
+    # Same discriminator as :func:`adds_satellite_marker`: only a longer name
+    # that adds real TOPIC words names a different (satellite) event. Extra
+    # boilerplate around the marker is index truncation of the SAME venue.
+    return not adds_satellite_marker(" ".join(longer), " ".join(shorter))
+
+
+#: A parenthetical acronym a venue declares for itself: an uppercase run of
+#: >= 3 chars, optionally trailed by the repeated year -- ``(CNSM)``,
+#: ``(NOMS 2024)``, ``(ICT4S)``. Two-letter parentheticals are excluded on
+#: purpose: acronyms that short (IM, ML, IP) collide across unrelated venues and
+#: cannot establish identity on their own.
+_PARENTHETICAL_ACRONYM_RE = re.compile(r"\(\s*([A-Z][A-Z0-9]{2,})\b[^)]*\)")
+
+#: A venue string that is a single acronym-like token (>= 3 chars). The API
+#: casing is unreliable, so lowercase is accepted here -- the all-caps
+#: parenthetical on the OTHER side is what anchors the match.
+_BARE_ACRONYM_RE = re.compile(r"^[A-Za-z][A-Za-z0-9]{2,}$")
+
+
+def _declared_acronyms(venue: str) -> set[str]:
+    """The uppercase acronyms a venue declares in its own parentheses."""
+    return {m.group(1).lower() for m in _PARENTHETICAL_ACRONYM_RE.finditer(venue)}
+
+
+def _bare_acronym(venue: str) -> str | None:
+    """The venue reduced to a single acronym token, lowercased, or None.
+
+    A record whose whole venue string is one >= 3-char token once the year is
+    stripped ("CNSM", "2024 NOMS") is a bare acronym; a multi-word name is not.
+    """
+    stripped = re.sub(r"\b(?:19|20)\d{2}\b", " ", venue)
+    tokens = stripped.split()
+    if len(tokens) != 1:
+        return None
+    token = tokens[0]
+    return token.lower() if _BARE_ACRONYM_RE.match(token) else None
+
+
+def venue_acronym_matches(venue_a: str, venue_b: str) -> bool:
+    """True when one venue is a bare acronym the OTHER declares parenthetically.
+
+    Indexes sometimes store only a conference's acronym ("CNSM") while the entry
+    spells the name out and appends the acronym itself ("... Network and Service
+    Management (CNSM)"). The parenthetical is the venue's OWN declaration of its
+    shorthand, so matching the two reads that declaration -- it does not guess an
+    acronym from initials. A bare acronym is one token, below
+    :data:`_MIN_SUBSUMPTION_TOKENS`, so :func:`venue_name_subsumes` cannot reach
+    it; this closes that gap without weakening the length guard. Restricted to
+    >= 3-char acronyms, since shorter ones collide across unrelated venues.
+
+    Purely additive: it only turns a would-be MISMATCH into a MATCH, never the
+    reverse, and it runs after the satellite-marker guard, so a workshop that
+    declares its parent's acronym is still rejected.
+    """
+    bare_a, bare_b = _bare_acronym(venue_a), _bare_acronym(venue_b)
+    if bare_a and bare_a in _declared_acronyms(venue_b):
+        return True
+    if bare_b and bare_b in _declared_acronyms(venue_a):
+        return True
+    return False
+
+
+def venue_acronyms_are_comparable(venue_a: str, venue_b: str) -> bool:
+    """True when both sides name an acronym, so a non-match is real disagreement.
+
+    :func:`venue_acronym_matches` answers "are these the same venue"; this
+    answers the prior question "is this pair even comparable". One side a bare
+    acronym and the other declaring its own acronym parenthetically means both
+    have stated their shorthand -- so if those shorthands differ, they are
+    different venues, and the comparator should say MISMATCH rather than
+    abstain.
+
+    Without this, "... Network and Service Management (CNSM)" against "NOMS"
+    reads as two unrecognised names and abstains, losing a genuine wrong-venue
+    detection. The two are recognised: each declares an acronym, and they differ.
+    """
+    bare_a, bare_b = _bare_acronym(venue_a), _bare_acronym(venue_b)
+    if bare_a and _declared_acronyms(venue_b):
+        return True
+    if bare_b and _declared_acronyms(venue_a):
+        return True
+    return bool(bare_a and bare_b)
+
+
+#: Hosting-*platform* markers. A record whose venue is only the platform name
+#: (OpenReview hosts ICLR, NeurIPS, TMLR, and many workshops) says nothing about
+#: the published venue, exactly like a preprint server -- so a venue comparison
+#: against it is non-comparable, not a mismatch. Not added as a venue *alias*
+#: (OpenReview is not a venue), only as a non-comparable platform string.
+_PLATFORM_MARKERS: tuple[str, ...] = ("openreview",)
+
+
+def is_preprint_or_series_venue(venue: str) -> bool:
+    """True if ``venue`` names a preprint server or non-specific publisher series.
+
+    Such venues (arXiv/CoRR, bioRxiv, "Proceedings of Machine Learning Research",
+    PMLR/JMLR W&CP, and hosting platforms like OpenReview) cannot pin a single
+    published venue, so a venue comparison against them is *non-comparable*
+    rather than a mismatch. The distinct journal "Journal of Machine Learning
+    Research" (JMLR) is deliberately NOT matched.
+    """
+    if not venue:
+        return False
+    raw = venue.lower().strip()
+    if not raw:
+        return False
+    return (
+        any(m in raw for m in _PREPRINT_SERVER_MARKERS)
+        or any(m in raw for m in _SERIES_MARKERS)
+        or any(m in raw for m in _PLATFORM_MARKERS)
+    )
+
+
+#: ISO-4 / LTWA word abbreviations, mapped to the full word.
+#:
+#: ISO-4 is the standard abbreviation scheme for journal titles ("ACM Trans.
+#: Graph."), and it is the form a large share of real ``.bib`` files carry --
+#: publisher templates and reference managers emit it by default. The venue
+#: comparator had no route for it: ``EXPANDED_VENUE_ALIASES`` covers ML and CS
+#: conferences by acronym and full name, so an abbreviated JOURNAL title
+#: canonicalises to nothing and falls through to a token-sort that scores it
+#: below threshold. Measured before this map existed:
+#:
+#:     ACM Trans. Graph.               vs ACM Transactions on Graphics      0.70
+#:     Proc. Natl. Acad. Sci. U.S.A.   vs Proceedings of the National ...   0.60
+#:     Annu. Rev. Stat. Appl.          vs Annual Review of Statistics ...   0.55
+#:
+#: Each is a correct citation of a real paper, reported as a venue disagreement.
+#:
+#: This is the common subset rather than the full LTWA list, which runs to tens
+#: of thousands of stems. Entries are lowercase, without the trailing period,
+#: and are applied per word so word order and the rest of the string are
+#: untouched. Ambiguous stems are deliberately absent: "comput." expands to
+#: Computing, Computer, Computational and Computers depending on the title, so
+#: expanding it would create false matches rather than remove false mismatches.
+LTWA_ABBREVIATIONS: dict[str, str] = {
+    "acad": "academy",
+    "adv": "advances",
+    "am": "american",
+    "ann": "annals",
+    "annu": "annual",
+    "appl": "application",
+    "artif": "artificial",
+    "assoc": "association",
+    "biol": "biology",
+    "bull": "bulletin",
+    "chem": "chemistry",
+    "commun": "communications",
+    "conf": "conference",
+    "eng": "engineering",
+    "environ": "environmental",
+    "eur": "european",
+    "exp": "experimental",
+    "inf": "information",
+    "int": "international",
+    "intell": "intelligence",
+    "j": "journal",
+    "learn": "learning",
+    "lett": "letters",
+    "mach": "machine",
+    "manag": "management",
+    "math": "mathematics",
+    "med": "medicine",
+    "mon": "monthly",
+    "nat": "nature",
+    "natl": "national",
+    "neurosci": "neuroscience",
+    "phys": "physics",
+    "proc": "proceedings",
+    "psychol": "psychology",
+    "publ": "publications",
+    "rep": "reports",
+    "res": "research",
+    "rev": "review",
+    "sci": "sciences",
+    "soc": "society",
+    "stat": "statistics",
+    "syst": "systems",
+    "technol": "technology",
+    "trans": "transactions",
+    "univ": "university",
+}
+
+#: Country/region abbreviations that appear as trailing qualifiers, where the
+#: full form adds nothing to identity ("Proc. Natl. Acad. Sci. U.S.A.").
+_LTWA_DROPPABLE = frozenset({"usa", "us", "uk", "ussr"})
+
+#: Function words that do not distinguish journal titles during the strict
+#: post-expansion alignment. Content-bearing venue words remain in place.
+_LTWA_ALIGNMENT_STOPWORDS = frozenset({"a", "an", "and", "at", "for", "in", "its", "of", "on", "the", "to"})
+
+#: The spelled-out country suffix ``U.S.A.`` expands to. Dropped from the tail of
+#: either title before the lengths are compared, so PNAS's two forms
+#: ("Proc. Natl. Acad. Sci. U.S.A." and "... Sciences of the United States of
+#: America") still align while a genuine extra word does not.
+_LTWA_TRAILING_COUNTRY_TOKENS = frozenset({"united", "states", "america", "usa"})
+
+
+def expand_ltwa_abbreviations(venue: str) -> str:
+    """Expand ISO-4 word abbreviations in a venue string.
+
+    Applied per word against :data:`LTWA_ABBREVIATIONS`, so word order and any
+    unabbreviated words are preserved. Words absent from the map pass through
+    unchanged, which is why an incomplete map is safe: it can only turn a
+    non-match into a match, never the reverse.
+
+    Returns the string lowercased with punctuation-only separators collapsed.
+    Idempotent -- expanding an already-expanded string is a no-op, since the
+    full forms are not themselves keys.
+    """
+    if not venue:
+        return ""
+    out: list[str] = []
+    for raw_word in re.split(r"[\s]+", venue.lower()):
+        word = raw_word.strip(".,;:()[]{}")
+        if not word:
+            continue
+        # "u.s.a." -> "usa" before the droppable check.
+        compact = word.replace(".", "")
+        if compact in _LTWA_DROPPABLE:
+            continue
+        out.append(LTWA_ABBREVIATIONS.get(word, LTWA_ABBREVIATIONS.get(compact, word)))
+    return " ".join(out)
+
+
+def _drop_trailing_country_tokens(tokens: list[str]) -> list[str]:
+    """Strip a trailing country qualifier from an expanded venue's tokens.
+
+    ``U.S.A.`` is dropped during expansion, but the same qualifier written out
+    ("... of the United States of America") survives as content tokens. Popping
+    it from the tail lets the two PNAS forms have the same length, without
+    letting a qualifier in the middle of a title disappear.
+    """
+    end = len(tokens)
+    while end > 0 and tokens[end - 1] in _LTWA_TRAILING_COUNTRY_TOKENS:
+        end -= 1
+    return tokens[:end]
+
+
+def venue_abbreviation_matches(venue_a: str, venue_b: str, threshold: float = 0.70) -> bool:
+    """True when two venue strings agree once ISO-4 abbreviations are expanded.
+
+    Only reports a *positive*: it can clear a false venue disagreement but never
+    create one, so a caller can consult it before falling through to a mismatch.
+    """
+    if not venue_a or not venue_b:
+        return False
+    expanded_a = expand_ltwa_abbreviations(venue_a)
+    expanded_b = expand_ltwa_abbreviations(venue_b)
+    if not expanded_a or not expanded_b:
+        return False
+    if expanded_a == expanded_b:
+        return True
+    # Keep ``threshold`` in the public signature for compatibility. A fuzzy
+    # aggregate is unsafe here: shared boilerplate can outweigh one journal-
+    # defining disagreement. Instead the two expanded titles must carry the same
+    # number of content tokens and align in order, once the country suffix PNAS
+    # writes out in full is dropped from either tail.
+    #
+    # The lengths must be equal because a journal name is a prefix of its own
+    # family: "Nature" is the head of "Nature Methods", "Science" of "Science
+    # Advances", "Lancet" of "Lancet Oncology". Walking only the shorter list
+    # leaves the longer title's tail unexamined, so every such pair reports a
+    # match and ``wrong_venue`` becomes undetectable across a journal family.
+    del threshold
+    tokens_a = [
+        token for token in normalize_title_for_match(expanded_a).split() if token not in _LTWA_ALIGNMENT_STOPWORDS
+    ]
+    tokens_b = [
+        token for token in normalize_title_for_match(expanded_b).split() if token not in _LTWA_ALIGNMENT_STOPWORDS
+    ]
+    tokens_a = _drop_trailing_country_tokens(tokens_a)
+    tokens_b = _drop_trailing_country_tokens(tokens_b)
+    if not tokens_a or not tokens_b:
+        return False
+    if len(tokens_a) != len(tokens_b):
+        return False
+
+    def tokens_match(left: str, right: str) -> bool:
+        return (
+            left == right or left.startswith(right) or right.startswith(left) or Levenshtein.distance(left, right) <= 2
+        )
+
+    return all(tokens_match(left, right) for left, right in zip(tokens_a, tokens_b, strict=True))

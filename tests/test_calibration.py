@@ -5,12 +5,89 @@ from __future__ import annotations
 import pytest
 
 from bibtex_updater.calibration import (
+    P_VALID_ABSTAIN_STATUSES,
+    P_VALID_NEUTRAL,
+    P_VALID_NOT_FOUND_CLEAN,
+    P_VALID_PROBLEM_STATUSES,
+    P_VALID_VALID_STATUSES,
     STATUS_BASE_CONFIDENCE,
     calibrate_result,
     compute_confidence_from_scores,
     decompose_field_confidence,
+    p_valid_from_result,
     status_aware_confidence,
 )
+
+# Bucket membership for the three-way verdict model (status .value strings).
+# Kept local so these tests do not depend on the concurrently-edited
+# fact_checker module importing cleanly.
+CORRECT_STATUSES = (
+    "verified",
+    "preprint_only",
+    "published_version_exists",
+    "url_verified",
+    "book_verified",
+    "working_paper_verified",
+)
+PROBLEM_STRONG_STATUSES = (
+    "hallucinated",
+    "future_date",
+    "invalid_year",
+    "doi_mismatch",
+    "arxiv_id_mismatch",
+)
+PROBLEM_SOFT_STATUSES = (
+    "title_mismatch",
+    "author_mismatch",
+    "year_mismatch",
+    "venue_mismatch",
+    "partial_match",
+    "url_content_mismatch",
+)
+ABSTAIN_STATUSES = (
+    "not_found",
+    "unconfirmed",
+    "api_error",
+    "doi_not_found",
+    "url_not_found",
+    "book_not_found",
+    "working_paper_not_found",
+    "url_accessible",
+)
+# Every status the calibrator must price (excludes "skipped" = not verifiable).
+ALL_VERDICT_STATUSES = CORRECT_STATUSES + PROBLEM_STRONG_STATUSES + PROBLEM_SOFT_STATUSES + ABSTAIN_STATUSES
+
+
+def _end_to_end(status, *, found, match_score):
+    """Run calibrate_result with a neutral, full-coverage context for a status."""
+    if found:
+        sources_with_hits = ["crossref", "dblp", "semanticscholar"]
+    else:
+        sources_with_hits = []
+    return calibrate_result(
+        status=status,
+        best_match_score=match_score,
+        field_comparisons={},
+        sources_queried=["crossref", "dblp", "semanticscholar"],
+        sources_with_hits=sources_with_hits,
+        errors=[],
+    )
+
+
+def _natural_problem_conf(status):
+    """End-to-end confidence for a problem status under its natural evidence.
+
+    hallucinated derives from a low scored candidate (a record was retrieved but
+    badly mismatched), whereas the self-contained problems carry no candidate.
+    Soft single-field mismatches imply a record WAS found and mostly matches.
+    """
+    if status == "hallucinated":
+        return _end_to_end(status, found=True, match_score=0.1)
+    if status in PROBLEM_SOFT_STATUSES:
+        return _end_to_end(status, found=True, match_score=0.6)
+    # Self-contained problems: no scored candidate.
+    return _end_to_end(status, found=False, match_score=None)
+
 
 # ------------- Fixtures -------------
 
@@ -74,17 +151,21 @@ class TestComputeConfidenceFromScores:
         # Should return base confidence for not_found (0.70)
         assert abs(confidence - STATUS_BASE_CONFIDENCE["not_found"]) < 0.01
 
-    def test_not_found_low_score_confirms(self):
-        """Not found with low match score confirms the classification."""
+    def test_not_found_low_score_stays_low(self):
+        """Not found is an abstention: a low match score does NOT inflate it.
+
+        A don't-know verdict must stay near-neutral. Inverting a low match score
+        to manufacture high "confidence it's not found" was the old over-flagging
+        bug; the abstention now holds its low base prior.
+        """
         confidence = compute_confidence_from_scores(
             status="not_found",
             best_match_score=0.25,
             field_comparisons={"title": {"similarity_score": 0.25, "matches": False}},
         )
-        # Low score (0.25) confirms not_found
-        # confidence_in_low_score = 1.0 - 0.25 = 0.75
-        # 0.6 * 0.75 + 0.4 * 0.70 = 0.45 + 0.28 = 0.73
-        assert confidence > 0.7
+        # Holds the low abstention prior, NOT boosted by 1 - score.
+        assert abs(confidence - STATUS_BASE_CONFIDENCE["not_found"]) < 0.01
+        assert confidence < 0.6
 
     def test_not_found_high_score_contradicts(self):
         """Not found with high match score contradicts the status."""
@@ -237,9 +318,14 @@ class TestStatusAwareConfidence:
         assert confidence > 0.85
         assert confidence <= 1.0
 
-    def test_not_found_all_sources(self):
-        """Not found with all sources queried should give high confidence."""
-        confidence = status_aware_confidence(
+    def test_not_found_source_count_does_not_inflate(self):
+        """Abstention confidence must NOT scale with how many sources were queried.
+
+        "Not found in 3 databases" is still a don't-know. Querying more sources
+        cannot push an abstention toward a confident verdict, so 1-source and
+        3-source not_found must report the same (low) confidence.
+        """
+        conf_three = status_aware_confidence(
             status="not_found",
             best_match_score=0.15,
             field_comparisons={},
@@ -247,14 +333,7 @@ class TestStatusAwareConfidence:
             sources_with_hits=[],
             errors=[],
         )
-        # All 3 sources queried, none found -> high confidence
-        # queried_factor = 3/3 = 1.0
-        # coverage_factor = 0.7 + 0.3 * 1.0 = 1.0
-        assert confidence > 0.7
-
-    def test_not_found_one_source(self):
-        """Not found with only one source should give lower confidence."""
-        confidence = status_aware_confidence(
+        conf_one = status_aware_confidence(
             status="not_found",
             best_match_score=0.20,
             field_comparisons={},
@@ -262,10 +341,10 @@ class TestStatusAwareConfidence:
             sources_with_hits=[],
             errors=[],
         )
-        # Only 1 source queried -> lower confidence
-        # queried_factor = 1/3 = 0.333
-        # coverage_factor = 0.7 + 0.3 * 0.333 ≈ 0.8
-        assert confidence < 0.70
+        # Both stay at the low abstention prior; source count is irrelevant.
+        assert conf_three < 0.6
+        assert conf_one < 0.6
+        assert abs(conf_three - conf_one) < 0.01
 
     def test_api_errors_reduce_confidence(self, sample_field_comparisons):
         """API errors should reduce confidence."""
@@ -357,7 +436,11 @@ class TestCalibrateResult:
         assert confidence <= 1.0
 
     def test_not_found_entry(self):
-        """End-to-end test for not found entry."""
+        """End-to-end test for not found entry: abstention stays low.
+
+        not_found is a don't-know verdict; it must report LOW confidence
+        regardless of how many sources were queried.
+        """
         confidence = calibrate_result(
             status="not_found",
             best_match_score=0.10,
@@ -366,9 +449,9 @@ class TestCalibrateResult:
             sources_with_hits=[],
             errors=[],
         )
-        # All sources queried, none found -> high confidence
-        assert confidence > 0.70
-        assert confidence <= 1.0
+        # Near-neutral abstention prior, NOT a high confident verdict.
+        assert confidence < 0.55
+        assert confidence >= 0.0
 
     def test_confidence_range(self):
         """All calibrated confidences should be in [0.0, 1.0]."""
@@ -470,3 +553,184 @@ class TestCalibrateResult:
         # Should use formula: 0.7 * base_confidence + 0.3 * weighted_field_score
         # Both components should be high, so final confidence should be high
         assert confidence > 0.85
+
+
+# ------------- Test three-way bucket coherence -------------
+
+
+class TestBucketCoherence:
+    """The priors must be coherent with the 3-way verdict model.
+
+    Ordering invariant: CLEARLY-CORRECT and CLEARLY-PROBLEM are both HIGH and
+    sit strictly ABOVE the DON'T-KNOW (abstention) bucket; positive-evidence
+    problems sit at or above soft single-field mismatches. This holds both for
+    the raw priors and end-to-end through ``calibrate_result``.
+    """
+
+    def test_every_verdict_status_has_a_prior(self):
+        """No verdict status may be missing from STATUS_BASE_CONFIDENCE."""
+        for status in ALL_VERDICT_STATUSES:
+            assert status in STATUS_BASE_CONFIDENCE, f"missing prior: {status}"
+        # "skipped" (not verifiable) is also present.
+        assert "skipped" in STATUS_BASE_CONFIDENCE
+
+    def test_confident_buckets_are_high(self):
+        """Both confident buckets must be clearly high (>= 0.72)."""
+        for status in CORRECT_STATUSES + PROBLEM_STRONG_STATUSES + PROBLEM_SOFT_STATUSES:
+            assert STATUS_BASE_CONFIDENCE[status] >= 0.72, status
+
+    def test_abstentions_are_low(self):
+        """Abstention priors must be near-neutral and low (<= 0.50)."""
+        for status in ABSTAIN_STATUSES:
+            assert STATUS_BASE_CONFIDENCE[status] <= 0.50, status
+
+    def test_abstention_below_both_confident_buckets_prior(self):
+        """Prior invariant: max(abstention) < min(either confident bucket)."""
+        max_abstain = max(STATUS_BASE_CONFIDENCE[s] for s in ABSTAIN_STATUSES)
+        min_correct = min(STATUS_BASE_CONFIDENCE[s] for s in CORRECT_STATUSES)
+        min_problem = min(STATUS_BASE_CONFIDENCE[s] for s in PROBLEM_STRONG_STATUSES + PROBLEM_SOFT_STATUSES)
+        assert max_abstain < min_correct
+        assert max_abstain < min_problem
+
+    def test_strong_problems_ge_soft_problems_prior(self):
+        """Positive-evidence problems must be >= soft single-field mismatches."""
+        min_strong = min(STATUS_BASE_CONFIDENCE[s] for s in PROBLEM_STRONG_STATUSES)
+        max_soft = max(STATUS_BASE_CONFIDENCE[s] for s in PROBLEM_SOFT_STATUSES)
+        assert min_strong >= max_soft
+
+    def test_abstention_below_both_confident_buckets_end_to_end(self):
+        """End-to-end: every abstention calibrates below every confident verdict.
+
+        This is the key correctness property -- an entry the tool could not
+        adjudicate must not report higher confidence than a decided one.
+        """
+        # Confident verdicts under their natural evidence context.
+        correct_confs = [_end_to_end(s, found=True, match_score=0.95) for s in CORRECT_STATUSES]
+        strong_confs = [_natural_problem_conf(s) for s in PROBLEM_STRONG_STATUSES]
+        soft_confs = [_natural_problem_conf(s) for s in PROBLEM_SOFT_STATUSES]
+        # Abstentions: vary found/score to prove neither inflates them.
+        abstain_confs = []
+        for s in ABSTAIN_STATUSES:
+            abstain_confs.append(_end_to_end(s, found=False, match_score=0.1))
+            abstain_confs.append(_end_to_end(s, found=False, match_score=None))
+
+        worst_confident = min(correct_confs + strong_confs + soft_confs)
+        best_abstain = max(abstain_confs)
+        assert best_abstain < worst_confident, f"abstention {best_abstain:.3f} >= confident {worst_confident:.3f}"
+
+    def test_strong_problems_ge_soft_problems_end_to_end(self):
+        """End-to-end (each status under its natural evidence context):
+        strong positive-evidence problems >= soft single-field mismatches.
+        """
+        min_strong = min(_natural_problem_conf(s) for s in PROBLEM_STRONG_STATUSES)
+        max_soft = max(_natural_problem_conf(s) for s in PROBLEM_SOFT_STATUSES)
+        assert min_strong >= max_soft
+
+    def test_abstention_not_inflated_by_match_or_sources(self):
+        """An abstention with a strong candidate / many sources stays low."""
+        for status in ABSTAIN_STATUSES:
+            # High match score must not lift it above the confident floor (0.72).
+            high = _end_to_end(status, found=True, match_score=0.95)
+            assert high < 0.72, f"{status} inflated to {high:.3f}"
+            # Many sources queried must not lift it either.
+            many = _end_to_end(status, found=False, match_score=0.1)
+            assert many <= STATUS_BASE_CONFIDENCE[status] + 0.01, status
+
+    def test_all_statuses_in_unit_range_end_to_end(self):
+        """Every verdict status calibrates within [0, 1]."""
+        for status in ALL_VERDICT_STATUSES + ("skipped",):
+            conf = _end_to_end(status, found=True, match_score=0.8)
+            assert 0.0 <= conf <= 1.0, f"{status} -> {conf}"
+
+
+# ------------- Test p_valid_from_result (explicit P(valid) layer) -------------
+
+
+class TestPValidFromResult:
+    """The explicit P(valid) output contract.
+
+    ``p_valid_from_result`` maps (status, verdict_confidence) onto the
+    probability that the ENTRY AS CITED is a real publication with correct
+    metadata. ``verdict_confidence`` keeps its existing meaning ("confidence
+    the assigned status is the right call"); the polarity map supplies the
+    direction consumers previously had to reverse-engineer.
+    """
+
+    def test_valid_polarity_spot_checks(self):
+        assert p_valid_from_result("verified", 0.88) == pytest.approx(0.94)
+        assert p_valid_from_result("published_version_exists", 0.88) == pytest.approx(0.94)
+        assert p_valid_from_result("book_verified", 0.6) == pytest.approx(0.8)
+        # Never below 0.5, even at zero confidence in the verdict.
+        for status in P_VALID_VALID_STATUSES:
+            assert p_valid_from_result(status, 0.0) == pytest.approx(0.5), status
+            assert p_valid_from_result(status, 0.3) > 0.5, status
+
+    def test_problem_polarity_spot_checks(self):
+        assert p_valid_from_result("hallucinated", 0.93) == pytest.approx(0.035)
+        assert p_valid_from_result("author_mismatch", 0.78) == pytest.approx(0.11)
+        assert p_valid_from_result("doi_mismatch", 0.93) == pytest.approx(0.035)
+        assert p_valid_from_result("nonexistent_venue", 0.78) == pytest.approx(0.11)
+        # Never above 0.5, even at zero confidence in the verdict.
+        for status in P_VALID_PROBLEM_STATUSES:
+            assert p_valid_from_result(status, 0.0) == pytest.approx(0.5), status
+            assert p_valid_from_result(status, 0.3) < 0.5, status
+
+    def test_preprint_only_is_problem_polarity_despite_correct_tier_prior(self):
+        """STATUS_BASE_CONFIDENCE prices preprint_only in the CLEARLY-CORRECT
+        tier (the tool is confident in the VERDICT: a real record was found);
+        for P(valid) the claim AS CITED (published at venue X) is contradicted,
+        so the polarity map deliberately diverges. Same for the OpenReview
+        not-accepted status."""
+        assert STATUS_BASE_CONFIDENCE["preprint_only"] >= 0.72
+        assert p_valid_from_result("preprint_only", 0.88) == pytest.approx(0.06)
+        assert p_valid_from_result("unpublished_at_claimed_venue", 0.88) == pytest.approx(0.06)
+
+    def test_abstention_polarity_is_neutral_regardless_of_confidence(self):
+        for status in P_VALID_ABSTAIN_STATUSES:
+            for conf in (0.0, 0.45, 1.0):
+                assert p_valid_from_result(status, conf) == pytest.approx(P_VALID_NEUTRAL), status
+
+    def test_not_found_clean_vs_coverage_incomplete(self):
+        """A clean exhaustive miss is weak evidence of fabrication; the same
+        miss with errored/throttled sources is no evidence at all."""
+        assert p_valid_from_result("not_found", 0.45) == pytest.approx(P_VALID_NOT_FOUND_CLEAN)
+        assert p_valid_from_result("not_found", 0.45, coverage_incomplete=False) == pytest.approx(
+            P_VALID_NOT_FOUND_CLEAN
+        )
+        assert p_valid_from_result("not_found", 0.45, coverage_incomplete=True) == pytest.approx(P_VALID_NEUTRAL)
+        # The confidence input does not move the not_found special case.
+        assert p_valid_from_result("not_found", 0.9) == pytest.approx(P_VALID_NOT_FOUND_CLEAN)
+
+    def test_ordering_invariants(self):
+        """The contract's headline ordering: confident-valid > abstention >
+        clean exhaustive miss > soft problem > strong problem."""
+        assert (
+            p_valid_from_result("verified", 0.88)
+            > p_valid_from_result("unconfirmed", 0.45)
+            > p_valid_from_result("not_found", 0.45)
+            > p_valid_from_result("author_mismatch", 0.78)
+            > p_valid_from_result("hallucinated", 0.93)
+        )
+
+    def test_clamping_at_confidence_bounds(self):
+        # Exact bounds.
+        assert p_valid_from_result("verified", 1.0) == pytest.approx(1.0)
+        assert p_valid_from_result("verified", 0.0) == pytest.approx(0.5)
+        assert p_valid_from_result("hallucinated", 1.0) == pytest.approx(0.0)
+        assert p_valid_from_result("hallucinated", 0.0) == pytest.approx(0.5)
+        # Out-of-range confidences clamp instead of leaving [0, 1].
+        assert p_valid_from_result("verified", 1.7) == pytest.approx(1.0)
+        assert p_valid_from_result("verified", -0.4) == pytest.approx(0.5)
+        assert p_valid_from_result("hallucinated", 1.7) == pytest.approx(0.0)
+        assert p_valid_from_result("hallucinated", -0.4) == pytest.approx(0.5)
+
+    def test_unknown_status_defaults_neutral(self):
+        assert p_valid_from_result("some_future_status", 0.93) == pytest.approx(P_VALID_NEUTRAL)
+
+    def test_unit_range_for_all_known_statuses(self):
+        all_statuses = P_VALID_VALID_STATUSES | P_VALID_PROBLEM_STATUSES | P_VALID_ABSTAIN_STATUSES | {"not_found"}
+        for status in all_statuses:
+            for conf in (0.0, 0.25, 0.5, 0.75, 1.0):
+                for incomplete in (False, True):
+                    p = p_valid_from_result(status, conf, incomplete)
+                    assert 0.0 <= p <= 1.0, (status, conf, incomplete)

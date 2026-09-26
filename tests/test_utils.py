@@ -53,6 +53,16 @@ class TestStripDiacritics:
         result = strip_diacritics("Ångström")
         assert "A" in result and "ngstr" in result
 
+    def test_strip_diacritics_eszett_folds_to_ss(self):
+        # ß has no NFKD decomposition; fold it so "Reiß" matches "Reiss".
+        assert strip_diacritics("Reiß").lower() == "reiss"
+        assert strip_diacritics("Reiß").lower() == strip_diacritics("Reiss").lower()
+
+    def test_strip_diacritics_nondecomposing_letters(self):
+        # ø/ł/æ/đ etc. lack combining marks but should still fold to ASCII.
+        assert strip_diacritics("Søndergaard").lower() == "sondergaard"
+        assert strip_diacritics("Łukasz").lower() == "lukasz"
+
 
 class TestLatexToPlain:
     """Tests for latex_to_plain function."""
@@ -152,6 +162,54 @@ class TestLastNameFromPerson:
         result = last_name_from_person("Smith, John Jr.")
         assert "smith" in result.lower()
 
+    def test_last_name_generational_suffix_after_surname(self):
+        # A generational suffix trailing the SURNAME must be dropped, or
+        # "John Smith Jr." reduces to "jr" and spuriously mismatches the
+        # suffix-less "John Smith" of the same author (and the comma form).
+        assert last_name_from_person("John Smith Jr.") == "smith"
+        assert last_name_from_person("Smith Jr., John") == "smith"
+        assert last_name_from_person("Forsyth III") == "forsyth"
+        assert last_name_from_person("Robert Downey IV") == "downey"
+
+    def test_normalize_surname_key_symmetric_with_suffix(self):
+        # The authoritative record side must reduce a suffixed family
+        # identically to the entry side, or the two never compare equal.
+        from bibtex_updater.utils import _normalize_surname_key
+
+        assert _normalize_surname_key("Smith Jr.") == last_name_from_person("John Smith Jr.")
+        assert _normalize_surname_key("Forsyth III") == "forsyth"
+
+    def test_last_name_trailing_initials_skipped(self):
+        # "Mallikarjun B. R." (surname first, then initials) -> "mallikarjun",
+        # not the naive last token "r".
+        assert last_name_from_person("Mallikarjun B. R.") == "mallikarjun"
+
+    def test_last_name_keeps_real_surname_after_initial(self):
+        # A middle initial must not cause the real trailing surname to be dropped.
+        assert last_name_from_person("John M. Smith") == "smith"
+        assert last_name_from_person("van den Oord, Aaron") == "oord"
+
+    def test_last_name_decodes_html_entity_apostrophe(self):
+        # DBLP/XML-scraped fields carry "&apos;"; without decoding, the entity
+        # letters survive punctuation-stripping ("d&apos;Amore" -> "daposamore")
+        # and spuriously fail to match the clean record ("damore").
+        assert last_name_from_person("Francesco d&apos;Amore") == "damore"
+        assert last_name_from_person("Shin-Fang Ch&apos;ng") == "chng"
+
+
+class TestHtmlEntityTitleDecoding:
+    """HTML/XML entities in titles must decode before fuzzy matching."""
+
+    def test_amp_entity_does_not_leak_amp_token(self):
+        result = normalize_title_for_match("Parameter Allocation &amp; Regularization")
+        assert "amp" not in result.split()
+        assert "allocation regularization" in result
+
+    def test_apos_entity_in_title(self):
+        result = normalize_title_for_match("An Extension of the D&apos;Hondt Method")
+        assert "apos" not in result
+        assert "hondt" in result
+
 
 class TestAuthorsLastNames:
     """Tests for authors_last_names function."""
@@ -225,6 +283,43 @@ class TestDoiNormalize:
     def test_doi_normalize_empty(self):
         result = doi_normalize("")
         assert result is None
+
+
+class TestNormalizeDoiForResolution:
+    """FIX D: arXiv DataCite DOIs must be version-stripped, others left intact."""
+
+    def test_strips_arxiv_version(self):
+        from bibtex_updater import normalize_doi_for_resolution
+
+        assert normalize_doi_for_resolution("10.48550/arXiv.2010.11929v1") == "10.48550/arxiv.2010.11929"
+
+    def test_strips_arxiv_version_multidigit(self):
+        from bibtex_updater import normalize_doi_for_resolution
+
+        assert normalize_doi_for_resolution("10.48550/arXiv.2010.11929v12") == "10.48550/arxiv.2010.11929"
+
+    def test_unversioned_arxiv_unchanged(self):
+        from bibtex_updater import normalize_doi_for_resolution
+
+        assert normalize_doi_for_resolution("10.48550/arXiv.2010.11929") == "10.48550/arxiv.2010.11929"
+
+    def test_non_arxiv_version_like_suffix_preserved(self):
+        from bibtex_updater import normalize_doi_for_resolution
+
+        # Non-arXiv DOI legitimately ending in letter+digit -> must NOT strip.
+        assert normalize_doi_for_resolution("10.1234/journal.v2") == "10.1234/journal.v2"
+
+    def test_strips_url_prefix(self):
+        from bibtex_updater import normalize_doi_for_resolution
+
+        result = normalize_doi_for_resolution("https://doi.org/10.48550/arXiv.2010.11929v3")
+        assert result == "10.48550/arxiv.2010.11929"
+
+    def test_none_and_empty(self):
+        from bibtex_updater import normalize_doi_for_resolution
+
+        assert normalize_doi_for_resolution(None) is None
+        assert normalize_doi_for_resolution("") is None
 
 
 class TestDoiUrl:
@@ -315,3 +410,266 @@ class TestMatcherThresholds:
 
         # Should still be reasonably high
         assert title_score >= 0.8
+
+
+class TestAtomicReplace:
+    """Tests for atomic_replace cross-device fallback."""
+
+    def test_same_filesystem(self, tmp_path):
+        """Standard case: src and dst on the same filesystem — atomic os.replace."""
+        from bibtex_updater.utils import atomic_replace
+
+        src = tmp_path / "src.txt"
+        dst = tmp_path / "dst.txt"
+        src.write_text("hello")
+
+        atomic_replace(str(src), str(dst))
+
+        assert dst.read_text() == "hello"
+        assert not src.exists()
+
+    def test_exdev_fallback(self, tmp_path, monkeypatch):
+        """When os.replace raises EXDEV, fall back to copy + unlink."""
+        import errno
+        import os
+
+        from bibtex_updater.utils import atomic_replace
+
+        src = tmp_path / "src.txt"
+        dst = tmp_path / "dst.txt"
+        src.write_text("payload")
+
+        def fake_replace(s, d):
+            raise OSError(errno.EXDEV, "Invalid cross-device link")
+
+        monkeypatch.setattr(os, "replace", fake_replace)
+
+        atomic_replace(str(src), str(dst))
+
+        assert dst.read_text() == "payload"
+        assert not src.exists()
+
+    def test_non_exdev_oserror_propagates(self, tmp_path, monkeypatch):
+        """OSErrors other than EXDEV should propagate, not silently fall back."""
+        import errno
+        import os
+
+        import pytest
+
+        from bibtex_updater.utils import atomic_replace
+
+        src = tmp_path / "src.txt"
+        dst = tmp_path / "dst.txt"
+        src.write_text("payload")
+
+        def fake_replace(s, d):
+            raise OSError(errno.EACCES, "Permission denied")
+
+        monkeypatch.setattr(os, "replace", fake_replace)
+
+        with pytest.raises(OSError) as excinfo:
+            atomic_replace(str(src), str(dst))
+        assert excinfo.value.errno == errno.EACCES
+        # Source must remain untouched on failure.
+        assert src.exists()
+
+
+class TestSameSurnameGivenOrderViolation:
+    """A swap of two co-authors sharing a surname (e.g. 'Yang Song' <-> 'Jiaming
+    Song') is invisible to surname-only matching; against an order-preserving
+    record, comparing given-name initials catches it. Conservative: aligned
+    shared-surname runs with given names on both sides only."""
+
+    def _record(self, names, order_reliable=True, structured=True):
+        from bibtex_updater.utils import PublishedRecord
+
+        authors = []
+        for n in names:
+            given, family = n.rsplit(" ", 1)
+            authors.append({"given": given, "family": family})
+        return PublishedRecord(
+            doi="10.1/x", title="T", authors=authors, order_reliable=order_reliable, structured_names=structured
+        )
+
+    # SDEdit: real order has Yang Song then Jiaming Song; entry swaps them.
+    SDEDIT_REAL = ["Chenlin Meng", "Yutong He", "Yang Song", "Jiaming Song", "Jun-Yan Zhu"]
+    SDEDIT_ENTRY = "Chenlin Meng and Yutong He and Jiaming Song and Yang Song and Jun-Yan Zhu"
+
+    def test_same_surname_swap_is_violation(self):
+        from bibtex_updater.utils import same_surname_given_order_violation
+
+        assert same_surname_given_order_violation(self.SDEDIT_ENTRY, self._record(self.SDEDIT_REAL)) is True
+
+    def test_correct_order_is_not_a_violation(self):
+        from bibtex_updater.utils import same_surname_given_order_violation
+
+        entry = " and ".join(self.SDEDIT_REAL)  # same order as the record
+        assert same_surname_given_order_violation(entry, self._record(self.SDEDIT_REAL)) is False
+
+    def test_no_check_when_record_not_order_reliable(self):
+        from bibtex_updater.utils import same_surname_given_order_violation
+
+        rec = self._record(self.SDEDIT_REAL, order_reliable=False)
+        assert same_surname_given_order_violation(self.SDEDIT_ENTRY, rec) is False
+
+    def test_no_shared_surname_run_is_not_a_violation(self):
+        from bibtex_updater.utils import same_surname_given_order_violation
+
+        entry = "Alice Smith and Bob Jones and Carol Lee"
+        rec = self._record(["Alice Smith", "Bob Jones", "Carol Lee"])
+        assert same_surname_given_order_violation(entry, rec) is False
+
+    def test_unequal_surname_counts_skipped(self):
+        from bibtex_updater.utils import same_surname_given_order_violation
+
+        # Entry dropped one 'Song' -> counts differ -> left to surname-level logic.
+        entry = "Chenlin Meng and Yutong He and Yang Song and Jiajun Wu and Jun-Yan Zhu and Stefano Ermon"
+        assert same_surname_given_order_violation(entry, self._record(self.SDEDIT_REAL)) is False
+
+    def test_missing_given_names_skipped(self):
+        from bibtex_updater.utils import PublishedRecord, same_surname_given_order_violation
+
+        # Record authors have no given names -> cannot disambiguate -> no violation.
+        rec = PublishedRecord(
+            doi="10.1/x",
+            title="T",
+            authors=[{"given": "", "family": "Song"}, {"given": "", "family": "Song"}],
+            order_reliable=True,
+            structured_names=True,
+        )
+        assert same_surname_given_order_violation("Jiaming Song and Yang Song", rec) is False
+
+
+class TestClassifyGivenPair:
+    """Graded given-name cascade: only a full-vs-full incompatible first token
+    (not a nickname/close-spelling variant) escalates."""
+
+    def _class(self, e, r):
+        from bibtex_updater.utils import GIVEN_VARIETY_CLASS, classify_given_pair
+
+        return GIVEN_VARIETY_CLASS[classify_given_pair(e, r)]
+
+    def test_substitution_escalates(self):
+        assert self._class("Yujing", "Yue") == "escalate"  # d67418 Zhao
+        assert self._class("Rafael", "Ramon") == "escalate"  # d67418 Navarro
+        assert self._class("Yoshua", "Yann") == "escalate"
+
+    def test_benign_variants_confirmed(self):
+        assert self._class("D. P.", "Diederik P.") == "confirmed"  # initials
+        assert self._class("Diederik", "Diederik P.") == "confirmed"  # middle name
+        assert self._class("Stephane", "St{\\'e}phane") == "confirmed"  # diacritic/LaTeX
+        assert self._class("Jun-Yan", "Junyan") == "confirmed"  # hyphen fold
+        assert self._class("Yue", "Yue") == "confirmed"  # exact
+
+    def test_abbreviation_prefix_is_confirmed(self):
+        # Diminutives/abbreviations where one full token is a prefix of the other.
+        assert self._class("Tim", "Timothy A.") == "confirmed"
+        assert self._class("Chris", "Christopher") == "confirmed"
+        assert self._class("Dan", "Daniel") == "confirmed"
+        # Genuine substitutions are NOT prefixes -> still escalate.
+        assert self._class("Yujing", "Yue") == "escalate"
+        assert self._class("Rafael", "Ramon") == "escalate"
+
+    def test_low_confidence_softens(self):
+        assert self._class("Bill", "William") == "soften"  # nickname
+        assert self._class("Sergey", "Serguei") == "soften"  # close romanization
+        assert self._class("Y.", "Jiaming") == "soften"  # initial conflict
+
+    def test_glued_pubmed_initials_are_confirmed_not_substitution(self):
+        # PubMed writes given names as glued separator-less initial runs ("ME"
+        # for Maria Elisabetta). Without deglueing these were read as a full
+        # token and mis-escalated to a substitution ("me" vs "maria").
+        assert self._class("ME", "Maria Elisabetta") == "confirmed"
+        assert self._class("MK", "Michael K.") == "confirmed"
+        assert self._class("RMF", "Robin Maria Francisca") == "confirmed"
+        assert self._class("AA", "Alexey A.") == "confirmed"
+        # A glued run whose letters do NOT lead the record name is a low-confidence
+        # initial conflict (soften/abstain), never a hard substitution flag.
+        assert self._class("XY", "Maria Elisabetta") == "soften"
+        # Real short given names are mixed-case, not glued initials -> untouched.
+        assert self._class("Bo", "Bo") == "confirmed"
+        assert self._class("Wei", "Wei Zhang") == "confirmed"
+        # Deglueing must NOT rescue a genuine full-name substitution.
+        assert self._class("Yujing", "Yue") == "escalate"
+
+    def test_missing_given_is_non_comparable(self):
+        assert self._class("", "Yue") == "skip"
+        assert self._class("Yue", "") == "skip"
+
+
+class TestGivenNamePositionAudit:
+    """The audit escalates a genuine substitution only on an order-reliable,
+    structured record, at surname-confirmed positions."""
+
+    def _rec(self, pairs, order_reliable=True, structured=True):
+        from bibtex_updater.utils import PublishedRecord
+
+        return PublishedRecord(
+            doi="10.1/x",
+            title="T",
+            authors=[{"given": g, "family": f} for g, f in pairs],
+            order_reliable=order_reliable,
+            structured_names=structured,
+        )
+
+    # d67418: real Yue Zhao / Ramon Navarro; entry Yujing Zhao / Rafael Navarro.
+    ENTRY = "Durmus Acar and Yujing Zhao and Rafael Navarro and Matthew Mattina"
+    REAL = [("Durmus", "Acar"), ("Yue", "Zhao"), ("Ramon", "Navarro"), ("Matthew", "Mattina")]
+
+    def test_substitution_escalates_on_structured_record(self):
+        from bibtex_updater.utils import given_name_position_audit
+
+        worst, findings = given_name_position_audit(self.ENTRY, self._rec(self.REAL))
+        assert worst == "escalate"
+        assert any(f["variety"] == "given_name_substitution" for f in findings)
+
+    def test_escalates_on_unstructured_but_order_reliable_record(self):
+        # Loosened gate: a DBLP/OpenAlex record (order-reliable but synthesized
+        # names) DOES drive escalation -- this is the d67418 path, where the
+        # substitution surfaces only via a non-structured source.
+        from bibtex_updater.utils import given_name_position_audit
+
+        worst, findings = given_name_position_audit(self.ENTRY, self._rec(self.REAL, structured=False))
+        assert worst == "escalate"
+        assert any(f["variety"] == "given_name_substitution" for f in findings)
+
+    def test_no_escalation_when_not_order_reliable(self):
+        # Semantic Scholar (not order_reliable) is still excluded.
+        from bibtex_updater.utils import given_name_position_audit
+
+        worst, _ = given_name_position_audit(self.ENTRY, self._rec(self.REAL, order_reliable=False))
+        assert worst == "skip"
+
+    def test_correct_initials_citation_is_confirmed(self):
+        from bibtex_updater.utils import given_name_position_audit
+
+        # Initials-style entry against the real full names -> never escalates.
+        entry = "D. Acar and Y. Zhao and R. Navarro and M. Mattina"
+        worst, _ = given_name_position_audit(entry, self._rec(self.REAL))
+        assert worst in ("confirmed", "skip")
+
+    def test_repeated_surname_with_scrambled_order_does_not_escalate(self):
+        # Regression (df33d8b19854): two co-authors named Liu, and the record
+        # returns authors alphabetized (not publication order). A raw positional
+        # pairing put Wanwei Liu opposite Xinwang Liu -> false substitution. With
+        # the unique-surname guard, the repeated 'Liu' positions are skipped.
+        from bibtex_updater.utils import given_name_position_audit
+
+        entry = (
+            "Yufeng Zhang and Jialu Pan and Li Ken Li and Wanwei Liu and " "Zhenbang Chen and Xinwang Liu and Ji Wang"
+        )
+        # Record authors alphabetized by surname (as the real source returned them).
+        rec = self._rec(
+            [
+                ("Zhenbang", "Chen"),
+                ("Li Ken", "Li"),
+                ("Wanwei", "Liu"),
+                ("Xinwang", "Liu"),
+                ("Jialu", "Pan"),
+                ("Ji", "Wang"),
+                ("Yufeng", "Zhang"),
+            ]
+        )
+        worst, findings = given_name_position_audit(entry, rec)
+        assert worst != "escalate"
+        assert not any(f["variety"] == "given_name_substitution" for f in findings)

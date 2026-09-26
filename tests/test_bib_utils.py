@@ -10,6 +10,7 @@ from bibtex_updater.utils import (
     DiskCache,
     RateLimiter,
     crossref_message_to_record,
+    dblp_hit_to_candidate_record,
     dblp_hit_to_record,
     s2_data_to_record,
 )
@@ -107,6 +108,111 @@ class TestCrossrefMessageToRecord:
         rec = crossref_message_to_record(msg)
         assert rec is not None
         assert rec.authors == []
+
+    def test_subtitle_joined_into_title(self):
+        """ACM/IEEE split colon-titles across title/subtitle; the converter must
+        re-join them (the CACM NeRF record: title=["NeRF"], subtitle=[...])."""
+        msg = {
+            "DOI": "10.1145/3503250",
+            "type": "journal-article",
+            "title": ["NeRF"],
+            "subtitle": ["Representing scenes as neural radiance fields for view synthesis"],
+        }
+        rec = crossref_message_to_record(msg)
+        assert rec is not None
+        assert rec.title == "NeRF: Representing scenes as neural radiance fields for view synthesis"
+
+    def test_subtitle_html_stripped_before_join(self):
+        msg = {
+            "DOI": "10.1234/test",
+            "title": ["<i>Head</i>"],
+            "subtitle": ["the <b>rest</b> of it"],
+        }
+        rec = crossref_message_to_record(msg)
+        assert rec is not None
+        assert rec.title == "Head: the rest of it"
+
+    def test_no_subtitle_leaves_title_alone(self):
+        msg = {
+            "DOI": "10.1234/test",
+            "title": ["Just a Title"],
+        }
+        rec = crossref_message_to_record(msg)
+        assert rec is not None
+        assert rec.title == "Just a Title"
+
+    def test_empty_subtitle_list_leaves_title_alone(self):
+        msg = {
+            "DOI": "10.1234/test",
+            "title": ["Just a Title"],
+            "subtitle": [],
+        }
+        rec = crossref_message_to_record(msg)
+        assert rec is not None
+        assert rec.title == "Just a Title"
+
+    def test_blank_subtitle_string_leaves_title_alone(self):
+        msg = {
+            "DOI": "10.1234/test",
+            "title": ["Just a Title"],
+            "subtitle": [""],
+        }
+        rec = crossref_message_to_record(msg)
+        assert rec is not None
+        assert rec.title == "Just a Title"
+
+    def test_subtitle_already_in_title_not_duplicated(self):
+        """Some publishers repeat the subtitle inside the full title; don't
+        append it twice (case-insensitive containment check)."""
+        msg = {
+            "DOI": "10.1234/test",
+            "title": ["NeRF: Representing Scenes as Neural Radiance Fields for View Synthesis"],
+            "subtitle": ["Representing scenes as neural radiance fields for view synthesis"],
+        }
+        rec = crossref_message_to_record(msg)
+        assert rec is not None
+        assert rec.title == "NeRF: Representing Scenes as Neural Radiance Fields for View Synthesis"
+
+    def test_subtitle_without_title_ignored(self):
+        msg = {
+            "DOI": "10.1234/test",
+            "subtitle": ["Orphan subtitle"],
+        }
+        rec = crossref_message_to_record(msg)
+        assert rec is not None
+        assert rec.title is None
+
+    def test_created_date_is_last_resort(self):
+        """``created`` is the DOI *deposit* date (years off for backfilled
+        archives) -- ``issued`` must win over it."""
+        msg = {
+            "DOI": "10.1234/test",
+            "issued": {"date-parts": [[1998]]},
+            "created": {"date-parts": [[2015, 4, 1]]},
+        }
+        rec = crossref_message_to_record(msg)
+        assert rec is not None
+        assert rec.year == 1998
+
+    def test_created_date_used_when_nothing_else(self):
+        msg = {
+            "DOI": "10.1234/test",
+            "created": {"date-parts": [[2015, 4, 1]]},
+        }
+        rec = crossref_message_to_record(msg)
+        assert rec is not None
+        assert rec.year == 2015
+
+    def test_published_print_still_wins_over_created(self):
+        msg = {
+            "DOI": "10.1234/test",
+            "published-print": {"date-parts": [[2003]]},
+            "created": {"date-parts": [[2011]]},
+            "issued": {"date-parts": [[2004]]},
+        }
+        rec = crossref_message_to_record(msg)
+        assert rec is not None
+        assert rec.year == 2003
 
 
 class TestDblpHitToRecord:
@@ -221,6 +327,117 @@ class TestDblpHitToRecord:
         rec = dblp_hit_to_record(hit)
         assert rec is not None
         assert rec.url == "https://example.com/paper"
+
+    def test_dblp_disambiguation_suffix_stripped_from_surname(self):
+        """Regression: DBLP appends a 4-digit homonym suffix ("Yu Sun 0020",
+        "Chuan Guo 0001"). It must be dropped so the family name is the real
+        surname, not the number -- otherwise the author comparison scores a
+        false author_mismatch against the correct bib entry.
+        """
+        hit = {
+            "info": {
+                "title": "On Calibration of Modern Neural Networks",
+                "authors": {"author": ["Chuan Guo 0001", "Geoff Pleiss", "Yu Sun 0020", "Kilian Q. Weinberger"]},
+                "venue": "Journal of Testing",
+                "year": "2017",
+                "doi": "10.1234/dblp.calib",
+                "type": "Conference and Workshop Papers",
+            }
+        }
+        rec = dblp_hit_to_record(hit)
+        assert rec is not None
+        families = [a["family"] for a in rec.authors]
+        assert families == ["Guo", "Pleiss", "Sun", "Weinberger"]
+        # The disambiguation digits move into the given name, not the surname.
+        assert rec.authors[0] == {"given": "Chuan", "family": "Guo"}
+        assert rec.authors[2] == {"given": "Yu", "family": "Sun"}
+
+    def test_corr_venue_rejected_as_preprint(self):
+        """Regression (F4): DBLP labels arXiv papers with venue "CoRR". Such a
+        hit must be rejected (return None) so resolution falls through to the
+        real published venue instead of accepting the preprint as published.
+        """
+        hit = {
+            "info": {
+                "title": "Some Preprint Indexed Under CoRR",
+                "authors": {"author": ["Jane Doe"]},
+                "venue": "CoRR",
+                "year": "2024",
+                "doi": "10.48550/arXiv.2401.00001",
+                "type": "Journal Articles",
+            }
+        }
+        assert dblp_hit_to_record(hit) is None
+
+
+class TestDblpHitToCandidateRecord:
+    """FIX E-DBLP: the permissive cascade-candidate converter must keep clean
+    title+author hits that the strict resolver converter drops -- i.e. DOI-less
+    conference papers and arXiv/CoRR copies -- so DBLP can contribute scorable
+    candidates for ICML/ICLR/NeurIPS references.
+    """
+
+    def test_keeps_doi_less_conference_hit(self):
+        """The exact failure case: a DOI-less, ee-less ICLR paper. The strict
+        converter returns None here; the permissive one must keep it."""
+        hit = {
+            "info": {
+                "title": "Context-Aware Sparse Deep Coordination Graphs",
+                "authors": {"author": ["Tonghan Wang", "Liang Zeng"]},
+                "venue": "ICLR",
+                "year": "2022",
+                "type": "Conference and Workshop Papers",
+            }
+        }
+        assert dblp_hit_to_record(hit) is None  # strict drops it
+        rec = dblp_hit_to_candidate_record(hit)  # permissive keeps it
+        assert rec is not None
+        assert rec.title == "Context-Aware Sparse Deep Coordination Graphs"
+        assert rec.type == "proceedings-article"
+        assert [a["family"] for a in rec.authors] == ["Wang", "Zeng"]
+
+    def test_keeps_corr_arxiv_copy(self):
+        """CoRR/arXiv hits are rejected by the strict converter but retained as
+        candidates here (we don't discard the preprint copy outright)."""
+        hit = {
+            "info": {
+                "title": "Some Paper Indexed Under CoRR",
+                "authors": {"author": ["Jane Doe"]},
+                "venue": "CoRR",
+                "year": "2024",
+                "doi": "10.48550/arXiv.2401.00001",
+                "type": "Journal Articles",
+            }
+        }
+        assert dblp_hit_to_record(hit) is None
+        rec = dblp_hit_to_candidate_record(hit)
+        assert rec is not None
+        assert rec.title == "Some Paper Indexed Under CoRR"
+
+    def test_strips_homonym_suffix(self):
+        hit = {
+            "info": {
+                "title": "On Calibration of Modern Neural Networks",
+                "authors": {"author": ["Chuan Guo 0001", "Yu Sun 0020"]},
+                "venue": "ICML",
+                "year": "2017",
+                "type": "Conference and Workshop Papers",
+            }
+        }
+        rec = dblp_hit_to_candidate_record(hit)
+        assert rec is not None
+        assert [a["family"] for a in rec.authors] == ["Guo", "Sun"]
+
+    def test_rejects_missing_title(self):
+        hit = {"info": {"authors": {"author": ["Jane Doe"]}, "venue": "ICML", "year": "2020"}}
+        assert dblp_hit_to_candidate_record(hit) is None
+
+    def test_rejects_no_authors(self):
+        hit = {"info": {"title": "Authorless", "venue": "ICML", "year": "2020"}}
+        assert dblp_hit_to_candidate_record(hit) is None
+
+    def test_empty_hit(self):
+        assert dblp_hit_to_candidate_record({}) is None
 
 
 class TestS2DataToRecord:

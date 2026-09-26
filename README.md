@@ -2,7 +2,7 @@
 
 Tools for managing BibTeX bibliographies: automatically update preprints to published versions, validate references against external databases, and filter to only cited references.
 
-![9-stage resolution pipeline](assets/pipeline.gif)
+![10-stage resolution pipeline](assets/pipeline.gif)
 
 ## Installation
 
@@ -72,7 +72,7 @@ bibtex-update references.bib --dry-run --verbose
 # Check if references exist and have correct metadata
 bibtex-check references.bib --report report.json
 
-# Strict mode: exit with error if hallucinated/not-found entries
+# Strict mode: exit 4 on problematic entries, 5 if the sources went down mid-run
 bibtex-check references.bib --strict
 ```
 
@@ -142,6 +142,7 @@ python filter_bibliography.py paper.tex -b references.bib -o filtered.bib
 | [docs/ZOTERO_UPDATER.md](docs/ZOTERO_UPDATER.md) | Full Zotero updater documentation |
 | [docs/FILTER_BIBLIOGRAPHY.md](docs/FILTER_BIBLIOGRAPHY.md) | Full filter documentation |
 | [docs/LANDSCAPE.md](docs/LANDSCAPE.md) | Databases, competing tools, and ecosystem landscape |
+| [benchmarks/HALLMARK.md](benchmarks/HALLMARK.md) | `bibtex-check` v1.2.0 detection metrics on HALLMARK v1.1.1 (all splits) + reproduction |
 | [examples/](examples/) | Example workflows and configuration files |
 
 ## Overleaf Integration
@@ -168,13 +169,13 @@ For `filter_bibliography.py` only (no dependencies required):
 
 ![Preprint to published](assets/before-after.gif)
 
-- **Multi-source resolution**: arXiv, OpenAlex, Europe PMC, Crossref, DBLP, ACL Anthology, Semantic Scholar, Google Scholar
+- **Multi-source resolution**: arXiv, OpenAlex, Europe PMC, Crossref, DBLP, ACL Anthology, OpenReview, Semantic Scholar, Google Scholar
 - **High accuracy**: Title and author fuzzy matching with confidence thresholds
 - **ACL Anthology support**: Zero-overhead resolution for NLP papers (ACL, EMNLP, NAACL, etc.)
 - **Batch processing**: Multiple files with concurrent workers (default: 8)
 - **Deduplication**: Merge duplicates by DOI or normalized title+authors
 - **Smart caching**: On-disk cache + semantic resolution cache with TTL
-- **Per-service rate limiting**: Optimized rate limits per API (Crossref, S2, DBLP, ACL Anthology, arXiv, OpenAlex, Europe PMC)
+- **Per-service rate limiting**: Optimized rate limits per API (Crossref, S2, DBLP, ACL Anthology, arXiv, OpenAlex, Europe PMC, OpenReview)
 - **Batch API support**: Faster bulk lookups via arXiv/S2/Crossref batch endpoints
 - **Resolution tracking**: `--mark-resolved` tags updated entries to skip on re-runs
 
@@ -210,11 +211,125 @@ For `filter_bibliography.py` only (no dependencies required):
 
 ![Reference fact-checker](assets/fact-checker.gif)
 
-- **Multi-source validation**: Crossref, DBLP, Semantic Scholar
+**v1.2.0** carries v1.1.0's held-out FPR work into the *catch-rate* dimension: ~110 previously-abstained hallucinations are now flagged as `problematic`, the SCoRe wrong-venue leak class is caught, and a `--strict` evaluation mode tuned for [arXiv's 2026 hallucinated-reference policy](https://www.nature.com/articles/d41586-026-01595-5) (1-year ban followed by peer-review-first requirement) is available for high-stakes audits. Against the corrected HALLMARK v1.0 gold:
+
+- **Held-out test FPR steady at 2.32%** (8.94% in v1.0.0 → 2.32% in v1.1.0+v1.2.0; **−74%** vs v1.0.0). Dev FPR 1.59% → 1.99% (+0.4pp; 3 small documented regression FPs)
+- **Caught-on-hallucinated**: dev 60% → **75%**, test 58% → **74%** (+15pp on both splits) — driven by the new cross-source venue verification (catches SCoRe-shape leaks), the ID-anchored venue/year mismatch helper, and the relaxed-author retrieval fallback
+- **Leak rate**: 0.65% dev (4 entries), 0.57% test (3 entries; SCoRe caught — was 4 in v1.1.0); policy-adjusted 0.32% / 0.38% — remaining "leaks" are mostly 1-character title perturbations; **hyphen-only differences are explicitly *not* counted as leaks in default mode** (hyphenation is bibliographic noise that varies across DBLP/Crossref/publisher records — flagging it would generate false positives on most legit refs). `--strict` catches every 1-char title diff (Levenshtein-1, hyphen included) for arXiv-style high-stakes audits, plus tolerance-0 year, single-source author-fab detection, and truncated-author flagging. See [docs/KNOWN_LEAKS.md](docs/KNOWN_LEAKS.md) for the per-leak enumeration and policy
+- **Could-not-verify** on real refs dropped ~70% via venue + retrieval refinements (OpenReview/PMLR track-suffix normalization, TMLR/JMLR ISO-4 alias expansion, diacritic-preserving paperhash)
+
+The "leak" headline is mostly benchmark noise: [HALLMARK PR #9](https://anonymous.4open.science/r/hallmark) corrects 30 entries — including **FlashAttention, DDPM, Imagen, SimCLR, Performers, ViT-vs-CNN, Chain-of-Thought (Wei), Zero-Shot Reasoner (Kojima), MERLOT** — that the v1.0 auto-labeller flagged as fabricated but are in fact real, correctly-cited papers (arXiv DOIs register with DataCite, not CrossRef, so the auto-labeller's "no resolve" check returned false). The corrected leak rate isolates genuine catch opportunities.
+
+![bibtex-check v1.2.0 accuracy](assets/accuracy_v1_2_0.png)
+
+The full per-split detection grid (DR / FPR / Precision / F1 / MCC / Coverage on
+`dev_public`, `test_public`, `stress_test`, `test_crossdomain`) against the
+**corrected HALLMARK v1.1.1 gold** lives in
+[`benchmarks/HALLMARK.md`](benchmarks/HALLMARK.md), with a reproducible eval
+script ([`scripts/eval_hallmark.py`](scripts/eval_hallmark.py)):
+
+```bash
+# Score bibtex-check on a HALLMARK split and emit detection metrics
+export S2_API_KEY=...   # optional: lifts Semantic Scholar rate limits
+python scripts/eval_hallmark.py --split /path/to/hallmark/data/v1.0/test_public.jsonl --out test_public.json
+```
+
+- **Multi-source validation**: Crossref, OpenAlex, DBLP, OpenReview, Semantic Scholar
 - **Detailed mismatch detection**: Title, author, year, venue comparisons
-- **Hallucination detection**: Identifies likely fabricated references
-- **Structured reports**: JSON and JSONL output formats
-- **CI/CD integration**: Strict mode with exit codes for automation
+- **Integrity checks**: DOI- and arXiv-ID-target consistency, ID-anchored author fabrication, chimeric-title detection, corrupt-index-record distrust
+- **Hallucination detection**: Reserves `hallucinated` for positive evidence (fabricated DOI, future/invalid year, ID misattribution); abstains (`not_found`) on weak matches. `not_found` means "the sources queried do not know this reference", not "this reference is fabricated" — but it carries negative polarity (`p_valid` 0.35) and integrations commonly map it to a hallucination label, so decide that policy deliberately ([what `not_found` does and does not assert](docs/REFERENCE_FACT_CHECKER.md#what-not_found-does-and-does-not-assert)). `--strict` fails on the whole problematic bucket, which makes it stricter than the NeurIPS 2026 criteria for hallucinated references: those treat a real venue that is wrong for the reference, a wrong arXiv ID and small author or title errors as errors to report to the authors rather than hallucinations ([verdicts](docs/REFERENCE_FACT_CHECKER.md#verdicts-verified-vs-could-not-verify-vs-problematic))
+- **Structured reports**: JSON and JSONL output. Every JSONL line and every JSON report entry names the sources the cascade queried (`api_sources_queried`) alongside the subset that returned a candidate (`api_sources`), and any record it declined to score (`distrusted_records`) ([per-line fields](docs/REFERENCE_FACT_CHECKER.md#jsonl-report---jsonl))
+- **CI/CD integration**: `--strict` exits 4 on problematic entries; a run whose sources did not answer exits 5 instead, in every mode ([exit codes](docs/REFERENCE_FACT_CHECKER.md#exit-codes))
+
+#### Cascading verification
+
+Inspired by [Abbonato 2026 (CheckIfExist)](https://arxiv.org/abs/2602.15871), verification runs a single cascade — CrossRef → OpenAlex → DBLP → OpenReview → Semantic Scholar — that short-circuits as soon as a source returns a candidate at or above 0.95 that positively confirms every claimed field. Each step retrieves top-K candidates and re-ranks them by title similarity; combined with cross-source author intersection, this catches swapped-author / chimeric citations that single-source verification misses.
+
+The order is throughput-aware: CrossRef (~300 req/min) and OpenAlex (polite pool, ~150 req/min) come first, then DBLP and OpenReview (~30 req/min) as the CS-conference and ICLR/NeurIPS/TMLR authorities, so the slow keyless Semantic Scholar fallback (~10 req/min) is only reached on hard entries. It is health-aware on top of that: a source whose circuit is open, or which has been failing consistently during the run, is consulted after the sources that are still answering, and is never dropped. Set a Semantic Scholar API key (`--s2-api-key` or `S2_API_KEY`) to lift S2 from ~10 to ~60 req/min.
+
+Health-awareness earns its place because one source is genuinely sick. DBLP answered 201 of 501 probes (40.1%) across 2026-09-04/05, and it refuses with `503` and an empty backend pool rather than the `429` and `Retry-After` its crawling FAQ documents, so the failure is server-side and requesting more slowly does not recover it: availability tracks the clock instead, 0-27% between 12:00 and 17:00 local against 42-75% between 00:00 and 04:00. In the pre-screening ablations measured over those two days it accounted for 92-96% of every entry with an incomplete source lookup, which is what normally carries a run past `--outage-threshold` to exit 5. Per-source measurements, and what to set before a long run, are in [docs/SOURCE_BOTTLENECKS.md](docs/SOURCE_BOTTLENECKS.md).
+
+OpenReview owns the submission record for most ML conferences, so it positively confirms ICLR/NeurIPS/TMLR papers that the DOI- and CS-index sources above can only leave in the "could-not-verify" bucket. Retrieval uses *fielded* title search (CrossRef `query.title`, OpenAlex `title.search`) rather than a free-text title+author blob, which keeps DOI-less ML-conference titles ranked correctly.
+
+OpenReview runs two hosts, and they hold disjoint sets of notes. Counted live under an authenticated session: ICLR 2024 has 0 notes on `api.openreview.net` and 2,260 on `api2.openreview.net`, NeurIPS 2024 0 and 4,035, TMLR 0 and 4,639, while ICLR 2021 has 860 on v1 and 0 on v2. v1 holds the pre-2023 venues and v2 everything from 2023 on, so the exact title + first-author lookup runs against v2 first and then v1, and a miss counts as exhaustive only once both have answered.
+
+The lookup key is OpenReview's own `paperhash`, which the client reproduces character for character: Latin-1 diacritics are preserved (`Akyürek` indexes as `akyürek`, and the folded `akyurek` returns nothing) while Latin Extended is dropped rather than folded (`Karlaš` indexes as `karla`); a title keeps the maths that survives into it (`$\ell_p$` indexes as `\ell_p`, `RoboMP$^2$` as `robomp^2`); and the surname is the last whitespace token, so `Marine Le Morvan` indexes as `morvan`. Because a client cannot know which Unicode range a name falls in — and because the DBLP mirror of the same paper arrives already transliterated, as a separate note — both the diacritic-preserving and the ASCII-folded form are issued.
+
+The two fixes were measured together against the live API over 617 previously unresolvable references: the single-host lookup under the old key resolved 136 of them (22.0%), asking both hosts under the old key resolved 438 (71.0%), and asking both hosts under the corrected key resolves 457 (74.1%). Reaching the second host is what recovers most of that; reproducing the key is what recovers the accented authors and the maths-bearing titles the second host still misses.
+
+A `venueid` of `OpenReview.net/Public_Article` or `OpenReview.net/Archive` is self-claimed ORCID/Crossref profile metadata rather than a submission OpenReview ran. Its `venue` string looks exactly like an accepted paper's ("WWW 2026", "Information Sciences"), so such a note never confirms a venue, a year, or an acceptance status; it can still corroborate a title and an author list, which is all OpenReview actually knows there.
+
+OpenReview keeps its `/notes` endpoints behind a browser challenge, so the exact title + first-author lookup answers `403` to an anonymous caller. An anonymous run reports that refusal honestly (the entry cannot become a `not_found`) and stops re-issuing the refused request per endpoint. Supplying an OpenReview account restores the lookup:
+
+```bash
+export OPENREVIEW_USERNAME=you@example.org   # or pass --openreview-username
+export OPENREVIEW_PASSWORD=...               # read from the environment only
+```
+
+Both halves are needed and both are optional: without them the run proceeds anonymously, and a login that fails degrades to anonymous rather than ending the run. The password is never accepted as a flag, never logged, and never written to the response cache. The same two variables (and the same `--openreview-username` flag) authenticate `bibtex-update`'s OpenReview stage, which asks the same two hosts and shares the cached token with the checker.
+
+The bearer token is cached across processes, at `~/.cache/bibtex-updater/openreview-tokens.json` (mode 0600, under `$XDG_CACHE_HOME` when set) and keyed by a hash of the username, so neither the address nor the password lands on disk. One token authenticates both hosts and is valid for 24 hours, while `/login` refused 44 of 47 logins with `429` in the measured run. A `401` refreshes the token once; a `403` is a challenge, not a stale token, and spends no login. Set `BIBTEX_CHECK_OPENREVIEW_TOKEN_CACHE=0` for the previous login-per-process behaviour, or to a path to move the file.
+
+```bash
+# Verification with top-3 candidates per source
+bibtex-check references.bib --top-k 3 --jsonl out.jsonl
+
+# Polite OpenAlex pool (recommended)
+bibtex-check references.bib --openalex-mailto you@example.com
+```
+
+A 0–100 numeric `confidence_score` (additive in the JSONL output) summarizes per-field similarity with explicit penalty/bonus contributions:
+
+- Multi-source bonus: `+10` when ≥2 sources confirm the same authors
+- Penalties: title-mismatch `-20`, author-mismatch `-20`, journal-mismatch `-15`, fabricated-author `-10` each (capped at `-20`)
+- Asymmetric formula for the high-title-low-author chimeric case: `confidence = S_title − 0.5 × (100 − S_author)`
+
+#### Corrupt index records
+
+An index can serve a work under the entry's own identifier and its real author list but a different paper's title — OpenAlex does this today for ToolLLM, Constitutional AI and LoRA. Scored as a candidate, such a record produces a `title_mismatch` against a correctly cited entry, and downstream that reads as a fabricated citation; over a 267-submission screening run the signature came from a corrupt record three times for every real citation error. The cascade therefore drops an identifier-anchored candidate whose authors the entry confirms and whose title similarity is below 0.50, and only once the identifier's own authority has answered: arXiv for a `10.48550/arxiv.*` DOI or a bare arXiv ID, Crossref for every other DOI. A source that confirms the entry's title wins outright, and a divergence that two identifier-anchored sources report independently is left to stand, so a hybrid fabrication — real identifier, real authors, invented title — keeps its verdict. Each dropped record is reported in `distrusted_records`, which is a statement about the source and never about the entry. Disable with `--no-distrust-corrupt-index-records`.
+
+#### Verdicts: verified vs. could-not-verify vs. problematic
+
+`VERIFIED` requires every claimed field to be *positively confirmed* against the matched record — not merely "not contradicted". When a record is found but a claimed field can't be confirmed (e.g. a published venue backed only by a preprint, or an incomplete author list), the entry is reported as **could-not-verify** (`UNCONFIRMED`/`NOT_FOUND`), distinct from a **problematic** flag (`*_mismatch`, `doi_mismatch`, chimeric, …) which is positive evidence of a defect. A "could-not-verify" is *not* a clean pass: it means the tool couldn't decide, and such entries warrant review.
+
+Venue comparison is three-valued for the same reason. Common ISO-4 journal abbreviations (`ACM Trans. Graph.`, `Proc. Natl. Acad. Sci. U.S.A.`) are expanded before the comparison, and a pair that neither canonicalizes to a known venue nor looks alike returns `NON_COMPARABLE`, which lands in `unconfirmed_fields` rather than `mismatched_fields`. `MISMATCH` is reserved for positive grounds: both sides canonicalizing to different known venues, a satellite event on exactly one side, or two venues that each state an acronym and state different ones.
+
+For full transparency, every residual `VERIFIED`-on-a-real-leak case against the corrected HALLMARK v1.0 gold is enumerated in [`docs/KNOWN_LEAKS.md`](docs/KNOWN_LEAKS.md), with the perturbation, the default verdict, and the `--strict` rule that catches it.
+
+#### Author handling
+
+All sources return authors in as-published order, so a *multiset-equal* reordering is treated as a real swapped-authors defect — *except* when the API record is alphabetized (Crossref NeurIPS/ICML proceedings deposits, prefix `10.52202`, sort contributors A–Z; that's a record-sort artifact, not a swap). Surname comparison uses each source's structured `family` field where available (Crossref, OpenAlex, OpenReview `~Given_Family` handles), so family-first/CJK names like "Chen Xing" ↔ "Xing Chen" match cleanly; when the matched source lacks structured names, a Crossref structured-name lookup vets a potential author mismatch before reporting it.
+
+The **lead author's given name** is graded via `classify_given_pair`: diacritic / initial / abbreviation / nickname / transliteration variants pass; a true substitution (e.g. "Shunyu Zhou" vs canonical "Denny Zhou") flags as `GIVEN_NAME_SUBSTITUTION`. The **cross-source author-fabrication** check downgrades the author outcome to `AUTHOR_MISMATCH` when the entry contributes ≥2 surnames absent from every order-reliable candidate's full author set (no `and others` sentinel, ≥2 sources contributing), catching fabricated trailing authors that slip past the prefix-N slice. DBLP-scraped XML entities (`&apos;`, `&amp;`) are decoded before any matching, so `d'Amore`, `D'Hondt`, `Ch'ng` no longer trigger spurious mismatches.
+
+#### Strict mode (`--strict`)
+
+For high-stakes submissions where the asymmetric cost is leak ≫ FP — [arXiv as of May 2026 imposes a 1-year ban for incontrovertible hallucinated references, thereafter requiring submissions to be accepted by a reputable peer-reviewed venue first](https://www.researchinformation.info/news/arxiv-imposes-one-year-ban-for-unchecked-ai-generated-content/) — `--strict` (or `BIBTEX_CHECK_STRICT=1`) tightens the verdict gate:
+
+- **Title:** Levenshtein-1 catches 1-character typos and added/removed hyphens (`"Privacy"`/`"Privacys"`, `"Schema Variable"`/`"Schema-Variable"`).
+- **Year:** tolerance 0; a preprint-twin record returns `STRICT_WARN_PREPRINT_YEAR` instead of silently confirming.
+- **Author-set:** even a single entry-side surname absent from a single complete canonical record flags `AUTHOR_MISMATCH` (the default requires ≥2 absent across ≥2 sources, to avoid false positives on stub records).
+- **Author order:** the alphabetized-record escape is disabled — every same-multiset reordering on an order-reliable source flags.
+- **Truncated author list without an `and others`/`et al` sentinel** flags `AUTHOR_TRUNCATED` (silent truncation is a misrepresentation; an explicit sentinel discloses it).
+
+The companion `--strict-warn-cnv` subflag (requires `--strict`) promotes `unconfirmed`/`not_found` to a fourth visible category `STRICT_WARN_CNV`, so CI integrations can fail on entries the tool couldn't anchor. Default mode keeps the principled three-way verdict unchanged.
+
+`--strict` exits 4 when problematic or unreadable entries remain; abstentions do not fail it unless `--strict-warn-cnv` is set. A run in which the fraction of entries with an incomplete source lookup reached `--outage-threshold` (default 10%) exits 5 instead, in strict and default mode alike — an incomplete run outranks its own content findings, because verdicts reached without a complete cascade are not the findings they look like.
+
+```bash
+# Strict pass for an arXiv submission
+bibtex-check references.bib --strict --strict-warn-cnv --jsonl strict.jsonl
+```
+
+#### Non-generative-AI mode (`--non-generative`)
+
+For venue-policy compliance ([ACL ARR](https://aclrollingreview.org/reviewerguidelines#q-can-i-use-generative-ai), [ICML 2026](https://icml.cc/Conferences/2026/LLM-Policy)) the `--non-generative` flag (or `BIBTEX_CHECK_NON_GENERATIVE=1` env var) refuses to load any LLM backend at runtime. Today the package has no LLM backends, so this is a forward-compat guard plus a startup banner:
+
+```bash
+bibtex-check references.bib --non-generative --strict
+# bibtex-check running in non-generative mode (no LLM calls).
+# Compliant with ICML 2026 / ACL ARR LLM-in-review policies.
+```
 
 ### Filter Bibliography (`bibtex-filter`)
 

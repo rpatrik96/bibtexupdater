@@ -182,7 +182,7 @@ Google Scholar is opt-in (`--use-scholarly` flag) because it is unreliable and s
 
 | Tool | Approach | Databases | Strengths | Limitations |
 |------|----------|-----------|-----------|-------------|
-| **bibtexupdater** | Multi-stage pipeline | arXiv, OpenAlex, Europe PMC, Crossref, DBLP, ACL Anthology, S2, Scholar | Most comprehensive pipeline, CI/CD ready, async support | Requires API calls (cached) |
+| **bibtexupdater** | Multi-stage pipeline | arXiv, OpenAlex, Europe PMC, Crossref, DBLP, ACL Anthology, OpenReview, S2, Scholar | Most comprehensive pipeline, CI/CD ready, async support | Requires API calls (cached) |
 | **rebiber** | Pre-built conference data | Static ACL/NeurIPS/etc. data | Fast, no API calls for known venues | NLP-only, static data requires manual updates |
 | **reffix** | Single-source lookup | DBLP | Simple, lightweight | Single source = lower coverage outside CS |
 | **PreprintResolver** | 4-database search | Crossref, DBLP, S2, OpenAlex | Published academic paper documenting approach | 60.3% success rate (2023 data) |
@@ -238,7 +238,7 @@ These tools verify whether references actually exist and have correct metadata. 
 
 | Tool | Type | Databases | Notes |
 |------|------|-----------|-------|
-| **bibtex-check** (bibtexupdater) | Open source CLI | Crossref, DBLP, S2 | Built-in fact checker in this project |
+| **bibtex-check** (bibtexupdater) | Open source CLI | Crossref, OpenAlex, DBLP, OpenReview, S2 | Built-in fact checker in this project |
 | **GPTZero** | Commercial API | Proprietary | Found 100+ hallucinations in NeurIPS 2025 submissions |
 | **Citely** | Commercial | CrossRef + multi-source | Claims >95% accuracy on hallucination detection |
 | **RefChecker** | Open source | S2, OpenAlex, CrossRef | Microsoft Research, Python library + web UI |
@@ -250,7 +250,7 @@ These tools verify whether references actually exist and have correct metadata. 
 #### bibtex-check (bibtexupdater)
 
 - **Command**: `bibtex-check references.bib --strict --report report.json`
-- **Approach**: For each BibTeX entry, queries Crossref, DBLP, and Semantic Scholar to verify existence and metadata accuracy. Checks title, author, year, and venue against database records. Flags entries as "not found", "hallucinated" (likely fabricated), or "mismatched" (exists but metadata differs).
+- **Approach**: For each BibTeX entry, runs a single short-circuiting cascade (Crossref → OpenAlex → DBLP → OpenReview → Semantic Scholar) to verify existence and metadata accuracy. Checks title, author, year, and venue against database records, plus identity-anchored integrity checks (a DOI/arXiv ID that resolves to a *different* paper, or correct ID with fabricated authors). Distinguishes three outcomes: "verified" (every field positively confirmed), "could-not-verify" (record found but a field unconfirmable — an abstention, not a pass), and "problematic" (positive evidence of a mismatch/fabrication).
 - **Output**: JSON/JSONL reports with detailed mismatch information. Strict mode exits with error code for CI/CD integration.
 - **Use case**: Verifying bibliographies before submission, catching LLM hallucinations in AI-generated papers, ensuring BibTeX accuracy.
 
@@ -273,7 +273,7 @@ These tools verify whether references actually exist and have correct metadata. 
 - **Repository**: https://github.com/markrussinovich/refchecker
 - **Approach**: Python library and web UI from Microsoft Research. Queries Semantic Scholar, OpenAlex, and Crossref to validate citations. Includes both exact matching and fuzzy matching modes.
 - **Strengths**: Microsoft-backed, open source, good documentation, supports multiple output formats.
-- **Comparison to bibtexupdater**: RefChecker and bibtexupdater's `bibtex-check` command have similar architectures (multi-source validation with fuzzy matching). RefChecker includes OpenAlex in validation while bibtexupdater uses OpenAlex primarily for resolution. RefChecker's web UI may be more accessible for non-technical users, while bibtexupdater's CLI is more suitable for automation and CI/CD.
+- **Comparison to bibtexupdater**: RefChecker and bibtexupdater's `bibtex-check` command have similar architectures (multi-source validation with fuzzy matching), and both include OpenAlex in validation. bibtexupdater additionally cascades through DBLP and OpenReview, giving it stronger authoritative coverage of ML-conference (ICLR/NeurIPS/TMLR) submissions, and distinguishes "could-not-verify" abstentions from positive-evidence problems. RefChecker's web UI may be more accessible for non-technical users, while bibtexupdater's CLI is more suitable for automation and CI/CD.
 
 #### HaRC (harcx)
 
